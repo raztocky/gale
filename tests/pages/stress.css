@@ -1,0 +1,10 @@
+body { font-family: Georgia, serif; max-width: 760px; margin: 0 auto; padding: 0 16px 40px; }
+#top { background: #222; margin: 0 -16px; padding: 10px 16px; }
+.bar { display: flex; gap: 18px; }
+.bar a { color: #fff; text-decoration: none; font-family: sans-serif; }
+h1 { color: #333; border-bottom: 3px solid #e67e22; }
+.note { background: #fff8dc; border-left: 4px solid gold; padding: 8px 12px; }
+.boxes .box { width: 300px; margin: 10px auto; padding: 10px; border: 2px dashed steelblue; text-align: center; }
+.box.right { margin-right: 0; background-color: #e8f1fa }
+.pill { display: inline-block; background: #2563eb; color: white; padding: 2px 10px; border-radius: 9px; font-family: sans-serif; font-size: 13px; }
+table { margin: 12px 0; }

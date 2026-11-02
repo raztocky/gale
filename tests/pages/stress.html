@@ -1,0 +1,42 @@
+<html><head><title>Stress test</title>
+<link rel="stylesheet" href="stress.css">
+</head>
+<body>
+<div id="top">
+  <nav class="bar"><a href="/">Home</a><a href="a.html">Articles</a><a href="../x.html">About</a></nav>
+</div>
+<h1>Plain old HTML &mdash; no closing tags</h1>
+<p>This paragraph is long enough that it should wrap across several lines of text in the window, testing
+   whitespace    collapsing across
+   newlines and <a href="link.html">an inline <b>bold link</b> that spans</a> words. Here is some <em>emphasis</em>,
+   a <mark>highlight</mark>, and <span style="color: rgb(200, 30, 30); font-weight: 700">inline-styled red bold</span>.
+<p class=note>A paragraph with an unquoted class attribute and a <br> line break.
+<blockquote>Quoted text is indented forty pixels on both sides as in a real browser's UA sheet.</blockquote>
+<ul>
+ <li>First
+ <li>Second, with nested:
+   <ul><li>Nested circle<li>Another
+     <ul><li>Square</ul>
+   </ul>
+ <li>Third
+</ul>
+<ol start=5><li>Five<li>Six</ol>
+<table border=1>
+<tr><th>Name<th>Value
+<tr><td>alpha<td>1
+<tr><td>beta<td>2
+</table>
+<div class="boxes">
+  <div class="box">Centered fixed-width box with <code>margin: auto</code></div>
+  <div class="box right">Right box</div>
+</div>
+<p>Inline-blocks: <span class="pill">one</span> <span class="pill">two</span> <span class="pill">three</span> after.</p>
+<pre>
+fn main() {
+    println!("preformatted   spacing kept");
+}
+</pre>
+<p style="text-align:right">right-aligned &copy; 2026</p>
+<p hidden>you should not see this</p>
+<div style="display:none">nor this</div>
+</body></html>

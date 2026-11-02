@@ -1,0 +1,18 @@
+[package]
+name = "gale"
+version = "0.1.0"
+edition = "2021"
+description = "A tiny web browser engine written from scratch"
+
+[features]
+default = ["gui"]
+gui = ["dep:minifb"]
+
+[dependencies]
+fontdue = "0.9"
+png = "0.17"
+ureq = { version = "2", features = ["native-certs"] }
+minifb = { version = "0.27", optional = true }
+
+[profile.dev]
+opt-level = 1

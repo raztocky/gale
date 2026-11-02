@@ -1,0 +1,47 @@
+<!doctype html>
+<html>
+<head>
+<title>Gale</title>
+<style>
+  body { font-family: sans-serif; margin: 0; background: #f6f7f9; color: #1d2330; }
+  .wrap { max-width: 720px; margin: 0 auto; padding: 32px 24px; }
+  header { background: #1d4ed8; color: white; padding: 28px 24px; }
+  header h1 { margin: 0; font-size: 40px; }
+  header p { margin: 6px 0 0 0; color: #c7d7ff; }
+  .card { background: white; border: 1px solid #dde1e7; padding: 16px 20px; margin-bottom: 16px; }
+  .card h2 { margin-top: 0; font-size: 20px; }
+  nav { display: flex; gap: 12px; }
+  nav a { color: white; background: #1e40af; padding: 6px 12px; text-decoration: none; }
+  code { background: #eef0f4; padding: 1px 4px; }
+  .muted { color: #6b7280; font-size: 14px; }
+  pre { background: #111827; color: #e5e7eb; padding: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Gale</h1>
+  <p>A browser engine written from scratch in Rust. No Chromium, no WebKit, no Gecko.</p>
+</header>
+<div class="wrap">
+  <div class="card">
+    <h2>What works</h2>
+    <ul>
+      <li>HTML parsing with <b>implicit tags</b>, entities &amp; raw text
+      <li>CSS selectors, specificity, the <i>cascade</i> and inheritance
+      <li>Block &amp; inline layout, text wrapping, <code>max-width</code>, auto margins
+      <li>Lists, borders, backgrounds, <u>underline</u>, <s>strikethrough</s>
+    </ul>
+  </div>
+  <div class="card">
+    <h2>Try it</h2>
+    <ol>
+      <li>Press <code>Ctrl+L</code> or click the address bar, type a URL, hit Enter.
+      <li>Click links. <code>Backspace</code> goes back.
+    </ol>
+    <pre>cargo run --release -- https://example.com
+cargo run --release -- render page.html -o page.png</pre>
+    <p style="text-align:center" class="muted">Links: <a href="https://example.com">example.com</a> · <a href="https://info.cern.ch/hypertext/WWW/TheProject.html">the first website</a></p>
+  </div>
+</div>
+</body>
+</html>
