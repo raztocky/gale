@@ -10,6 +10,9 @@ use std::sync::OnceLock;
 
 pub struct Page {
     pub url: String,
+    /// The page whose link opened this one (`None` if the user typed it).
+    /// Kept so reload/back/forward re-apply the same security checks.
+    pub opener: Option<String>,
     pub title: String,
     pub dom: Node,
     pub sheets: Vec<Stylesheet>,
@@ -22,22 +25,43 @@ pub struct Rendered {
     pub links: Vec<(Rect, String)>,
 }
 
+/// Most external stylesheets a page may pull in.
+const MAX_STYLESHEETS: usize = 16;
+
 fn ua_sheet() -> &'static Stylesheet {
     static UA: OnceLock<Stylesheet> = OnceLock::new();
     UA.get_or_init(|| css::parse(style::UA_CSS))
 }
 
 impl Page {
-    pub fn load(url: &str) -> Page {
-        match net::fetch(url) {
-            Ok(src) => Page::from_html(url, &src),
-            Err(e) => Page::from_html(url, &error_page(url, &e)),
+    /// Load `url`. `from` is the page that asked for it (a clicked link), or
+    /// `None` when the user typed the address themselves.
+    pub fn load(url: &str, from: Option<&str>) -> Page {
+        if !net::may_load(from, url) {
+            let why = if net::scheme(url) == "file" {
+                "Web pages aren't allowed to open files on your computer."
+            } else {
+                "Brickle can only open http, https and local file addresses."
+            };
+            return Page::from_html(url, &error_page(url, why)).opened_by(from);
         }
+        let page = match net::fetch(url) {
+            Ok(f) => Page::from_html(&f.url, &f.body),
+            Err(e) => Page::from_html(url, &error_page(url, &e)),
+        };
+        page.opened_by(from)
     }
+
+    fn opened_by(mut self, from: Option<&str>) -> Page {
+        self.opener = from.map(str::to_string);
+        self
+    }
+
 
     pub fn from_html(url: &str, src: &str) -> Page {
         let dom = html::parse(src);
         let mut sheets = Vec::new();
+        let mut external = 0;
         let mut found = Vec::new();
         dom.walk(&mut found, &|n| matches!(n.tag(), Some("style") | Some("link")));
         for n in found {
@@ -50,9 +74,19 @@ impl Page {
                     if media.contains("print") {
                         continue;
                     }
-                    match net::fetch(&net::resolve(url, href)) {
-                        Ok(text) => sheets.push(css::parse(&text)),
-                        Err(err) => eprintln!("gale: stylesheet failed: {err}"),
+                    let target = net::resolve(url, href);
+                    if !net::may_load(Some(url), &target) {
+                        eprintln!("brickle: blocked stylesheet {target}");
+                        continue;
+                    }
+                    external += 1;
+                    if external > MAX_STYLESHEETS {
+                        eprintln!("brickle: too many stylesheets, skipping {target}");
+                        continue;
+                    }
+                    match net::fetch(&target) {
+                        Ok(f) => sheets.push(css::parse(&f.body)),
+                        Err(err) => eprintln!("brickle: stylesheet failed: {err}"),
                     }
                 }
             }
@@ -63,7 +97,7 @@ impl Page {
             .first()
             .map(|t| t.text_content().split_whitespace().collect::<Vec<_>>().join(" "))
             .unwrap_or_default();
-        Page { url: url.to_string(), title, dom, sheets }
+        Page { url: url.to_string(), opener: None, title, dom, sheets }
     }
 
     pub fn render(&self, width: f32, viewport_h: f32) -> Rendered {
@@ -128,4 +162,25 @@ fn error_page(url: &str, err: &str) -> String {
         esc(url),
         esc(err)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Page;
+
+    #[test]
+    fn web_page_links_to_local_files_are_blocked() {
+        let dir = std::env::temp_dir().join("brickle-test-secret.html");
+        std::fs::write(&dir, "<title>SECRET</title>").unwrap();
+        let file_url = format!("file://{}", dir.display());
+
+        // Clicked from a web page (also how reload/back replay it): blocked.
+        let p = Page::load(&file_url, Some("https://evil.example/"));
+        assert_eq!(p.title, "Error");
+        assert_eq!(p.opener.as_deref(), Some("https://evil.example/"));
+
+        // Typed by the user, or linked from another local file: allowed.
+        assert_eq!(Page::load(&file_url, None).title, "SECRET");
+        assert_eq!(Page::load(&file_url, Some("file:///tmp/x.html")).title, "SECRET");
+    }
 }

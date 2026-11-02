@@ -94,6 +94,13 @@ impl Color {
     }
 }
 
+/// Deepest `@media`/`@supports` nesting we follow.
+const MAX_NESTING: usize = 8;
+/// Longest selector (number of compound parts) we accept.
+const MAX_SELECTOR_PARTS: usize = 32;
+/// Most rules kept from one stylesheet.
+pub const MAX_RULES: usize = 5_000;
+
 pub fn parse(source: &str) -> Stylesheet {
     let src = strip_comments(source);
     let mut p = Parser { chars: src.chars().collect(), pos: 0 };
@@ -200,7 +207,7 @@ impl Parser {
                         && !lower.contains("max-width"))
                         || lower.starts_with("@supports")
                         || lower.starts_with("@layer");
-                    if usable {
+                    if usable && depth < MAX_NESTING {
                         self.pos += 1;
                         rules.extend(self.rules(depth + 1));
                     } else {
@@ -220,7 +227,7 @@ impl Parser {
                     }
                     let selectors: Vec<Selector> =
                         prelude.split(',').filter_map(parse_selector).collect();
-                    if !selectors.is_empty() && !declarations.is_empty() {
+                    if !selectors.is_empty() && !declarations.is_empty() && rules.len() < MAX_RULES {
                         rules.push(Rule { selectors, declarations });
                     }
                 }
@@ -355,7 +362,7 @@ pub fn parse_selector(text: &str) -> Option<Selector> {
         compounds.push((s, pending));
         pending = Combinator::None;
     }
-    if compounds.is_empty() || pending != Combinator::None {
+    if compounds.is_empty() || pending != Combinator::None || compounds.len() > MAX_SELECTOR_PARTS {
         return None;
     }
     // Store right-to-left, with each combinator describing the link to the left.

@@ -1,5 +1,5 @@
 [package]
-name = "gale"
+name = "brickle"
 version = "0.1.0"
 edition = "2021"
 description = "A tiny web browser engine written from scratch"
@@ -11,6 +11,7 @@ gui = ["dep:minifb"]
 [dependencies]
 fontdue = "0.9"
 png = "0.17"
+url = "2"
 ureq = { version = "2", features = ["native-certs"] }
 minifb = { version = "0.27", optional = true }
 

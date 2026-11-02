@@ -5,6 +5,9 @@ use crate::dom::{ElementData, Node, NodeType};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+/// Largest font size we render, in px.
+pub const MAX_FONT_SIZE: f32 = 256.0;
+
 pub const UA_CSS: &str = include_str!("ua.css");
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -232,6 +235,14 @@ fn matches(e: &ElementData, ancestors: &[&ElementData], sel: &css::Selector) -> 
             Combinator::Child => anc
                 .split_last()
                 .is_some_and(|(p, rest)| go(&parts[1..], p, rest)),
+            // With only descendant combinators left, matching the nearest
+            // qualifying ancestor is always optimal, so no backtracking is
+            // needed. This keeps crafted selectors like `a a a a a b` on deep
+            // trees from taking exponential time.
+            _ if parts[1..].iter().all(|(_, c)| *c != Combinator::Child) => (0..anc.len())
+                .rev()
+                .find(|&i| matches_simple(anc[i], &parts[1].0, i == 0 && anc[i].tag == "html"))
+                .is_some_and(|i| go(&parts[1..], anc[i], &anc[..i])),
             _ => (0..anc.len()).rev().any(|i| go(&parts[1..], anc[i], &anc[..i])),
         }
     }
@@ -325,6 +336,8 @@ fn compute(
             v => ctxv.length(v, parent.font_size).unwrap_or(parent.font_size),
         };
     }
+    // Clamp absurd sizes: huge glyphs would eat memory in the glyph cache.
+    s.font_size = s.font_size.clamp(0.0, MAX_FONT_SIZE);
     // Keep line-height proportional when the font size changes, unless set.
     if (s.font_size - parent.font_size).abs() > f32::EPSILON {
         s.line_height = parent.line_height / parent.font_size * s.font_size;
@@ -497,6 +510,7 @@ fn compute(
             s.border_color[i] = s.color;
         }
     }
+    s.line_height = s.line_height.clamp(0.0, MAX_FONT_SIZE * 4.0);
     if is_root && s.display == Display::Inline {
         s.display = Display::Block;
     }

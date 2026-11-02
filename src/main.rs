@@ -13,15 +13,28 @@ mod style;
 use page::Page;
 
 const USAGE: &str = "\
-gale — a tiny browser engine
+brickle — Brickle Browser, a tiny from-scratch browser engine
 
 USAGE:
-  gale [URL|FILE]                        open a browser window
-  gale render URL|FILE [-o out.png] [-w WIDTH]   render a full page to PNG
-  gale dom URL|FILE                      print the parsed DOM tree
+  brickle [URL|FILE]                        open a browser window
+  brickle render URL|FILE [-o out.png] [-w WIDTH]   render a full page to PNG
+  brickle dom URL|FILE                      print the parsed DOM tree
 ";
 
 fn main() {
+    // Style, layout and paint recurse over the tree. The parser caps nesting
+    // depth, and a roomy stack gives that cap a wide safety margin.
+    let worker = std::thread::Builder::new()
+        .name("brickle".into())
+        .stack_size(256 * 1024 * 1024)
+        .spawn(real_main)
+        .expect("failed to start main thread");
+    if worker.join().is_err() {
+        std::process::exit(101);
+    }
+}
+
+fn real_main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("-h") | Some("--help") => {
@@ -31,7 +44,7 @@ fn main() {
         Some("render") => render(&args[1..]),
         Some("dom") => match args.get(1) {
             Some(u) => {
-                let page = Page::load(&net::normalize(u));
+                let page = Page::load(&net::normalize(u), None);
                 let mut s = String::new();
                 page.dom.dump(0, &mut s);
                 print!("{s}");
@@ -55,7 +68,10 @@ fn render(args: &[String]) -> Result<(), String> {
     while let Some(a) = it.next() {
         match a.as_str() {
             "-o" => out = it.next().ok_or("-o needs a path")?.clone(),
-            "-w" => width = it.next().and_then(|w| w.parse().ok()).ok_or("-w needs a number")?,
+            "-w" => {
+                width = it.next().and_then(|w| w.parse().ok()).ok_or("-w needs a number")?;
+                width = width.clamp(100.0, 8000.0);
+            }
             u => url = Some(u.to_string()),
         }
     }
@@ -74,13 +90,13 @@ fn load(input: &str) -> Page {
     if input == "about:home" {
         return Page::from_html("about:home", include_str!("../pages/home.html"));
     }
-    Page::load(&net::normalize(input))
+    Page::load(&net::normalize(input), None)
 }
 
 #[cfg(feature = "gui")]
 fn open(input: &str) -> Result<(), String> {
     let start = if input == "about:home" {
-        let p = std::env::temp_dir().join("gale-home.html");
+        let p = std::env::temp_dir().join("brickle-home.html");
         std::fs::write(&p, include_str!("../pages/home.html")).map_err(|e| e.to_string())?;
         format!("file://{}", p.display())
     } else {

@@ -18,9 +18,16 @@ const CLOSES_P: &[&str] = &[
     "section", "table", "ul",
 ];
 
+/// Deepest element nesting we build. Deeper start tags are ignored (their
+/// text is kept), which stops hostile pages from overflowing the stack in the
+/// recursive style/layout/paint passes. Browsers use similar caps.
+pub const MAX_DEPTH: usize = 256;
+/// Most nodes we create for one document.
+pub const MAX_NODES: usize = 100_000;
+
 pub fn parse(source: &str) -> Node {
     let tokens = Tokenizer { chars: source.chars().collect(), pos: 0 }.run();
-    let mut b = TreeBuilder { stack: vec![dom::elem("#document".into(), AttrMap::new(), vec![])] };
+    let mut b = TreeBuilder { stack: vec![dom::elem("#document".into(), AttrMap::new(), vec![])], nodes: 0 };
     for t in tokens {
         b.feed(t);
     }
@@ -183,6 +190,7 @@ impl Tokenizer {
 
 struct TreeBuilder {
     stack: Vec<Node>,
+    nodes: usize,
 }
 
 impl TreeBuilder {
@@ -227,11 +235,15 @@ impl TreeBuilder {
                     parent.children.last_mut()
                 {
                     prev.push_str(&t);
-                } else {
+                } else if self.nodes < MAX_NODES {
+                    self.nodes += 1;
                     parent.children.push(dom::text(t));
                 }
             }
             Token::Start { name, attrs, self_closing } => {
+                if self.nodes >= MAX_NODES {
+                    return;
+                }
                 let block_boundary = ["div", "td", "th", "li", "body", "html", "button", "blockquote"];
                 if CLOSES_P.contains(&name.as_str()) {
                     self.close_in_scope(&["p"], &block_boundary);
@@ -246,6 +258,10 @@ impl TreeBuilder {
                     _ => {}
                 }
                 let void = VOID.contains(&name.as_str());
+                if self.stack.len() >= MAX_DEPTH {
+                    return;
+                }
+                self.nodes += 1;
                 self.stack.push(dom::elem(name, attrs, vec![]));
                 if void || self_closing {
                     self.pop();
@@ -413,6 +429,21 @@ mod tests {
     fn void_and_entities() {
         let s = body("a&amp;b<br>c &#x41;&lt;");
         assert_eq!(s, "<body>\n  \"a&b\"\n  <br>\n  \"c A<\"\n");
+    }
+
+    #[test]
+    fn nesting_and_size_are_capped() {
+        fn depth(n: &Node) -> usize {
+            1 + n.children.iter().map(depth).max().unwrap_or(0)
+        }
+        let doc = parse(&format!("{}deep", "<div>".repeat(100_000)));
+        assert!(depth(&doc) <= MAX_DEPTH + 3);
+        assert!(doc.text_content().contains("deep"));
+
+        let doc = parse(&"<b>x</b>".repeat(MAX_NODES));
+        let mut all = Vec::new();
+        doc.walk(&mut all, &|_| true);
+        assert!(all.len() <= MAX_NODES + 4);
     }
 
     #[test]

@@ -109,10 +109,14 @@ pub struct Canvas {
 
 type GlyphKey = (usize, char, u32);
 
+/// Rasterized glyphs. Bounded so a page can't grow it without limit.
 #[derive(Default)]
 pub struct GlyphCache {
     map: HashMap<GlyphKey, (fontdue::Metrics, Vec<u8>)>,
+    bytes: usize,
 }
+
+const GLYPH_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 impl Canvas {
     pub fn new(width: usize, height: usize, bg: Color) -> Canvas {
@@ -165,8 +169,18 @@ impl Canvas {
         let f = &font::fonts()[font_idx];
         let mut pen = x;
         for ch in text.chars() {
+            let size = size.clamp(0.0, crate::style::MAX_FONT_SIZE);
             let key = (font_idx, ch, (size * 4.0) as u32);
-            let (m, bitmap) = cache.map.entry(key).or_insert_with(|| f.rasterize(ch, size));
+            if !cache.map.contains_key(&key) {
+                if cache.bytes > GLYPH_CACHE_BYTES {
+                    cache.map.clear();
+                    cache.bytes = 0;
+                }
+                let g = f.rasterize(ch, size);
+                cache.bytes += g.1.len() + 64;
+                cache.map.insert(key, g);
+            }
+            let (m, bitmap) = &cache.map[&key];
             let gx = (pen + m.xmin as f32).round() as i64;
             let gy = (baseline - (m.height as i32 + m.ymin) as f32).round() as i64;
             for row in 0..m.height {

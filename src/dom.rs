@@ -78,7 +78,7 @@ impl Node {
         }
     }
 
-    /// Pretty-print the tree (for `gale dom`).
+    /// Pretty-print the tree (for `brickle dom`).
     pub fn dump(&self, depth: usize, out: &mut String) {
         let pad = "  ".repeat(depth);
         match &self.node_type {
