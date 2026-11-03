@@ -25,6 +25,7 @@ landlock = "0.4.7"
 seccompiler = "0.5.0"
 rlimit = "0.11.0"
 libc = "0.2.191"
+nix = { version = "0.31.3", default-features = false, features = ["sched", "user"] }
 
 [profile.dev]
 opt-level = 1

@@ -9,15 +9,17 @@
 use crate::css::Color;
 use crate::layout::Rect;
 use crate::page::Rendered;
-use crate::paint::DisplayCommand;
-use crate::style::MAX_FONT_SIZE;
+use crate::paint::{DisplayCommand, GlyphBitmap, PlacedGlyph, MAX_ATLAS_BYTES, MAX_GLYPH_SIDE};
 use std::io::{self, Read, Write};
 
 /// Largest frame either side will accept.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 /// Largest coordinate we accept from a renderer (keeps the painter's math sane).
 const MAX_COORD: f32 = 10_000_000.0;
-const FONT_COUNT: u8 = 6;
+/// Most display commands / placed glyphs a renderer may send for one page,
+/// so a hostile renderer can't bog down the browser's painter.
+const MAX_COMMANDS: usize = 500_000;
+const MAX_GLYPHS: usize = 4_000_000;
 
 /// Browser -> renderer.
 #[derive(Debug, Clone, PartialEq)]
@@ -263,23 +265,15 @@ impl FromRenderer {
                             e.rect(*rect);
                             e.color(*color);
                         }
-                        DisplayCommand::Text {
-                            x,
-                            baseline,
-                            text,
-                            font,
-                            size,
-                            color,
-                            italic,
-                        } => {
+                        DisplayCommand::Glyphs { color, glyphs } => {
                             e.u8(2);
-                            e.f32(*x);
-                            e.f32(*baseline);
-                            e.str(text);
-                            e.u8(*font as u8);
-                            e.f32(*size);
                             e.color(*color);
-                            e.u8(*italic as u8);
+                            e.u32(glyphs.len() as u32);
+                            for g in glyphs {
+                                e.f32(g.x);
+                                e.f32(g.y);
+                                e.u32(g.id);
+                            }
                         }
                     }
                 }
@@ -287,6 +281,12 @@ impl FromRenderer {
                 for (rect, href) in &r.links {
                     e.rect(*rect);
                     e.str(href);
+                }
+                e.u32(r.atlas.len() as u32);
+                for g in &r.atlas {
+                    e.0.extend_from_slice(&g.w.to_le_bytes());
+                    e.0.extend_from_slice(&g.h.to_le_bytes());
+                    e.0.extend_from_slice(&g.data);
                 }
             }
             FromRenderer::Dom(s) => {
@@ -306,7 +306,11 @@ impl FromRenderer {
             3 => {
                 let height = d.f32()?.max(0.0);
                 let background = d.color()?;
-                let n = d.count(21)?;
+                let n = d.count(9)?;
+                if n > MAX_COMMANDS {
+                    return Err("too many display commands".into());
+                }
+                let mut glyph_total = 0usize;
                 let mut list = Vec::with_capacity(n);
                 for _ in 0..n {
                     list.push(match d.u8()? {
@@ -315,32 +319,21 @@ impl FromRenderer {
                             color: d.color()?,
                         },
                         2 => {
-                            let x = d.f32()?;
-                            let baseline = d.f32()?;
-                            let text = d.str()?;
-                            let font = d.u8()?;
-                            if font >= FONT_COUNT {
-                                return Err(format!("bad font index {font}"));
-                            }
-                            // Sizes below 1px are invisible and unsafe to
-                            // rasterize (see paint::MIN_TEXT_SIZE): zero them.
-                            let size = d.f32()?.clamp(0.0, MAX_FONT_SIZE);
-                            let size = if size < crate::paint::MIN_TEXT_SIZE {
-                                0.0
-                            } else {
-                                size
-                            };
                             let color = d.color()?;
-                            let italic = d.u8()? != 0;
-                            DisplayCommand::Text {
-                                x,
-                                baseline,
-                                text,
-                                font: font as usize,
-                                size,
-                                color,
-                                italic,
+                            let n = d.count(12)?;
+                            glyph_total += n;
+                            if glyph_total > MAX_GLYPHS {
+                                return Err("too many glyphs".into());
                             }
+                            let mut glyphs = Vec::with_capacity(n);
+                            for _ in 0..n {
+                                glyphs.push(PlacedGlyph {
+                                    x: d.f32()?,
+                                    y: d.f32()?,
+                                    id: d.u32()?,
+                                });
+                            }
+                            DisplayCommand::Glyphs { color, glyphs }
                         }
                         t => return Err(format!("unknown display command {t}")),
                     });
@@ -350,7 +343,36 @@ impl FromRenderer {
                 for _ in 0..n {
                     links.push((d.rect()?, d.str()?));
                 }
+                let n = d.count(4)?;
+                let mut atlas = Vec::with_capacity(n);
+                let mut atlas_bytes = 0usize;
+                for _ in 0..n {
+                    let w = u16::from_le_bytes(d.take(2)?.try_into().unwrap());
+                    let h = u16::from_le_bytes(d.take(2)?.try_into().unwrap());
+                    if w > MAX_GLYPH_SIDE || h > MAX_GLYPH_SIDE {
+                        return Err(format!("glyph bitmap too large: {w}x{h}"));
+                    }
+                    let len = w as usize * h as usize;
+                    atlas_bytes += len;
+                    if atlas_bytes > MAX_ATLAS_BYTES * 2 {
+                        return Err("glyph atlas too large".into());
+                    }
+                    atlas.push(GlyphBitmap {
+                        w,
+                        h,
+                        data: d.take(len)?.to_vec(),
+                    });
+                }
+                // Every placed glyph must refer to a bitmap that exists.
+                for cmd in &list {
+                    if let DisplayCommand::Glyphs { glyphs, .. } = cmd {
+                        if glyphs.iter().any(|g| g.id as usize >= atlas.len()) {
+                            return Err("glyph id out of range".into());
+                        }
+                    }
+                }
                 FromRenderer::Rendered(Rendered {
+                    atlas,
                     list,
                     height,
                     background,
@@ -381,14 +403,32 @@ mod tests {
                     },
                     color: Color::rgb(1, 2, 3),
                 },
-                DisplayCommand::Text {
-                    x: 5.0,
-                    baseline: 6.0,
-                    text: "héllo".into(),
-                    font: 3,
-                    size: 16.0,
+                DisplayCommand::Glyphs {
                     color: Color::BLACK,
-                    italic: true,
+                    glyphs: vec![
+                        PlacedGlyph {
+                            x: 5.0,
+                            y: 6.0,
+                            id: 0,
+                        },
+                        PlacedGlyph {
+                            x: 9.0,
+                            y: 6.0,
+                            id: 1,
+                        },
+                    ],
+                },
+            ],
+            atlas: vec![
+                GlyphBitmap {
+                    w: 2,
+                    h: 2,
+                    data: vec![0, 128, 255, 64],
+                },
+                GlyphBitmap {
+                    w: 1,
+                    h: 3,
+                    data: vec![1, 2, 3],
                 },
             ],
             height: 99.0,
@@ -452,22 +492,39 @@ mod tests {
         let mut bad = good.clone();
         bad[1..5].copy_from_slice(&f32::NAN.to_le_bytes());
         assert!(FromRenderer::decode(&bad).is_err());
-        // Out-of-range font index.
+        // A glyph id outside the atlas.
+        let mut r = sample();
+        r.list.push(DisplayCommand::Glyphs {
+            color: Color::BLACK,
+            glyphs: vec![PlacedGlyph {
+                x: 0.0,
+                y: 0.0,
+                id: 7,
+            }],
+        });
+        assert!(FromRenderer::decode(&FromRenderer::Rendered(r).encode())
+            .unwrap_err()
+            .contains("out of range"));
+        // An oversized glyph bitmap header.
+        let mut r = sample();
+        r.atlas.push(GlyphBitmap {
+            w: 5000,
+            h: 1,
+            data: vec![0; 5000],
+        });
+        assert!(FromRenderer::decode(&FromRenderer::Rendered(r).encode())
+            .unwrap_err()
+            .contains("too large"));
+        // A forged glyph count larger than the message.
         let mut e = Enc::default();
         e.u8(3);
         e.f32(1.0);
         e.color(Color::WHITE);
         e.u32(1);
         e.u8(2);
-        e.f32(0.0);
-        e.f32(0.0);
-        e.str("x");
-        e.u8(200);
-        e.f32(10.0);
         e.color(Color::BLACK);
-        e.u8(0);
-        e.u32(0);
-        assert!(FromRenderer::decode(&e.0).unwrap_err().contains("font"));
+        e.u32(u32::MAX);
+        assert!(FromRenderer::decode(&e.0).is_err());
         // Oversized frame header.
         let mut r: &[u8] = &(u32::MAX).to_le_bytes();
         assert!(read_frame(&mut r).is_err());

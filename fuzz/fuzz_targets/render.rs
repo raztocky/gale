@@ -14,5 +14,5 @@ fuzz_target!(|data: &[u8]| {
     let r = page.render(width, 600.0);
     assert!(r.height.is_finite());
     let mut canvas = paint::Canvas::new(64, 64, r.background);
-    canvas.paint(&r.list, 0.0, 0.0, &mut paint::GlyphCache::default());
+    canvas.paint(&r.list, &r.atlas, 0.0, 0.0);
 });

@@ -4,6 +4,8 @@
 //! process most likely to be compromised by a bug. Once sandboxed it can only
 //! talk to the browser over its stdin/stdout pipes:
 //!
+//! - **namespaces (best effort):** its own user, network and IPC namespace,
+//!   so there is no network to reach even past the other layers.
 //! - **rlimits:** bounded memory and CPU time, no core dumps.
 //! - **Landlock:** no filesystem access at all, no TCP bind/connect, no
 //!   signals or abstract UNIX sockets outside the sandbox.
@@ -19,6 +21,7 @@
 pub struct Report {
     pub landlock: &'static str,
     pub seccomp: bool,
+    pub namespaces: String,
 }
 
 #[cfg(target_os = "linux")]
@@ -55,12 +58,30 @@ mod linux {
         set(Resource::CPU, CPU_SECONDS)?;
         set(Resource::CORE, 0)?;
 
+        // Namespaces must come first: unshare needs a single-threaded process
+        // and syscalls the seccomp filter later forbids.
+        let namespaces = enter_namespaces();
         let landlock = restrict_landlock()?;
         apply_seccomp()?;
         Ok(Report {
             landlock,
             seccomp: true,
+            namespaces,
         })
+    }
+
+    /// Best effort: a fresh user, network and IPC namespace. The new network
+    /// namespace has no interfaces except a downed loopback, so even code
+    /// that got past seccomp and Landlock would find no network at all.
+    /// Some systems forbid unprivileged user namespaces (for example Ubuntu
+    /// 24.04 / Linux Mint 22 through AppArmor); then this layer is skipped
+    /// and the others still apply.
+    fn enter_namespaces() -> String {
+        use nix::sched::{unshare, CloneFlags};
+        match unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNET | CloneFlags::CLONE_NEWIPC) {
+            Ok(()) => "network and IPC isolated (own user namespace)".into(),
+            Err(e) => format!("unavailable on this system ({e}); other layers still apply"),
+        }
     }
 
     fn restrict_landlock() -> Result<&'static str, String> {

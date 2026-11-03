@@ -53,13 +53,14 @@ libraries, run `sudo apt install build-essential libxkbcommon-dev`.
  ─────────────────────────                     ──────────────────────────────────────────
  window, address bar, history                  html.rs ─▶ dom.rs ─▶ style.rs ◀─ css.rs
  network.rs: rules, blocker, HTTPS ◀─ipc─▶                           │
- tab.rs: security policy, timeouts             layout.rs ─▶ display list
- paint.rs: rasterizes the display list
+ tab.rs: security policy, timeouts             layout.rs ─▶ draw ops ─▶ glyph atlas (fontdue)
+ paint.rs: paints rects + glyph bitmaps
 ```
 
 The browser fetches everything and enforces the security rules. Untrusted HTML and CSS are parsed
 and laid out only in the renderer, which can't open files, use the network or run programs.
-It sends back a display list, which the browser validates before painting.
+It sends back rectangles and pre-rasterized glyph bitmaps, which the browser validates before
+painting.
 
 | Module | What it does |
 |---|---|
@@ -67,7 +68,7 @@ It sends back a display list, which the browser validates before painting.
 | `css.rs` | Rules, selectors (type, `.class`, `#id`, `*`, `[attr]`, `:root`, `:link`, descendant and `>` combinators), `@media`, `!important`, colors, units |
 | `style.rs` | Selector matching, specificity, the cascade (UA < author < inline), inheritance, shorthand expansion and computed values. The UA sheet is `ua.css` |
 | `layout.rs` | Block and inline formatting contexts, box model, auto margins, `max-width`, margin collapsing between siblings, word wrapping, `text-align`, `<pre>`, list markers, inline-blocks (baseline-aligned) and a basic row flexbox |
-| `paint.rs` | Display list and a software rasterizer: alpha-blended rects, anti-aliased glyphs (fontdue), synthetic italics |
+| `paint.rs` | Draw ops, glyph-atlas rasterization (in the renderer, via fontdue), and the browser's software painter: alpha-blended rects and glyph bitmaps |
 | `net.rs` | The only code that touches the network: single HTTP exchanges with Firefox's headers, decompression, URL helpers |
 | `network.rs` | The network service: applies tracking stripping, your rules, the filter lists, HTTPS-only and redirect checks to every request, and keeps the request log |
 | `filter.rs` | EasyList/uBlock filter engine: network rules, exceptions, options, cosmetic hiding, `$removeparam` |
@@ -86,15 +87,20 @@ Fonts are bundled DejaVu (see `assets/fonts/LICENSE-DejaVu.txt`).
 Brickle runs no JavaScript and stores no cookies or other site data. Privacy protections are
 described in [PRIVACY.md](PRIVACY.md). Security measures:
 
-- **Sandboxed renderer (Linux).** Each page is parsed in its own process, locked down with:
+- **Sandboxed renderer (Linux).** Each page is parsed, laid out and its text rasterized in its own
+  process, locked down with:
+  - **namespaces** (where the system allows unprivileged user namespaces): its own network and
+    IPC namespace, so there's no network to reach even past the other layers.
   - **Landlock:** no filesystem access, no TCP, no signals or abstract sockets outside the sandbox.
   - **seccomp-bpf:** a syscall allowlist, so `open`, `socket` and the like fail. `clone` can only
     create threads, memory can never be made executable, and attacker-only calls (`execve`,
     `ptrace`, `mount`, `bpf`, …) kill the renderer outright.
   - **rlimits:** 4 GB of memory and 120 s of CPU time.
 
-  The browser kills a renderer that hangs for 20 s or sends a malformed message, then shows an
-  error page. Run `brickle sandbox-test` to see it block file reads, network and exec on your
+  The browser only ever receives rectangles and finished glyph bitmaps from a renderer, and checks
+  them (sizes, counts, references) before painting. It never runs the font rasterizer on anything
+  a page controls. It kills a renderer that hangs for 20 s or sends a malformed message, then
+  shows an error page. Run `brickle sandbox-test` to see it block file reads, network and exec on your
   machine.
 - **Web pages can't reach your local network.** A public website can't make Brickle send
   requests to your router, printer or other devices (`192.168.x.x`, `localhost`, …). This is
@@ -129,6 +135,11 @@ described in [PRIVACY.md](PRIVACY.md). Security measures:
 - **Static analysis.** CodeQL scans the Rust code and the workflows, zizmor audits the CI
   workflows, and OpenSSF Scorecard rates the project's practices. Results are under the repo's
   Security tab.
+
+- **Verifiable releases.** Release binaries are built only by GitHub Actions, with SHA-256 checksums
+  and a signed build-provenance attestation:
+  `gh attestation verify brickle-*-x86_64-linux.tar.gz --repo raztocky/gale`.
+  Brickle never updates itself.
 
 To report a vulnerability, see [SECURITY.md](SECURITY.md).
 

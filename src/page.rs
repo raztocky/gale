@@ -22,6 +22,8 @@ pub struct Page {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Rendered {
     pub list: DisplayList,
+    /// Glyph bitmaps the list's `Glyphs` commands refer to.
+    pub atlas: Vec<paint::GlyphBitmap>,
     pub height: f32,
     pub background: Color,
     pub links: Vec<(Rect, String)>,
@@ -110,12 +112,13 @@ impl Page {
             background = Color::WHITE;
         }
 
-        let list = paint::build_display_list(&root);
+        let (list, atlas) = paint::rasterize(paint::build_display_list(&root));
         let mut links = Vec::new();
         collect_links(&root, &mut links);
         let mb = root.dims.margin_box();
         Rendered {
             list,
+            atlas,
             height: mb.y + mb.h,
             background,
             links,

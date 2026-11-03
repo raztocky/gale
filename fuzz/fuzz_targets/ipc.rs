@@ -11,9 +11,9 @@ fuzz_target!(|data: &[u8]| {
         // The browser paints whatever a (possibly hostile) renderer sends.
         if let FromRenderer::Rendered(r) = &msg {
             let mut canvas = brickle::paint::Canvas::new(64, 48, r.background);
-            let mut cache = brickle::paint::GlyphCache::default();
-            canvas.paint(&r.list, 0.0, 10.0, &mut cache);
-            canvas.paint(&r.list, 1e6, 10.0, &mut cache);
+            canvas.paint(&r.list, &r.atlas, 0.0, 10.0);
+            canvas.paint(&r.list, &r.atlas, 1e6, 10.0);
+            canvas.paint(&r.list, &r.atlas, -1e6, 10.0);
             let _ = r.link_at(10.0, 10.0);
         }
     }

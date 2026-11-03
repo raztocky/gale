@@ -72,7 +72,8 @@ fn main() {
         };
         if name.is_empty() {
             println!(
-                "landlock: {}\nseccomp: {}",
+                "namespaces: {}\nlandlock: {}\nseccomp: {}",
+                report.namespaces,
                 report.landlock,
                 if report.seccomp { "on" } else { "off" }
             );
@@ -289,7 +290,7 @@ fn render(args: &[String], sandboxed: bool, filters: bool) -> Result<(), String>
     let r = tab.render(width, 768.0);
     let height = (r.height.ceil() as usize).clamp(1, 20_000);
     let mut canvas = paint::Canvas::new(width as usize, height, r.background);
-    canvas.paint(&r.list, 0.0, 0.0, &mut paint::GlyphCache::default());
+    canvas.paint(&r.list, &r.atlas, 0.0, 0.0);
     canvas.write_png(&out).map_err(|e| e.to_string())?;
     println!("{out}: {}x{height} \"{}\"", width as usize, tab.title);
     Ok(())

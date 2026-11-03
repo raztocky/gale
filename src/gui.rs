@@ -167,6 +167,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
     };
     let mut rendered = Rendered {
         list: vec![],
+        atlas: vec![],
         height: 0.0,
         background: Color::WHITE,
         links: vec![],
@@ -454,7 +455,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         let loading = matches!(busy, Some(Some(_))) || queued.is_some();
         if dirty || loading {
             canvas = Canvas::new(w, h, rendered.background);
-            canvas.paint(&rendered.list, scroll, BAR_H, &mut cache);
+            canvas.paint(&rendered.list, &rendered.atlas, scroll, BAR_H);
             draw_chrome(
                 &mut canvas,
                 &ui,
