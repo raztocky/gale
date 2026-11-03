@@ -22,6 +22,8 @@ pub enum Dest {
     Document,
     Stylesheet,
     Script,
+    /// `fetch`/`XMLHttpRequest` from a page's script.
+    Xhr,
 }
 
 const T_DOCUMENT: u8 = 1;
@@ -29,7 +31,10 @@ const T_STYLESHEET: u8 = 2;
 /// Types Brickle never requests (image, xhr, font, ...).
 const T_OTHER: u8 = 4;
 const T_SCRIPT: u8 = 8;
-const T_ALL: u8 = T_DOCUMENT | T_STYLESHEET | T_OTHER | T_SCRIPT;
+const T_XHR: u8 = 16;
+const T_ALL: u8 = T_DOCUMENT | T_STYLESHEET | T_OTHER | T_SCRIPT | T_XHR;
+/// Types Brickle requests, so rules for them matter.
+const T_USED: u8 = T_DOCUMENT | T_STYLESHEET | T_SCRIPT | T_XHR;
 
 #[derive(Debug, Clone)]
 struct NetRule {
@@ -238,6 +243,7 @@ impl NetRule {
             Dest::Document => T_DOCUMENT,
             Dest::Stylesheet => T_STYLESHEET,
             Dest::Script => T_SCRIPT,
+            Dest::Xhr => T_XHR,
         };
         let type_ok = if self.types == 0 {
             // Untyped rules apply to subresources; top-level documents are
@@ -727,7 +733,8 @@ fn parse_network(line: &str) -> Option<Parsed> {
                 "document" | "doc" => Some(T_DOCUMENT),
                 "stylesheet" | "css" => Some(T_STYLESHEET),
                 "script" => Some(T_SCRIPT),
-                "image" | "xmlhttprequest" | "xhr" | "font" | "media" | "object" | "subdocument"
+                "xmlhttprequest" | "xhr" => Some(T_XHR),
+                "image" | "font" | "media" | "object" | "subdocument"
                 | "frame" | "ping" | "websocket" | "other" | "beacon" | "webrtc" | "object-subrequest" => {
                     Some(T_OTHER)
                 }
@@ -783,7 +790,7 @@ fn parse_network(line: &str) -> Option<Parsed> {
     if neg_types != 0 {
         types = T_ALL & !neg_types & !T_DOCUMENT | (types & T_DOCUMENT);
     }
-    if types != 0 && types & (T_DOCUMENT | T_STYLESHEET | T_SCRIPT) == 0 && !generichide && !elemhide {
+    if types != 0 && types & T_USED == 0 && !generichide && !elemhide {
         return Some(Parsed::Irrelevant);
     }
 
@@ -844,7 +851,7 @@ fn parse_network(line: &str) -> Option<Parsed> {
         // removeparam applies to navigations as well as subresources.
         let mut rule = rule;
         if rule.types == 0 {
-            rule.types = T_DOCUMENT | T_STYLESHEET | T_SCRIPT;
+            rule.types = T_USED;
         }
         let pattern = if rest.is_empty() && start == Anchor::None {
             None

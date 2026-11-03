@@ -244,6 +244,8 @@ pub enum Dest {
     Stylesheet,
     /// A page's script (only for sites where you allowed JavaScript).
     Script,
+    /// A request a page's script made (`fetch`, `XMLHttpRequest`).
+    Xhr,
     /// `brickle filters update`.
     Download,
 }
@@ -272,12 +274,46 @@ fn with_cookie(req: ureq::Request, cookie: Option<&str>) -> ureq::Request {
     }
 }
 
+/// A request made by a page's script (`fetch`/`XMLHttpRequest`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ScriptRequest {
+    /// Upper-case method.
+    pub method: String,
+    /// Headers the script set (already filtered by policy).
+    pub headers: Vec<(String, String)>,
+    pub body: Option<String>,
+    pub credentials: Credentials,
+}
+
+/// Whether a script request carries cookies (`fetch`'s `credentials`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Credentials {
+    Omit,
+    #[default]
+    SameOrigin,
+    Include,
+}
+
+/// Wire details of a script request for one hop.
+#[derive(Debug, Clone, Copy)]
+pub struct Outgoing<'a> {
+    pub method: &'a str,
+    pub headers: &'a [(String, String)],
+    pub body: Option<&'a str>,
+    /// `Origin` header value, if one is sent.
+    pub origin: Option<&'a str>,
+    /// A cross-origin (CORS) request rather than a same-origin one.
+    pub cors: bool,
+}
+
 pub struct Response {
     pub status: u16,
     /// `Location` header of a redirect, unresolved.
     pub location: Option<String>,
     /// `Set-Cookie` headers, for the cookie jar.
     pub set_cookies: Vec<String>,
+    /// Every response header (lower-case names), for script requests.
+    pub headers: Vec<(String, String)>,
     pub body: String,
 }
 
@@ -295,6 +331,7 @@ pub fn http_get(
     cookie: Option<&str>,
 ) -> Result<Response, NetError> {
     http_get_timeout(
+        None,
         url,
         dest,
         initiator,
@@ -318,6 +355,49 @@ pub fn http_get_until(
     deadline: Instant,
     cancel: &Cancel,
 ) -> Result<Response, NetError> {
+    http_request_until(None, url, dest, initiator, public_only, cookie, deadline, cancel)
+}
+
+/// An owned copy of [`Outgoing`] for the request thread.
+struct OwnedOutgoing {
+    method: String,
+    headers: Vec<(String, String)>,
+    body: Option<String>,
+    origin: Option<String>,
+    cors: bool,
+}
+
+impl OwnedOutgoing {
+    fn as_outgoing(&self) -> Outgoing<'_> {
+        Outgoing {
+            method: &self.method,
+            headers: &self.headers,
+            body: self.body.as_deref(),
+            origin: self.origin.as_deref(),
+            cors: self.cors,
+        }
+    }
+}
+
+/// [`http_get_until`] for any request, including a script's (`script`).
+#[allow(clippy::too_many_arguments)]
+pub fn http_request_until(
+    script: Option<Outgoing>,
+    url: &str,
+    dest: Dest,
+    initiator: Option<&str>,
+    public_only: bool,
+    cookie: Option<&str>,
+    deadline: Instant,
+    cancel: &Cancel,
+) -> Result<Response, NetError> {
+    let outgoing = script.map(|o| OwnedOutgoing {
+        method: o.method.to_string(),
+        headers: o.headers.to_vec(),
+        body: o.body.map(str::to_string),
+        origin: o.origin.map(str::to_string),
+        cors: o.cors,
+    });
     let left = deadline.saturating_duration_since(Instant::now());
     if cancel.is_cancelled() {
         return Err(NetError::Cancelled);
@@ -342,6 +422,7 @@ pub fn http_get_until(
         .spawn(move || {
             let _slot = slot;
             let r = http_get_timeout(
+                outgoing.as_ref().map(|o| o.as_outgoing()),
                 &url,
                 dest,
                 initiator.as_deref(),
@@ -425,6 +506,7 @@ fn classify(e: &ureq::Error) -> NetError {
 }
 
 fn http_get_timeout(
+    script: Option<Outgoing>,
     url: &str,
     dest: Dest,
     initiator: Option<&str>,
@@ -456,7 +538,8 @@ fn http_get_timeout(
     let agent = builder.build();
     let site = fetch_site(initiator, url);
     // Header names, values and order as sent by Firefox.
-    let mut req = agent.get(url).set("User-Agent", &user_agent());
+    let method = script.map(|o| o.method).unwrap_or("GET");
+    let mut req = agent.request(method, url).set("User-Agent", &user_agent());
     req = match dest {
         Dest::Document => {
             req = req
@@ -498,6 +581,31 @@ fn http_get_timeout(
                 .set("Sec-Fetch-Mode", "no-cors")
                 .set("Sec-Fetch-Site", site)
         }
+        Dest::Xhr => {
+            let o = script.ok_or_else(|| NetError::Other("script request without details".into()))?;
+            let accept = o
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("accept"))
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("*/*");
+            req = req
+                .set("Accept", accept)
+                .set("Accept-Language", "en-US,en;q=0.5")
+                .set("Accept-Encoding", "gzip, deflate, br, zstd");
+            for (k, v) in o.headers.iter().filter(|(k, _)| !k.eq_ignore_ascii_case("accept")) {
+                req = req.set(k, v);
+            }
+            if let Some(origin) = o.origin {
+                req = req.set("Origin", origin);
+            }
+            req = req.set("Connection", "keep-alive");
+            req = with_cookie(req, cookie);
+            req.set("Sec-Fetch-Dest", "empty")
+                .set("Sec-Fetch-Mode", if o.cors { "cors" } else { "same-origin" })
+                .set("Sec-Fetch-Site", site)
+                .set("Priority", "u=4")
+        }
         Dest::Download => req
             .set("Accept", "*/*")
             .set("Accept-Language", "en-US,en;q=0.5")
@@ -505,18 +613,29 @@ fn http_get_timeout(
             .set("Connection", "keep-alive"),
     };
     REQUESTS.fetch_add(1, Ordering::SeqCst);
-    let resp = match req.call() {
+    let sent = match script.and_then(|o| o.body) {
+        Some(body) => req.send_string(body),
+        None => req.call(),
+    };
+    let resp = match sent {
         Ok(r) => r,
         Err(ureq::Error::Status(_, r)) => r,
         Err(e) => return Err(classify(&e)),
     };
     let status = resp.status();
     let set_cookies: Vec<String> = resp.all("set-cookie").into_iter().map(str::to_string).collect();
+    let mut headers = Vec::new();
+    for name in resp.headers_names() {
+        for v in resp.all(&name) {
+            headers.push((name.to_ascii_lowercase(), v.to_string()));
+        }
+    }
     if (300..400).contains(&status) {
         return Ok(Response {
             status,
             location: resp.header("location").map(str::to_string),
             set_cookies,
+            headers,
             body: String::new(),
         });
     }
@@ -578,6 +697,7 @@ fn http_get_timeout(
         status,
         location: None,
         set_cookies,
+        headers,
         body: String::from_utf8_lossy(&bytes).into_owned(),
     })
 }

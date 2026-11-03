@@ -1037,6 +1037,7 @@ fn draw_panel(
             net::Dest::Document => "page",
             net::Dest::Stylesheet => "css",
             net::Dest::Script => "js",
+            net::Dest::Xhr => "xhr",
             net::Dest::Download => "list",
         };
         let head = format!("{status} · {kind}");

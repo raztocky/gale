@@ -365,6 +365,47 @@ impl Jar {
 
     /// The `Cookie` header for a request, and the names it contains.
     pub fn header_for(&mut self, url: &str, ctx: Context) -> Option<(String, Vec<String>)> {
+        self.cookie_string(url, ctx, true)
+    }
+
+    /// `document.cookie` for a page: its cookies as a request to the page
+    /// itself would carry them, minus HttpOnly ones.
+    pub fn script_string(&mut self, page_url: &str) -> String {
+        let ctx = Context {
+            top: page_url,
+            initiator: Some(page_url),
+            navigation: false,
+        };
+        self.cookie_string(page_url, ctx, false).map(|(s, _)| s).unwrap_or_default()
+    }
+
+    /// A page's script setting `document.cookie = value`. Scripts can't
+    /// create HttpOnly cookies or replace existing ones.
+    pub fn script_set(&mut self, page_url: &str, value: &str) -> Stored {
+        let ctx = Context {
+            top: page_url,
+            initiator: Some(page_url),
+            navigation: false,
+        };
+        match parse(value, page_url, now()) {
+            Ok(c) if c.http_only => Stored {
+                set: vec![],
+                refused: vec![format!("{} (scripts can't set HttpOnly cookies)", c.name)],
+            },
+            Ok(c) if self.cookies.iter().any(|o| {
+                o.http_only && o.partition == site(page_url) && o.name == c.name && o.domain == c.domain && o.path == c.path
+            }) =>
+            {
+                Stored {
+                    set: vec![],
+                    refused: vec![format!("{} (scripts can't replace HttpOnly cookies)", c.name)],
+                }
+            }
+            _ => self.store(page_url, ctx, &[value.to_string()], false),
+        }
+    }
+
+    fn cookie_string(&mut self, url: &str, ctx: Context, http_only: bool) -> Option<(String, Vec<String>)> {
         let target = site(url);
         let top = site(ctx.top);
         if target.is_empty() || target != top {
@@ -389,6 +430,7 @@ impl Jar {
             })
             .filter(|c| path_match(&path, &c.path))
             .filter(|c| !c.secure || secure)
+            .filter(|c| http_only || !c.http_only)
             .filter(|c| match c.same_site {
                 SameSite::Strict => !cross_site,
                 SameSite::Lax => !cross_site || ctx.navigation,
@@ -974,6 +1016,20 @@ mod tests {
             &["sid=new; Secure; Path=/; Domain=example.com"],
         );
         assert_eq!(r.set, vec!["sid"]);
+    }
+
+    #[test]
+    fn scripts_see_and_set_only_non_http_only_cookies() {
+        let mut j = Jar::new();
+        let u = "https://example.com/";
+        set(&mut j, u, nav(u, None), &["sid=secret; HttpOnly", "theme=dark"]);
+        assert_eq!(j.script_string(u), "theme=dark");
+        assert_eq!(j.script_set(u, "lang=en; Path=/").set, vec!["lang"]);
+        assert!(j.script_set(u, "x=1; HttpOnly").refused[0].contains("HttpOnly"));
+        assert!(j.script_set(u, "sid=stolen").refused[0].contains("replace HttpOnly"));
+        assert_eq!(j.script_string(u), "theme=dark; lang=en");
+        let h = j.header_for(u, nav(u, None)).unwrap().0;
+        assert!(h.contains("sid=secret") && h.contains("lang=en"), "{h}");
     }
 
     #[test]
