@@ -12,6 +12,7 @@ pub mod image;
 pub mod ipc;
 pub mod js;
 pub mod layout;
+pub mod lineedit;
 pub mod lists;
 pub mod net;
 pub mod network;

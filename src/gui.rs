@@ -5,6 +5,7 @@ use brickle::css::Color;
 use brickle::font;
 use brickle::forms::Submission;
 use brickle::layout::{Edges, Rect};
+use brickle::lineedit::LineEdit;
 use brickle::net;
 use brickle::network::{Action, LogEntry, Network, Outcome};
 use brickle::page::{Key as PageKey, Rendered};
@@ -126,7 +127,8 @@ fn clean_paste(t: &str) -> String {
 type Entry = (String, Option<String>);
 
 struct Ui {
-    address: String,
+    /// The address bar: what it shows, or what you're typing.
+    address: LineEdit,
     editing: bool,
     hover: Option<String>,
     panel: bool,
@@ -342,7 +344,11 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
     let mut laid_out_at = (0.0f32, 0.0f32);
     let mut scroll = 0.0f32;
     let mut ui = Ui {
-        address: start.to_string(),
+        address: {
+            let mut a = LineEdit::new(MAX_ADDRESS);
+            a.set(start);
+            a
+        },
         editing: false,
         hover: None,
         panel,
@@ -412,7 +418,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 address: if ui.editing {
                     info.url.clone()
                 } else {
-                    ui.address.clone()
+                    ui.address.text.clone()
                 },
                 script_hops,
             }
@@ -438,7 +444,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             page_focus = p.page_focus;
             pending_input = p.pending_input;
             stop = p.stop;
-            ui.address = p.address;
+            ui.address.set(&p.address);
             ui.editing = false;
             ui.hover = None;
             ui.panel_scroll = 0.0;
@@ -488,7 +494,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     unpark!(p);
                     if url == "about:home" {
                         ui.editing = true;
-                        ui.address.clear();
+                        ui.address.set("");
                     }
                 } else {
                     child_anchor = Some(id);
@@ -560,7 +566,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             tab = Some(done.tab);
             if done.new_page {
                 if !ui.editing {
-                    ui.address = info.url.clone();
+                    ui.address.set(&info.url);
                 }
                 ui.panel_scroll = 0.0;
                 ui.hover = None;
@@ -670,12 +676,8 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 match clip.paste() {
                     Some(t) if ui.editing => {
                         // One line: newlines and tabs are dropped.
-                        for c in t.trim().chars().filter(|c| !c.is_control()) {
-                            if ui.address.len() + c.len_utf8() > MAX_ADDRESS {
-                                break;
-                            }
-                            ui.address.push(c);
-                        }
+                        let line: String = t.trim().chars().filter(|c| !c.is_control()).collect();
+                        ui.address.insert(&line);
                     }
                     // Single-line fields drop newlines themselves.
                     Some(t) if !t.is_empty() => pending_input.push(Input::Type(t)),
@@ -694,7 +696,10 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     .filter(|t| !t.is_empty());
                 let (what, done) = match &selected {
                     Some(t) => (t.as_str(), "Copied"),
-                    None if ui.editing => (ui.address.as_str(), "Copied the address"),
+                    None if ui.editing => match ui.address.selected() {
+                        Some(part) => (part, "Copied"),
+                        None => (ui.address.text.as_str(), "Copied the address"),
+                    },
                     None => (info.url.as_str(), "Copied the address"),
                 };
                 ui.flash = Some(if clip.copy(what) {
@@ -711,17 +716,28 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 continue;
             }
             if ui.editing {
+                let a = &mut ui.address;
+                let end = a.text.chars().count();
                 match key {
-                    Key::Enter => {
-                        navigate = Some((net::address_or_search(&ui.address), None));
+                    Key::Enter | Key::NumPadEnter => {
+                        navigate = Some((net::address_or_search(&a.text), None));
                         ui.editing = false;
                     }
                     Key::Escape => {
                         ui.editing = false;
-                        ui.address = info.url.clone();
+                        a.set(&info.url);
                     }
-                    Key::Backspace => {
-                        ui.address.pop();
+                    Key::Backspace => a.backspace(ctrl),
+                    Key::Delete => a.delete(ctrl),
+                    Key::Left => a.left(ctrl, shift),
+                    Key::Right => a.right(ctrl, shift),
+                    Key::Home => a.move_to(0, shift),
+                    Key::End => a.move_to(end, shift),
+                    Key::A if ctrl => a.select_all(),
+                    Key::X if ctrl => {
+                        if let Some(cut) = a.cut() {
+                            clip.copy(&cut);
+                        }
                     }
                     _ => {}
                 }
@@ -757,8 +773,10 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 Key::Home => scroll = 0.0,
                 Key::End => scroll = max_scroll,
                 Key::L if ctrl => {
+                    // The address, selected: typing replaces it.
                     ui.editing = true;
-                    ui.address.clear();
+                    ui.address.set(&info.url);
+                    ui.address.select_all();
                     dirty = true;
                 }
                 Key::R if ctrl => reload = true,
@@ -771,7 +789,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     stop.cancel();
                     discard = true;
                     queued = None;
-                    ui.address = info.url.clone();
+                    ui.address.set(&info.url);
                     ui.flash = Some("Stopped".into());
                     dirty = true;
                 }
@@ -789,8 +807,9 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             }
         }
         if ui.editing {
-            for c in chars.into_iter().filter(|c| !c.is_control()) {
-                ui.address.push(c);
+            let typed: String = chars.into_iter().filter(|c| !c.is_control()).collect();
+            if !typed.is_empty() {
+                ui.address.insert(&typed);
                 dirty = true;
             }
         } else if page_focus {
@@ -901,8 +920,15 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 } else if badge.contains(mx, my) {
                     ui.panel = !ui.panel;
                 } else if my < BAR_H {
-                    ui.editing = true;
-                    ui.address.clear();
+                    if ui.editing {
+                        // Already typing: put the cursor where you clicked.
+                        let at = address_index(&ui.address, badge.x - 40.0, mx - 20.0);
+                        ui.address.move_to(at, shift);
+                    } else {
+                        ui.editing = true;
+                        ui.address.set(&info.url);
+                        ui.address.select_all();
+                    }
                 } else if let Some(b) = button {
                     let site = brickle::cookies::site(&info.url);
                     ui.flash = Some(match (net.try_lock(), b) {
@@ -967,11 +993,11 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     };
                     if ui.editing {
                         ui.editing = false;
-                        ui.address = info.url.clone();
+                        ui.address.set(&info.url);
                     }
                 } else if ui.editing {
                     ui.editing = false;
-                    ui.address = info.url.clone();
+                    ui.address.set(&info.url);
                 }
                 dirty = true;
             }
@@ -1144,7 +1170,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     history.push((info.url.clone(), info.opener.clone()));
                     forward.clear();
                 }
-                ui.address = url.clone();
+                ui.address.set(&url);
                 queued = Some((url, from));
             }
         }
@@ -1607,13 +1633,58 @@ fn draw_chrome(
     let base = field.y + 19.0;
     let max_x = field.x + field.w - 10.0;
     if ui.editing {
-        let shown = fit(&format!("{}|", ui.address), max_x - field.x - 10.0, SANS, 14.0);
-        text(c, field.x + 10.0, base, &shown, SANS, 14.0, DARK, cache, 0.0);
+        // The part of the text around the cursor that fits, the selection
+        // behind it, and the cursor.
+        let a = &ui.address;
+        let avail = max_x - field.x - 10.0;
+        let start = address_window(a, avail);
+        let chars: Vec<char> = a.text.chars().collect();
+        let x_of = |i: usize| {
+            let s: String = chars[start..i.clamp(start, chars.len())].iter().collect();
+            field.x + 10.0 + font::measure(SANS, 14.0, &s)
+        };
+        if let Some((lo, hi)) = a.selection() {
+            let (x0, x1) = (x_of(lo), x_of(hi).min(max_x));
+            c.fill(
+                Rect {
+                    x: x0,
+                    y: field.y + 5.0,
+                    w: (x1 - x0).max(0.0),
+                    h: field.h - 10.0,
+                },
+                Color::rgb(0xbf, 0xdb, 0xfe),
+                0.0,
+            );
+        }
+        let shown: String = chars[start..].iter().collect();
+        text(
+            c,
+            field.x + 10.0,
+            base,
+            &fit(&shown, avail, SANS, 14.0),
+            SANS,
+            14.0,
+            DARK,
+            cache,
+            0.0,
+        );
+        c.fill(
+            Rect {
+                x: x_of(a.cursor).min(max_x),
+                y: field.y + 5.0,
+                w: 1.0,
+                h: field.h - 10.0,
+            },
+            DARK,
+            0.0,
+        );
     } else {
         // Anti-spoofing: the real (punycode) host in bold, the rest dimmed,
         // and a warning on unencrypted pages.
         let mut x = field.x + 10.0;
-        if net::scheme(&ui.address) == "http" && !net::is_local_host(&brickle::filter::host_of(&ui.address)) {
+        if net::scheme(&ui.address.text) == "http"
+            && !net::is_local_host(&brickle::filter::host_of(&ui.address.text))
+        {
             text(c, x, base, "Not secure", BOLD, 13.0, RED, cache, 0.0);
             x += font::measure(BOLD, 13.0, "Not secure") + 6.0;
             c.fill(
@@ -1628,7 +1699,7 @@ fn draw_chrome(
             );
             x += 8.0;
         }
-        let (head, rest) = net::display_parts(&ui.address);
+        let (head, rest) = net::display_parts(&ui.address.text);
         let head = fit(&head, max_x - x, BOLD, 14.0);
         text(c, x, base, &head, BOLD, 14.0, DARK, cache, 0.0);
         x += font::measure(BOLD, 14.0, &head);
@@ -1878,6 +1949,37 @@ fn draw_status(c: &mut Canvas, ui: &Ui, page_w: f32, cache: &mut GlyphCache) {
 }
 
 /// Truncate `text` with an ellipsis so it fits in `max_w` pixels.
+/// The first character shown in an address bar `avail` px wide, so the
+/// cursor stays in view.
+fn address_window(a: &LineEdit, avail: f32) -> usize {
+    let chars: Vec<char> = a.text.chars().collect();
+    let mut start = 0;
+    let cursor = a.cursor.min(chars.len());
+    while start < cursor {
+        let s: String = chars[start..cursor].iter().collect();
+        if font::measure(SANS, 14.0, &s) <= avail - 4.0 {
+            break;
+        }
+        start += 1;
+    }
+    start
+}
+
+/// The character position nearest `x` px into an address bar `avail` px
+/// wide.
+fn address_index(a: &LineEdit, avail: f32, x: f32) -> usize {
+    let start = address_window(a, avail);
+    let mut w = 0.0;
+    for (i, c) in a.text.chars().enumerate().skip(start) {
+        let cw = font::measure(SANS, 14.0, &c.to_string());
+        if x < w + cw / 2.0 {
+            return i;
+        }
+        w += cw;
+    }
+    a.text.chars().count()
+}
+
 fn fit(text: &str, max_w: f32, font_idx: usize, size: f32) -> String {
     if font::measure(font_idx, size, text) <= max_w {
         return text.to_string();

@@ -252,6 +252,67 @@ pub fn word(runs: &[TextRun], p: Pos) -> Option<(Pos, Pos)> {
     Some(((start, 0), (end, runs[end].len())))
 }
 
+/// The page's text flattened for searching: lowercased characters, each
+/// with where it came from. A space stands in between lines.
+pub struct FindText {
+    chars: Vec<char>,
+    at: Vec<Pos>,
+}
+
+/// Most matches found, so a one-letter search on a huge page stays quick.
+pub const MAX_MATCHES: usize = 1000;
+
+impl FindText {
+    pub fn new(runs: &[TextRun]) -> FindText {
+        let mut t = FindText {
+            chars: Vec::new(),
+            at: Vec::new(),
+        };
+        let mut prev: Option<&Rect> = None;
+        for (i, r) in runs.iter().enumerate() {
+            if prev.is_some_and(|p| new_line(p, &r.rect))
+                && t.chars.last().is_some_and(|c| !c.is_whitespace())
+            {
+                t.chars.push(' ');
+                t.at.push((i, 0));
+            }
+            prev = Some(&r.rect);
+            for (k, c) in r.text.chars().enumerate().filter(|(_, c)| copyable(*c)) {
+                t.chars.push(fold(c));
+                t.at.push((i, k));
+            }
+        }
+        t
+    }
+
+    /// Where `query` appears (ignoring case), as selections, in reading order.
+    pub fn find(&self, runs: &[TextRun], query: &str) -> Vec<(Pos, Pos)> {
+        let q: Vec<char> = query.chars().map(fold).collect();
+        if q.is_empty() || q.len() > self.chars.len() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + q.len() <= self.chars.len() && out.len() < MAX_MATCHES {
+            if self.chars[i..i + q.len()] == q[..] {
+                let start = self.at[i];
+                // Just past the last character matched.
+                let (run, k) = self.at[i + q.len() - 1];
+                let end = (run, (k + 1).min(runs.get(run).map_or(0, |r| r.len())));
+                out.push((start, end));
+                i += q.len();
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+}
+
+fn fold(c: char) -> char {
+    c.to_lowercase().next().unwrap_or(c)
+}
+
 /// Everything on the page.
 pub fn all(runs: &[TextRun]) -> Option<(Pos, Pos)> {
     let last = runs.len().checked_sub(1)?;
@@ -394,6 +455,21 @@ mod tests {
                 assert_eq!(hit(&r, &b, x, y), hit(&r, &all, x, y), "at {x},{y}");
             }
         }
+    }
+
+    #[test]
+    fn find_across_runs_and_lines() {
+        // "Hello" + " " + "world" on one line, "again" on the next.
+        let r = two_lines();
+        let f = FindText::new(&r);
+        assert_eq!(f.find(&r, "WORLD"), vec![((2, 0), (2, 5))]);
+        assert_eq!(f.find(&r, "lo wo"), vec![((0, 3), (2, 2))]);
+        // A line break counts as a space.
+        assert_eq!(f.find(&r, "world again"), vec![((2, 0), (3, 5))]);
+        assert_eq!(f.find(&r, "a").len(), 2);
+        assert!(f.find(&r, "").is_empty() && f.find(&r, "missing").is_empty());
+        let many = runs(&[(&"ab".repeat(5000), 0.0, 0)]);
+        assert_eq!(FindText::new(&many).find(&many, "a").len(), MAX_MATCHES);
     }
 
     #[test]
