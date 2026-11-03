@@ -37,7 +37,8 @@ except for sites in ~/.config/brickle/keep-cookies.txt. See PRIVACY.md for what 
 and won't do on the network.
 ";
 
-const HOME: &str = include_str!("../pages/home.html");
+/// The built-in start page (`about:home`).
+pub(crate) const HOME: &str = include_str!("../pages/home.html");
 
 /// Style, layout and paint recurse over the tree. The parser caps nesting
 /// depth, and a roomy stack gives that cap a wide safety margin.
@@ -428,13 +429,7 @@ fn render(args: &[String], sandboxed: bool, filters: bool) -> Result<(), String>
 
 #[cfg(feature = "gui")]
 fn open_window(input: &str, sandboxed: bool, net: Network, panel: bool) -> Result<(), String> {
-    let start = if input == "about:home" {
-        let p = std::env::temp_dir().join("brickle-home.html");
-        std::fs::write(&p, HOME).map_err(|e| e.to_string())?;
-        format!("file://{}", p.display())
-    } else {
-        net::normalize(input)
-    };
+    let start = net::normalize(input);
     gui::run(&start, sandboxed, net, panel)
 }
 

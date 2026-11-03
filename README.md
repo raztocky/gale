@@ -45,6 +45,10 @@ libraries, run `sudo apt install build-essential libxkbcommon-dev`.
 | Scroll | mouse wheel, arrow keys, `Space`, `PgUp`/`PgDn` |
 | Back / forward | `Backspace` or `Alt+←` / `Alt+→` |
 | Reload / stop | `Ctrl+R` or `F5` / `Esc` |
+| New tab / close tab | `Ctrl+T` or `+` / `Ctrl+W` or `×` |
+| Switch tabs | `Ctrl+Tab`, `Ctrl+Shift+Tab`, `Ctrl+PgDn`/`PgUp`, `Ctrl+1`…`Ctrl+9` |
+| Open a link in a new tab | middle-click, or `Ctrl`+click |
+| Forms | click a field to type; `Tab` next field, `Enter` submit, `Esc` leave the field |
 
 ## Architecture
 

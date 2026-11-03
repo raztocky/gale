@@ -14,7 +14,12 @@ use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
-const BAR_H: f32 = 40.0;
+/// The tab strip, then the address bar.
+const TABS_H: f32 = 30.0;
+const ADDR_H: f32 = 40.0;
+const BAR_H: f32 = TABS_H + ADDR_H;
+/// Most tabs open at once (each has its own renderer process).
+const MAX_TABS: usize = 30;
 const STATUS_H: f32 = 22.0;
 const PANEL_W: f32 = 400.0;
 const PANEL_HEAD: f32 = 116.0;
@@ -113,14 +118,20 @@ struct Done {
     click: Option<(brickle::tab::Click, Option<String>)>,
 }
 
-fn spawn_loader(net: Arc<Mutex<Network>>, sandboxed: bool) -> (Sender<Job>, Receiver<Done>) {
-    let (job_tx, job_rx) = mpsc::channel::<Job>();
-    let (done_tx, done_rx) = mpsc::channel::<Done>();
+/// Which tab a job or its result is for.
+type TabId = u64;
+
+/// The window's ends of the loader's channels.
+type Loader = (Sender<(TabId, Job)>, Receiver<(TabId, Done)>);
+
+fn spawn_loader(net: Arc<Mutex<Network>>, sandboxed: bool) -> Loader {
+    let (job_tx, job_rx) = mpsc::channel::<(TabId, Job)>();
+    let (done_tx, done_rx) = mpsc::channel::<(TabId, Done)>();
     std::thread::Builder::new()
         .name("brickle-loader".into())
         .stack_size(256 * 1024 * 1024)
         .spawn(move || {
-            for job in job_rx {
+            for (id, job) in job_rx {
                 let done = match job {
                     Job::Open {
                         url,
@@ -135,6 +146,15 @@ fn spawn_loader(net: Arc<Mutex<Network>>, sandboxed: bool) -> (Sender<Job>, Rece
                             n.cancel = cancel;
                             match &post {
                                 Some(sub) => Tab::submit(&mut n, sub, from.as_deref(), sandboxed, (w, h)),
+                                // The built-in start page.
+                                None if url == "about:home" => Tab::with_html_sized(
+                                    &mut n,
+                                    "about:home",
+                                    None,
+                                    crate::HOME,
+                                    sandboxed,
+                                    (w, h),
+                                ),
                                 None => Tab::open_sized(&mut n, &url, from.as_deref(), sandboxed, (w, h)),
                             }
                         };
@@ -175,7 +195,7 @@ fn spawn_loader(net: Arc<Mutex<Network>>, sandboxed: bool) -> (Sender<Job>, Rece
                         }
                     }
                 };
-                if done_tx.send(done).is_err() {
+                if done_tx.send((id, done)).is_err() {
                     break;
                 }
             }
@@ -256,17 +276,137 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
     let mut frame = 0u32;
     let mut canvas = Canvas::new(w, h, Color::WHITE);
 
+    // Tabs: the loop's variables above are the current tab's; the others
+    // wait in `parked`. `order` is the tab strip, left to right.
+    let mut next_id: TabId = 1;
+    let mut cur_id: TabId = 0;
+    let mut order: Vec<TabId> = vec![cur_id];
+    let mut parked: Vec<Parked> = Vec::new();
+    let mut was_mid = false;
+    // The last background tab opened from the current one: the next goes
+    // after it, so tabs open in the order you opened them (as in Firefox).
+    let mut child_anchor: Option<TabId> = None;
+
     // Stop button for the load in flight.
     let mut stop = net::Cancel::new();
-    let _ = jobs.send(Job::Open {
-        url: start.to_string(),
-        from: None,
-        w: w as f32,
-        h: h as f32 - BAR_H,
-        cancel: stop.clone(),
-        post: None,
-    });
+    let _ = jobs.send((
+        cur_id,
+        Job::Open {
+            url: start.to_string(),
+            from: None,
+            w: w as f32,
+            h: h as f32 - BAR_H,
+            cancel: stop.clone(),
+            post: None,
+        },
+    ));
     busy = Some(Some(start.to_string()));
+
+    // Put the current tab's state away / make a parked tab current.
+    macro_rules! park {
+        () => {
+            Parked {
+                id: cur_id,
+                tab: tab.take(),
+                info: info.clone(),
+                rendered: std::mem::replace(&mut rendered, blank_rendered()),
+                history: std::mem::take(&mut history),
+                forward: std::mem::take(&mut forward),
+                scroll,
+                busy: busy.take(),
+                discard,
+                queued: queued.take(),
+                queued_post: queued_post.take(),
+                laid_out_at,
+                page_focus,
+                pending_input: std::mem::take(&mut pending_input),
+                stop: stop.clone(),
+                address: if ui.editing {
+                    info.url.clone()
+                } else {
+                    ui.address.clone()
+                },
+                script_hops,
+            }
+        };
+    }
+    macro_rules! unpark {
+        ($p:expr) => {{
+            let p: Parked = $p;
+            cur_id = p.id;
+            tab = p.tab;
+            info = p.info;
+            rendered = p.rendered;
+            history = p.history;
+            forward = p.forward;
+            scroll = p.scroll;
+            busy = p.busy;
+            discard = p.discard;
+            queued = p.queued;
+            queued_post = p.queued_post;
+            laid_out_at = p.laid_out_at;
+            page_focus = p.page_focus;
+            pending_input = p.pending_input;
+            stop = p.stop;
+            ui.address = p.address;
+            ui.editing = false;
+            ui.hover = None;
+            ui.panel_scroll = 0.0;
+            script_hops = p.script_hops;
+            tiles = None;
+            let title = if info.title.is_empty() {
+                &info.url
+            } else {
+                &info.title
+            };
+            window.set_title(&format!("{title} — Brickle Browser"));
+        }};
+    }
+    // Start loading `url` in a new tab (in the background unless `front`).
+    macro_rules! open_tab {
+        ($url:expr, $from:expr, $front:expr) => {{
+            if order.len() >= MAX_TABS {
+                ui.flash = Some(format!("Brickle keeps at most {MAX_TABS} tabs open"));
+            } else {
+                let id = next_id;
+                next_id += 1;
+                let url: String = $url;
+                let cancel = net::Cancel::new();
+                let _ = jobs.send((
+                    id,
+                    Job::Open {
+                        url: url.clone(),
+                        from: $from,
+                        w: page_w_now(&ui, w),
+                        h: h as f32 - BAR_H,
+                        cancel: cancel.clone(),
+                        post: None,
+                    },
+                ));
+                let after = child_anchor.filter(|a| order.contains(a)).unwrap_or(cur_id);
+                let pos = order
+                    .iter()
+                    .position(|&t| t == after)
+                    .map(|i| i + 1)
+                    .unwrap_or(order.len());
+                order.insert(pos, id);
+                let p = Parked::loading(id, &url, cancel);
+                if $front {
+                    child_anchor = None;
+                    let old = park!();
+                    parked.push(old);
+                    unpark!(p);
+                    if url == "about:home" {
+                        ui.editing = true;
+                        ui.address.clear();
+                    }
+                } else {
+                    child_anchor = Some(id);
+                    parked.push(p);
+                }
+            }
+        }};
+    }
 
     while window.is_open() {
         frame = frame.wrapping_add(1);
@@ -283,7 +423,14 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         let view_h = h as f32 - BAR_H;
 
         // Results from the loader.
-        while let Ok(done) = done_rx.try_recv() {
+        while let Ok((id, done)) = done_rx.try_recv() {
+            if id != cur_id {
+                // A background tab finished something.
+                if let Some(p) = parked.iter_mut().find(|p| p.id == id) {
+                    p.finish(done, &jobs);
+                }
+                continue;
+            }
             let was_open = matches!(busy, Some(Some(_)));
             busy = None;
             if discard && was_open {
@@ -320,7 +467,9 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             }
             tab = Some(done.tab);
             if done.new_page {
-                ui.address = info.url.clone();
+                if !ui.editing {
+                    ui.address = info.url.clone();
+                }
                 ui.panel_scroll = 0.0;
                 ui.hover = None;
                 let title = if info.title.is_empty() {
@@ -336,37 +485,46 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         if busy.is_none() {
             if let Some((url, from)) = queued.take() {
                 stop = net::Cancel::new();
-                let _ = jobs.send(Job::Open {
-                    url: url.clone(),
-                    from,
-                    w: page_w,
-                    h: view_h,
-                    cancel: stop.clone(),
-                    post: queued_post.take(),
-                });
+                let _ = jobs.send((
+                    cur_id,
+                    Job::Open {
+                        url: url.clone(),
+                        from,
+                        w: page_w,
+                        h: view_h,
+                        cancel: stop.clone(),
+                        post: queued_post.take(),
+                    },
+                ));
                 busy = Some(Some(url));
                 scroll = 0.0;
             } else if let (Some(input), true) = (pending_input.first().cloned(), tab.is_some()) {
                 // Typing goes to the page in order, a batch at a time.
                 pending_input.remove(0);
                 if let Some(t) = tab.take() {
-                    let _ = jobs.send(Job::Input {
-                        tab: Box::new(t),
-                        input,
-                        link: None,
-                        w: page_w,
-                        h: view_h,
-                    });
+                    let _ = jobs.send((
+                        cur_id,
+                        Job::Input {
+                            tab: Box::new(t),
+                            input,
+                            link: None,
+                            w: page_w,
+                            h: view_h,
+                        },
+                    ));
                     busy = Some(None);
                 }
             } else if need_layout || laid_out_at != (page_w, view_h) {
                 need_layout = false;
                 if let Some(t) = tab.take() {
-                    let _ = jobs.send(Job::Render {
-                        tab: Box::new(t),
-                        w: page_w,
-                        h: view_h,
-                    });
+                    let _ = jobs.send((
+                        cur_id,
+                        Job::Render {
+                            tab: Box::new(t),
+                            w: page_w,
+                            h: view_h,
+                        },
+                    ));
                     busy = Some(None);
                 }
             }
@@ -376,6 +534,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         let mut navigate: Option<Entry> = None;
         let mut reload = false;
         let mut hist = 0i32;
+        let mut tab_action: Option<TabAction> = None;
 
         // Keyboard
         let ctrl = window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl);
@@ -383,6 +542,34 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         let alt = window.is_key_down(Key::LeftAlt) || window.is_key_down(Key::RightAlt);
         let chars: Vec<char> = std::mem::take(&mut *typed.lock().unwrap());
         for key in window.get_keys_pressed(KeyRepeat::Yes) {
+            if ctrl {
+                let digit = [
+                    Key::Key1,
+                    Key::Key2,
+                    Key::Key3,
+                    Key::Key4,
+                    Key::Key5,
+                    Key::Key6,
+                    Key::Key7,
+                    Key::Key8,
+                    Key::Key9,
+                ]
+                .iter()
+                .position(|k| *k == key);
+                let action = match key {
+                    Key::T => Some(TabAction::New),
+                    Key::W => Some(TabAction::Close(cur_id)),
+                    Key::Tab => Some(TabAction::Next(if shift { -1 } else { 1 })),
+                    Key::PageDown => Some(TabAction::Next(1)),
+                    Key::PageUp => Some(TabAction::Next(-1)),
+                    _ if digit == Some(8) => Some(TabAction::Switch(order.len().saturating_sub(1))),
+                    _ => digit.map(TabAction::Switch),
+                };
+                if action.is_some() {
+                    tab_action = action;
+                    continue;
+                }
+            }
             if ui.editing {
                 match key {
                     Key::Enter => {
@@ -529,9 +716,45 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 ui.hover = hover;
                 dirty = true;
             }
-            if down && !was_down {
+            let mid = window.get_mouse_down(MouseButton::Middle);
+            if mid && !was_mid && my > BAR_H && mx < page_w {
+                if let Some(l) = rendered.link_at(mx, my - BAR_H + scroll) {
+                    let url = net::resolve(&info.url, l);
+                    if matches!(net::scheme(&url).as_str(), "http" | "https" | "file") {
+                        tab_action = Some(TabAction::Background(url));
+                    }
+                }
+            }
+            was_mid = mid;
+            let link_under = (my > BAR_H && mx < page_w)
+                .then(|| {
+                    rendered
+                        .link_at(mx, my - BAR_H + scroll)
+                        .map(|l| net::resolve(&info.url, l))
+                })
+                .flatten();
+            if down
+                && !was_down
+                && ctrl
+                && link_under
+                    .as_deref()
+                    .is_some_and(|u| net::scheme(u).starts_with("http"))
+            {
+                tab_action = Some(TabAction::Background(link_under.clone().unwrap_or_default()));
+            } else if down && !was_down {
                 ui.flash = None;
-                if badge.contains(mx, my) {
+                if my < TABS_H {
+                    let (rects, plus) = tab_rects(order.len(), w as f32);
+                    if plus.contains(mx, my) {
+                        tab_action = Some(TabAction::New);
+                    } else if let Some(i) = rects.iter().position(|(r, _)| r.contains(mx, my)) {
+                        tab_action = Some(if rects[i].1.contains(mx, my) {
+                            TabAction::Close(order[i])
+                        } else {
+                            TabAction::Switch(i)
+                        });
+                    }
+                } else if badge.contains(mx, my) {
                     ui.panel = !ui.panel;
                 } else if my < BAR_H {
                     ui.editing = true;
@@ -584,13 +807,16 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     // the link is followed after, unless a script prevents it.
                     let link = rendered.link_at(mx, my - BAR_H + scroll).map(|l| l.to_string());
                     if let Some(t) = tab.take() {
-                        let _ = jobs.send(Job::Input {
-                            tab: Box::new(t),
-                            input: Input::Click(mx, my - BAR_H + scroll),
-                            link,
-                            w: page_w,
-                            h: view_h,
-                        });
+                        let _ = jobs.send((
+                            cur_id,
+                            Job::Input {
+                                tab: Box::new(t),
+                                input: Input::Click(mx, my - BAR_H + scroll),
+                                link,
+                                w: page_w,
+                                h: view_h,
+                            },
+                        ));
                         busy = Some(None);
                     }
                 } else if let Some(l) = rendered.link_at(mx, my - BAR_H + scroll) {
@@ -619,6 +845,60 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             }
         }
         was_down = down;
+
+        if let Some(action) = tab_action {
+            // What was decided for the old tab doesn't apply to the new one.
+            navigate = None;
+            reload = false;
+            hist = 0;
+            macro_rules! switch_to {
+                ($id:expr) => {{
+                    let id: TabId = $id;
+                    if id != cur_id {
+                        if let Some(i) = parked.iter().position(|p| p.id == id) {
+                            let p = parked.remove(i);
+                            let old = park!();
+                            parked.push(old);
+                            unpark!(p);
+                            child_anchor = None;
+                        }
+                    }
+                }};
+            }
+            match action {
+                TabAction::New => open_tab!("about:home".to_string(), None, true),
+                TabAction::Background(url) => {
+                    open_tab!(url, Some(info.url.clone()), false);
+                    ui.flash = Some(format!("Opened in a new tab ({} open)", order.len()));
+                }
+                TabAction::Switch(i) => {
+                    if let Some(&id) = order.get(i) {
+                        switch_to!(id);
+                    }
+                }
+                TabAction::Next(d) => {
+                    let i = order.iter().position(|&t| t == cur_id).unwrap_or(0) as i32;
+                    let j = (i + d).rem_euclid(order.len() as i32) as usize;
+                    switch_to!(order[j]);
+                }
+                TabAction::Close(id) => {
+                    if order.len() == 1 {
+                        // Closing the last tab leaves a fresh one.
+                        open_tab!("about:home".to_string(), None, true);
+                    } else if id == cur_id {
+                        let i = order.iter().position(|&t| t == id).unwrap_or(0);
+                        let j = if i + 1 < order.len() { i + 1 } else { i - 1 };
+                        switch_to!(order[j]);
+                    }
+                    // Dropping a tab ends its renderer process.
+                    if id != cur_id {
+                        order.retain(|&t| t != id);
+                        parked.retain(|p| p.id != id);
+                    }
+                }
+            }
+            dirty = true;
+        }
 
         if let Some(sub) = submitted.take() {
             // Opened like a link from this page; POSTs carry their body.
@@ -705,6 +985,23 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 page_w,
                 &mut cache,
             );
+            let titles: Vec<(String, bool)> = order
+                .iter()
+                .map(|&id| {
+                    if id == cur_id {
+                        let t = if info.title.is_empty() {
+                            &info.url
+                        } else {
+                            &info.title
+                        };
+                        (t.clone(), true)
+                    } else {
+                        let t = parked.iter().find(|p| p.id == id).map(|p| p.title().to_string());
+                        (t.unwrap_or_default(), false)
+                    }
+                })
+                .collect();
+            draw_tabs(&mut canvas, &titles, &mut cache);
             if loading {
                 // Indeterminate progress bar under the address bar.
                 let x = (frame % 120) as f32 / 120.0 * (w as f32 + 200.0) - 200.0;
@@ -745,6 +1042,200 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
     Ok(())
 }
 
+/// Something to do with tabs, decided during input and done after it.
+#[derive(Debug, Clone, PartialEq)]
+enum TabAction {
+    New,
+    Close(TabId),
+    Switch(usize),
+    Next(i32),
+    /// Open a link in a new tab, in the background.
+    Background(String),
+}
+
+/// A tab that isn't showing: everything the loop keeps for the current one.
+struct Parked {
+    id: TabId,
+    tab: Option<Tab>,
+    info: Info,
+    rendered: Rendered,
+    history: Vec<Entry>,
+    forward: Vec<Entry>,
+    scroll: f32,
+    busy: Option<Option<String>>,
+    discard: bool,
+    queued: Option<Entry>,
+    queued_post: Option<Submission>,
+    laid_out_at: (f32, f32),
+    page_focus: bool,
+    pending_input: Vec<Input>,
+    stop: net::Cancel,
+    address: String,
+    script_hops: u32,
+}
+
+impl Parked {
+    /// A new tab whose first page is being loaded.
+    fn loading(id: TabId, url: &str, stop: net::Cancel) -> Parked {
+        Parked {
+            id,
+            tab: None,
+            info: Info {
+                url: url.to_string(),
+                opener: None,
+                title: String::new(),
+                log: vec![],
+                interstitial: None,
+            },
+            rendered: blank_rendered(),
+            history: vec![],
+            forward: vec![],
+            scroll: 0.0,
+            busy: Some(Some(url.to_string())),
+            discard: false,
+            queued: None,
+            queued_post: None,
+            laid_out_at: (0.0, 0.0),
+            page_focus: false,
+            pending_input: vec![],
+            stop,
+            address: url.to_string(),
+            script_hops: 0,
+        }
+    }
+
+    /// A loader result for this tab while it's in the background.
+    fn finish(&mut self, done: Done, jobs: &Sender<(TabId, Job)>) {
+        let was_open = matches!(self.busy, Some(Some(_)));
+        self.busy = None;
+        if self.discard && was_open {
+            self.discard = false;
+            return;
+        }
+        self.discard = false;
+        self.info = Info::of(&done.tab);
+        if let Some(r) = done.rendered {
+            self.rendered = r;
+        }
+        if done.new_page {
+            self.address = self.info.url.clone();
+            self.scroll = 0.0;
+            self.page_focus = false;
+            // A script redirect (rare in the background): follow it once.
+            if let (Some(to), 0) = (done.tab.script_navigate.clone(), self.script_hops) {
+                self.script_hops += 1;
+                self.stop = net::Cancel::new();
+                let from = Some(self.info.url.clone());
+                let _ = jobs.send((
+                    self.id,
+                    Job::Open {
+                        url: to.clone(),
+                        from,
+                        w: self.laid_out_at.0.max(800.0),
+                        h: self.laid_out_at.1.max(600.0),
+                        cancel: self.stop.clone(),
+                        post: None,
+                    },
+                ));
+                self.busy = Some(Some(to));
+            }
+        }
+        self.tab = Some(done.tab);
+    }
+
+    fn title(&self) -> &str {
+        if self.info.title.is_empty() {
+            &self.info.url
+        } else {
+            &self.info.title
+        }
+    }
+}
+
+fn blank_rendered() -> Rendered {
+    Rendered {
+        list: vec![],
+        atlas: vec![],
+        height: 0.0,
+        background: Color::WHITE,
+        links: vec![],
+    }
+}
+
+fn page_w_now(ui: &Ui, w: usize) -> f32 {
+    if ui.panel {
+        (w as f32 - PANEL_W).max(200.0)
+    } else {
+        w as f32
+    }
+}
+
+/// Tab strip layout: each tab's rectangle and its close button, then the
+/// new-tab button.
+fn tab_rects(n: usize, w: f32) -> (Vec<(Rect, Rect)>, Rect) {
+    let tw = ((w - 44.0) / n.max(1) as f32).clamp(60.0, 220.0);
+    let mut v = Vec::new();
+    for i in 0..n {
+        let r = Rect {
+            x: 6.0 + i as f32 * tw,
+            y: 4.0,
+            w: tw - 4.0,
+            h: TABS_H - 4.0,
+        };
+        let close = Rect {
+            x: r.x + r.w - 20.0,
+            y: r.y + 5.0,
+            w: 16.0,
+            h: 16.0,
+        };
+        v.push((r, close));
+    }
+    let plus = Rect {
+        x: 6.0 + n as f32 * tw,
+        y: 6.0,
+        w: 24.0,
+        h: TABS_H - 8.0,
+    };
+    (v, plus)
+}
+
+fn draw_tabs(c: &mut Canvas, titles: &[(String, bool)], cache: &mut GlyphCache) {
+    let w = c.width as f32;
+    let (rects, plus) = tab_rects(titles.len(), w);
+    for ((title, current), (r, close)) in titles.iter().zip(&rects) {
+        let bg = if *current {
+            Color::WHITE
+        } else {
+            Color::rgb(0xdd, 0xe0, 0xe5)
+        };
+        c.fill(*r, bg, 0.0);
+        let shown = fit(title, r.w - 34.0, SANS, 12.0);
+        text(
+            c,
+            r.x + 8.0,
+            r.y + 17.0,
+            &shown,
+            if *current { BOLD } else { SANS },
+            12.0,
+            DARK,
+            cache,
+            0.0,
+        );
+        text(
+            c,
+            close.x + 4.0,
+            close.y + 12.0,
+            "×",
+            SANS,
+            13.0,
+            GRAY,
+            cache,
+            0.0,
+        );
+    }
+    text(c, plus.x + 7.0, plus.y + 16.0, "+", BOLD, 16.0, GRAY, cache, 0.0);
+}
+
 fn counts(log: &[LogEntry]) -> (usize, usize) {
     let blocked = log
         .iter()
@@ -762,9 +1253,9 @@ fn badge_rect(log: &[LogEntry], w: f32) -> Rect {
     let tw = font::measure(SANS, 12.0, &badge_text(log)) + 20.0;
     Rect {
         x: w - tw - 10.0,
-        y: 8.0,
+        y: TABS_H + 8.0,
         w: tw,
-        h: BAR_H - 16.0,
+        h: ADDR_H - 16.0,
     }
 }
 
@@ -882,9 +1373,9 @@ fn draw_chrome(
 
     let field = Rect {
         x: 10.0,
-        y: 6.0,
+        y: TABS_H + 6.0,
         w: badge.x - 20.0,
-        h: BAR_H - 12.0,
+        h: ADDR_H - 12.0,
     };
     let border = if ui.editing {
         Color::rgb(0x3b, 0x82, 0xf6)

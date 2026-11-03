@@ -59,3 +59,10 @@ Tab between fields, Enter to submit, GET/POST (url-encoded, multipart, text/plai
 - [ ] File uploads (`<input type=file>`).
 - [ ] Form validation (`required`, `pattern`), `<input type=number>` steppers, date pickers.
 - [ ] Ask before re-sending a POST on reload or back (reload currently does a GET).
+
+## Tabs
+
+Done: tab strip, new/close/switch (keyboard and mouse), links in background tabs, each tab with
+its own renderer, history, scroll and form focus.
+- [ ] Reopen closed tab (`Ctrl+Shift+T`), drag to reorder.
+- [ ] Discard the renderers of tabs left in the background for a long time.
