@@ -1,0 +1,69 @@
+<!doctype html>
+<html>
+<head>
+<title>Tables</title>
+<style>
+  body { font-family: sans-serif; max-width: 900px; }
+  .grid { border: 1px solid #888; }
+  .grid td, .grid th { border: 1px solid #bbb; padding: 4px 8px; }
+  .grid th { background-color: #eee; }
+  .zebra tr:nth-child(2n) { background-color: #f4f4f4; }
+  .css-table { display: table; border-spacing: 6px; background-color: #eef; }
+  .css-table > div { display: table-cell; background-color: white; padding: 6px; }
+</style>
+</head>
+<body>
+<h1>Tables</h1>
+
+<h2>Columns line up</h2>
+<table class="grid">
+  <caption>Fruit prices</caption>
+  <thead><tr><th>Fruit</th><th>Colour</th><th>Price</th></tr></thead>
+  <tfoot><tr><td colspan="2">Total</td><td align="right">€6.10</td></tr></tfoot>
+  <tbody>
+    <tr><td>Apple</td><td>Red or green</td><td align="right">€1.20</td></tr>
+    <tr><td>Banana</td><td>Yellow</td><td align="right">€0.90</td></tr>
+    <tr><td>Dragon fruit</td><td>Pink, with green scales</td><td align="right">€4.00</td></tr>
+  </tbody>
+</table>
+
+<h2>Rowspan and vertical alignment</h2>
+<table class="grid">
+  <tr><td rowspan="3">Spans<br>three<br>rows</td><td valign="top">top</td><td>middle (default)</td><td valign="bottom">bottom</td></tr>
+  <tr><td colspan="3">A cell across the remaining three columns</td></tr>
+  <tr><td>a</td><td>b</td><td>c</td></tr>
+</table>
+
+<h2>Full width, text wrapping</h2>
+<table class="grid" width="100%">
+  <tr>
+    <td width="20%">20% wide</td>
+    <td>This cell has a long sentence that has to wrap onto several lines, because the table is only as wide as the page and the other cell takes a fifth of it.</td>
+  </tr>
+</table>
+
+<h2>Old-school layout (cellpadding, cellspacing, bgcolor, center)</h2>
+<table width="85%" align="center" cellpadding="0" cellspacing="0" bgcolor="#f6f6ef">
+  <tr><td bgcolor="#ff6600"><table cellpadding="0" cellspacing="0" width="100%"><tr>
+    <td width="18"><b>Y</b></td><td><b>News</b> | new | past | comments</td><td align="right" nowrap>login</td>
+  </tr></table></td></tr>
+  <tr><td><table cellpadding="4" cellspacing="0">
+    <tr><td align="right" valign="top">1.</td><td>A story title <small>(example.com)</small><br><small>100 points by someone 2 hours ago | 42 comments</small></td></tr>
+    <tr><td align="right" valign="top">2.</td><td>Another story <small>(example.org)</small><br><small>57 points by someone else 3 hours ago | 12 comments</small></td></tr>
+  </table></td></tr>
+</table>
+
+<h2>CSS tables</h2>
+<div class="css-table">
+  <div>display: table-cell</div>
+  <div>No row element, so an anonymous one holds these cells</div>
+  <div>Third</div>
+</div>
+
+<h2>Collapsed borders (approximate)</h2>
+<table class="grid" style="border-collapse: collapse">
+  <tr><td>1</td><td>2</td><td>3</td></tr>
+  <tr><td>4</td><td>5</td><td>6</td></tr>
+</table>
+</body>
+</html>
