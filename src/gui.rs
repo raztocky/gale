@@ -9,7 +9,7 @@ use brickle::net;
 use brickle::network::{Action, LogEntry, Network, Outcome};
 use brickle::page::{Key as PageKey, Rendered};
 use brickle::paint::{Canvas, GlyphCache, TileCache};
-use brickle::select::{self, Pos};
+use brickle::select::{self, Bands, Pos};
 use brickle::tab::{Input, Tab};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -53,6 +53,33 @@ impl minifb::InputCallback for Chars {
         if let Some(c) = char::from_u32(c) {
             self.0.lock().unwrap().push(c);
         }
+    }
+}
+
+/// Lookups into the current page's text and links, so hovering, clicking
+/// and selecting look only near the mouse however much a page sends.
+struct PageIndex {
+    text: Bands,
+    links: Bands,
+}
+
+impl PageIndex {
+    fn new(r: &Rendered) -> PageIndex {
+        PageIndex {
+            text: Bands::new(r.texts.iter().map(|t| t.rect)),
+            links: Bands::new(r.links.iter().map(|(rect, _)| *rect)),
+        }
+    }
+
+    /// Topmost link under a page-space point.
+    fn link_at<'r>(&self, r: &'r Rendered, x: f32, y: f32) -> Option<&'r str> {
+        self.links
+            .at(y)
+            .into_iter()
+            .rev()
+            .filter_map(|i| r.links.get(i))
+            .find(|(rect, _)| rect.contains(x, y))
+            .map(|(_, l)| l.as_str())
     }
 }
 
@@ -328,6 +355,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
     // press on the page that becomes a click when you let go, unless you
     // dragged to select. A second press soon after selects a word.
     let mut sel: Option<(Pos, Pos)> = None;
+    let mut ix = PageIndex::new(&rendered);
     let mut press: Option<(f32, f32)> = None;
     let mut dragged = false;
     let mut word_press = false;
@@ -398,6 +426,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             info = p.info;
             rendered = p.rendered;
             sel = None;
+            ix = PageIndex::new(&rendered);
             history = p.history;
             forward = p.forward;
             scroll = p.scroll;
@@ -520,6 +549,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             if let Some(r) = done.rendered {
                 rendered = r;
                 sel = None;
+                ix = PageIndex::new(&rendered);
                 tiles = None; // new content: repaint tiles on demand
                 laid_out_at = (page_w, view_h);
             }
@@ -822,7 +852,8 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             } else if badge.contains(mx, my) {
                 Some("Show every request this page made (F12)".into())
             } else if my > BAR_H && mx < page_w {
-                rendered.link_at(mx, my - BAR_H + scroll).map(|s| s.to_string())
+                ix.link_at(&rendered, mx, my - BAR_H + scroll)
+                    .map(|s| s.to_string())
             } else {
                 None
             };
@@ -832,7 +863,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             }
             let mid = window.get_mouse_down(MouseButton::Middle);
             if mid && !was_mid && my > BAR_H && mx < page_w {
-                if let Some(l) = rendered.link_at(mx, my - BAR_H + scroll) {
+                if let Some(l) = ix.link_at(&rendered, mx, my - BAR_H + scroll) {
                     let url = net::resolve(&info.url, l);
                     if matches!(net::scheme(&url).as_str(), "http" | "https" | "file") {
                         tab_action = Some(TabAction::Background(url));
@@ -842,8 +873,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             was_mid = mid;
             let link_under = (my > BAR_H && mx < page_w)
                 .then(|| {
-                    rendered
-                        .link_at(mx, my - BAR_H + scroll)
+                    ix.link_at(&rendered, mx, my - BAR_H + scroll)
                         .map(|l| net::resolve(&info.url, l))
                 })
                 .flatten();
@@ -930,7 +960,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                         Some((Instant::now(), mx, my))
                     };
                     word_press = double;
-                    sel = match select::hit(&rendered.texts, mx, my - BAR_H + scroll) {
+                    sel = match select::hit(&rendered.texts, &ix.text, mx, my - BAR_H + scroll) {
                         Some(p) if double => select::word(&rendered.texts, p),
                         Some(p) => Some((p, p)),
                         None => None,
@@ -955,7 +985,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                         dragged = true;
                     }
                     if dragged && !word_press {
-                        let to = select::hit(&rendered.texts, mx, my - BAR_H + scroll);
+                        let to = select::hit(&rendered.texts, &ix.text, mx, my - BAR_H + scroll);
                         if let (Some((from, _)), Some(to)) = (sel, to) {
                             if sel != Some((from, to)) {
                                 sel = Some((from, to));
@@ -975,7 +1005,9 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     if busy.is_none() && tab.is_some() && info.interstitial.is_none() {
                         // The page sees the click first (form controls, scripts);
                         // the link is followed after, unless a script prevents it.
-                        let link = rendered.link_at(mx, my - BAR_H + scroll).map(|l| l.to_string());
+                        let link = ix
+                            .link_at(&rendered, mx, my - BAR_H + scroll)
+                            .map(|l| l.to_string());
                         if let Some(t) = tab.take() {
                             let _ = jobs.send((
                                 cur_id,
@@ -989,7 +1021,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                             ));
                             busy = Some(None);
                         }
-                    } else if let Some(l) = rendered.link_at(mx, my - BAR_H + scroll) {
+                    } else if let Some(l) = ix.link_at(&rendered, mx, my - BAR_H + scroll) {
                         let url = net::resolve(&info.url, l);
                         if let Some(rest) = url.strip_prefix("brickle:") {
                             // Internal actions only work on our own warning pages.
@@ -1144,7 +1176,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 BAR_H as usize,
             );
             if let Some((a, b)) = sel {
-                for r in select::highlights(&rendered.texts, a, b, scroll, scroll + view_h) {
+                for r in select::highlights(&rendered.texts, &ix.text, a, b, scroll, scroll + view_h) {
                     let r = Rect {
                         y: r.y - scroll + BAR_H,
                         w: r.w.min(page_w - r.x),

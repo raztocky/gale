@@ -577,6 +577,7 @@ impl Page {
         for b in &order {
             collect_links(b, &mut links);
         }
+        links.truncate(MAX_LINKS);
         let mut hits = Vec::new();
         for b in &order {
             collect_hits(b, &mut hits);
@@ -632,6 +633,10 @@ fn content_bottom(b: &LayoutBox) -> f32 {
 /// Most characters of a page's text sent for selection; past this, the rest
 /// can't be selected.
 pub const MAX_TEXT_CHARS: usize = 2_000_000;
+/// Most text runs (words and spaces) and links per page, so a page can't
+/// hand the browser more than it can look through quickly.
+pub const MAX_TEXT_RUNS: usize = 500_000;
+pub const MAX_LINKS: usize = 200_000;
 
 /// What decides whether a piece of text can be seen. Text a page hides
 /// from you (transparent, the colour of what's behind it, tiny, off the
@@ -777,7 +782,7 @@ fn collect_text(
                 continue;
             }
             let n = f.text.chars().count();
-            if *chars + n > MAX_TEXT_CHARS {
+            if *chars + n > MAX_TEXT_CHARS || out.len() >= MAX_TEXT_RUNS {
                 return;
             }
             *chars += n;

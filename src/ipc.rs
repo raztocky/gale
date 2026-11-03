@@ -13,7 +13,7 @@ use crate::layout::Rect;
 use crate::net::{Credentials, Dest, ScriptRequest};
 use crate::network::ScriptResponse;
 use crate::page::Key;
-use crate::page::{Rendered, MAX_TEXT_CHARS};
+use crate::page::{Rendered, MAX_LINKS, MAX_TEXT_CHARS, MAX_TEXT_RUNS};
 use crate::paint::{
     DisplayCommand, GlyphBitmap, PlacedGlyph, MAX_ATLAS_BYTES, MAX_FRAME_IMAGE_BYTES, MAX_GLYPH_SIDE,
 };
@@ -756,6 +756,9 @@ impl FromRenderer {
                     });
                 }
                 let n = d.count(20)?;
+                if n > MAX_LINKS {
+                    return Err("too many links".into());
+                }
                 let mut links = Vec::with_capacity(n);
                 for _ in 0..n {
                     links.push((d.rect()?, d.str()?));
@@ -763,6 +766,9 @@ impl FromRenderer {
                 // Text for selection: each run's offsets must fit its text,
                 // start at 0 and never go backwards.
                 let n = d.count(28)?;
+                if n > MAX_TEXT_RUNS {
+                    return Err("too many text runs".into());
+                }
                 let mut texts = Vec::with_capacity(n);
                 let mut chars = 0usize;
                 for _ in 0..n {
@@ -997,6 +1003,22 @@ mod tests {
         for m in msgs {
             assert_eq!(ToRenderer::decode(&m.encode()).unwrap(), m);
         }
+    }
+
+    #[test]
+    fn link_and_text_counts_are_capped() {
+        let mut r = sample();
+        let link = r.links[0].clone();
+        r.links = vec![link; MAX_LINKS + 1];
+        assert!(FromRenderer::decode(&FromRenderer::Rendered(r).encode()).is_err());
+        let mut r = sample();
+        let run = r.texts[0].clone();
+        r.texts = vec![run; MAX_TEXT_RUNS + 1];
+        assert!(FromRenderer::decode(&FromRenderer::Rendered(r).encode()).is_err());
+        let mut r = sample();
+        let run = r.texts[0].clone();
+        r.texts = vec![run; 1000];
+        assert!(FromRenderer::decode(&FromRenderer::Rendered(r).encode()).is_ok());
     }
 
     #[test]

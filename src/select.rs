@@ -3,6 +3,7 @@
 //! renderer sent (and `ipc` checked).
 
 use crate::layout::Rect;
+use std::collections::HashMap;
 
 /// A piece of text as painted, in page coordinates. `offsets` holds the x
 /// of each character boundary relative to `rect.x`: one more than the
@@ -29,9 +30,75 @@ impl TextRun {
 /// positions compare in reading order too.
 pub type Pos = (usize, usize);
 
+/// Rectangles indexed by 64px horizontal band, so looking up what's at a
+/// point checks a few of them instead of every one on the page.
+#[derive(Debug, Default)]
+pub struct Bands {
+    map: HashMap<i64, Vec<usize>>,
+    /// Rectangles too tall to list in every band they cross.
+    tall: Vec<usize>,
+    /// The first and last bands with anything in them.
+    range: Option<(i64, i64)>,
+}
+
+const BAND_H: f32 = 64.0;
+/// Bands one rectangle is listed in at most; taller ones go in `tall`, and
+/// past `MAX_TALL` of those, the rest aren't found.
+const MAX_SPAN: i64 = 64;
+const MAX_TALL: usize = 4096;
+
+fn band(y: f32) -> i64 {
+    (y / BAND_H).floor() as i64
+}
+
+impl Bands {
+    pub fn new(rects: impl IntoIterator<Item = Rect>) -> Bands {
+        let mut b = Bands::default();
+        for (i, r) in rects.into_iter().enumerate() {
+            let (top, bottom) = (band(r.y), band(r.y + r.h));
+            if bottom - top > MAX_SPAN {
+                if b.tall.len() >= MAX_TALL {
+                    continue;
+                }
+                b.tall.push(i);
+            } else {
+                for k in top..=bottom {
+                    b.map.entry(k).or_default().push(i);
+                }
+            }
+            b.range = Some(
+                b.range
+                    .map_or((top, bottom), |(lo, hi)| (lo.min(top), hi.max(bottom))),
+            );
+        }
+        b
+    }
+
+    /// The rectangles that may reach height `y`, in their original order.
+    pub fn at(&self, y: f32) -> Vec<usize> {
+        self.between(y, y)
+    }
+
+    /// The rectangles that may reach heights `y0..=y1`, in order.
+    pub fn between(&self, y0: f32, y1: f32) -> Vec<usize> {
+        let Some((lo, hi)) = self.range else {
+            return Vec::new();
+        };
+        let mut v = self.tall.clone();
+        for k in band(y0).max(lo)..=band(y1).min(hi) {
+            if let Some(ix) = self.map.get(&k) {
+                v.extend(ix);
+            }
+        }
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+}
+
 /// The boundary nearest a page point: on the line under it if there is one,
-/// else on the nearest line.
-pub fn hit(runs: &[TextRun], x: f32, y: f32) -> Option<Pos> {
+/// else on the nearest line. `bands` indexes the runs' rectangles.
+pub fn hit(runs: &[TextRun], bands: &Bands, x: f32, y: f32) -> Option<Pos> {
     let gap = |v: f32, lo: f32, hi: f32| {
         if v < lo {
             lo - v
@@ -42,11 +109,35 @@ pub fn hit(runs: &[TextRun], x: f32, y: f32) -> Option<Pos> {
         }
     };
     let dist = |r: &Rect| (gap(y, r.y, r.y + r.h), gap(x, r.x, r.x + r.w));
-    let (i, run) = runs.iter().enumerate().min_by(|(_, a), (_, b)| {
-        dist(&a.rect)
-            .partial_cmp(&dist(&b.rect))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    })?;
+    // The nearest run, ties going to the earliest, looking outwards band by
+    // band from `y` until no further band could hold a nearer one.
+    let mut best: Option<((f32, f32), usize)> = None;
+    let consider = |best: &mut Option<((f32, f32), usize)>, i: usize| {
+        if let Some(r) = runs.get(i) {
+            let d = (dist(&r.rect), i);
+            if best.is_none_or(|b| d.partial_cmp(&b) == Some(std::cmp::Ordering::Less)) {
+                *best = Some(d);
+            }
+        }
+    };
+    bands.tall.iter().for_each(|&i| consider(&mut best, i));
+    let (lo, hi) = bands.range?;
+    let b0 = band(y);
+    let mut k = 0i64;
+    loop {
+        for kb in [b0 - k, b0 + k].into_iter().take(if k == 0 { 1 } else { 2 }) {
+            if let Some(ix) = bands.map.get(&kb) {
+                ix.iter().for_each(|&i| consider(&mut best, i));
+            }
+        }
+        // Runs listed further out are at least `k` bands away.
+        if best.is_some_and(|((dy, _), _)| dy <= k as f32 * BAND_H) || (b0 - k <= lo && b0 + k >= hi) {
+            break;
+        }
+        k += 1;
+    }
+    let (_, i) = best?;
+    let run = &runs[i];
     let lx = x - run.rect.x;
     let n = run.len();
     let o = &run.offsets;
@@ -116,19 +207,25 @@ pub fn text(runs: &[TextRun], a: Pos, b: Pos) -> String {
 }
 
 /// The rectangles to highlight, for the runs between `y0` and `y1`.
-pub fn highlights(runs: &[TextRun], a: Pos, b: Pos, y0: f32, y1: f32) -> Vec<Rect> {
-    spans(runs, a, b)
-        .filter(|(r, from, to)| to > from && r.rect.y < y1 && r.rect.y + r.rect.h > y0)
-        .map(|(r, from, to)| {
+pub fn highlights(runs: &[TextRun], bands: &Bands, a: Pos, b: Pos, y0: f32, y1: f32) -> Vec<Rect> {
+    let (a, b) = ordered(a, b);
+    bands
+        .between(y0, y1)
+        .into_iter()
+        .filter(|&i| i >= a.0 && i <= b.0)
+        .filter_map(|i| {
+            let r = runs.get(i)?;
+            let from = if i == a.0 { a.1.min(r.len()) } else { 0 };
+            let to = if i == b.0 { b.1.min(r.len()) } else { r.len() };
             let x = r.x_at(from);
-            Rect {
+            let w = r.x_at(to) - x;
+            (to > from && w > 0.0 && r.rect.y < y1 && r.rect.y + r.rect.h > y0).then_some(Rect {
                 x,
                 y: r.rect.y,
-                w: r.x_at(to) - x,
+                w,
                 h: r.rect.h,
-            }
+            })
         })
-        .filter(|r| r.w > 0.0)
         .collect()
 }
 
@@ -191,17 +288,22 @@ mod tests {
         ])
     }
 
+    fn bands(r: &[TextRun]) -> Bands {
+        Bands::new(r.iter().map(|t| t.rect))
+    }
+
     #[test]
     fn hits_the_nearest_boundary() {
         let r = two_lines();
-        assert_eq!(hit(&r, 3.0, 5.0), Some((0, 0)));
-        assert_eq!(hit(&r, 7.0, 5.0), Some((0, 1)));
-        assert_eq!(hit(&r, 64.0, 5.0), Some((2, 0)));
+        let b = bands(&r);
+        assert_eq!(hit(&r, &b, 3.0, 5.0), Some((0, 0)));
+        assert_eq!(hit(&r, &b, 7.0, 5.0), Some((0, 1)));
+        assert_eq!(hit(&r, &b, 64.0, 5.0), Some((2, 0)));
         // Past the end of a line, and between lines.
-        assert_eq!(hit(&r, 500.0, 5.0), Some((2, 5)));
-        assert_eq!(hit(&r, 22.0, 30.0), Some((3, 2)));
-        assert_eq!(hit(&r, 22.0, 500.0), Some((3, 2)));
-        assert_eq!(hit(&[], 0.0, 0.0), None);
+        assert_eq!(hit(&r, &b, 500.0, 5.0), Some((2, 5)));
+        assert_eq!(hit(&r, &b, 22.0, 30.0), Some((3, 2)));
+        assert_eq!(hit(&r, &b, 22.0, 500.0), Some((3, 2)));
+        assert_eq!(hit(&[], &Bands::default(), 0.0, 0.0), None);
     }
 
     #[test]
@@ -222,11 +324,12 @@ mod tests {
     #[test]
     fn highlight_only_whats_selected_and_visible() {
         let r = two_lines();
-        let h = highlights(&r, (0, 1), (3, 2), 0.0, 1000.0);
+        let b = bands(&r);
+        let h = highlights(&r, &b, (0, 1), (3, 2), 0.0, 1000.0);
         assert_eq!(h.len(), 4);
         assert_eq!((h[0].x, h[0].w), (10.0, 40.0));
         assert_eq!((h[3].x, h[3].w), (0.0, 20.0));
-        assert_eq!(highlights(&r, (0, 1), (3, 2), 19.0, 40.0).len(), 1);
+        assert_eq!(highlights(&r, &b, (0, 1), (3, 2), 19.0, 40.0).len(), 1);
     }
 
     #[test]
@@ -254,10 +357,50 @@ mod tests {
     }
 
     #[test]
+    fn indexed_hit_matches_checking_every_run() {
+        // Lines of words, a tall block, and runs far down the page.
+        let mut items: Vec<(String, f32, usize)> = Vec::new();
+        for line in 0..40 {
+            for w in 0..6 {
+                items.push((
+                    format!("w{line}x{w}"),
+                    w as f32 * 60.0 + (line % 3) as f32 * 7.0,
+                    line,
+                ));
+            }
+        }
+        items.push(("far".into(), 30.0, 5000));
+        let items: Vec<(&str, f32, usize)> = items.iter().map(|(t, x, l)| (t.as_str(), *x, *l)).collect();
+        let mut r = runs(&items);
+        r.push(TextRun {
+            rect: Rect {
+                x: 500.0,
+                y: 0.0,
+                w: 10.0,
+                h: 20_000.0,
+            },
+            text: "t".into(),
+            offsets: vec![0.0, 10.0],
+        });
+        let b = bands(&r);
+        let all = Bands {
+            tall: (0..r.len()).collect(),
+            range: Some((0, 0)),
+            ..Bands::default()
+        };
+        for y in (-200..120_000).step_by(37) {
+            for x in [-50.0, 3.0, 61.0, 200.0, 333.3, 700.0] {
+                let y = y as f32;
+                assert_eq!(hit(&r, &b, x, y), hit(&r, &all, x, y), "at {x},{y}");
+            }
+        }
+    }
+
+    #[test]
     fn out_of_range_positions_are_safe() {
         let r = two_lines();
         assert_eq!(text(&r, (0, 99), (99, 99)), " world\nagain");
-        assert!(highlights(&r, (99, 0), (99, 0), 0.0, 100.0).is_empty());
+        assert!(highlights(&r, &bands(&r), (99, 0), (99, 0), 0.0, 100.0).is_empty());
         assert_eq!(word(&r, (99, 0)), None);
     }
 }
