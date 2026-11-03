@@ -112,8 +112,25 @@ pub fn site(url_or_host: &str) -> String {
     psl::domain_str(&host).map(str::to_string).unwrap_or(host)
 }
 
+/// HTTPS, or plain HTTP to this computer itself (loopback), which never
+/// crosses a network. Other local-network addresses (`192.168.x.x`,
+/// `printer.local`) are *not* secure: anyone on that network can read and
+/// change plain HTTP.
 fn is_secure_url(url: &str) -> bool {
-    url.starts_with("https://") || crate::net::is_local_host(&host_of(url))
+    let Ok(u) = url::Url::parse(url) else { return false };
+    match u.scheme() {
+        "https" => true,
+        "http" => match u.host() {
+            Some(url::Host::Domain(d)) => {
+                let d = d.trim_end_matches('.').to_ascii_lowercase();
+                d == "localhost" || d.ends_with(".localhost")
+            }
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        },
+        _ => false,
+    }
 }
 
 fn domain_match(host: &str, domain: &str) -> bool {
@@ -429,6 +446,25 @@ impl Jar {
             if let Some(why) = why {
                 out.refused.push(format!("{} ({why})", c.name));
                 continue;
+            }
+            // An insecure response may not replace, shadow or delete a
+            // Secure cookie (RFC 6265bis §5.7): no `sid=attacker` over HTTP
+            // in place of the real `sid` set over HTTPS.
+            if !c.secure && !is_secure_url(url) {
+                let clobbers = self.cookies.iter().any(|o| {
+                    o.partition == top
+                        && o.secure
+                        && o.name == c.name
+                        && (domain_match(&c.domain, &o.domain) || domain_match(&o.domain, &c.domain))
+                        && path_match(&c.path, &o.path)
+                });
+                if clobbers {
+                    out.refused.push(format!(
+                        "{} (would overwrite a Secure cookie over plain HTTP)",
+                        c.name
+                    ));
+                    continue;
+                }
             }
             let replaced = self.cookies.iter().position(|o| {
                 o.partition == top && o.name == c.name && o.domain == c.domain && o.path == c.path
@@ -859,6 +895,85 @@ mod tests {
             }
         }
         assert_eq!(j.cookies.len(), MAX_TOTAL, "20 sites x 180 > the total cap");
+    }
+
+    #[test]
+    fn only_loopback_http_counts_as_secure() {
+        for u in [
+            "https://example.com/",
+            "http://localhost:8080/",
+            "http://app.localhost/",
+            "http://127.0.0.1/",
+            "http://[::1]/",
+        ] {
+            assert!(is_secure_url(u), "{u}");
+        }
+        for u in [
+            "http://192.168.1.1/",
+            "http://10.0.0.2/",
+            "http://printer.local/",
+            "http://[fd00::1]/",
+            "http://example.com/",
+            "file:///tmp/x",
+        ] {
+            assert!(!is_secure_url(u), "{u}");
+        }
+        // A Secure cookie a LAN device set over HTTPS never goes over its HTTP.
+        let mut j = Jar::new();
+        let s = "https://192.168.1.1/";
+        set(&mut j, s, nav(s, None), &["sid=1; Secure"]);
+        assert!(j
+            .header_for("http://192.168.1.1/", nav("http://192.168.1.1/", None))
+            .is_none());
+        assert!(j.header_for(s, nav(s, None)).is_some());
+        // And plain HTTP on the LAN can't set Secure cookies.
+        let h = "http://192.168.1.1/";
+        let r = set(&mut j, h, nav(h, None), &["x=1; Secure"]);
+        assert!(r.refused[0].contains("Secure cookie over plain HTTP"), "{r:?}");
+    }
+
+    #[test]
+    fn http_cannot_overwrite_secure_cookies() {
+        let mut j = Jar::new();
+        let https = "https://www.example.com/app/";
+        set(
+            &mut j,
+            https,
+            nav(https, None),
+            &["sid=real; Secure; Path=/; Domain=example.com"],
+        );
+        let http = "http://www.example.com/app/";
+        for attack in [
+            "sid=attacker; Path=/",                            // same name, host-only, same path
+            "sid=attacker; Path=/; Domain=example.com",        // exact same key
+            "sid=attacker; Path=/app; Domain=www.example.com", // narrower domain and path
+            "sid=attacker",                                    // default path /app shadows /
+            "sid=; Max-Age=0; Path=/; Domain=example.com",     // deletion
+        ] {
+            let r = set(&mut j, http, nav(http, None), &[attack]);
+            assert!(
+                r.set.is_empty() && r.refused[0].contains("overwrite a Secure"),
+                "{attack}: {r:?}"
+            );
+        }
+        let c = j.for_site(https);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].value, "real");
+        // Unrelated names are fine, and so is a path a Secure cookie
+        // doesn't cover.
+        let r = set(&mut j, http, nav(http, None), &["theme=dark"]);
+        assert_eq!(r.set, vec!["theme"]);
+        set(&mut j, https, nav(https, None), &["tok=1; Secure; Path=/admin"]);
+        let r = set(&mut j, http, nav(http, None), &["tok=2; Path=/blog"]);
+        assert_eq!(r.set, vec!["tok"], "different path: no overlap");
+        // HTTPS may still replace it.
+        let r = set(
+            &mut j,
+            https,
+            nav(https, None),
+            &["sid=new; Secure; Path=/; Domain=example.com"],
+        );
+        assert_eq!(r.set, vec!["sid"]);
     }
 
     #[test]
