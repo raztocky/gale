@@ -5,8 +5,9 @@
 
 use crate::ipc::{read_frame, write_frame, FromRenderer, ToRenderer};
 use crate::js::{self, ClickResult, Runtime};
-use crate::net::Dest;
-use crate::page::{Page, ScriptOutput};
+use crate::net::{Dest, ScriptRequest};
+use crate::network::ScriptResponse;
+use crate::page::{pump, Host, Page, ScriptOutput};
 use std::io::{self, Read, Write};
 use std::time::Instant;
 
@@ -27,10 +28,78 @@ fn recv(input: &mut impl Read) -> Result<Option<ToRenderer>, String> {
     }
 }
 
+/// The browser, as the renderer sees it: every request goes over the pipe
+/// and waits for its answer (the protocol is strictly request/response).
+struct IpcHost<'a, R: Read, W: Write> {
+    input: &'a mut R,
+    output: &'a mut W,
+    cookies: String,
+    /// A protocol error: once set, everything fails and `serve` reports it.
+    broken: Option<String>,
+}
+
+impl<R: Read, W: Write> IpcHost<'_, R, W> {
+    fn ask(&mut self, msg: FromRenderer) -> Result<ToRenderer, String> {
+        if let Some(e) = &self.broken {
+            return Err(e.clone());
+        }
+        let r = send(self.output, msg)
+            .and_then(|_| recv(self.input)?.ok_or_else(|| "browser went away".to_string()));
+        if let Err(e) = &r {
+            self.broken = Some(e.clone());
+        }
+        r
+    }
+}
+
+impl<R: Read, W: Write> Host for IpcHost<'_, R, W> {
+    fn fetch(&mut self, url: &str, dest: Dest) -> Result<String, String> {
+        match self.ask(FromRenderer::Fetch {
+            url: url.to_string(),
+            dest,
+        })? {
+            ToRenderer::FetchReply(r) => r,
+            _ => {
+                self.broken = Some("protocol error: expected a fetch reply".into());
+                Err("protocol error".into())
+            }
+        }
+    }
+
+    fn request(&mut self, url: &str, req: ScriptRequest) -> Result<ScriptResponse, String> {
+        match self.ask(FromRenderer::Request {
+            url: url.to_string(),
+            req,
+        })? {
+            ToRenderer::Response { result, cookies } => {
+                self.cookies = cookies;
+                result
+            }
+            _ => {
+                self.broken = Some("protocol error: expected a response".into());
+                Err("protocol error".into())
+            }
+        }
+    }
+
+    fn set_cookie(&mut self, value: &str) {
+        match self.ask(FromRenderer::SetCookie(value.to_string())) {
+            Ok(ToRenderer::Cookies(c)) => self.cookies = c,
+            Ok(_) => self.broken = Some("protocol error: expected cookies".into()),
+            Err(_) => {}
+        }
+    }
+
+    fn cookies(&mut self) -> String {
+        self.cookies.clone()
+    }
+}
+
 pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), String> {
     let mut page: Option<Page> = None;
     // The page's scripts, if it has any (only for sites you allowed).
     let mut rt: Option<Runtime> = None;
+    let mut cookies = String::new();
     while let Some(msg) = recv(input)? {
         match msg {
             ToRenderer::Load {
@@ -39,29 +108,25 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                 blocker_css,
                 scripts,
                 viewport,
+                cookies: start_cookies,
             } => {
-                let mut fetch = |target: &str, dest: Dest| -> Result<String, String> {
-                    send(
-                        output,
-                        FromRenderer::Fetch {
-                            url: target.to_string(),
-                            dest,
-                        },
-                    )?;
-                    match recv(input)? {
-                        Some(ToRenderer::FetchReply(r)) => r,
-                        _ => Err("protocol error: expected a fetch reply".into()),
-                    }
+                cookies = start_cookies;
+                let mut host = IpcHost {
+                    input: &mut *input,
+                    output: &mut *output,
+                    cookies: cookies.clone(),
+                    broken: None,
                 };
                 let (p, new_rt, out) = if scripts {
-                    Page::load_with_scripts(&url, &html, &blocker_css, viewport, &mut fetch)
+                    Page::load_with_scripts(&url, &html, &blocker_css, viewport, &mut host)
                 } else {
-                    (
-                        Page::parse(&url, &html, &blocker_css, &mut fetch),
-                        None,
-                        ScriptOutput::default(),
-                    )
+                    let p = Page::parse(&url, &html, &blocker_css, &mut |u, d| host.fetch(u, d));
+                    (p, None, ScriptOutput::default())
                 };
+                if let Some(e) = host.broken {
+                    return Err(e);
+                }
+                cookies = host.cookies;
                 send(
                     output,
                     FromRenderer::Loaded {
@@ -87,7 +152,21 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                 let mut result = ClickResult::default();
                 let (mut navigate, mut console) = (None, vec![]);
                 if let (Some(rt), Some(uid)) = (rt.as_mut(), p.hit(x, y)) {
-                    result = rt.click(uid, Instant::now() + js::EVENT_BUDGET);
+                    let until = Instant::now() + js::EVENT_BUDGET;
+                    let before = rt.version();
+                    result = rt.click(uid, until);
+                    let mut host = IpcHost {
+                        input: &mut *input,
+                        output: &mut *output,
+                        cookies: cookies.clone(),
+                        broken: None,
+                    };
+                    pump(rt, &mut host, until);
+                    if let Some(e) = host.broken {
+                        return Err(e);
+                    }
+                    cookies = host.cookies;
+                    result.changed = rt.version() != before;
                     if result.changed {
                         p.refresh(rt);
                     }
@@ -111,7 +190,9 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                 }
                 send(output, FromRenderer::Dom(s))?;
             }
-            ToRenderer::FetchReply(_) => return Err("protocol error: unexpected fetch reply".into()),
+            ToRenderer::FetchReply(_) | ToRenderer::Response { .. } | ToRenderer::Cookies(_) => {
+                return Err("protocol error: unexpected reply".into())
+            }
         }
     }
     Ok(())

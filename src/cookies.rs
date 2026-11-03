@@ -376,7 +376,9 @@ impl Jar {
             initiator: Some(page_url),
             navigation: false,
         };
-        self.cookie_string(page_url, ctx, false).map(|(s, _)| s).unwrap_or_default()
+        self.cookie_string(page_url, ctx, false)
+            .map(|(s, _)| s)
+            .unwrap_or_default()
     }
 
     /// A page's script setting `document.cookie = value`. Scripts can't
@@ -392,9 +394,14 @@ impl Jar {
                 set: vec![],
                 refused: vec![format!("{} (scripts can't set HttpOnly cookies)", c.name)],
             },
-            Ok(c) if self.cookies.iter().any(|o| {
-                o.http_only && o.partition == site(page_url) && o.name == c.name && o.domain == c.domain && o.path == c.path
-            }) =>
+            Ok(c)
+                if self.cookies.iter().any(|o| {
+                    o.http_only
+                        && o.partition == site(page_url)
+                        && o.name == c.name
+                        && o.domain == c.domain
+                        && o.path == c.path
+                }) =>
             {
                 Stored {
                     set: vec![],

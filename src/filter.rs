@@ -734,10 +734,8 @@ fn parse_network(line: &str) -> Option<Parsed> {
                 "stylesheet" | "css" => Some(T_STYLESHEET),
                 "script" => Some(T_SCRIPT),
                 "xmlhttprequest" | "xhr" => Some(T_XHR),
-                "image" | "font" | "media" | "object" | "subdocument"
-                | "frame" | "ping" | "websocket" | "other" | "beacon" | "webrtc" | "object-subrequest" => {
-                    Some(T_OTHER)
-                }
+                "image" | "font" | "media" | "object" | "subdocument" | "frame" | "ping" | "websocket"
+                | "other" | "beacon" | "webrtc" | "object-subrequest" => Some(T_OTHER),
                 "all" => Some(T_ALL),
                 _ => None,
             };

@@ -505,6 +505,7 @@ fn classify(e: &ureq::Error) -> NetError {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn http_get_timeout(
     script: Option<Outgoing>,
     url: &str,
@@ -593,7 +594,11 @@ fn http_get_timeout(
                 .set("Accept", accept)
                 .set("Accept-Language", "en-US,en;q=0.5")
                 .set("Accept-Encoding", "gzip, deflate, br, zstd");
-            for (k, v) in o.headers.iter().filter(|(k, _)| !k.eq_ignore_ascii_case("accept")) {
+            for (k, v) in o
+                .headers
+                .iter()
+                .filter(|(k, _)| !k.eq_ignore_ascii_case("accept"))
+            {
                 req = req.set(k, v);
             }
             if let Some(origin) = o.origin {

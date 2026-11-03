@@ -876,7 +876,9 @@ fn n_request(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
     });
     match id {
         Some(id) => Ok(id.into()),
-        None => Err(JsNativeError::range().with_message("too many requests waiting").into()),
+        None => Err(JsNativeError::range()
+            .with_message("too many requests waiting")
+            .into()),
     }
 }
 
@@ -1360,26 +1362,121 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(5));
     }
 
+    /// A stand-in browser: records requests and answers them.
+    struct FakeHost {
+        seen: Vec<(String, ScriptRequest)>,
+        cookies: String,
+    }
+
+    impl crate::page::Host for FakeHost {
+        fn fetch(&mut self, _: &str, _: crate::net::Dest) -> Result<String, String> {
+            Err("no files".into())
+        }
+        fn request(&mut self, url: &str, req: ScriptRequest) -> Result<ScriptResponse, String> {
+            self.seen.push((url.to_string(), req));
+            if url.contains("blocked") {
+                return Err("blocked by a filter".into());
+            }
+            Ok(ScriptResponse {
+                status: 200,
+                url: url.to_string(),
+                redirected: false,
+                headers: vec![("content-type".into(), "application/json".into())],
+                body: "{\"n\": 42}".into(),
+            })
+        }
+        fn set_cookie(&mut self, v: &str) {
+            let pair = v.split(';').next().unwrap_or("").trim();
+            self.cookies = if self.cookies.is_empty() {
+                pair.to_string()
+            } else {
+                format!("{}; {pair}", self.cookies)
+            };
+        }
+        fn cookies(&mut self) -> String {
+            self.cookies.clone()
+        }
+    }
+
     #[test]
-    fn no_network_no_cookies_no_storage() {
+    fn script_requests_go_through_the_browser() {
+        let tree = crate::html::parse("<p id=out></p>");
+        let mut rt = Runtime::new(&tree, "https://example.com/app/", (1000.0, 700.0)).unwrap();
+        let mut host = FakeHost {
+            seen: vec![],
+            cookies: "theme=dark".into(),
+        };
+        rt.set_cookies(host.cookies.clone());
+        rt.run_script(
+            r#"
+            console.log(document.cookie, navigator.cookieEnabled);
+            document.cookie = 'lang=en; Path=/';
+            fetch('api/data?x=1', { method: 'POST', headers: { 'X-Thing': 'a' }, body: JSON.stringify({a: 1}),
+                                    credentials: 'include' })
+              .then(r => r.json()).then(j => console.log('fetch', j.n));
+            fetch('https://blocked.example/t').catch(e => console.log('rejected', e instanceof TypeError));
+            const x = new XMLHttpRequest();
+            x.onload = () => console.log('xhr', x.status, x.getResponseHeader('Content-Type'), JSON.parse(x.responseText).n);
+            x.open('GET', '/other'); x.send();
+            const f = new FormData(); f.append('q', 'cats');
+            fetch('/form', { method: 'POST', body: f });
+            const c = new AbortController(); fetch('/aborted', { signal: c.signal }).catch(e => console.log('aborted'));
+            c.abort();
+            "#,
+            0,
+            "test",
+        );
+        crate::page::pump(&mut rt, &mut host, Instant::now() + Duration::from_secs(2));
+        rt.run_script("console.log(document.cookie)", 0, "after");
+        let c = rt.take_console();
+        assert_eq!(c[0], "[log] theme=dark true");
+        for want in [
+            "[log] fetch 42",
+            "[log] rejected true",
+            "[log] xhr 200 application/json 42",
+            "[log] aborted",
+        ] {
+            assert!(c.contains(&want.to_string()), "{want}: {c:?}");
+        }
+        assert_eq!(c.last().unwrap(), "[log] theme=dark; lang=en", "{c:?}");
+        let (url, req) = &host.seen[0];
+        assert_eq!(url, "https://example.com/app/api/data?x=1");
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.body.as_deref(), Some("{\"a\":1}"));
+        assert_eq!(req.credentials, Credentials::Include);
+        assert!(
+            req.headers.contains(&("x-thing".into(), "a".into())),
+            "{:?}",
+            req.headers
+        );
+        assert!(req
+            .headers
+            .iter()
+            .any(|(k, v)| k == "content-type" && v.starts_with("text/plain")));
+        let form = host.seen.iter().find(|(u, _)| u.ends_with("/form")).unwrap();
+        let body = form.1.body.as_deref().unwrap();
+        assert!(body.contains("name=\"q\"") && body.contains("cats"), "{body}");
+        assert!(form
+            .1
+            .headers
+            .iter()
+            .any(|(k, v)| k == "content-type" && v.starts_with("multipart/form-data; boundary=")));
+    }
+
+    #[test]
+    fn storage_lasts_only_for_the_page() {
         let (mut rt, _) = run(
             "",
             r#"
-            console.log(typeof fetch, document.cookie === '', navigator.userAgent.includes('Firefox'));
-            fetch('https://tracker.example/').catch(e => console.log('fetch failed'));
-            const x = new XMLHttpRequest(); x.onerror = () => console.log('xhr failed');
-            x.open('GET', 'https://tracker.example/'); x.send();
             localStorage.setItem('a', '1'); console.log(localStorage.getItem('a'));
-            document.cookie = 'id=1'; console.log(document.cookie === '');
             console.log(new Date(0).getTimezoneOffset(), innerWidth, innerHeight, screen.width);
+            navigator.sendBeacon('/beacon', 'x');
             "#,
         );
         let c = rt.take_console();
-        assert_eq!(c[0], "[log] function true true");
-        assert!(c.contains(&"[log] fetch failed".to_string()), "{c:?}");
-        assert!(c.contains(&"[log] xhr failed".to_string()), "{c:?}");
         assert!(c.contains(&"[log] 1".to_string()), "{c:?}");
         assert!(c.contains(&"[log] 0 1000 700 1920".to_string()), "{c:?}");
+        assert!(rt.take_requests().is_empty(), "sendBeacon sends nothing");
     }
 
     #[test]

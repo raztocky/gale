@@ -573,8 +573,9 @@
     get baseURI() { return dom.url(); }
     get domain() { return location.hostname; }
     get referrer() { return ''; }
-    get cookie() { return ''; }
-    set cookie(v) { /* scripts can't read or set cookies (yet); see PRIVACY.md */ }
+    // The page's non-HttpOnly cookies; the browser decides what's stored.
+    get cookie() { return dom.cookie(); }
+    set cookie(v) { dom.setCookie(str(v)); }
     get defaultView() { return G; }
     get characterSet() { return 'UTF-8'; }
     get charset() { return 'UTF-8'; }
@@ -780,7 +781,7 @@
     language: 'en-US',
     languages: Object.freeze(['en-US', 'en']),
     onLine: true,
-    cookieEnabled: false,
+    cookieEnabled: true,
     doNotTrack: 'unspecified',
     webdriver: false,
     hardwareConcurrency: 4,
@@ -802,30 +803,294 @@
     getEntries: () => [], getEntriesByName: () => [], getEntriesByType: () => [],
   };
 
-  function noNetwork(what) {
-    return new TypeError(`NetworkError: Brickle doesn't let scripts make network requests yet (${what})`);
+  // ---------------------------------------------------------------- network
+  // Scripts' requests go to the browser, which applies every rule (your
+  // rules, the blocker, HTTPS-only, CORS, cookies) and answers later.
+  const pending = new Map(); // request id -> {resolve, reject}
+
+  class Headers {
+    constructor(init) {
+      this._h = [];
+      if (init instanceof Headers) init.forEach((v, k) => this.append(k, v));
+      else if (Array.isArray(init)) for (const [k, v] of init) this.append(k, v);
+      else if (init && typeof init === 'object') for (const k of Object.keys(init)) this.append(k, init[k]);
+    }
+    append(k, v) { this._h.push([str(k).toLowerCase(), str(v)]); }
+    set(k, v) { this.delete(k); this.append(k, v); }
+    get(k) {
+      const vals = this._h.filter((h) => h[0] === str(k).toLowerCase()).map((h) => h[1]);
+      return vals.length ? vals.join(', ') : null;
+    }
+    has(k) { return this._h.some((h) => h[0] === str(k).toLowerCase()); }
+    delete(k) { this._h = this._h.filter((h) => h[0] !== str(k).toLowerCase()); }
+    forEach(fn, self) { for (const [k, v] of this.entries()) fn.call(self, v, k, this); }
+    *entries() {
+      const names = [...new Set(this._h.map((h) => h[0]))].sort();
+      for (const n of names) yield [n, this.get(n)];
+    }
+    *keys() { for (const [k] of this.entries()) yield k; }
+    *values() { for (const [, v] of this.entries()) yield v; }
+    [Symbol.iterator]() { return this.entries(); }
   }
-  class XMLHttpRequest extends EventTarget {
-    constructor() { super(); this.readyState = 0; this.status = 0; this.responseText = ''; this.response = null; }
-    open() { this.readyState = 1; }
-    setRequestHeader() {}
-    getResponseHeader() { return null; }
-    getAllResponseHeaders() { return ''; }
-    overrideMimeType() {}
-    abort() {}
-    send() {
-      dom.log('warn', '[brickle] blocked XMLHttpRequest: scripts can\'t use the network yet');
-      addTimer(() => {
-        this.readyState = 4;
-        const ev = new Event('error');
-        if (typeof this.onreadystatechange === 'function') try { this.onreadystatechange(ev); } catch (e) { reportError(e); }
-        if (typeof this.onerror === 'function') try { this.onerror(ev); } catch (e) { reportError(e); }
-        dispatchOn(this, ev);
-        if (typeof this.onloadend === 'function') try { this.onloadend(ev); } catch (e) { reportError(e); }
-      }, 0, [], false);
+
+  const utf8 = (s) => {
+    const out = [];
+    for (const ch of str(s)) {
+      let c = ch.codePointAt(0);
+      if (c < 0x80) out.push(c);
+      else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
+      else if (c < 0x10000) out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+      else out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+    }
+    return new Uint8Array(out);
+  };
+  class TextEncoder {
+    get encoding() { return 'utf-8'; }
+    encode(s = '') { return utf8(s); }
+  }
+  class TextDecoder {
+    get encoding() { return 'utf-8'; }
+    decode(buf) {
+      if (!buf) return '';
+      const b = buf instanceof ArrayBuffer ? new Uint8Array(buf) : new Uint8Array(buf.buffer || buf, buf.byteOffset || 0, buf.byteLength);
+      let s = '';
+      for (let i = 0; i < b.length;) {
+        const c = b[i++];
+        let cp;
+        if (c < 0x80) cp = c;
+        else if (c < 0xe0) cp = ((c & 31) << 6) | (b[i++] & 63);
+        else if (c < 0xf0) cp = ((c & 15) << 12) | ((b[i++] & 63) << 6) | (b[i++] & 63);
+        else cp = ((c & 7) << 18) | ((b[i++] & 63) << 12) | ((b[i++] & 63) << 6) | (b[i++] & 63);
+        s += String.fromCodePoint(cp > 0x10ffff ? 0xfffd : cp);
+      }
+      return s;
     }
   }
-  XMLHttpRequest.UNSENT = 0; XMLHttpRequest.OPENED = 1; XMLHttpRequest.DONE = 4;
+
+  class FormData {
+    constructor(form) {
+      this._e = [];
+      if (form && form.querySelectorAll) {
+        for (const el of form.querySelectorAll('input, select, textarea')) {
+          const name = el.getAttribute('name');
+          if (!name || el.hasAttribute('disabled')) continue;
+          const type = (el.getAttribute('type') || '').toLowerCase();
+          if ((type === 'checkbox' || type === 'radio') && !el.hasAttribute('checked')) continue;
+          if (['submit', 'button', 'reset', 'image', 'file'].includes(type)) continue;
+          this.append(name, el.value);
+        }
+      }
+    }
+    append(k, v) { this._e.push([str(k), str(v)]); }
+    set(k, v) { this.delete(k); this.append(k, v); }
+    get(k) { const e = this._e.find((x) => x[0] === str(k)); return e ? e[1] : null; }
+    getAll(k) { return this._e.filter((x) => x[0] === str(k)).map((x) => x[1]); }
+    has(k) { return this._e.some((x) => x[0] === str(k)); }
+    delete(k) { this._e = this._e.filter((x) => x[0] !== str(k)); }
+    forEach(fn, self) { for (const [k, v] of this._e) fn.call(self, v, k, this); }
+    *entries() { yield* this._e.map((e) => e.slice()); }
+    *keys() { for (const [k] of this._e) yield k; }
+    *values() { for (const [, v] of this._e) yield v; }
+    [Symbol.iterator]() { return this.entries(); }
+  }
+
+  // A request body as text, and the content type it implies.
+  function encodeBody(body) {
+    if (body === undefined || body === null) return [null, null];
+    if (body instanceof URLSearchParams) return [body.toString(), 'application/x-www-form-urlencoded;charset=UTF-8'];
+    if (body instanceof FormData) {
+      const boundary = '----brickle' + Math.floor(Math.random() * 1e16).toString(36);
+      let out = '';
+      for (const [k, v] of body._e) {
+        const q = (x) => x.replace(/"/g, '%22').replace(/\r|\n/g, ' ');
+        out += `--${boundary}\r\nContent-Disposition: form-data; name="${q(k)}"\r\n\r\n${v}\r\n`;
+      }
+      return [out + `--${boundary}--\r\n`, 'multipart/form-data; boundary=' + boundary];
+    }
+    if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) return [new TextDecoder().decode(body), null];
+    if (typeof body === 'object' && typeof body.text === 'function' && body._text !== undefined) return [body._text, body.type || null];
+    return [str(body), 'text/plain;charset=UTF-8'];
+  }
+
+  class AbortSignal extends EventTarget {
+    constructor(token) { super(); if (token !== TOKEN) illegal(); this.aborted = false; this.reason = undefined; this.onabort = null; }
+    throwIfAborted() { if (this.aborted) throw this.reason; }
+    static abort(reason) { const c = new AbortController(); c.abort(reason); return c.signal; }
+    static timeout(ms) {
+      const c = new AbortController();
+      addTimer(() => c.abort(new Error('TimeoutError: signal timed out')), ms, [], false);
+      return c.signal;
+    }
+  }
+  class AbortController {
+    constructor() { this.signal = new AbortSignal(TOKEN); }
+    abort(reason) {
+      const s = this.signal;
+      if (s.aborted) return;
+      s.aborted = true;
+      s.reason = reason === undefined ? new Error('AbortError: the operation was aborted') : reason;
+      const ev = new Event('abort');
+      if (typeof s.onabort === 'function') try { s.onabort(ev); } catch (e) { reportError(e); }
+      dispatchOn(s, ev);
+    }
+  }
+
+  const STATUS_TEXT = { 200: 'OK', 201: 'Created', 204: 'No Content', 301: 'Moved Permanently', 302: 'Found',
+    304: 'Not Modified', 400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found',
+    405: 'Method Not Allowed', 409: 'Conflict', 429: 'Too Many Requests', 500: 'Internal Server Error',
+    502: 'Bad Gateway', 503: 'Service Unavailable' };
+
+  class Response {
+    constructor(body = null, init = {}) {
+      this._text = body === null || body === undefined ? '' : str(body);
+      this.status = init.status === undefined ? 200 : init.status | 0;
+      this.statusText = init.statusText !== undefined ? str(init.statusText) : (STATUS_TEXT[this.status] || '');
+      this.headers = init.headers instanceof Headers ? init.headers : new Headers(init.headers);
+      this.url = init._url || '';
+      this.redirected = !!init._redirected;
+      this.type = init._type || 'default';
+      this.bodyUsed = false;
+    }
+    get ok() { return this.status >= 200 && this.status < 300; }
+    _consume() {
+      if (this.bodyUsed) return Promise.reject(new TypeError('Body has already been consumed'));
+      this.bodyUsed = true;
+      return Promise.resolve(this._text);
+    }
+    text() { return this._consume(); }
+    json() { return this._consume().then((t) => JSON.parse(t)); }
+    arrayBuffer() { return this._consume().then((t) => utf8(t).buffer); }
+    blob() { return this._consume().then((t) => ({ size: utf8(t).length, type: this.headers.get('content-type') || '', text: () => Promise.resolve(t), _text: t })); }
+    formData() { return this._consume().then((t) => { const f = new FormData(); new URLSearchParams(t).forEach((v, k) => f.append(k, v)); return f; }); }
+    clone() {
+      if (this.bodyUsed) throw new TypeError('Body has already been consumed');
+      return new Response(this._text, { status: this.status, statusText: this.statusText, headers: new Headers(this.headers),
+        _url: this.url, _redirected: this.redirected, _type: this.type });
+    }
+    static json(data, init = {}) {
+      const h = new Headers(init.headers);
+      if (!h.has('content-type')) h.set('content-type', 'application/json');
+      return new Response(JSON.stringify(data), { ...init, headers: h });
+    }
+    static error() { const r = new Response(null, { status: 0 }); r.type = 'error'; return r; }
+  }
+
+  class Request {
+    constructor(input, init = {}) {
+      const base = input instanceof Request ? input : null;
+      this.url = dom.resolve(base ? base.url : str(input));
+      this.method = str(init.method || (base && base.method) || 'GET').toUpperCase();
+      this.headers = new Headers(init.headers || (base && base.headers));
+      this.credentials = init.credentials || (base && base.credentials) || 'same-origin';
+      this.signal = init.signal || (base && base.signal) || null;
+      this.mode = init.mode || 'cors';
+      this._body = init.body !== undefined ? init.body : base ? base._body : null;
+    }
+    clone() { return new Request(this); }
+  }
+
+  // Send a request to the browser; `done(err, response)` is called later.
+  function send(method, url, headers, body, credentials, done) {
+    const [text, implied] = encodeBody(body);
+    const h = headers instanceof Headers ? headers : new Headers(headers);
+    if (implied && !h.has('content-type')) h.set('content-type', implied);
+    const flat = [];
+    for (const [k, v] of h) flat.push(k, v);
+    const id = dom.request(method, url, flat, text, credentials);
+    pending.set(id, done);
+    return id;
+  }
+
+  function fetch(input, init = {}) {
+    let req;
+    try { req = new Request(input, init); } catch (e) { return Promise.reject(e); }
+    if (req.signal && req.signal.aborted) return Promise.reject(req.signal.reason);
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      if (req.signal) req.signal.addEventListener('abort', () => { if (!settled) { settled = true; reject(req.signal.reason); } });
+      try {
+        send(req.method, req.url, req.headers, req._body, req.credentials, (err, r) => {
+          if (settled) return;
+          settled = true;
+          if (err !== null) { reject(new TypeError('NetworkError when attempting to fetch resource: ' + err)); return; }
+          resolve(new Response(r.method === 'HEAD' ? '' : r.body, { status: r.status, headers: new Headers(r.headers),
+            _url: r.url, _redirected: r.redirected, _type: new URLImpl(r.url).origin === location.origin ? 'basic' : 'cors' }));
+        });
+      } catch (e) { settled = true; reject(new TypeError('NetworkError: ' + (e && e.message))); }
+    });
+  }
+
+  class XMLHttpRequest extends EventTarget {
+    constructor() {
+      super();
+      this.readyState = 0; this.status = 0; this.statusText = ''; this.responseText = ''; this.response = '';
+      this.responseType = ''; this.responseURL = ''; this.withCredentials = false; this.timeout = 0;
+      this._headers = new Headers(); this._respHeaders = new Headers(); this._aborted = false;
+      this.upload = new EventTarget();
+    }
+    open(method, url, async = true) {
+      if (async === false) dom.log('warn', '[brickle] synchronous XMLHttpRequest runs asynchronously in Brickle');
+      this._method = str(method).toUpperCase();
+      this._url = dom.resolve(str(url));
+      this._headers = new Headers();
+      this._aborted = false;
+      this._state(1);
+    }
+    setRequestHeader(k, v) { this._headers.append(k, v); }
+    getResponseHeader(k) { return this._respHeaders.get(k); }
+    getAllResponseHeaders() { let s = ''; for (const [k, v] of this._respHeaders) s += `${k}: ${v}\r\n`; return s; }
+    overrideMimeType() {}
+    abort() { this._aborted = true; if (this.readyState > 0 && this.readyState < 4) { this._state(4); this._fire('abort'); this._fire('loadend'); } this.readyState = 0; }
+    _fire(type) {
+      const ev = new Event(type);
+      const h = this['on' + type];
+      if (typeof h === 'function') try { h.call(this, ev); } catch (e) { reportError(e); }
+      dispatchOn(this, ev);
+    }
+    _state(n) { this.readyState = n; this._fire('readystatechange'); }
+    send(body = null) {
+      if (this.readyState !== 1) throw new Error('InvalidStateError: open() first');
+      this._fire('loadstart');
+      send(this._method, this._url, this._headers, body, this.withCredentials ? 'include' : 'same-origin', (err, r) => {
+        if (this._aborted) return;
+        if (err !== null) {
+          this.status = 0;
+          this._state(4);
+          this._fire('error');
+          this._fire('loadend');
+          return;
+        }
+        this.status = r.status;
+        this.statusText = STATUS_TEXT[r.status] || '';
+        this.responseURL = r.url;
+        this._respHeaders = new Headers(r.headers);
+        this._state(2);
+        this._state(3);
+        this.responseText = r.body;
+        if (this.responseType === 'json') { try { this.response = JSON.parse(r.body); } catch (e) { this.response = null; } }
+        else if (this.responseType === 'arraybuffer') this.response = utf8(r.body).buffer;
+        else this.response = r.body;
+        this._state(4);
+        this._fire('load');
+        this._fire('loadend');
+      });
+    }
+  }
+  XMLHttpRequest.UNSENT = 0; XMLHttpRequest.OPENED = 1; XMLHttpRequest.HEADERS_RECEIVED = 2;
+  XMLHttpRequest.LOADING = 3; XMLHttpRequest.DONE = 4;
+  for (const n of ['onreadystatechange', 'onload', 'onerror', 'onloadend', 'onloadstart', 'onabort', 'ontimeout', 'onprogress'])
+    XMLHttpRequest.prototype[n] = null;
+
+  // Called by the renderer with the browser's answer.
+  function deliver(id, err, status, url, redirected, headers, body) {
+    const done = pending.get(id);
+    if (!done) return;
+    pending.delete(id);
+    if (err !== null && err !== undefined) { done(str(err), null); return; }
+    const pairs = [];
+    for (let i = 0; i + 1 < headers.length; i += 2) pairs.push([headers[i], headers[i + 1]]);
+    done(null, { status, url, redirected, headers: pairs, body });
+  }
 
   class Observer {
     constructor(cb) { this._cb = cb; }
@@ -895,10 +1160,7 @@
     requestIdleCallback: (fn) => addTimer(() => fn({ didTimeout: false, timeRemaining: () => 10 }), 1, [], false),
     cancelIdleCallback: (id) => { timers.delete(id); },
     queueMicrotask: (fn) => { Promise.resolve().then(fn); },
-    fetch: () => {
-      dom.log('warn', '[brickle] blocked fetch(): scripts can\'t use the network yet');
-      return Promise.reject(noNetwork('fetch'));
-    },
+    fetch, Headers, Request, Response, AbortController, AbortSignal, FormData, TextEncoder, TextDecoder,
     // Images aren't loaded (Brickle doesn't show images yet), so these are
     // plain elements: setting src requests nothing.
     Image: function Image(w, h) {
@@ -968,5 +1230,6 @@
       fire(G, 'pageshow');
     },
     setViewport(w, h) { viewport = [w, h]; },
+    deliver,
   };
 });

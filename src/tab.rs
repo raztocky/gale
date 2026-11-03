@@ -7,9 +7,11 @@
 //! it is killed and an error page is shown; the browser keeps running.
 
 use crate::ipc::{read_frame, write_frame, FromRenderer, ToRenderer, MAX_FRAME};
-use crate::net::Dest;
 use crate::net::{self, Cancel};
+use crate::net::{Dest, ScriptRequest};
+use crate::network::ScriptResponse;
 use crate::network::{Action, LogEntry, Nav, Network, MAX_STYLESHEETS};
+use crate::page::Host;
 use crate::page::{error_page, Page, Rendered};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
@@ -26,6 +28,34 @@ const MAX_FETCHES: usize = MAX_STYLESHEETS + crate::js::MAX_SCRIPTS + 8;
 /// Longest a page with JavaScript may take to load before Brickle gives up
 /// on its scripts and shows it without them.
 const SCRIPT_LOAD_LIMIT: Duration = Duration::from_secs(15);
+/// Bytes a renderer running scripts may send per exchange (script
+/// requests carry bodies).
+const SCRIPT_BYTES: usize = 16 * 1024 * 1024;
+/// Messages a renderer may send per exchange.
+const MAX_MESSAGES: usize = 2000;
+
+/// The browser's [`Host`]: every request goes through the network service,
+/// for the page the browser itself recorded (`page`).
+struct NetHost<'a> {
+    net: &'a mut Network,
+    page: String,
+}
+
+impl Host for NetHost<'_> {
+    fn fetch(&mut self, url: &str, dest: Dest) -> Result<String, String> {
+        self.net.subresource(&self.page, url, dest)
+    }
+    fn request(&mut self, url: &str, req: ScriptRequest) -> Result<ScriptResponse, String> {
+        self.net.script_request(&self.page, url, req)
+    }
+    fn set_cookie(&mut self, value: &str) {
+        self.net.set_script_cookie(&self.page, value);
+    }
+    fn cookies(&mut self) -> String {
+        self.net.script_cookies(&self.page)
+    }
+}
+
 /// Console lines kept per tab.
 const MAX_CONSOLE: usize = 1000;
 /// Default window size for scripts when there's no window (command line).
@@ -177,15 +207,19 @@ impl Tab {
     /// Tell the page you clicked at page-space point (x, y), so its scripts
     /// can react. Returns what happened; the caller follows the link (if
     /// any) unless a script prevented it.
-    pub fn click(&mut self, x: f32, y: f32) -> Click {
+    pub fn click(&mut self, net: &mut Network, x: f32, y: f32) -> Click {
         let Backend::Sandboxed(r) = &mut self.backend else {
             return Click::default();
         };
         if !self.scripts {
             return Click::default();
         }
+        let mut host = NetHost {
+            net,
+            page: self.url.clone(),
+        };
         let result = r.send(ToRenderer::Click { x, y }).and_then(|_| {
-            match r.recv(Instant::now() + RENDERER_TIMEOUT, &mut { LOAD_BYTES })? {
+            match r.serve(Instant::now() + RENDERER_TIMEOUT, SCRIPT_BYTES, &mut host)? {
                 FromRenderer::Clicked {
                     prevented,
                     changed,
@@ -279,9 +313,11 @@ fn load_sandboxed(
         // without them.
         deadline = deadline.min(Instant::now() + SCRIPT_LOAD_LIMIT);
     }
-    let page_url = url.to_string();
     let mut r = Renderer::spawn(net.cancel.clone())?;
-    let mut fetch = |target: &str, dest: Dest| net.subresource(&page_url, target, dest);
+    let mut host = NetHost {
+        net,
+        page: url.to_string(),
+    };
     let loaded = r.load(
         url,
         html,
@@ -289,7 +325,7 @@ fn load_sandboxed(
         scripts,
         viewport,
         deadline,
-        &mut fetch,
+        &mut host,
     )?;
     Ok((r, loaded))
 }
@@ -359,8 +395,8 @@ impl Renderer {
         })
     }
 
-    /// Hand the renderer a document and serve its subresource requests
-    /// until it reports the page loaded.
+    /// Hand the renderer a document and serve its requests until it
+    /// reports the page loaded.
     #[allow(clippy::too_many_arguments)]
     fn load(
         &mut self,
@@ -370,38 +406,66 @@ impl Renderer {
         scripts: bool,
         viewport: (f32, f32),
         deadline: Instant,
-        fetch: &mut dyn FnMut(&str, Dest) -> Result<String, String>,
+        host: &mut dyn Host,
     ) -> Result<Loaded, String> {
+        let cookies = if scripts { host.cookies() } else { String::new() };
         self.send(ToRenderer::Load {
             url: url.to_string(),
             html: html.to_string(),
             blocker_css,
             scripts,
             viewport,
+            cookies,
         })?;
-        let mut budget = LOAD_BYTES;
-        let mut fetches = 0;
+        let budget = if scripts { SCRIPT_BYTES } else { LOAD_BYTES };
+        match self.serve(deadline, budget, host)? {
+            FromRenderer::Loaded {
+                title,
+                navigate,
+                console,
+            } => Ok(Loaded {
+                title,
+                navigate,
+                console,
+            }),
+            _ => Err(self.kill("renderer sent an unexpected message and was killed")),
+        }
+    }
+
+    /// Answer the renderer's requests (files, script requests, cookies)
+    /// through `host` until it sends anything else, which is returned.
+    fn serve(
+        &mut self,
+        deadline: Instant,
+        budget: usize,
+        host: &mut dyn Host,
+    ) -> Result<FromRenderer, String> {
+        let mut budget = budget;
+        let (mut fetches, mut messages) = (0, 0);
         loop {
+            messages += 1;
+            if messages > MAX_MESSAGES {
+                return Err(self.kill("renderer sent too many messages and was killed"));
+            }
             match self.recv(deadline, &mut budget)? {
                 FromRenderer::Fetch { url, dest } if fetches < MAX_FETCHES => {
                     fetches += 1;
-                    self.send(ToRenderer::FetchReply(fetch(&url, dest)))?
+                    self.send(ToRenderer::FetchReply(host.fetch(&url, dest)))?
                 }
                 FromRenderer::Fetch { .. } => {
                     return Err(self.kill("renderer made too many requests and was killed"))
                 }
-                FromRenderer::Loaded {
-                    title,
-                    navigate,
-                    console,
-                } => {
-                    return Ok(Loaded {
-                        title,
-                        navigate,
-                        console,
-                    })
+                FromRenderer::Request { url, req } => {
+                    let result = host.request(&url, req);
+                    let cookies = host.cookies();
+                    self.send(ToRenderer::Response { result, cookies })?
                 }
-                _ => return Err(self.kill("renderer sent an unexpected message and was killed")),
+                FromRenderer::SetCookie(v) => {
+                    host.set_cookie(&v);
+                    let cookies = host.cookies();
+                    self.send(ToRenderer::Cookies(cookies))?
+                }
+                other => return Ok(other),
             }
         }
     }
@@ -545,7 +609,7 @@ except BrokenPipeError:
             false,
             DEFAULT_VIEWPORT,
             deadline,
-            fetch,
+            &mut crate::page::FetchOnly(fetch),
         )
         .map(|l| l.title)
     }
@@ -716,7 +780,7 @@ except BrokenPipeError:
                 false,
                 DEFAULT_VIEWPORT,
                 deadline,
-                &mut no_fetch,
+                &mut crate::page::FetchOnly(no_fetch),
             )
             .map(|l| l.title)
             .unwrap_err();

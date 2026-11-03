@@ -358,6 +358,9 @@ pub fn describe(e: &LogEntry) -> (&'static str, String) {
     if !e.cookies_set.is_empty() {
         notes.push(format!("set cookies {}", e.cookies_set.join(", ")));
     }
+    if e.cors_blocked {
+        notes.push("response hidden from the page (CORS)".into());
+    }
     if !e.cookies_refused.is_empty() {
         notes.push(format!("refused cookies {}", e.cookies_refused.join(", ")));
     }

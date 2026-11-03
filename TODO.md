@@ -39,9 +39,9 @@ Done: Boa in the sandboxed renderer, off by default, allowed per site, DOM, even
 clicks, no network for scripts. Rules that still apply to what's next:
 - Cookie selection and network authorization stay in the browser process, using the browser's
   own record of the page's origin, never what the renderer claims.
-- [ ] `fetch`/XHR, only together with same-origin policy, CORS and credential rules, each request
-  shown in the request panel and subject to the blocker.
-- [ ] `document.cookie` for non-HttpOnly cookies, answered by the browser.
+- [x] `fetch`/XHR through the browser, with same-origin policy, CORS and credentials rules.
+- [ ] CORS preflight (`OPTIONS`) for non-simple cross-origin requests.
+- [x] `document.cookie` for non-HttpOnly cookies, answered by the browser.
 - [ ] JavaScript modules (`type=module`, `import`).
 - [ ] Keyboard input and form controls (typing into fields, submitting forms).
 - [ ] More selectors for `querySelector` (sibling combinators, `:not()`, attribute values),

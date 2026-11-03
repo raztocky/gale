@@ -517,29 +517,54 @@ fn cookies_follow_redirect_hops_and_values_stay_out_of_logs() {
     );
 }
 
-/// JavaScript is off unless you allow a site; when on, scripts are fetched
-/// through the same policy as everything else, and scripts themselves get
-/// no network access.
+/// JavaScript is off unless you allow a site. When on, scripts and their
+/// requests go through the same policy as everything else, CORS keeps
+/// other sites' responses from the page, and HttpOnly cookies stay hidden.
 #[test]
-fn javascript_is_off_by_default_and_has_no_network() {
+fn javascript_is_off_by_default_and_its_requests_follow_the_rules() {
     let home = temp_dir("js");
     std::fs::create_dir_all(home.join("data/brickle/filters")).unwrap();
-    std::fs::write(home.join("data/brickle/filters/test.txt"), "/tracker.js$script\n").unwrap();
-    let page = "<p id=out>static</p>\
-                <script>document.getElementById('out').textContent = 'inline ran';\
-                fetch('/beacon?from=fetch'); var x = new XMLHttpRequest(); x.open('GET', '/beacon?from=xhr'); x.send();\
-                navigator.sendBeacon('/beacon?from=beacon'); new Image().src = '/beacon?from=img';</script>\
-                <script src=/app.js></script><script src=/tracker.js></script>"
-        .to_string();
-    let (port, seen) = serve(vec![
-        ("/", "text/html", page),
-        (
-            "/app.js",
-            "application/javascript",
-            "document.title = 'app ran';".into(),
-        ),
-        ("/tracker.js", "application/javascript", "".into()),
-    ]);
+    std::fs::write(
+        home.join("data/brickle/filters/test.txt"),
+        "/tracker.js$script\n/collect$xmlhttprequest\n",
+    )
+    .unwrap();
+    let (port, seen) = serve_dynamic(|port| {
+        let page = format!(
+            "<p id=out>static</p>\
+             <script>document.getElementById('out').textContent = 'inline ran';\
+             console.log('cookie', document.cookie);\
+             document.cookie = 'lang=en; Path=/';\
+             fetch('/api').then(r => r.text()).then(t => console.log('same-origin', t));\
+             fetch('http://localhost:{port}/open').then(r => r.text()).then(t => console.log('cors ok', t));\
+             fetch('http://localhost:{port}/closed').then(r => r.text()).then(t => console.log('LEAK', t),\
+               e => console.log('cors blocked'));\
+             fetch('http://localhost:{port}/custom', {{headers: {{'X-Custom': '1'}}}}).catch(e => console.log('no preflight'));\
+             fetch('/collect').catch(e => console.log('filtered'));\
+             navigator.sendBeacon('/beacon');</script>\
+             <script src=/app.js></script><script src=/tracker.js></script>"
+        );
+        vec![
+            (
+                "/",
+                "text/html\r\nSet-Cookie: sid=secret; HttpOnly\r\nSet-Cookie: theme=dark",
+                page,
+            ),
+            (
+                "/app.js",
+                "application/javascript",
+                "document.title = 'app ran';".into(),
+            ),
+            ("/tracker.js", "application/javascript", "".into()),
+            ("/api", "text/plain", "from api".into()),
+            (
+                "/open",
+                "text/plain\r\nAccess-Control-Allow-Origin: *",
+                "public data".into(),
+            ),
+            ("/closed", "text/plain", "private data".into()),
+        ]
+    });
     let url = format!("http://127.0.0.1:{port}/");
     let paths = |seen: &Arc<Mutex<Vec<Vec<String>>>>| -> Vec<String> {
         seen.lock()
@@ -554,8 +579,9 @@ fn javascript_is_off_by_default_and_has_no_network() {
     let dom = String::from_utf8_lossy(&out.stdout);
     assert!(dom.contains("\"static\""), "{dom}");
     assert_eq!(paths(&seen), vec!["/"]);
+    seen.lock().unwrap().clear();
 
-    // Allowed for the site: scripts run, fetched as scripts, filters apply.
+    // Allowed for the site.
     let allow = brickle(&home)
         .args(["js", "allow", "127.0.0.1"])
         .output()
@@ -563,30 +589,61 @@ fn javascript_is_off_by_default_and_has_no_network() {
     assert!(allow.status.success());
     let out = brickle(&home).args(["requests", &url]).output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("BLOCKED  js    ") && stdout.contains("tracker.js"),
-        "{stdout}"
-    );
-    assert!(
-        stdout.contains("blocked fetch()") && stdout.contains("blocked XMLHttpRequest"),
-        "{stdout}"
+    for want in [
+        "[log] cookie theme=dark",
+        "[log] same-origin from api",
+        "[log] cors ok public data",
+        "[log] cors blocked",
+        "[log] no preflight",
+        "[log] filtered",
+        "BLOCKED  js",
+        "BLOCKED  xhr",
+        "response hidden from the page (CORS)",
+    ] {
+        assert!(stdout.contains(want), "missing {want:?}:\n{stdout}");
+    }
+    assert!(!stdout.contains("LEAK"), "{stdout}");
+    let got = paths(&seen);
+    for p in ["/", "/app.js", "/api", "/open", "/closed"] {
+        assert!(got.contains(&p.to_string()), "{p} not requested: {got:?}");
+    }
+    for p in ["/tracker.js", "/collect", "/custom", "/beacon"] {
+        assert!(!got.contains(&p.to_string()), "{p} must not be sent: {got:?}");
+    }
+    let seen = seen.lock().unwrap();
+    let req = |path: &str| {
+        seen.iter()
+            .find(|r| r[0].split(' ').nth(1) == Some(path))
+            .unwrap()
+            .clone()
+    };
+    let header =
+        |r: &Vec<String>, name: &str| r.iter().find(|l| l.starts_with(&format!("{name}: "))).cloned();
+    // Same-origin: cookies (including HttpOnly, and the one the script set).
+    assert_eq!(
+        header(&req("/api"), "Cookie").as_deref(),
+        Some("Cookie: sid=secret; theme=dark; lang=en")
     );
     assert_eq!(
-        paths(&seen),
-        vec!["/", "/", "/app.js"],
-        "scripts made no requests: {stdout}"
+        header(&req("/api"), "Sec-Fetch-Mode").as_deref(),
+        Some("Sec-Fetch-Mode: same-origin")
     );
-    let js_req = seen.lock().unwrap()[2].clone();
-    assert!(
-        js_req.contains(&"Sec-Fetch-Dest: script".to_string()),
-        "{js_req:?}"
+    // Cross-site: an Origin header and no cookies.
+    let open = req("/open");
+    assert_eq!(
+        header(&open, "Origin"),
+        Some(format!("Origin: http://127.0.0.1:{port}"))
     );
-    let out = brickle(&home).args(["dom", &url]).output().unwrap();
-    let dom = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        dom.contains("\"inline ran\"") && dom.contains("\"app ran\""),
-        "{dom}"
+    assert_eq!(header(&open, "Cookie"), None);
+    assert_eq!(
+        header(&open, "Sec-Fetch-Mode").as_deref(),
+        Some("Sec-Fetch-Mode: cors")
     );
+    assert_eq!(
+        header(&req("/app.js"), "Sec-Fetch-Dest").as_deref(),
+        Some("Sec-Fetch-Dest: script")
+    );
+    drop(seen);
 
     // --no-sandbox never runs scripts.
     let out = brickle(&home)

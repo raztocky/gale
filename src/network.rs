@@ -137,10 +137,23 @@ enum Fetch {
         headers: Vec<(String, String)>,
     },
     Stopped(String),
-    NeedsHttp { host: String, url: String },
-    FilterBlocked { host: String, url: String, rule: String },
-    LocalNetwork { host: String, url: String },
-    Certificate { host: String, err: String },
+    NeedsHttp {
+        host: String,
+        url: String,
+    },
+    FilterBlocked {
+        host: String,
+        url: String,
+        rule: String,
+    },
+    LocalNetwork {
+        host: String,
+        url: String,
+    },
+    Certificate {
+        host: String,
+        err: String,
+    },
 }
 
 pub struct Network {
@@ -495,7 +508,12 @@ impl Network {
     /// the response if the server allows it (`Access-Control-Allow-Origin`).
     /// Every other rule (your rules, the blocker, HTTPS-only, the
     /// local-network block, cookies) applies as for any request.
-    pub fn script_request(&mut self, page_url: &str, url: &str, req: ScriptRequest) -> Result<ScriptResponse, String> {
+    pub fn script_request(
+        &mut self,
+        page_url: &str,
+        url: &str,
+        req: ScriptRequest,
+    ) -> Result<ScriptResponse, String> {
         let dest = Dest::Xhr;
         if !self.scripts_allowed(page_url) {
             self.record(url, dest, Outcome::NotAllowed, vec![]);
@@ -531,7 +549,9 @@ impl Network {
         let cross = !same_origin(page_url, &target);
         if cross && !is_cors_simple(&req) {
             self.record(&target, dest, Outcome::NotAllowed, vec![]);
-            return Err("this cross-origin request needs a CORS preflight, which Brickle doesn't support yet".into());
+            return Err(
+                "this cross-origin request needs a CORS preflight, which Brickle doesn't support yet".into(),
+            );
         }
         // After the page has loaded, each script request gets its own time.
         let now = std::time::Instant::now();
@@ -558,7 +578,8 @@ impl Network {
                     let origin = origin_of(page_url);
                     let acao = header("access-control-allow-origin").unwrap_or_default();
                     let ok = if creds == Credentials::Include {
-                        acao == origin && header("access-control-allow-credentials").as_deref() == Some("true")
+                        acao == origin
+                            && header("access-control-allow-credentials").as_deref() == Some("true")
                     } else {
                         acao == "*" || acao == origin
                     };
@@ -649,7 +670,13 @@ impl Network {
 
     /// `script`: the method, headers, body and credentials of a page
     /// script's request (`dest` is then `Xhr`).
-    fn fetch_with(&mut self, url: &str, initiator: Option<&str>, dest: Dest, script: Option<&ScriptRequest>) -> Fetch {
+    fn fetch_with(
+        &mut self,
+        url: &str,
+        initiator: Option<&str>,
+        dest: Dest,
+        script: Option<&ScriptRequest>,
+    ) -> Fetch {
         let fdest = filter_dest(dest);
         let mut method = script.map(|s| s.method.clone()).unwrap_or_else(|| "GET".into());
         let mut body = script.and_then(|s| s.body.clone());
@@ -981,15 +1008,39 @@ pub struct ScriptResponse {
 /// fingerprint-relevant ones stay as Firefox sends them.
 fn allowed_script_headers(headers: Vec<(String, String)>) -> Vec<(String, String)> {
     const FORBIDDEN: &[&str] = &[
-        "accept-charset", "accept-encoding", "connection", "content-length", "cookie", "cookie2", "date",
-        "dnt", "expect", "host", "keep-alive", "origin", "referer", "set-cookie", "te", "trailer",
-        "transfer-encoding", "upgrade", "via", "user-agent", "accept-language", "priority",
-        "x-http-method", "x-http-method-override", "x-method-override",
+        "accept-charset",
+        "accept-encoding",
+        "connection",
+        "content-length",
+        "cookie",
+        "cookie2",
+        "date",
+        "dnt",
+        "expect",
+        "host",
+        "keep-alive",
+        "origin",
+        "referer",
+        "set-cookie",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "via",
+        "user-agent",
+        "accept-language",
+        "priority",
+        "x-http-method",
+        "x-http-method-override",
+        "x-method-override",
     ];
     let mut out: Vec<(String, String)> = Vec::new();
     for (k, v) in headers {
         let name = k.trim().to_ascii_lowercase();
-        let token = !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b));
+        let token = !name.is_empty()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b));
         if !token
             || FORBIDDEN.contains(&name.as_str())
             || name.starts_with("sec-")
@@ -1014,7 +1065,10 @@ fn is_cors_simple(req: &ScriptRequest) -> bool {
             "accept" | "accept-language" | "content-language" => v.len() <= 128,
             "content-type" => {
                 let mime = v.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
-                matches!(mime.as_str(), "application/x-www-form-urlencoded" | "multipart/form-data" | "text/plain")
+                matches!(
+                    mime.as_str(),
+                    "application/x-www-form-urlencoded" | "multipart/form-data" | "text/plain"
+                )
             }
             _ => false,
         })
@@ -1024,13 +1078,22 @@ fn is_cors_simple(req: &ScriptRequest) -> bool {
 /// CORS-safelisted ones and those the server exposes.
 fn exposed_headers(headers: Vec<(String, String)>, cross: bool, creds: bool) -> Vec<(String, String)> {
     const SAFE: &[&str] = &[
-        "cache-control", "content-language", "content-length", "content-type", "expires", "last-modified",
+        "cache-control",
+        "content-language",
+        "content-length",
+        "content-type",
+        "expires",
+        "last-modified",
         "pragma",
     ];
     let expose: Vec<String> = headers
         .iter()
         .filter(|(k, _)| k == "access-control-expose-headers")
-        .flat_map(|(_, v)| v.split(',').map(|s| s.trim().to_ascii_lowercase()).collect::<Vec<_>>())
+        .flat_map(|(_, v)| {
+            v.split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .collect::<Vec<_>>()
+        })
         .collect();
     let all = !creds && expose.iter().any(|e| e == "*");
     headers
