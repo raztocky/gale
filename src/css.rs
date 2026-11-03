@@ -64,6 +64,8 @@ pub enum Value {
     Number(f32),
     Color(Color),
     Str(String),
+    /// `url(...)`, with its case kept.
+    Url(String),
     Comma,
 }
 
@@ -87,7 +89,24 @@ impl Value {
             Value::Number(n) => format!("{n}"),
             Value::Color(c) => format!("rgba({}, {}, {}, {})", c.r, c.g, c.b, c.a as f32 / 255.0),
             Value::Str(s) => format!("\"{}\"", s.replace('"', "")),
+            Value::Url(u) => format!("url(\"{}\")", u.replace('"', "%22")),
             Value::Comma => ",".into(),
+        }
+    }
+}
+
+/// Make the sheet's `url()`s absolute, relative to `base` (where the sheet
+/// came from), so they mean the same once the sheet is used elsewhere.
+pub fn resolve_urls(sheet: &mut Stylesheet, base: &str) {
+    for rule in &mut sheet.rules {
+        for d in &mut rule.declarations {
+            for v in &mut d.values {
+                if let Value::Url(u) = v {
+                    if !u.starts_with("data:") {
+                        *u = crate::net::resolve(base, u);
+                    }
+                }
+            }
         }
     }
 }
@@ -476,6 +495,11 @@ pub fn parse_values(text: &str) -> Vec<Value> {
 
 fn parse_value_token(tok: &str) -> Option<Value> {
     let lower = tok.to_ascii_lowercase();
+    if lower.starts_with("url(") && tok.ends_with(')') {
+        let inner = tok[4..tok.len() - 1].trim();
+        let inner = inner.trim_matches(|c| c == '"' || c == '\'');
+        return Some(Value::Url(inner.to_string()));
+    }
     if let Some(hex) = lower.strip_prefix('#') {
         return parse_hex(hex).map(Value::Color);
     }
@@ -626,6 +650,22 @@ fn named_color(name: &str) -> Option<Color> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn urls_keep_their_case_and_resolve_against_the_sheet() {
+        assert_eq!(
+            parse_values("url('Img/Logo.PNG') no-repeat")[0],
+            Value::Url("Img/Logo.PNG".into())
+        );
+        let mut sheet = parse("a { background: url(img/a.png) } b { background-image: url(/top.png) }");
+        resolve_urls(&mut sheet, "https://example.com/css/site.css");
+        let url = |i: usize| match &sheet.rules[i].declarations[0].values[0] {
+            Value::Url(u) => u.clone(),
+            v => panic!("{v:?}"),
+        };
+        assert_eq!(url(0), "https://example.com/css/img/a.png");
+        assert_eq!(url(1), "https://example.com/top.png");
+    }
 
     #[test]
     fn parses_rules_and_values() {

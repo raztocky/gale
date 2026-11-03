@@ -262,10 +262,12 @@ impl Page {
     pub fn load_images(&mut self, fetch: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>) {
         let mut imgs = Vec::new();
         self.dom.walk(&mut imgs, &|n| n.tag() == Some("img"));
-        let urls: Vec<String> = imgs
+        let mut urls: Vec<String> = imgs
             .iter()
             .filter_map(|n| n.element().and_then(|e| image_source(&self.url, e)))
             .collect();
+        // CSS background images, after the page's own images.
+        urls.extend(self.background_urls());
         for url in urls {
             if self.images.contains_key(&url) || self.images.len() >= crate::network::MAX_IMAGES {
                 continue;
@@ -292,6 +294,33 @@ impl Page {
     }
 
     /// Decoded images for the `<img>` elements in `tree`, by node.
+    /// The `background-image`s the page's elements use, absolute.
+    fn background_urls(&self) -> Vec<String> {
+        let mut all = vec![(0u8, ua_sheet())];
+        all.extend(self.sheets.iter().map(|s| (1u8, s)));
+        let ctx = StyleContext {
+            sheets: all,
+            viewport: (1024.0, 768.0),
+        };
+        let styled = style::style_tree(&self.dom, &ctx);
+        fn walk(n: &style::StyledNode, base: &str, out: &mut Vec<String>) {
+            if let Some(u) = &n.style.background_image {
+                if n.node.element().is_some() && n.style.display != style::Display::None {
+                    let u = net::resolve(base, u);
+                    if !out.contains(&u) && out.len() < crate::network::MAX_IMAGES {
+                        out.push(u);
+                    }
+                }
+            }
+            for c in &n.children {
+                walk(c, base, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(&styled, &self.url, &mut out);
+        out
+    }
+
     fn images_by_node(&self, tree: &Node) -> HashMap<u32, Decoded> {
         let mut imgs = Vec::new();
         tree.walk(&mut imgs, &|n| n.tag() == Some("img"));
@@ -334,7 +363,8 @@ impl Page {
                         sheets.push(s.clone());
                     } else if let Ok(text) = fetch(&abs, Dest::Stylesheet) {
                         // Failures are shown in the request log.
-                        let s = css::parse(&text);
+                        let mut s = css::parse(&text);
+                        css::resolve_urls(&mut s, &abs);
                         self.sheet_cache.insert(abs, s.clone());
                         sheets.push(s);
                     }
@@ -574,7 +604,8 @@ impl Page {
             background = Color::WHITE;
         }
 
-        let (ops, layer_ops) = paint::build_layered(&root);
+        let backgrounds = |u: &str| self.images.get(&net::resolve(&self.url, u)).cloned().flatten();
+        let (ops, layer_ops) = paint::build_layered(&root, &backgrounds);
         let (list, atlas, starts) = paint::rasterize_indexed(ops);
         let layers = layer_ops
             .into_iter()
@@ -1173,6 +1204,53 @@ mod image_tests {
             "only the visible pixels are sent: {}x{}",
             img.w,
             img.h
+        );
+    }
+
+    fn images_drawn(r: &Rendered) -> Vec<Rect> {
+        r.list
+            .iter()
+            .filter_map(|c| match c {
+                DisplayCommand::Image { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn background_images() {
+        let body = "<body style='margin:0'>";
+        // Fetched like any image, and tiled across the padding box.
+        let (page, asked) = load(&format!(
+            "{body}<div style='width:100px;height:50px;background-image:url(/20x20.png)'></div>"
+        ));
+        assert!(asked.iter().any(|u| u.ends_with("/20x20.png")), "{asked:?}");
+        let tiles = images_drawn(&page.render(800.0, 600.0));
+        assert_eq!(
+            tiles.len(),
+            15,
+            "5 across, 3 down (the last row cropped): {tiles:?}"
+        );
+        assert!(tiles.iter().all(|t| t.y + t.h <= 50.5));
+        // One copy, centred.
+        let (page, _) = load(&format!(
+            "{body}<div style='width:100px;height:50px;background:#eee url(/20x20.png) no-repeat center'></div>"
+        ));
+        let one = images_drawn(&page.render(800.0, 600.0));
+        assert_eq!(one.len(), 1);
+        assert!(
+            (one[0].x - 40.0).abs() < 0.5 && (one[0].y - 15.0).abs() < 0.5,
+            "{one:?}"
+        );
+        // Cover: scaled to fill, cropped to the box.
+        let (page, _) = load(&format!(
+            "{body}<div style='width:100px;height:50px;background-image:url(/20x20.png);background-size:cover;background-repeat:no-repeat'></div>"
+        ));
+        let cover = images_drawn(&page.render(800.0, 600.0));
+        assert_eq!(cover.len(), 1);
+        assert!(
+            (cover[0].w - 100.0).abs() < 0.5 && (cover[0].h - 50.0).abs() < 0.5,
+            "{cover:?}"
         );
     }
 

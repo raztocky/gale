@@ -4,7 +4,7 @@ use crate::css::Color;
 use crate::font;
 use crate::image::{self, Bitmap};
 use crate::layout::{BoxKind, LayoutBox, Rect};
-use crate::style::Position;
+use crate::style::{BgSize, Len, Position};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -253,7 +253,82 @@ fn skew(m: &fontdue::Metrics, bitmap: &[u8]) -> GlyphBitmap {
 }
 
 pub fn build_display_list(root: &LayoutBox) -> Vec<DrawOp> {
-    build_layered(root).0
+    build_layered(root, &|_| None).0
+}
+
+/// Looks up a decoded background image by its `url()` as written.
+pub type Backgrounds<'b> = dyn Fn(&str) -> Option<crate::image::Decoded> + 'b;
+
+/// Most tiles of a repeating background along each side; a smaller image is
+/// stretched across instead.
+const MAX_TILES_PER_SIDE: f32 = 32.0;
+
+/// A box's background image: sized, positioned and tiled in its padding
+/// box, and clipped to it.
+fn background_image(list: &mut Vec<DrawOp>, b: &LayoutBox, img: &crate::image::Decoded) {
+    let s = b.style();
+    let area = b.dims.padding_box();
+    let (nw, nh) = (img.natural.0 as f32, img.natural.1 as f32);
+    if nw < 1.0 || nh < 1.0 || area.is_empty() {
+        return;
+    }
+    let (w, h) = match s.background_size {
+        BgSize::Auto => (nw, nh),
+        BgSize::Cover | BgSize::Contain => {
+            let (kx, ky) = (area.w / nw, area.h / nh);
+            let k = if s.background_size == BgSize::Cover {
+                kx.max(ky)
+            } else {
+                kx.min(ky)
+            };
+            (nw * k, nh * k)
+        }
+        BgSize::Len(lw, lh) => match (lw.resolve(area.w), lh.resolve(area.h)) {
+            (Some(w), Some(h)) => (w, h),
+            (Some(w), None) => (w, w * nh / nw),
+            (None, Some(h)) => (h * nw / nh, h),
+            (None, None) => (nw, nh),
+        },
+    };
+    if !(w >= 0.5 && h >= 0.5 && w.is_finite() && h.is_finite()) {
+        return;
+    }
+    // Percentages line up that point of the image with that point of the box.
+    let at = |l: Len, free: f32| match l {
+        Len::Percent(p) => free * p / 100.0,
+        Len::Calc(px, p) => px + free * p / 100.0,
+        l => l.or_zero(free),
+    };
+    let x = area.x + at(s.background_position[0], area.w - w);
+    let y = area.y + at(s.background_position[1], area.h - h);
+    let tiles = |repeat: bool, start: f32, size: f32, lo: f32, len: f32| -> Vec<(f32, f32)> {
+        if !repeat {
+            return vec![(start, size)];
+        }
+        let first = start - ((start - lo) / size).ceil() * size;
+        let n = ((lo + len - first) / size).ceil();
+        if n > MAX_TILES_PER_SIDE {
+            vec![(lo, len)]
+        } else {
+            (0..n as usize).map(|i| (first + i as f32 * size, size)).collect()
+        }
+    };
+    let (rx, ry) = s.background_repeat;
+    let xs = tiles(rx, x, w, area.x, area.w);
+    for (ty, th) in tiles(ry, y, h, area.y, area.h) {
+        for &(tx, tw) in &xs {
+            list.push(DrawOp::Image {
+                rect: Rect {
+                    x: tx,
+                    y: ty,
+                    w: tw,
+                    h: th,
+                },
+                image: img.bitmap.clone(),
+                clip: Some(area),
+            });
+        }
+    }
 }
 
 /// How a layer moves as the page scrolls.
@@ -341,7 +416,7 @@ pub const MAX_LAYERS: usize = 64;
 /// A layer as a range of draw ops, before rasterizing.
 pub type LayerOps = (LayerKind, Rect, std::ops::Range<usize>);
 
-pub fn build_layered(root: &LayoutBox) -> (Vec<DrawOp>, Vec<LayerOps>) {
+pub fn build_layered(root: &LayoutBox, backgrounds: &Backgrounds) -> (Vec<DrawOp>, Vec<LayerOps>) {
     let clips = crate::layout::clip_map(root);
     let (in_layer, kinds) = layer_map(root);
     let mut list = Vec::new();
@@ -356,7 +431,7 @@ pub fn build_layered(root: &LayoutBox) -> (Vec<DrawOp>, Vec<LayerOps>) {
             open = id.map(|i| (i, list.len()));
         }
         let start = list.len();
-        render_box(&mut list, b);
+        render_box(&mut list, b, backgrounds);
         if let Some(&c) = clips.get(&crate::layout::box_addr(b)) {
             clip_ops(&mut list, start, c);
         }
@@ -373,7 +448,9 @@ fn clip_ops(list: &mut Vec<DrawOp>, start: usize, c: Rect) {
     for op in &mut list[start..] {
         match op {
             DrawOp::Rect { rect, .. } => *rect = rect.intersect(c),
-            DrawOp::Text { clip, .. } | DrawOp::Image { clip, .. } => *clip = Some(c),
+            DrawOp::Text { clip, .. } | DrawOp::Image { clip, .. } => {
+                *clip = Some(clip.map_or(c, |x| x.intersect(c)))
+            }
         }
     }
     let mut i = start;
@@ -384,7 +461,7 @@ fn clip_ops(list: &mut Vec<DrawOp>, start: usize, c: Rect) {
 }
 
 /// Paint one box (not its children).
-fn render_box(list: &mut Vec<DrawOp>, b: &LayoutBox) {
+fn render_box(list: &mut Vec<DrawOp>, b: &LayoutBox, backgrounds: &Backgrounds) {
     let s = b.style();
     if let BoxKind::Block(_) = b.kind {
         let bb = b.dims.border_box();
@@ -393,6 +470,10 @@ fn render_box(list: &mut Vec<DrawOp>, b: &LayoutBox) {
                 rect: bb,
                 color: s.background,
             });
+        }
+        // The image goes over the colour and under the borders.
+        if let Some(img) = s.background_image.as_deref().and_then(backgrounds) {
+            background_image(list, b, &img);
         }
         let bw = s.border_width;
         let bc = s.border_color;

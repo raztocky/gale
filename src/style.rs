@@ -51,6 +51,16 @@ pub enum Align {
     Center,
 }
 
+/// `background-size`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BgSize {
+    Auto,
+    Cover,
+    Contain,
+    /// Width and height; `Auto` in one keeps the image's proportions.
+    Len(Len, Len),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Float {
     None,
@@ -136,6 +146,14 @@ pub struct ComputedStyle {
     pub display: Display,
     pub color: Color,
     pub background: Color,
+    /// `background-image: url(...)`, as written (absolute if it came from
+    /// an external stylesheet).
+    pub background_image: Option<String>,
+    /// Repeats across, and down.
+    pub background_repeat: (bool, bool),
+    pub background_size: BgSize,
+    /// `background-position`: x, then y.
+    pub background_position: [Len; 2],
     pub font_size: f32,
     pub bold: bool,
     pub italic: bool,
@@ -205,6 +223,10 @@ impl ComputedStyle {
             display: Display::Block,
             color: Color::BLACK,
             background: Color::TRANSPARENT,
+            background_image: None,
+            background_repeat: (true, true),
+            background_size: BgSize::Auto,
+            background_position: [Len::Percent(0.0); 2],
             font_size: 16.0,
             bold: false,
             italic: false,
@@ -757,6 +779,72 @@ fn compute(
                 if let Some(Value::Color(c)) = first {
                     s.background = *c;
                 }
+            }
+            "background-image" => {
+                s.background_image = vals.iter().find_map(|v| match v {
+                    Value::Url(u) if !u.is_empty() => Some(u.clone()),
+                    _ => None,
+                })
+            }
+            "background-repeat" => {
+                let kws: Vec<&str> = vals
+                    .iter()
+                    .filter_map(|v| match v {
+                        Value::Keyword(k) => Some(k.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let rep = |k: &str| k != "no-repeat";
+                s.background_repeat = match kws.as_slice() {
+                    ["repeat-x"] => (true, false),
+                    ["repeat-y"] => (false, true),
+                    [k] => (rep(k), rep(k)),
+                    [x, y, ..] => (rep(x), rep(y)),
+                    [] => s.background_repeat,
+                };
+            }
+            "background-size" => {
+                s.background_size = match kw {
+                    "cover" => BgSize::Cover,
+                    "contain" => BgSize::Contain,
+                    _ => {
+                        let w = ctxv.len(vals.first(), fs);
+                        let h = ctxv.len(vals.get(1), fs);
+                        match (w, h) {
+                            (Len::Auto, Len::Auto) => BgSize::Auto,
+                            (w, h) => BgSize::Len(w, h),
+                        }
+                    }
+                }
+            }
+            "background-position" => {
+                // Keywords as percentages; `top`/`bottom` first means y.
+                let pos = |v: &Value| match v {
+                    Value::Keyword(k) => match k.as_str() {
+                        "left" | "top" => Some(Len::Percent(0.0)),
+                        "center" => Some(Len::Percent(50.0)),
+                        "right" | "bottom" => Some(Len::Percent(100.0)),
+                        _ => None,
+                    },
+                    v => match ctxv.len(Some(v), fs) {
+                        Len::Auto => None,
+                        l => Some(l),
+                    },
+                };
+                let parts: Vec<(Len, bool)> = vals
+                    .iter()
+                    .filter_map(|v| {
+                        let vertical = matches!(v, Value::Keyword(k) if k == "top" || k == "bottom");
+                        pos(v).map(|l| (l, vertical))
+                    })
+                    .collect();
+                s.background_position = match parts.as_slice() {
+                    [(l, true)] => [Len::Percent(50.0), *l],
+                    [(l, false)] => [*l, Len::Percent(50.0)],
+                    [(a, true), (b, _)] => [*b, *a],
+                    [(a, _), (b, _), ..] => [*a, *b],
+                    [] => s.background_position,
+                };
             }
             "font-weight" => {
                 s.bold = match first {
@@ -1449,6 +1537,54 @@ fn expand(d: &Declaration, props: &mut HashMap<String, Vec<Value>>) {
             set(
                 "background-color".into(),
                 vec![color.unwrap_or(Value::Color(Color::TRANSPARENT))],
+            );
+            // The image and how it's laid out; the shorthand resets them.
+            let kw = |v: &Value, ks: &[&str]| matches!(v, Value::Keyword(k) if ks.contains(&k.as_str()));
+            let pick =
+                |ks: &[&str]| -> Vec<Value> { d.values.iter().filter(|v| kw(v, ks)).cloned().collect() };
+            let url: Vec<Value> = d
+                .values
+                .iter()
+                .filter(|v| matches!(v, Value::Url(_)))
+                .take(1)
+                .cloned()
+                .collect();
+            set("background-image".into(), url);
+            let repeat = pick(&["repeat", "no-repeat", "repeat-x", "repeat-y", "space", "round"]);
+            set(
+                "background-repeat".into(),
+                if repeat.is_empty() {
+                    vec![Value::Keyword("repeat".into())]
+                } else {
+                    repeat
+                },
+            );
+            let size = pick(&["cover", "contain"]);
+            set(
+                "background-size".into(),
+                if size.is_empty() {
+                    vec![Value::Keyword("auto".into())]
+                } else {
+                    size
+                },
+            );
+            let position: Vec<Value> = d
+                .values
+                .iter()
+                .filter(|v| {
+                    kw(v, &["left", "right", "top", "bottom", "center"])
+                        || matches!(v, Value::Length(..) | Value::Percent(_))
+                })
+                .take(2)
+                .cloned()
+                .collect();
+            set(
+                "background-position".into(),
+                if position.is_empty() {
+                    vec![Value::Percent(0.0), Value::Percent(0.0)]
+                } else {
+                    position
+                },
             );
         }
         "font" => {

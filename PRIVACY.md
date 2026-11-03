@@ -162,7 +162,7 @@ in `src/cookies.rs`.
 
 ## 10. Images
 
-Images on a page (`<img>`) are requests like any other: listed in the request panel (as "img"),
+Images on a page (`<img>`, and CSS `background-image`s) are requests like any other: listed in the request panel (as "img"),
 with your rules, the blocker (including `$image` rules, which most tracking pixels match),
 tracking-parameter stripping, HTTPS-only, the local-network block and the cookie rules (no
 third-party cookies) applied to each. Brickle sends Firefox's headers for images. Each image is
