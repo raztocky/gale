@@ -11,6 +11,51 @@ use std::time::{Duration, Instant};
 
 /// Longest a single request may take.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// Requests that may be running at once, counting ones abandoned by Stop
+/// that are still waiting to connect (that phase can't be interrupted).
+const MAX_IN_FLIGHT: usize = 8;
+static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// Counts a running request; uncounted when dropped.
+struct InFlight;
+
+impl InFlight {
+    fn start() -> Option<InFlight> {
+        // Take a slot, and give it back if there wasn't one.
+        if IN_FLIGHT.fetch_add(1, Ordering::SeqCst) < MAX_IN_FLIGHT {
+            Some(InFlight)
+        } else {
+            IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+            None
+        }
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Stops reading a response (and so closes its connection) once Stop is
+/// pressed or the deadline passes.
+struct Stoppable<R> {
+    inner: R,
+    cancel: Cancel,
+    deadline: Instant,
+}
+
+impl<R: Read> Read for Stoppable<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.cancel.is_cancelled() {
+            return Err(std::io::Error::other("stopped"));
+        }
+        if Instant::now() >= self.deadline {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out"));
+        }
+        self.inner.read(buf)
+    }
+}
 
 /// Why a request failed. Kept typed so policy can tell, for example, a bad
 /// certificate (never a reason to fall back to HTTP) from a site that just
@@ -249,7 +294,15 @@ pub fn http_get(
     public_only: bool,
     cookie: Option<&str>,
 ) -> Result<Response, NetError> {
-    http_get_timeout(url, dest, initiator, public_only, cookie, REQUEST_TIMEOUT)
+    http_get_timeout(
+        url,
+        dest,
+        initiator,
+        public_only,
+        cookie,
+        REQUEST_TIMEOUT,
+        &Cancel::new(),
+    )
 }
 
 /// [`http_get`] that gives up at `deadline` or when `cancel` is pressed,
@@ -272,6 +325,12 @@ pub fn http_get_until(
     if left.is_zero() {
         return Err(NetError::TimedOut);
     }
+    let Some(slot) = InFlight::start() else {
+        return Err(NetError::Other(
+            "too many requests still running (stopped ones are still timing out)".into(),
+        ));
+    };
+    let worker_cancel = cancel.clone();
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     let (url, initiator, cookie) = (
         url.to_string(),
@@ -281,6 +340,7 @@ pub fn http_get_until(
     std::thread::Builder::new()
         .name("brickle-http".into())
         .spawn(move || {
+            let _slot = slot;
             let r = http_get_timeout(
                 &url,
                 dest,
@@ -288,6 +348,7 @@ pub fn http_get_until(
                 public_only,
                 cookie.as_deref(),
                 left.min(REQUEST_TIMEOUT),
+                &worker_cancel,
             );
             let _ = tx.send(r);
         })
@@ -370,7 +431,9 @@ fn http_get_timeout(
     public_only: bool,
     cookie: Option<&str>,
     timeout: Duration,
+    cancel: &Cancel,
 ) -> Result<Response, NetError> {
+    let deadline = Instant::now() + timeout;
     let host = url::Url::parse(url)
         .ok()
         .and_then(|u| u.host_str().map(str::to_string))
@@ -475,7 +538,11 @@ fn http_get_timeout(
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase();
-    let reader: Box<dyn Read> = Box::new(resp.into_reader().take(MAX_BYTES * 4));
+    let reader: Box<dyn Read> = Box::new(Stoppable {
+        inner: resp.into_reader().take(MAX_BYTES * 4),
+        cancel: cancel.clone(),
+        deadline,
+    });
     let mut decoded: Box<dyn Read> = match encoding.as_str() {
         "deflate" => Box::new(flate2::read::ZlibDecoder::new(reader)),
         "zstd" => Box::new(
@@ -490,7 +557,9 @@ fn http_get_timeout(
         .take(MAX_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| {
-            if matches!(
+            if cancel.is_cancelled() {
+                NetError::Cancelled
+            } else if matches!(
                 e.kind(),
                 std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
             ) {
@@ -703,6 +772,46 @@ mod tests {
         let r = http_get_until(&url, Dest::Stylesheet, None, false, None, soon, &Cancel::new());
         assert_eq!(r.err(), Some(NetError::TimedOut));
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn stop_closes_a_slow_download() {
+        use std::io::Write;
+        // A server that sends headers, then a body one byte at a time.
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}/", l.local_addr().unwrap().port());
+        let closed = std::sync::Arc::new(AtomicBool::new(false));
+        let closed2 = closed.clone();
+        std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = std::io::Read::read(&mut s, &mut buf);
+            let _ =
+                s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/css\r\nContent-Length: 100000\r\n\r\n");
+            for _ in 0..200 {
+                std::thread::sleep(Duration::from_millis(50));
+                if s.write_all(b"x").and_then(|_| s.flush()).is_err() {
+                    closed2.store(true, Ordering::SeqCst);
+                    return;
+                }
+            }
+        });
+        let cancel = Cancel::new();
+        let c = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            c.cancel();
+        });
+        let far = Instant::now() + Duration::from_secs(30);
+        let r = http_get_until(&url, Dest::Stylesheet, None, false, None, far, &cancel);
+        assert_eq!(r.err(), Some(NetError::Cancelled));
+        // The abandoned worker stops reading and drops the connection soon
+        // after, instead of downloading until its timeout.
+        let start = Instant::now();
+        while !closed.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(closed.load(Ordering::SeqCst), "connection still open");
     }
 
     #[test]
