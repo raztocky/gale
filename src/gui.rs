@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 const BAR_H: f32 = 40.0;
 const STATUS_H: f32 = 22.0;
 const PANEL_W: f32 = 400.0;
-const PANEL_HEAD: f32 = 88.0;
+const PANEL_HEAD: f32 = 116.0;
 const ROW_H: f32 = 38.0;
 
 const SANS: usize = 0;
@@ -61,6 +61,8 @@ struct Info {
     title: String,
     log: Vec<LogEntry>,
     interstitial: Option<Action>,
+    /// The page runs JavaScript, so clicks go to its scripts first.
+    scripts: bool,
 }
 
 impl Info {
@@ -71,6 +73,7 @@ impl Info {
             title: tab.title.clone(),
             log: tab.log.clone(),
             interstitial: tab.interstitial.clone(),
+            scripts: tab.scripts,
         }
     }
 }
@@ -90,12 +93,23 @@ enum Job {
         w: f32,
         h: f32,
     },
+    /// A click on a page with scripts; `link` is the link under it, if any.
+    Click {
+        tab: Box<Tab>,
+        x: f32,
+        y: f32,
+        link: Option<String>,
+        w: f32,
+        h: f32,
+    },
 }
 
 struct Done {
     tab: Tab,
     rendered: Rendered,
     new_page: bool,
+    /// For a click: what scripts did, and the link that was clicked.
+    click: Option<(brickle::tab::Click, Option<String>)>,
 }
 
 fn spawn_loader(net: Arc<Mutex<Network>>, sandboxed: bool) -> (Sender<Job>, Receiver<Done>) {
@@ -117,13 +131,14 @@ fn spawn_loader(net: Arc<Mutex<Network>>, sandboxed: bool) -> (Sender<Job>, Rece
                         let mut tab = {
                             let mut n = net.lock().unwrap_or_else(|e| e.into_inner());
                             n.cancel = cancel;
-                            Tab::open(&mut n, &url, from.as_deref(), sandboxed)
+                            Tab::open_sized(&mut n, &url, from.as_deref(), sandboxed, (w, h))
                         };
                         let rendered = tab.render(w, h);
                         Done {
                             tab,
                             rendered,
                             new_page: true,
+                            click: None,
                         }
                     }
                     Job::Render { mut tab, w, h } => {
@@ -132,6 +147,24 @@ fn spawn_loader(net: Arc<Mutex<Network>>, sandboxed: bool) -> (Sender<Job>, Rece
                             tab: *tab,
                             rendered,
                             new_page: false,
+                            click: None,
+                        }
+                    }
+                    Job::Click {
+                        mut tab,
+                        x,
+                        y,
+                        link,
+                        w,
+                        h,
+                    } => {
+                        let click = tab.click(x, y);
+                        let rendered = tab.render(w, h);
+                        Done {
+                            tab: *tab,
+                            rendered,
+                            new_page: false,
+                            click: Some((click, link)),
                         }
                     }
                 };
@@ -172,6 +205,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         title: String::new(),
         log: vec![],
         interstitial: None,
+        scripts: false,
     };
     // Painted tiles of the current page; rebuilt when the page changes.
     let mut tiles: Option<TileCache> = None;
@@ -189,6 +223,11 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
     // Wanted while busy: a navigation, or a re-layout at a new size.
     let mut queued: Option<Entry> = None;
     let mut need_layout = false;
+    // Navigations scripts asked for, and how many in a row (a page that
+    // keeps redirecting itself is stopped).
+    let mut script_nav: Option<String> = None;
+    let mut script_hops = 0u32;
+    let mut clicked_link: Option<String> = None;
     let mut laid_out_at = (0.0f32, 0.0f32);
     let mut scroll = 0.0f32;
     let mut ui = Ui {
@@ -239,6 +278,19 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 continue; // stopped: keep showing the old page
             }
             discard = false;
+            if let Some((click, link)) = &done.click {
+                // Scripts had their say; now the link (or their navigation).
+                if let Some(to) = &click.navigate {
+                    script_nav = Some(to.clone());
+                } else if let (false, Some(l)) = (click.prevented, link) {
+                    clicked_link = Some(l.clone());
+                }
+            }
+            if done.new_page {
+                if let Some(to) = &done.tab.script_navigate {
+                    script_nav = Some(to.clone());
+                }
+            }
             info = Info::of(&done.tab);
             rendered = done.rendered;
             tiles = None; // new content: repaint tiles on demand
@@ -386,6 +438,9 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                         "Keep this site's cookies when Brickle closes (to stay logged in)".to_string()
                     }
                     SiteButton::ForgetCookies => "Delete this site's cookies now".to_string(),
+                    SiteButton::ToggleJs => {
+                        "Run this site's JavaScript (sandboxed; scripts get no network access)".to_string()
+                    }
                 })
             } else if let Some(i) = row {
                 let e = &info.log[i];
@@ -434,6 +489,16 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                             let _ = n.cookies.save();
                             format!("Deleted {count} cookie(s) for {site}")
                         }
+                        (Ok(mut n), SiteButton::ToggleJs) => {
+                            let on = !n.scripts_allowed(&info.url);
+                            match n.set_scripts_allowed(&info.url, on) {
+                                Ok(site) => {
+                                    reload = true;
+                                    format!("JavaScript {} for {site}", if on { "on" } else { "off" })
+                                }
+                                Err(e) => e,
+                            }
+                        }
                     });
                 } else if let Some(i) = row {
                     let e = info.log[i].clone();
@@ -448,6 +513,20 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                         Err(_) => "Wait for the page to finish loading".into(),
                     });
                 } else if over_panel {
+                } else if info.scripts && my > BAR_H && busy.is_none() && tab.is_some() {
+                    // Let the page's scripts see the click first.
+                    let link = rendered.link_at(mx, my - BAR_H + scroll).map(|l| l.to_string());
+                    if let Some(t) = tab.take() {
+                        let _ = jobs.send(Job::Click {
+                            tab: Box::new(t),
+                            x: mx,
+                            y: my - BAR_H + scroll,
+                            link,
+                            w: page_w,
+                            h: view_h,
+                        });
+                        busy = Some(None);
+                    }
                 } else if let Some(l) = rendered.link_at(mx, my - BAR_H + scroll) {
                     let url = net::resolve(&info.url, l);
                     if let Some(rest) = url.strip_prefix("brickle:") {
@@ -475,6 +554,22 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         }
         was_down = down;
 
+        if let Some(l) = clicked_link.take() {
+            let url = net::resolve(&info.url, &l);
+            if !url.starts_with("brickle:") {
+                navigate = Some((url, Some(info.url.clone())));
+            }
+        }
+        if let Some(to) = script_nav.take() {
+            script_hops += 1;
+            if script_hops <= 5 {
+                navigate = Some((to, Some(info.url.clone())));
+            } else {
+                ui.flash = Some("Stopped a page that kept redirecting itself".into());
+            }
+        } else if navigate.is_some() || reload || hist != 0 {
+            script_hops = 0;
+        }
         // Navigation requests are queued and started when the loader is free.
         let moved = match hist {
             -1 => history
@@ -603,20 +698,21 @@ fn badge_rect(log: &[LogEntry], w: f32) -> Rect {
 enum SiteButton {
     KeepCookies,
     ForgetCookies,
+    ToggleJs,
 }
 
 /// Per-site controls at the top of the request panel.
-fn site_buttons(x0: f32) -> [(Rect, SiteButton); 2] {
-    let y = BAR_H + 54.0;
-    let r = |x: f32, w: f32| Rect {
+fn site_buttons(x0: f32) -> [(Rect, SiteButton); 3] {
+    let r = |x: f32, y: f32, w: f32| Rect {
         x: x0 + x,
-        y,
+        y: BAR_H + y,
         w,
         h: 22.0,
     };
     [
-        (r(100.0, 140.0), SiteButton::KeepCookies),
-        (r(246.0, 60.0), SiteButton::ForgetCookies),
+        (r(100.0, 54.0, 140.0), SiteButton::KeepCookies),
+        (r(246.0, 54.0, 60.0), SiteButton::ForgetCookies),
+        (r(100.0, 82.0, 206.0), SiteButton::ToggleJs),
     ]
 }
 
@@ -848,11 +944,25 @@ fn draw_panel(
         let kept = n.cookies.is_kept(page_url);
         let label = format!("Cookies: {count}");
         text(c, x0 + 14.0, BAR_H + 68.0, &label, BOLD, 11.0, DARK, cache, BAR_H);
+        text(
+            c,
+            x0 + 14.0,
+            BAR_H + 96.0,
+            "JavaScript:",
+            BOLD,
+            11.0,
+            DARK,
+            cache,
+            BAR_H,
+        );
+        let js = n.scripts_allowed(page_url);
         for (r, b) in site_buttons(x0) {
             let (caption, on) = match b {
                 SiteButton::KeepCookies if kept => ("Kept after closing ✓", true),
                 SiteButton::KeepCookies => ("Keep after closing", false),
                 SiteButton::ForgetCookies => ("Forget", false),
+                SiteButton::ToggleJs if js => ("On for this site ✓", true),
+                SiteButton::ToggleJs => ("Off · allow on this site", false),
             };
             let (bg, fg) = if on {
                 (GREEN, Color::WHITE)
@@ -926,6 +1036,7 @@ fn draw_panel(
         let kind = match e.dest {
             net::Dest::Document => "page",
             net::Dest::Stylesheet => "css",
+            net::Dest::Script => "js",
             net::Dest::Download => "list",
         };
         let head = format!("{status} · {kind}");

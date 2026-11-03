@@ -51,8 +51,11 @@ Limits, honestly:
 - Brickle's TLS handshake comes from rustls, not Firefox's NSS, so services doing TLS
   fingerprinting (JA3/JA4) can tell the difference.
 - Brickle sends no `Referer` header at all, which is stricter than Firefox's default.
-- With no JavaScript there is very little else to fingerprint (no canvas, fonts list, screen
-  size, etc.).
+- JavaScript is off unless you allow a site (rule 9). With it off there is very little else to
+  fingerprint. With it on, scripts see Firefox's `navigator` values, a fixed 1920x1080 screen,
+  UTC as the time zone, and the window size rounded down to steps of 200x100 px (like Firefox's
+  letterboxing). There's no canvas, WebGL, audio or font list to probe. A determined script can
+  still tell Brickle from Firefox, for example by which APIs exist.
 
 ## 5. HTTPS-only
 
@@ -114,10 +117,33 @@ Brickle stores no other site data: no local storage, no cache.
 *Enforced by:* `cookies_first_party_only_and_session_only` in `tests/privacy.rs`, and the tests
 in `src/cookies.rs`.
 
+## 9. JavaScript: off unless you allow a site
+
+- **Off by default.** Pages' scripts aren't downloaded or run. `<noscript>` content is shown
+  instead.
+- **Allowed per site.** Use the "JavaScript" button in the request panel, or
+  `brickle js allow SITE`. The list is `~/.config/brickle/js-sites.txt`. `--js` allows it
+  everywhere for one run.
+- **Scripts get no network access.** `fetch`, `XMLHttpRequest` and `sendBeacon` don't send
+  anything, and setting an image's `src` loads nothing. Script files themselves are fetched by
+  the browser like any other request: shown in the request panel, subject to the blocker, your
+  rules and HTTPS-only. The browser, not the page, decides whether a site may load scripts.
+- **No cookies or storage for scripts.** `document.cookie` is empty and can't be set.
+  `localStorage` and `sessionStorage` only last as long as the page.
+- **Navigation from scripts** (`location.href = ...`) goes through the same checks as a link,
+  only to web addresses, and a page that keeps redirecting itself is stopped.
+- **Sandboxed, interpreted, bounded.** Scripts run in the sandboxed renderer, in Boa, a
+  JavaScript interpreter written in Rust with no JIT. Loops and recursion are capped. If scripts
+  hang or crash, the page is shown without them after at most 15 seconds.
+
+*Enforced by:* `javascript_is_off_by_default_and_has_no_network` in `tests/privacy.rs`, and the
+tests in `src/js.rs`.
+
 ## What Brickle does store
 
 - `~/.config/brickle/rules.txt`: the block and allow rules you make in the request panel.
 - `~/.local/share/brickle/filters/`: downloaded filter lists.
+- `~/.config/brickle/js-sites.txt`: the sites where you allowed JavaScript.
 - `~/.config/brickle/keep-cookies.txt` and `~/.local/share/brickle/cookies.txt`: the sites whose
   cookies you keep, and those cookies.
 

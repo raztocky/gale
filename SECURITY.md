@@ -46,6 +46,16 @@ oversized, out-of-order and unsolicited messages, stop reading, and ask for loca
 network devices and blocked trackers. Security decisions about URLs all use one parser (the
 `url` crate's WHATWG implementation, via `net::canonical`).
 
+## JavaScript
+
+Scripts run only in the sandboxed renderer, in Boa (an interpreter, no JIT: the sandbox forbids
+executable memory anyway). What a script can reach is the page's own DOM through a small set of
+native functions in `src/js.rs`, which validate every node id and string; there is no network,
+cookie or storage access. Loop-iteration and recursion limits can't be caught by scripts, work
+runs in time-boxed batches, and a renderer that still hangs is killed and the page reloaded
+without JavaScript. The `js` fuzz target drives random DOM operations through the whole
+pipeline.
+
 ## Supported versions
 
 Only the latest commit on `main`.

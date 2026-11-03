@@ -19,6 +19,8 @@ USAGE:
   brickle cookies                                   list sites whose cookies are kept, and saved cookies
   brickle cookies keep|unkeep SITE                  keep a site's cookies after closing, or stop
   brickle cookies forget SITE                       delete a site's saved cookies
+  brickle js                                        list sites where JavaScript is on
+  brickle js allow|block SITE                       turn JavaScript on or off for a site
   brickle sandbox-test                              check the renderer sandbox works here
 
 OPTIONS:
@@ -26,6 +28,8 @@ OPTIONS:
                  renderer (for debugging; less safe)
   --no-filters   don't load filter lists or your rules (for debugging)
   --panel        open the window with the request panel showing
+  --js           run JavaScript on every site, this time only (it's off
+                 unless you allow a site; never with --no-sandbox)
 
 Your rules live in ~/.config/brickle/rules.txt; filter lists in
 ~/.local/share/brickle/filters/. Cookies are deleted when Brickle closes,
@@ -117,8 +121,9 @@ fn main() {
     let sandboxed = !args.iter().any(|a| a == "--no-sandbox");
     let filters = !args.iter().any(|a| a == "--no-filters");
     let panel = args.iter().any(|a| a == "--panel");
-    args.retain(|a| a != "--no-sandbox" && a != "--no-filters" && a != "--panel");
-    with_big_stack(move || match run(args, sandboxed, filters, panel) {
+    let js = args.iter().any(|a| a == "--js");
+    args.retain(|a| !matches!(a.as_str(), "--no-sandbox" | "--no-filters" | "--panel" | "--js"));
+    with_big_stack(move || match run(args, sandboxed, filters, panel, js) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("{e}");
@@ -138,7 +143,12 @@ fn network(filters: bool) -> Network {
     n
 }
 
-fn run(args: Vec<String>, sandboxed: bool, filters: bool, panel: bool) -> Result<(), String> {
+fn run(args: Vec<String>, sandboxed: bool, filters: bool, panel: bool, js: bool) -> Result<(), String> {
+    let network = |filters: bool| {
+        let mut n = network(filters);
+        n.js_everywhere = js;
+        n
+    };
     match args.first().map(String::as_str) {
         Some("filters") => match args.get(1).map(String::as_str) {
             Some("update") => {
@@ -159,9 +169,16 @@ fn run(args: Vec<String>, sandboxed: bool, filters: bool, panel: bool) -> Result
             let mut tab = open_tab(&mut net, u, sandboxed);
             let _ = tab.render(1024.0, 768.0);
             print_log(&tab.log);
+            if !tab.console.is_empty() {
+                println!("console:");
+                for l in &tab.console {
+                    println!("  {l}");
+                }
+            }
             Ok(())
         }
         Some("cookies") => cookies_cmd(&args[1..]),
+        Some("js") => js_cmd(&args[1..]),
         Some("-h") | Some("--help") => {
             print!("{USAGE}");
             Ok(())
@@ -210,6 +227,33 @@ fn run(args: Vec<String>, sandboxed: bool, filters: bool, panel: bool) -> Result
             Ok(())
         }
         other => open_window(other.unwrap_or("about:home"), sandboxed, network(filters), panel),
+    }
+}
+
+fn js_cmd(args: &[String]) -> Result<(), String> {
+    let mut n = Network::from_disk();
+    match (args.first().map(String::as_str), args.get(1)) {
+        (None | Some("list"), _) => {
+            let sites = n.js_sites();
+            if sites.is_empty() {
+                println!("JavaScript is off everywhere. `brickle js allow SITE` turns it on for a site.");
+            } else {
+                println!("JavaScript is on for:");
+                for s in sites {
+                    println!("  {s}");
+                }
+            }
+            Ok(())
+        }
+        (Some("allow"), Some(site)) => {
+            println!("JavaScript on for {}", n.set_scripts_allowed(site, true)?);
+            Ok(())
+        }
+        (Some("block"), Some(site)) => {
+            println!("JavaScript off for {}", n.set_scripts_allowed(site, false)?);
+            Ok(())
+        }
+        _ => Err(USAGE.to_string()),
     }
 }
 
@@ -324,6 +368,7 @@ fn print_log(log: &[LogEntry]) {
     let kind = |e: &LogEntry| match e.dest {
         net::Dest::Document => "page",
         net::Dest::Stylesheet => "css",
+        net::Dest::Script => "js",
         net::Dest::Download => "list",
     };
     for e in log {

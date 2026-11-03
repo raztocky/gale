@@ -7,6 +7,7 @@
 //! it is killed and an error page is shown; the browser keeps running.
 
 use crate::ipc::{read_frame, write_frame, FromRenderer, ToRenderer, MAX_FRAME};
+use crate::net::Dest;
 use crate::net::{self, Cancel};
 use crate::network::{Action, LogEntry, Nav, Network, MAX_STYLESHEETS};
 use crate::page::{error_page, Page, Rendered};
@@ -21,7 +22,14 @@ const LOAD_EXTRA: Duration = Duration::from_secs(10);
 /// Most subresource requests a renderer may make for one page. The network
 /// service refuses anything past its own budget; a renderer that keeps
 /// asking anyway is misbehaving.
-const MAX_FETCHES: usize = MAX_STYLESHEETS + 8;
+const MAX_FETCHES: usize = MAX_STYLESHEETS + crate::js::MAX_SCRIPTS + 8;
+/// Longest a page with JavaScript may take to load before Brickle gives up
+/// on its scripts and shows it without them.
+const SCRIPT_LOAD_LIMIT: Duration = Duration::from_secs(15);
+/// Console lines kept per tab.
+const MAX_CONSOLE: usize = 1000;
+/// Default window size for scripts when there's no window (command line).
+pub const DEFAULT_VIEWPORT: (f32, f32) = (1024.0, 768.0);
 /// Total bytes a renderer may send while a page loads (subresource
 /// requests and the title): a few kilobytes is normal.
 const LOAD_BYTES: usize = 1024 * 1024;
@@ -37,20 +45,55 @@ pub struct Tab {
     /// Set when this is a browser-generated warning page; its
     /// `brickle:proceed` link performs this action.
     pub interstitial: Option<Action>,
+    /// The page's JavaScript runs (you allowed it for this site).
+    pub scripts: bool,
+    /// What the page's scripts wrote to the console.
+    pub console: Vec<String>,
+    /// A navigation the page's scripts asked for while loading.
+    pub script_navigate: Option<String>,
     backend: Backend,
+}
+
+/// What a click on a page did.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Click {
+    /// A script called `preventDefault()`: don't follow the link.
+    pub prevented: bool,
+    /// The page changed and needs rendering again.
+    pub changed: bool,
+    /// A script asked to go somewhere.
+    pub navigate: Option<String>,
+}
+
+/// What the renderer reported when a page loaded.
+struct Loaded {
+    title: String,
+    navigate: Option<String>,
+    console: Vec<String>,
 }
 
 enum Backend {
     Sandboxed(Renderer),
-    InProcess(Page),
+    InProcess(Box<Page>),
     Failed(String),
 }
 
 impl Tab {
     /// Navigate to `url`. `from` is the page that linked here, if any.
     pub fn open(net: &mut Network, url: &str, from: Option<&str>, sandbox: bool) -> Tab {
+        Tab::open_sized(net, url, from, sandbox, DEFAULT_VIEWPORT)
+    }
+
+    /// [`Tab::open`] for a window of this size.
+    pub fn open_sized(
+        net: &mut Network,
+        url: &str,
+        from: Option<&str>,
+        sandbox: bool,
+        viewport: (f32, f32),
+    ) -> Tab {
         match net.navigate(url, from) {
-            Nav::Page { url, html } => Tab::with_html(net, &url, from, &html, sandbox),
+            Nav::Page { url, html } => Tab::with_html_sized(net, &url, from, &html, sandbox, viewport),
             Nav::Interstitial { url, html, action } => {
                 // Our own trusted HTML: no renderer or subresources needed.
                 let page = Page::trusted(&url, &html);
@@ -60,7 +103,10 @@ impl Tab {
                     title: page.title.clone(),
                     log: net.take_log(),
                     interstitial: Some(action),
-                    backend: Backend::InProcess(page),
+                    scripts: false,
+                    console: vec![],
+                    script_navigate: None,
+                    backend: Backend::InProcess(Box::new(page)),
                 }
             }
         }
@@ -68,37 +114,105 @@ impl Tab {
 
     /// Show `html` as the document at `url`.
     pub fn with_html(net: &mut Network, url: &str, from: Option<&str>, html: &str, sandbox: bool) -> Tab {
+        Tab::with_html_sized(net, url, from, html, sandbox, DEFAULT_VIEWPORT)
+    }
+
+    pub fn with_html_sized(
+        net: &mut Network,
+        url: &str,
+        from: Option<&str>,
+        html: &str,
+        sandbox: bool,
+        viewport: (f32, f32),
+    ) -> Tab {
+        // JavaScript only in the sandboxed renderer, and only where you
+        // allowed it.
+        let scripts = sandbox && net.scripts_allowed(url);
         let mut tab = Tab {
             url: url.to_string(),
             opener: from.map(str::to_string),
             title: String::new(),
             log: Vec::new(),
             interstitial: None,
+            scripts,
+            console: vec![],
+            script_navigate: None,
             backend: Backend::Failed(String::new()),
         };
         let blocker_css = net.cosmetic_css(url);
-        let page_url = url.to_string();
-        let (cancel, net_deadline) = (net.cancel.clone(), net.deadline());
-        {
-            let mut fetch = |target: &str| net.subresource(&page_url, target);
-            if !sandbox {
-                let page = Page::parse(url, html, &blocker_css, &mut fetch);
-                tab.title = page.title.clone();
-                tab.backend = Backend::InProcess(page);
-            } else {
-                let deadline = net_deadline.max(Instant::now()) + LOAD_EXTRA;
-                let result = Renderer::spawn(cancel).and_then(|mut r| {
-                    tab.title = r.load(url, html, blocker_css, deadline, &mut fetch)?;
-                    Ok(r)
-                });
-                tab.backend = match result {
-                    Ok(r) => Backend::Sandboxed(r),
-                    Err(e) => Backend::Failed(e),
-                };
+        if !sandbox {
+            let page_url = url.to_string();
+            let mut fetch = |target: &str, dest: Dest| net.subresource(&page_url, target, dest);
+            let page = Page::parse(url, html, &blocker_css, &mut fetch);
+            tab.title = page.title.clone();
+            tab.backend = Backend::InProcess(Box::new(page));
+            tab.log = net.take_log();
+            return tab;
+        }
+        let mut result = load_sandboxed(net, url, html, &blocker_css, scripts, viewport);
+        if scripts && result.is_err() && !net.cancel.is_cancelled() {
+            // Scripts hung or crashed the renderer: show the page without
+            // them rather than not at all.
+            let why = result.as_ref().err().cloned().unwrap_or_default();
+            net.restart_page_budget();
+            result = load_sandboxed(net, url, html, &blocker_css, false, viewport);
+            tab.scripts = false;
+            tab.console.push(format!(
+                "[brickle] JavaScript failed ({why}); showing the page without it"
+            ));
+        }
+        match result {
+            Ok((r, loaded)) => {
+                tab.title = loaded.title;
+                tab.script_navigate = loaded.navigate;
+                tab.console.extend(loaded.console);
+                tab.backend = Backend::Sandboxed(r);
             }
+            Err(e) => tab.backend = Backend::Failed(e),
         }
         tab.log = net.take_log();
         tab
+    }
+
+    /// Tell the page you clicked at page-space point (x, y), so its scripts
+    /// can react. Returns what happened; the caller follows the link (if
+    /// any) unless a script prevented it.
+    pub fn click(&mut self, x: f32, y: f32) -> Click {
+        let Backend::Sandboxed(r) = &mut self.backend else {
+            return Click::default();
+        };
+        if !self.scripts {
+            return Click::default();
+        }
+        let result = r.send(ToRenderer::Click { x, y }).and_then(|_| {
+            match r.recv(Instant::now() + RENDERER_TIMEOUT, &mut { LOAD_BYTES })? {
+                FromRenderer::Clicked {
+                    prevented,
+                    changed,
+                    navigate,
+                    console,
+                } => Ok((prevented, changed, navigate, console)),
+                _ => Err(r.kill("renderer sent an unexpected message and was killed")),
+            }
+        });
+        match result {
+            Ok((prevented, changed, navigate, console)) => {
+                let room = MAX_CONSOLE.saturating_sub(self.console.len());
+                self.console.extend(console.into_iter().take(room));
+                Click {
+                    prevented,
+                    changed,
+                    navigate,
+                }
+            }
+            Err(e) => {
+                self.backend = Backend::Failed(e);
+                Click {
+                    changed: true,
+                    ..Click::default()
+                }
+            }
+        }
     }
 
     pub fn render(&mut self, width: f32, height: f32) -> Rendered {
@@ -148,6 +262,36 @@ fn crashed_page(url: &str, err: &str) -> Page {
          is unaffected. Reload to try again, or run Brickle with --no-sandbox to debug."
     );
     Page::trusted(url, &error_page(url, &msg))
+}
+
+/// Load a page in a fresh sandboxed renderer.
+fn load_sandboxed(
+    net: &mut Network,
+    url: &str,
+    html: &str,
+    blocker_css: &str,
+    scripts: bool,
+    viewport: (f32, f32),
+) -> Result<(Renderer, Loaded), String> {
+    let mut deadline = net.deadline().max(Instant::now()) + LOAD_EXTRA;
+    if scripts {
+        // Don't keep you waiting on scripts: past this, the page is shown
+        // without them.
+        deadline = deadline.min(Instant::now() + SCRIPT_LOAD_LIMIT);
+    }
+    let page_url = url.to_string();
+    let mut r = Renderer::spawn(net.cancel.clone())?;
+    let mut fetch = |target: &str, dest: Dest| net.subresource(&page_url, target, dest);
+    let loaded = r.load(
+        url,
+        html,
+        blocker_css.to_string(),
+        scripts,
+        viewport,
+        deadline,
+        &mut fetch,
+    )?;
+    Ok((r, loaded))
 }
 
 /// The browser's end of a renderer process.
@@ -216,32 +360,47 @@ impl Renderer {
     }
 
     /// Hand the renderer a document and serve its subresource requests
-    /// until it reports the page loaded. Returns the page title.
+    /// until it reports the page loaded.
+    #[allow(clippy::too_many_arguments)]
     fn load(
         &mut self,
         url: &str,
         html: &str,
         blocker_css: String,
+        scripts: bool,
+        viewport: (f32, f32),
         deadline: Instant,
-        fetch: &mut dyn FnMut(&str) -> Result<String, String>,
-    ) -> Result<String, String> {
+        fetch: &mut dyn FnMut(&str, Dest) -> Result<String, String>,
+    ) -> Result<Loaded, String> {
         self.send(ToRenderer::Load {
             url: url.to_string(),
             html: html.to_string(),
             blocker_css,
+            scripts,
+            viewport,
         })?;
         let mut budget = LOAD_BYTES;
         let mut fetches = 0;
         loop {
             match self.recv(deadline, &mut budget)? {
-                FromRenderer::Fetch { url } if fetches < MAX_FETCHES => {
+                FromRenderer::Fetch { url, dest } if fetches < MAX_FETCHES => {
                     fetches += 1;
-                    self.send(ToRenderer::FetchReply(fetch(&url)))?
+                    self.send(ToRenderer::FetchReply(fetch(&url, dest)))?
                 }
                 FromRenderer::Fetch { .. } => {
                     return Err(self.kill("renderer made too many requests and was killed"))
                 }
-                FromRenderer::Loaded { title } => return Ok(title),
+                FromRenderer::Loaded {
+                    title,
+                    navigate,
+                    console,
+                } => {
+                    return Ok(Loaded {
+                        title,
+                        navigate,
+                        console,
+                    })
+                }
                 _ => return Err(self.kill("renderer sent an unexpected message and was killed")),
             }
         }
@@ -360,22 +519,38 @@ except BrokenPipeError:
     }
 
     fn fetch_msg(url: &str) -> String {
-        hex(F::Fetch { url: url.into() })
+        hex(F::Fetch {
+            url: url.into(),
+            dest: Dest::Stylesheet,
+        })
     }
     fn loaded() -> String {
-        hex(F::Loaded { title: "t".into() })
+        hex(F::Loaded {
+            title: "t".into(),
+            navigate: None,
+            console: vec![],
+        })
     }
 
     fn load(
         r: &mut Renderer,
         secs: f32,
-        fetch: &mut dyn FnMut(&str) -> Result<String, String>,
+        fetch: &mut dyn FnMut(&str, Dest) -> Result<String, String>,
     ) -> Result<String, String> {
         let deadline = Instant::now() + Duration::from_secs_f32(secs);
-        r.load("https://page.example/", "<p>hi", String::new(), deadline, fetch)
+        r.load(
+            "https://page.example/",
+            "<p>hi",
+            String::new(),
+            false,
+            DEFAULT_VIEWPORT,
+            deadline,
+            fetch,
+        )
+        .map(|l| l.title)
     }
 
-    fn no_fetch(_: &str) -> Result<String, String> {
+    fn no_fetch(_: &str, _: Dest) -> Result<String, String> {
         Err("no".into())
     }
 
@@ -391,7 +566,7 @@ except BrokenPipeError:
             return;
         };
         let mut asked = vec![];
-        let title = load(&mut r, 5.0, &mut |u| {
+        let title = load(&mut r, 5.0, &mut |u, _| {
             asked.push(u.to_string());
             Ok(String::new())
         });
@@ -411,7 +586,7 @@ except BrokenPipeError:
         };
         let mut n = 0;
         let start = Instant::now();
-        let err = load(&mut r, 10.0, &mut |_| {
+        let err = load(&mut r, 10.0, &mut |_, _| {
             n += 1;
             Err("over budget".into())
         })
@@ -538,9 +713,12 @@ except BrokenPipeError:
                 "https://page.example/",
                 &html,
                 String::new(),
+                false,
+                DEFAULT_VIEWPORT,
                 deadline,
                 &mut no_fetch,
             )
+            .map(|l| l.title)
             .unwrap_err();
         assert!(err.contains("stopped responding"), "{err}");
         let err = r.send(ToRenderer::Dom).unwrap_err();
@@ -586,8 +764,8 @@ except BrokenPipeError:
         let mut net = Network::with_filters(crate::filter::Filters::parse("||tracker.example^\n"));
         let before = net::requests_sent();
         let mut replies = vec![];
-        load(&mut r, 5.0, &mut |u| {
-            let res = net.subresource("https://page.example/", u);
+        load(&mut r, 5.0, &mut |u, _| {
+            let res = net.subresource("https://page.example/", u, Dest::Stylesheet);
             replies.push(res.clone());
             res
         })

@@ -33,14 +33,18 @@ Planned work, roughly in priority order. Items marked *discuss* need a decision 
 - [ ] App icon and home-page art of Brickle the cat; `.desktop` file for the Linux menu
 - [ ] Bump `FIREFOX_VERSION` in `src/net.rs` with Firefox releases
 
-## JavaScript (decided: Boa, off by default, allowed per site, no JIT)
+## JavaScript
 
-Rules for the design, before any code:
-- Boa runs only inside the sandboxed renderer, with DOM access and nothing else at first.
+Done: Boa in the sandboxed renderer, off by default, allowed per site, DOM, events, timers,
+clicks, no network for scripts. Rules that still apply to what's next:
 - Cookie selection and network authorization stay in the browser process, using the browser's
   own record of the page's origin, never what the renderer claims.
-- Script network access (`fetch`, XHR) only together with same-origin policy, CORS and
-  credential rules, each request shown in the request panel and subject to the blocker.
-- `document.cookie` only for non-HttpOnly cookies, answered by the browser.
-- Boa's loop-iteration, recursion and stack limits set, on top of the renderer's deadline,
-  address-space and CPU limits.
+- [ ] `fetch`/XHR, only together with same-origin policy, CORS and credential rules, each request
+  shown in the request panel and subject to the blocker.
+- [ ] `document.cookie` for non-HttpOnly cookies, answered by the browser.
+- [ ] JavaScript modules (`type=module`, `import`).
+- [ ] Keyboard input and form controls (typing into fields, submitting forms).
+- [ ] More selectors for `querySelector` (sibling combinators, `:not()`, attribute values),
+  shared with CSS.
+- [ ] `MutationObserver` callbacks; `getComputedStyle` beyond inline styles.
+- [ ] Faster startup for the JS fuzzer (snapshot the prelude).

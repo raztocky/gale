@@ -69,6 +69,8 @@ pub struct TextFrag {
     pub style: Rc<ComputedStyle>,
     pub bg: Color,
     pub link: Option<String>,
+    /// The DOM node the text came from.
+    pub uid: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +80,7 @@ pub enum InlineItem {
         style: Rc<ComputedStyle>,
         bg: Color,
         link: Option<String>,
+        uid: u32,
     },
     Break(Rc<ComputedStyle>),
     /// Index into the anonymous box's `children` (an inline-block).
@@ -100,16 +103,23 @@ pub struct LayoutBox<'a> {
     pub children: Vec<LayoutBox<'a>>,
     pub marker: Option<String>,
     pub link: Option<String>,
+    /// The DOM node this box is for (0 for anonymous boxes).
+    pub uid: u32,
 }
 
 impl<'a> LayoutBox<'a> {
     fn new(kind: BoxKind<'a>) -> Self {
+        let kind_uid = match &kind {
+            BoxKind::Block(n) => Some(n.node.uid),
+            _ => None,
+        };
         LayoutBox {
             dims: Dimensions::default(),
             kind,
             children: Vec::new(),
             marker: None,
             link: None,
+            uid: kind_uid.unwrap_or(0),
         }
     }
 
@@ -237,6 +247,7 @@ fn flatten_inline<'a>(node: &'a StyledNode<'a>, anon: &mut LayoutBox<'a>, bg: Co
                     style: node.style.clone(),
                     bg,
                     link,
+                    uid: node.node.uid,
                 },
             );
         }
@@ -260,6 +271,7 @@ fn flatten_inline<'a>(node: &'a StyledNode<'a>, anon: &mut LayoutBox<'a>, bg: Co
                                 style: node.style.clone(),
                                 bg: Color::TRANSPARENT,
                                 link: link.clone(),
+                                uid: node.node.uid,
                             }],
                             frags: vec![],
                             style: node.style.clone(),
@@ -563,6 +575,7 @@ impl<'a> LayoutBox<'a> {
                 style: Rc<ComputedStyle>,
                 bg: Color,
                 link: Option<String>,
+                uid: u32,
                 w: f32,
                 /// No line break allowed between this and the previous piece.
                 glue: bool,
@@ -571,6 +584,7 @@ impl<'a> LayoutBox<'a> {
                 style: Rc<ComputedStyle>,
                 bg: Color,
                 link: Option<String>,
+                uid: u32,
                 w: f32,
             },
             Break(Rc<ComputedStyle>),
@@ -588,6 +602,7 @@ impl<'a> LayoutBox<'a> {
                     style,
                     bg,
                     link,
+                    uid,
                 } => {
                     let f = font::index(style);
                     let text = if style.uppercase {
@@ -600,6 +615,7 @@ impl<'a> LayoutBox<'a> {
                         style: style.clone(),
                         bg: *bg,
                         link: link.clone(),
+                        uid: *uid,
                         w: font::measure(f, style.font_size, t),
                         glue,
                     };
@@ -659,6 +675,7 @@ impl<'a> LayoutBox<'a> {
                                     style: style.clone(),
                                     bg: *bg,
                                     link: link.clone(),
+                                    uid: *uid,
                                     w: font::measure(f, style.font_size, " "),
                                 });
                                 last_space = true;
@@ -734,6 +751,7 @@ impl<'a> LayoutBox<'a> {
                     style,
                     bg,
                     link,
+                    uid,
                     w,
                     glue,
                 } => {
@@ -749,10 +767,17 @@ impl<'a> LayoutBox<'a> {
                         style,
                         bg,
                         link,
+                        uid,
                     }));
                     x += w;
                 }
-                Piece::Space { style, bg, link, w } => {
+                Piece::Space {
+                    style,
+                    bg,
+                    link,
+                    uid,
+                    w,
+                } => {
                     if cur.is_empty() {
                         continue;
                     }
@@ -764,6 +789,7 @@ impl<'a> LayoutBox<'a> {
                         style,
                         bg,
                         link,
+                        uid,
                     }));
                     x += w;
                 }
