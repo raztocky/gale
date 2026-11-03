@@ -1,9 +1,15 @@
 /* Brickle's user-agent stylesheet (a trimmed-down version of the HTML spec's). */
 html, body, div, p, ul, ol, dl, dt, dd, h1, h2, h3, h4, h5, h6, pre, blockquote,
 address, article, aside, footer, header, main, nav, section, figure, figcaption,
-form, fieldset, hr, table, tr, thead, tbody, tfoot, caption, center, details, summary, legend, menu { display: block; }
+form, fieldset, hr, center, details, summary, legend, menu { display: block; }
 li { display: list-item; }
-td, th { display: inline-block; padding: 1px 4px; }
+table { display: table; border-spacing: 2px; }
+thead, tbody, tfoot { display: table-row-group; }
+tr { display: table-row; }
+td, th { display: table-cell; padding: 1px; vertical-align: middle; }
+th { text-align: center; }
+caption { display: table-caption; text-align: center; }
+col, colgroup { display: table-column; }
 head, script, style, title, meta, link, base, template, datalist, [hidden] { display: none; }
 img, input, button, select, textarea { display: inline-block; }
 

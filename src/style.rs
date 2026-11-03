@@ -17,7 +17,21 @@ pub enum Display {
     InlineBlock,
     ListItem,
     Flex,
+    Table,
+    InlineTable,
+    /// `thead`, `tbody`, `tfoot` and their `display` equivalents.
+    TableRowGroup,
+    TableRow,
+    TableCell,
+    TableCaption,
     None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum VAlign {
+    Top,
+    Middle,
+    Bottom,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -92,6 +106,11 @@ pub struct ComputedStyle {
     pub visible: bool,
     pub flex_row: bool,
     pub gap: f32,
+    /// Horizontal and vertical `border-spacing` between table cells.
+    pub border_spacing: [f32; 2],
+    pub border_collapse: bool,
+    /// Only used for table cells.
+    pub vertical_align: VAlign,
 }
 
 impl ComputedStyle {
@@ -124,6 +143,9 @@ impl ComputedStyle {
             visible: true,
             flex_row: true,
             gap: 0.0,
+            border_spacing: [0.0; 2],
+            border_collapse: false,
+            vertical_align: VAlign::Middle,
         }
     }
 
@@ -144,6 +166,8 @@ impl ComputedStyle {
         s.uppercase = self.uppercase;
         s.list_style = self.list_style;
         s.visible = self.visible;
+        s.border_spacing = self.border_spacing;
+        s.border_collapse = self.border_collapse;
         s.display = Display::Inline;
         s
     }
@@ -372,7 +396,7 @@ fn compute(
                 continue;
             }
             if (attr == "width" || attr == "height")
-                && !matches!(e.tag.as_str(), "img" | "table" | "td" | "th" | "hr")
+                && !matches!(e.tag.as_str(), "img" | "table" | "td" | "th" | "tr" | "hr")
             {
                 continue;
             }
@@ -408,6 +432,75 @@ fn compute(
             values: css::parse_values("1px inset gray"),
             important: false,
         });
+    }
+    let table = ancestors.iter().rev().find(|a| a.tag == "table");
+    let px = |v: &str| {
+        let v = v.trim();
+        if v.chars().all(|c| c.is_ascii_digit()) && !v.is_empty() {
+            Some(format!("{v}px"))
+        } else {
+            None
+        }
+    };
+    let mut hint = |name: &str, value: &str| {
+        presentational.push(Declaration {
+            name: name.into(),
+            values: css::parse_values(value),
+            important: false,
+        })
+    };
+    if e.tag == "table" {
+        if let Some(v) = e.attrs.get("cellspacing").and_then(|v| px(v)) {
+            hint("border-spacing", &v);
+        }
+        if e.attrs
+            .get("align")
+            .is_some_and(|a| a.eq_ignore_ascii_case("center"))
+        {
+            hint("margin-left", "auto");
+            hint("margin-right", "auto");
+        }
+    }
+    if matches!(e.tag.as_str(), "td" | "th") {
+        if let Some(v) = table.and_then(|t| t.attrs.get("cellpadding")).and_then(|v| px(v)) {
+            hint("padding", &v);
+        }
+        if e.attrs.contains_key("nowrap") {
+            hint("white-space", "nowrap");
+        }
+        // `valign` on the cell, else on its row.
+        let row = ancestors.iter().rev().find(|a| a.tag == "tr");
+        let valign = e
+            .attrs
+            .get("valign")
+            .or_else(|| row.and_then(|r| r.attrs.get("valign")));
+        if let Some(v) = valign {
+            hint("vertical-align", &v.to_ascii_lowercase());
+        }
+    }
+    if matches!(
+        e.tag.as_str(),
+        "td" | "th"
+            | "tr"
+            | "tbody"
+            | "thead"
+            | "tfoot"
+            | "div"
+            | "p"
+            | "caption"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+    ) {
+        if let Some(a) = e.attrs.get("align") {
+            let a = a.to_ascii_lowercase();
+            if matches!(a.as_str(), "left" | "center" | "right") {
+                hint("text-align", &a);
+            }
+        }
     }
     if e.attrs.contains_key("hidden") {
         presentational.push(Declaration {
@@ -475,15 +568,19 @@ fn compute(
         match name.as_str() {
             "display" => {
                 s.display = match kw {
-                    "block" | "table" | "table-row" | "table-row-group" | "table-header-group"
-                    | "table-footer-group" | "grid" | "flow-root" | "table-caption" => Display::Block,
+                    "block" | "grid" | "flow-root" => Display::Block,
                     "inline" => Display::Inline,
-                    "inline-block" | "table-cell" | "inline-table" | "inline-flex" | "inline-grid" => {
-                        Display::InlineBlock
-                    }
+                    "inline-block" | "inline-flex" | "inline-grid" => Display::InlineBlock,
                     "list-item" => Display::ListItem,
                     "flex" => Display::Flex,
-                    "none" => Display::None,
+                    "table" => Display::Table,
+                    "inline-table" => Display::InlineTable,
+                    "table-row-group" | "table-header-group" | "table-footer-group" => Display::TableRowGroup,
+                    "table-row" => Display::TableRow,
+                    "table-cell" => Display::TableCell,
+                    "table-caption" => Display::TableCaption,
+                    // Columns only carry widths and backgrounds, which aren't supported yet.
+                    "none" | "table-column" | "table-column-group" => Display::None,
                     _ => s.display,
                 }
             }
@@ -603,6 +700,21 @@ fn compute(
             "gap" | "column-gap" => {
                 if let Some(v) = first {
                     s.gap = ctxv.length(v, fs).unwrap_or(0.0)
+                }
+            }
+            "border-spacing" => {
+                let mut ls = vals.iter().filter_map(|v| ctxv.length(v, fs));
+                if let Some(h) = ls.next() {
+                    s.border_spacing = [h, ls.next().unwrap_or(h)];
+                }
+            }
+            "border-collapse" => s.border_collapse = kw == "collapse",
+            "vertical-align" => {
+                s.vertical_align = match kw {
+                    "top" | "text-top" | "baseline" => VAlign::Top,
+                    "bottom" | "text-bottom" => VAlign::Bottom,
+                    "middle" => VAlign::Middle,
+                    _ => s.vertical_align,
                 }
             }
             "width" => s.width = ctxv.len(first, fs),
