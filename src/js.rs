@@ -988,6 +988,19 @@ pub struct Runtime {
     // Declared before `ctx` so these handles are dropped first.
     internals: Internals,
     ctx: Context,
+    // Declared last, so it runs after the context is gone.
+    _collect: CollectOnDrop,
+}
+
+/// Frees JavaScript objects the page left in reference cycles, which Boa
+/// otherwise only collects on a later allocation (so a long-lived thread,
+/// like the fuzzer's, would keep them).
+struct CollectOnDrop;
+
+impl Drop for CollectOnDrop {
+    fn drop(&mut self) {
+        boa_engine::gc::force_collect();
+    }
 }
 
 /// Viewport size as scripts see it: rounded down to steps of 200x100 px,
@@ -1052,7 +1065,11 @@ impl Runtime {
             set_viewport: get("setViewport", &mut ctx)?,
             deliver: get("deliver", &mut ctx)?,
         };
-        let mut rt = Runtime { internals, ctx };
+        let mut rt = Runtime {
+            internals,
+            ctx,
+            _collect: CollectOnDrop,
+        };
         rt.call(&rt.internals.set_viewport.clone(), &[vw.into(), vh.into()]);
         Ok(rt)
     }
@@ -1496,6 +1513,21 @@ mod tests {
             "history.pushState({}, '', '/new'); console.log(location.pathname);",
         );
         assert_eq!(rt.take_console(), vec!["[log] /new"]);
+    }
+
+    #[test]
+    fn dropping_a_page_with_cycles_is_safe() {
+        // Objects that only reference each other, and a listener closing
+        // over its element; the runtime's drop collects them (the fuzzer's
+        // leak checker is what verifies they're freed).
+        for _ in 0..3 {
+            run(
+                "<div id=d></div>",
+                "const a = {}; const b = {a}; a.b = b; const d = document.getElementById('d');\
+                 d.addEventListener('click', () => d.x = a);",
+            );
+        }
+        boa_engine::gc::force_collect();
     }
 
     #[test]
