@@ -16,6 +16,9 @@ USAGE:
   brickle requests URL|FILE                         list every request a page makes
   brickle filters update                            download the filter lists (prints each request)
   brickle filters status                            show installed filter lists
+  brickle cookies                                   list sites whose cookies are kept, and saved cookies
+  brickle cookies keep|unkeep SITE                  keep a site's cookies after closing, or stop
+  brickle cookies forget SITE                       delete a site's saved cookies
   brickle sandbox-test                              check the renderer sandbox works here
 
 OPTIONS:
@@ -25,7 +28,8 @@ OPTIONS:
   --panel        open the window with the request panel showing
 
 Your rules live in ~/.config/brickle/rules.txt; filter lists in
-~/.local/share/brickle/filters/. See PRIVACY.md for what Brickle will
+~/.local/share/brickle/filters/. Cookies are deleted when Brickle closes,
+except for sites in ~/.config/brickle/keep-cookies.txt. See PRIVACY.md for what Brickle will
 and won't do on the network.
 ";
 
@@ -157,6 +161,7 @@ fn run(args: Vec<String>, sandboxed: bool, filters: bool, panel: bool) -> Result
             print_log(&tab.log);
             Ok(())
         }
+        Some("cookies") => cookies_cmd(&args[1..]),
         Some("-h") | Some("--help") => {
             print!("{USAGE}");
             Ok(())
@@ -205,6 +210,47 @@ fn run(args: Vec<String>, sandboxed: bool, filters: bool, panel: bool) -> Result
             Ok(())
         }
         other => open_window(other.unwrap_or("about:home"), sandboxed, network(filters), panel),
+    }
+}
+
+fn cookies_cmd(args: &[String]) -> Result<(), String> {
+    use brickle::network::{config_dir, data_dir};
+    let mut jar = brickle::cookies::Jar::from_disk(config_dir().as_deref(), data_dir().as_deref());
+    match (args.first().map(String::as_str), args.get(1)) {
+        (None | Some("list"), _) => {
+            let kept = jar.kept();
+            if kept.is_empty() {
+                println!("No sites on your keep list: all cookies are deleted when Brickle closes.");
+            } else {
+                println!("Cookies kept after closing Brickle for:");
+                for s in kept {
+                    let names: Vec<String> = jar.for_site(&s).iter().map(|c| c.name.clone()).collect();
+                    println!("  {s:<30} {} saved {}", names.len(), names.join(", "));
+                }
+            }
+            Ok(())
+        }
+        (Some("keep"), Some(site)) => {
+            jar.set_kept(site, true)?;
+            println!("keeping cookies for {}", brickle::cookies::site(site));
+            Ok(())
+        }
+        (Some("unkeep"), Some(site)) => {
+            jar.forget(site);
+            jar.set_kept(site, false)?;
+            println!(
+                "{}: cookies will be deleted when Brickle closes",
+                brickle::cookies::site(site)
+            );
+            Ok(())
+        }
+        (Some("forget"), Some(site)) => {
+            let n = jar.forget(site);
+            jar.save()?;
+            println!("deleted {n} saved cookie(s) for {}", brickle::cookies::site(site));
+            Ok(())
+        }
+        _ => Err(USAGE.to_string()),
     }
 }
 
@@ -257,6 +303,15 @@ pub fn describe(e: &LogEntry) -> (&'static str, String) {
     }
     if let Some(r) = &e.allowed_by {
         notes.push(format!("allowed by {r}"));
+    }
+    if !e.cookies_sent.is_empty() {
+        notes.push(format!("sent cookies {}", e.cookies_sent.join(", ")));
+    }
+    if !e.cookies_set.is_empty() {
+        notes.push(format!("set cookies {}", e.cookies_set.join(", ")));
+    }
+    if !e.cookies_refused.is_empty() {
+        notes.push(format!("refused cookies {}", e.cookies_refused.join(", ")));
     }
     (status, notes.join("; "))
 }

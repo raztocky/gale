@@ -88,7 +88,7 @@ are only parsed when a page actually uses them.
 
 ## Security
 
-Brickle runs no JavaScript and stores no cookies or other site data. Privacy protections are
+Brickle runs no JavaScript. Cookies are first-party only and deleted on close unless you keep a site (see PRIVACY.md). Privacy protections are
 described in [PRIVACY.md](PRIVACY.md). Security measures:
 
 - **Sandboxed renderer (Linux).** Each page is parsed, laid out and its text rasterized in its own

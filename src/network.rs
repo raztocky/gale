@@ -13,6 +13,7 @@
 //!
 //! Every step is recorded in the request log, shown in the request panel.
 
+use crate::cookies::{self, Jar};
 use crate::filter::{self, Filters, Req, Verdict};
 use crate::net::{self, Dest};
 use crate::page::error_page;
@@ -73,6 +74,12 @@ pub struct LogEntry {
     pub insecure: bool,
     /// An allow rule (yours or a filter exception) let this through.
     pub allowed_by: Option<String>,
+    /// Names of the cookies sent with the request.
+    pub cookies_sent: Vec<String>,
+    /// Cookies the response set (or deleted).
+    pub cookies_set: Vec<String>,
+    /// Cookies the response tried to set but weren't stored, with why.
+    pub cookies_refused: Vec<String>,
 }
 
 impl LogEntry {
@@ -141,6 +148,8 @@ pub struct Network {
     page_started: std::time::Instant,
     page_bytes: usize,
     pub lists_loaded: usize,
+    /// The cookie jar (see `cookies.rs` for the policy).
+    pub cookies: Jar,
 }
 
 pub fn config_dir() -> Option<PathBuf> {
@@ -173,6 +182,7 @@ impl Network {
             page_started: std::time::Instant::now(),
             page_bytes: 0,
             lists_loaded: 0,
+            cookies: Jar::new(),
         }
     }
 
@@ -211,6 +221,7 @@ impl Network {
             n.rules_path = Some(path);
         }
         n.rebuild_user();
+        n.cookies = Jar::from_disk(config_dir().as_deref(), data_dir().as_deref());
         n
     }
 
@@ -251,7 +262,11 @@ impl Network {
         self.page_stylesheets = 0;
         self.page_started = std::time::Instant::now();
         self.page_bytes = 0;
-        match self.fetch(url, from, Dest::Document) {
+        let fetched = self.fetch(url, from, Dest::Document);
+        if let Err(e) = self.cookies.save() {
+            eprintln!("brickle: saving cookies: {e}");
+        }
+        match fetched {
             Fetch::Done { url, body } => {
                 self.page_bytes = body.len();
                 Nav::Page { url, html: body }
@@ -369,6 +384,9 @@ impl Network {
             upgraded: false,
             insecure: false,
             allowed_by: None,
+            cookies_sent: vec![],
+            cookies_set: vec![],
+            cookies_refused: vec![],
         });
         self.log.last_mut().unwrap()
     }
@@ -441,8 +459,31 @@ impl Network {
             // you said so for this host (navigations only).
             let public_only = from.as_deref().is_some_and(is_public_page)
                 && !(dest == Dest::Document && self.local_allowed.contains(&host));
-            let result = net::http_get(&target, dest, from.as_deref(), public_only);
+            let top = match (dest, page) {
+                (Dest::Document, _) | (_, None) => target.clone(),
+                (_, Some(p)) => p.to_string(),
+            };
+            let ctx = cookies::Context {
+                top: &top,
+                initiator: from.as_deref(),
+                navigation: dest == Dest::Document,
+            };
+            let (cookie, sent) = self.cookies.header_for(&target, ctx).unzip();
+            let result = net::http_get(&target, dest, from.as_deref(), public_only, cookie.as_deref());
+            let stored = match &result {
+                Ok(resp) => {
+                    let redirect = (300..400).contains(&resp.status);
+                    self.cookies.store(&target, ctx, &resp.set_cookies, redirect)
+                }
+                Err(_) => cookies::Stored::default(),
+            };
             let entry_url = target.clone();
+            let sent = sent.unwrap_or_default();
+            let note = |e: &mut LogEntry| {
+                e.cookies_sent = sent.clone();
+                e.cookies_set = stored.set.clone();
+                e.cookies_refused = stored.refused.clone();
+            };
             match result {
                 Ok(resp) if (300..400).contains(&resp.status) && resp.location.is_some() => {
                     let next = net::resolve(&target, resp.location.as_deref().unwrap_or(""));
@@ -452,6 +493,7 @@ impl Network {
                         Outcome::Redirected { to: next.clone() },
                         stripped,
                     );
+                    note(e);
                     e.upgraded = upgraded;
                     e.insecure = insecure;
                     e.allowed_by = allowed_by;
@@ -465,6 +507,7 @@ impl Network {
                         Outcome::Loaded { status: resp.status },
                         stripped,
                     );
+                    note(e);
                     e.upgraded = upgraded;
                     e.insecure = insecure;
                     e.allowed_by = allowed_by;
@@ -719,6 +762,9 @@ mod tests {
             upgraded: false,
             insecure: false,
             allowed_by: None,
+            cookies_sent: vec![],
+            cookies_set: vec![],
+            cookies_refused: vec![],
         };
         assert_eq!(n.toggle_preview(&e), ("||cdn.example^".into(), "block"));
         n.toggle(&e).unwrap();

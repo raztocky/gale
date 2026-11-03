@@ -32,8 +32,16 @@ fn brickle(home: &PathBuf) -> Command {
 
 /// Records every request (request line + headers) and serves `pages`.
 fn serve(pages: Vec<(&'static str, &'static str, String)>) -> (u16, Arc<Mutex<Vec<Vec<String>>>>) {
+    serve_dynamic(|_| pages)
+}
+
+/// Like `serve`, but the pages can mention the server's own port.
+fn serve_dynamic(
+    pages: impl FnOnce(u16) -> Vec<(&'static str, &'static str, String)>,
+) -> (u16, Arc<Mutex<Vec<Vec<String>>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    let pages = pages(port);
     let seen = Arc::new(Mutex::new(Vec::new()));
     let seen2 = seen.clone();
     std::thread::spawn(move || {
@@ -306,6 +314,7 @@ fn local_proxy_still_works_for_public_pages() {
         brickle::net::Dest::Stylesheet,
         Some("https://page.example/"),
         true,
+        None,
     );
     std::env::remove_var("HTTPS_PROXY");
     assert_eq!(r.map(|r| r.body).unwrap(), "ok");
@@ -321,6 +330,80 @@ fn local_proxy_still_works_for_public_pages() {
         brickle::net::Dest::Stylesheet,
         Some("https://page.example/"),
         true,
+        None,
     );
     assert_eq!(r.err().as_deref(), Some(brickle::net::LOCAL_NETWORK_ERR));
+}
+
+/// PRIVACY.md rule 8: first-party cookies work, third parties get nothing,
+/// and nothing survives a restart unless you keep the site.
+#[test]
+fn cookies_first_party_only_and_session_only() {
+    let home = temp_dir("cookies");
+    // `Content-Type` is written raw, so a Set-Cookie header can ride along.
+    let set = |c: &str| -> &'static str { format!("text/html\r\nSet-Cookie: {c}").leak() };
+    let (port, seen) = serve_dynamic(|port| {
+        vec![
+            (
+                "/",
+                set("sid=1; Max-Age=3600; HttpOnly"),
+                format!(
+                    "<link rel=stylesheet href=/same.css>\
+                     <link rel=stylesheet href=http://localhost:{port}/third.css><p>hi"
+                ),
+            ),
+            ("/same.css", "text/css", String::new()),
+            ("/third.css", set("track=1; Max-Age=3600"), String::new()),
+        ]
+    });
+    let url = format!("http://127.0.0.1:{port}/");
+    let run = || {
+        let out = brickle(&home).args(["requests", &url]).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "{stdout}");
+        stdout
+    };
+    let cookie_of = |req: &Vec<String>| req.iter().find(|l| l.starts_with("Cookie: ")).cloned();
+
+    let out = run();
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3, "{out}");
+        assert_eq!(cookie_of(&seen[0]), None, "fresh start has no cookies");
+        assert_eq!(
+            cookie_of(&seen[1]).as_deref(),
+            Some("Cookie: sid=1"),
+            "{:?}",
+            seen[1]
+        );
+        assert_eq!(cookie_of(&seen[2]), None, "third party gets nothing");
+    }
+    assert!(out.contains("set cookies sid"), "{out}");
+    assert!(out.contains("refused cookies track (third-party)"), "{out}");
+
+    // A new session forgets everything...
+    run();
+    assert_eq!(cookie_of(&seen.lock().unwrap()[3]), None);
+
+    // ...unless you keep the site.
+    let keep = brickle(&home)
+        .args(["cookies", "keep", "127.0.0.1"])
+        .output()
+        .unwrap();
+    assert!(keep.status.success());
+    run();
+    run();
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 12);
+    assert_eq!(
+        cookie_of(&seen[9]).as_deref(),
+        Some("Cookie: sid=1"),
+        "{:?}",
+        seen[9]
+    );
+    assert!(!seen
+        .iter()
+        .any(|r| cookie_of(r).is_some_and(|c| c.contains("track"))));
+    let saved = std::fs::read_to_string(home.join("data/brickle/cookies.txt")).unwrap();
+    assert!(saved.contains("sid") && !saved.contains("track"));
 }

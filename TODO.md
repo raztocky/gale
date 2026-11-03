@@ -6,8 +6,8 @@ Planned work, roughly in priority order. Items marked *discuss* need a decision 
 - [ ] Images (PNG/JPEG/WebP/GIF), decoded inside the sandboxed renderer
 - [ ] Floats and positioning (`float`, `position: absolute/fixed/relative`)
 - [ ] Real table layout
-- [ ] Show `<noscript>` content (Brickle never runs scripts)
-- [ ] Cookies (*discuss*: third-party blocked by default, per-site storage)
+- [x] Show `<noscript>` content
+- [x] Cookies: session-only, first-party only, per-site keep list
 - [ ] JavaScript (*discuss*: big project; would require same-origin policy and CSP first)
 
 ## Text

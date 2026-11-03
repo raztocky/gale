@@ -147,10 +147,19 @@ pub fn fetch_site(initiator: Option<&str>, target: &str) -> &'static str {
     }
 }
 
+fn with_cookie(req: ureq::Request, cookie: Option<&str>) -> ureq::Request {
+    match cookie {
+        Some(c) => req.set("Cookie", c),
+        None => req,
+    }
+}
+
 pub struct Response {
     pub status: u16,
     /// `Location` header of a redirect, unresolved.
     pub location: Option<String>,
+    /// `Set-Cookie` headers, for the cookie jar.
+    pub set_cookies: Vec<String>,
     pub body: String,
 }
 
@@ -165,6 +174,7 @@ pub fn http_get(
     dest: Dest,
     initiator: Option<&str>,
     public_only: bool,
+    cookie: Option<&str>,
 ) -> Result<Response, String> {
     let host = url::Url::parse(url)
         .ok()
@@ -190,29 +200,35 @@ pub fn http_get(
     // Header names, values and order as sent by Firefox.
     let mut req = agent.get(url).set("User-Agent", &user_agent());
     req = match dest {
-        Dest::Document => req
-            .set(
-                "Accept",
-                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            )
-            .set("Accept-Language", "en-US,en;q=0.5")
-            .set("Accept-Encoding", "gzip, deflate, br, zstd")
-            .set("Connection", "keep-alive")
-            .set("Upgrade-Insecure-Requests", "1")
-            .set("Sec-Fetch-Dest", "document")
-            .set("Sec-Fetch-Mode", "navigate")
-            .set("Sec-Fetch-Site", site)
-            .set("Sec-Fetch-User", "?1")
-            .set("Priority", "u=0, i"),
-        Dest::Stylesheet => req
-            .set("Accept", "text/css,*/*;q=0.1")
-            .set("Accept-Language", "en-US,en;q=0.5")
-            .set("Accept-Encoding", "gzip, deflate, br, zstd")
-            .set("Connection", "keep-alive")
-            .set("Sec-Fetch-Dest", "style")
-            .set("Sec-Fetch-Mode", "no-cors")
-            .set("Sec-Fetch-Site", site)
-            .set("Priority", "u=2"),
+        Dest::Document => {
+            req = req
+                .set(
+                    "Accept",
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                )
+                .set("Accept-Language", "en-US,en;q=0.5")
+                .set("Accept-Encoding", "gzip, deflate, br, zstd")
+                .set("Connection", "keep-alive");
+            req = with_cookie(req, cookie);
+            req.set("Upgrade-Insecure-Requests", "1")
+                .set("Sec-Fetch-Dest", "document")
+                .set("Sec-Fetch-Mode", "navigate")
+                .set("Sec-Fetch-Site", site)
+                .set("Sec-Fetch-User", "?1")
+                .set("Priority", "u=0, i")
+        }
+        Dest::Stylesheet => {
+            req = req
+                .set("Accept", "text/css,*/*;q=0.1")
+                .set("Accept-Language", "en-US,en;q=0.5")
+                .set("Accept-Encoding", "gzip, deflate, br, zstd")
+                .set("Connection", "keep-alive");
+            req = with_cookie(req, cookie);
+            req.set("Sec-Fetch-Dest", "style")
+                .set("Sec-Fetch-Mode", "no-cors")
+                .set("Sec-Fetch-Site", site)
+                .set("Priority", "u=2")
+        }
         Dest::Download => req
             .set("Accept", "*/*")
             .set("Accept-Language", "en-US,en;q=0.5")
@@ -233,10 +249,12 @@ pub fn http_get(
         }
     };
     let status = resp.status();
+    let set_cookies: Vec<String> = resp.all("set-cookie").into_iter().map(str::to_string).collect();
     if (300..400).contains(&status) {
         return Ok(Response {
             status,
             location: resp.header("location").map(str::to_string),
+            set_cookies,
             body: String::new(),
         });
     }
@@ -275,6 +293,7 @@ pub fn http_get(
     Ok(Response {
         status,
         location: None,
+        set_cookies,
         body: String::from_utf8_lossy(&bytes).into_owned(),
     })
 }

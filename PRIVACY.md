@@ -83,14 +83,36 @@ Before any request, Brickle removes known tracking parameters (`utm_*`, `fbclid`
 `msclkid`, `mc_eid`, `igshid`, `_hsenc`, … see `src/urlclean.rs`), plus any `$removeparam`
 rules from the filter lists. The request panel shows what was removed.
 
-## 8. Cookies and storage
+## 8. Cookies
 
-Brickle currently stores nothing from websites: no cookies, no local storage, no cache.
-How cookies will work is still to be decided before they are implemented.
+- **Session-only by default.** Cookies live in memory and are deleted when Brickle closes.
+- **Keep list.** Sites you choose (the "Keep after closing" button in the request panel, or
+  `brickle cookies keep SITE`) keep their cookies across restarts, so you stay logged in.
+  The list is `~/.config/brickle/keep-cookies.txt`; their cookies are saved, readable only by
+  you, in `~/.local/share/brickle/cookies.txt`.
+- **No third-party cookies, ever.** A request carries cookies only when it goes to the same site
+  as the page you're on, and only that site can set them. Cookies are also partitioned by the
+  site you're visiting, as with Firefox's Total Cookie Protection.
+- **No bounce tracking.** Cookies set while a link redirects you through another site on the way
+  to the real page are dropped.
+- **Safer defaults.** A cookie without `SameSite` is treated as `Lax`; `Secure` cookies only go
+  over HTTPS; lifetimes are capped at 400 days; cookies for a whole public suffix (like
+  `.co.uk` or `.github.io`) are refused.
+- **Visible.** The request panel shows the cookies each request sent, set and was refused, and a
+  "Forget" button deletes a site's cookies.
+- **Out of the renderer's reach.** Only the browser process holds cookies; sandboxed page
+  renderers never see them.
+
+Brickle stores no other site data: no local storage, no cache.
+
+*Enforced by:* `cookies_first_party_only_and_session_only` in `tests/privacy.rs`, and the tests
+in `src/cookies.rs`.
 
 ## What Brickle does store
 
 - `~/.config/brickle/rules.txt`: the block and allow rules you make in the request panel.
 - `~/.local/share/brickle/filters/`: downloaded filter lists.
+- `~/.config/brickle/keep-cookies.txt` and `~/.local/share/brickle/cookies.txt`: the sites whose
+  cookies you keep, and those cookies.
 
 There is no history file. Back/forward history exists only in memory while the window is open.

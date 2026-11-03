@@ -4,7 +4,7 @@ address, article, aside, footer, header, main, nav, section, figure, figcaption,
 form, fieldset, hr, table, tr, thead, tbody, tfoot, caption, center, details, summary, legend, menu { display: block; }
 li { display: list-item; }
 td, th { display: inline-block; padding: 1px 4px; }
-head, script, style, title, meta, link, base, template, noscript, datalist, [hidden] { display: none; }
+head, script, style, title, meta, link, base, template, datalist, [hidden] { display: none; }
 img, input, button, select, textarea { display: inline-block; }
 
 body { margin: 8px; }

@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 const BAR_H: f32 = 40.0;
 const STATUS_H: f32 = 22.0;
 const PANEL_W: f32 = 400.0;
-const PANEL_HEAD: f32 = 58.0;
+const PANEL_HEAD: f32 = 88.0;
 const ROW_H: f32 = 38.0;
 
 const SANS: usize = 0;
@@ -359,7 +359,19 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             } else {
                 None
             };
-            let hover = if let Some(i) = row {
+            let button = if over_panel && net::scheme(&info.url).starts_with("http") {
+                site_button_at(page_w, mx, my)
+            } else {
+                None
+            };
+            let hover = if let Some(b) = button {
+                Some(match b {
+                    SiteButton::KeepCookies => {
+                        "Keep this site's cookies when Brickle closes (to stay logged in)".to_string()
+                    }
+                    SiteButton::ForgetCookies => "Delete this site's cookies now".to_string(),
+                })
+            } else if let Some(i) = row {
                 let e = &info.log[i];
                 Some(match net.try_lock() {
                     _ if e.host().is_empty() => "local file".to_string(),
@@ -387,6 +399,26 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 } else if my < BAR_H {
                     ui.editing = true;
                     ui.address.clear();
+                } else if let Some(b) = button {
+                    let site = brickle::cookies::site(&info.url);
+                    ui.flash = Some(match (net.try_lock(), b) {
+                        (Err(_), _) => "Wait for the page to finish loading".into(),
+                        (Ok(mut n), SiteButton::KeepCookies) => {
+                            let keep = !n.cookies.is_kept(&site);
+                            match n.cookies.set_kept(&site, keep) {
+                                Ok(true) => format!("Keeping cookies for {site} after Brickle closes"),
+                                Ok(false) => {
+                                    format!("Cookies for {site} will be deleted when Brickle closes")
+                                }
+                                Err(e) => e,
+                            }
+                        }
+                        (Ok(mut n), SiteButton::ForgetCookies) => {
+                            let count = n.cookies.forget(&site);
+                            let _ = n.cookies.save();
+                            format!("Deleted {count} cookie(s) for {site}")
+                        }
+                    });
                 } else if let Some(i) = row {
                     let e = info.log[i].clone();
                     ui.flash = Some(match net.try_lock() {
@@ -505,6 +537,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 let n = net.try_lock().ok();
                 draw_panel(
                     &mut canvas,
+                    &info.url,
                     &info.log,
                     n.as_deref(),
                     ui.panel_scroll,
@@ -518,6 +551,10 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         window
             .update_with_buffer(&canvas.pixels, w, h)
             .map_err(|e| e.to_string())?;
+    }
+    // Session cookies die with the process; kept sites' cookies are saved.
+    if let Err(e) = net.lock().unwrap_or_else(|e| e.into_inner()).cookies.save() {
+        eprintln!("brickle: saving cookies: {e}");
     }
     Ok(())
 }
@@ -543,6 +580,34 @@ fn badge_rect(log: &[LogEntry], w: f32) -> Rect {
         w: tw,
         h: BAR_H - 16.0,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SiteButton {
+    KeepCookies,
+    ForgetCookies,
+}
+
+/// Per-site controls at the top of the request panel.
+fn site_buttons(x0: f32) -> [(Rect, SiteButton); 2] {
+    let y = BAR_H + 54.0;
+    let r = |x: f32, w: f32| Rect {
+        x: x0 + x,
+        y,
+        w,
+        h: 22.0,
+    };
+    [
+        (r(100.0, 140.0), SiteButton::KeepCookies),
+        (r(246.0, 60.0), SiteButton::ForgetCookies),
+    ]
+}
+
+fn site_button_at(x0: f32, mx: f32, my: f32) -> Option<SiteButton> {
+    site_buttons(x0)
+        .into_iter()
+        .find(|(r, _)| r.contains(mx, my))
+        .map(|(_, b)| b)
 }
 
 fn panel_row(log: &[LogEntry], my: f32, panel_scroll: f32) -> Option<usize> {
@@ -706,6 +771,7 @@ fn draw_chrome(
 
 fn draw_panel(
     c: &mut Canvas,
+    page_url: &str,
     log: &[LogEntry],
     net: Option<&Network>,
     panel_scroll: f32,
@@ -760,6 +826,47 @@ fn draw_panel(
     };
     let sub = fit(&sub, pw - 28.0, SANS, 11.0);
     text(c, x0 + 14.0, BAR_H + 42.0, &sub, SANS, 11.0, GRAY, cache, BAR_H);
+    if let Some(n) = net.filter(|_| net::scheme(page_url).starts_with("http")) {
+        let count = n.cookies.for_site(page_url).len();
+        let kept = n.cookies.is_kept(page_url);
+        let label = format!("Cookies: {count}");
+        text(c, x0 + 14.0, BAR_H + 68.0, &label, BOLD, 11.0, DARK, cache, BAR_H);
+        for (r, b) in site_buttons(x0) {
+            let (caption, on) = match b {
+                SiteButton::KeepCookies if kept => ("Kept after closing ✓", true),
+                SiteButton::KeepCookies => ("Keep after closing", false),
+                SiteButton::ForgetCookies => ("Forget", false),
+            };
+            let (bg, fg) = if on {
+                (GREEN, Color::WHITE)
+            } else {
+                (Color::WHITE, DARK)
+            };
+            c.fill(r, LINE, BAR_H);
+            c.fill(
+                Rect {
+                    x: r.x + 1.0,
+                    y: r.y + 1.0,
+                    w: r.w - 2.0,
+                    h: r.h - 2.0,
+                },
+                bg,
+                BAR_H,
+            );
+            let tw = font::measure(SANS, 11.0, caption);
+            text(
+                c,
+                r.x + (r.w - tw) / 2.0,
+                r.y + 15.0,
+                caption,
+                SANS,
+                11.0,
+                fg,
+                cache,
+                BAR_H,
+            );
+        }
+    }
     c.fill(
         Rect {
             x: x0,

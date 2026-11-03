@@ -70,7 +70,7 @@ fn download(url: &str, log: &mut dyn FnMut(&str)) -> Result<String, String> {
             log(&format!("  refused  {url} (not https)"));
             return Err("refusing non-https download".into());
         }
-        let r = net::http_get(&url, Dest::Download, None, true);
+        let r = net::http_get(&url, Dest::Download, None, true, None);
         match r {
             Ok(resp) if (300..400).contains(&resp.status) => {
                 let next = net::resolve(&url, resp.location.as_deref().unwrap_or(""));
