@@ -599,15 +599,33 @@ impl Page {
             &mut texts,
             &mut 0,
         );
+        // Tall enough to scroll to everything drawn, including positioned
+        // boxes and text overflowing its box.
         let mb = root.dims.margin_box();
+        let height = order.iter().fold(mb.y + mb.h, |h, b| h.max(content_bottom(b)));
         Rendered {
             list,
             atlas,
-            height: mb.y + mb.h,
+            height,
             background,
             links,
             texts,
         }
+    }
+}
+
+/// The lowest point drawn by `b` itself (not its children): its border box,
+/// or its text.
+fn content_bottom(b: &LayoutBox) -> f32 {
+    match &b.kind {
+        BoxKind::Block(_) => {
+            let bb = b.dims.border_box();
+            bb.y + bb.h
+        }
+        BoxKind::Anonymous { frags, .. } => frags
+            .iter()
+            .map(|f| f.baseline + font::vmetrics(font::index(&f.style), f.style.font_size).1)
+            .fold(0.0, f32::max),
     }
 }
 
@@ -1243,6 +1261,16 @@ mod text_tests {
             assert!(!r.texts.is_empty(), "{t}: no text at all");
             assert!(copied(t).contains("SHOWN"), "{t}: copied {:?}", copied(t));
         }
+    }
+
+    #[test]
+    fn page_height_covers_positioned_and_overflowing_content() {
+        let r = render("<p>short</p><div style='position:absolute;top:2000px'>far down</div>");
+        assert!(r.height >= 2000.0 + 10.0, "{}", r.height);
+        let r = render("<div style='height:10px'>a<br>b<br>c<br>d<br>e<br>f</div>");
+        assert!(r.height > 60.0, "text overflowing a short box: {}", r.height);
+        let plain = render("<p>short</p>");
+        assert!(plain.height < 100.0, "{}", plain.height);
     }
 
     #[test]
