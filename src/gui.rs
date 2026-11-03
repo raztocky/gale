@@ -5,11 +5,12 @@ use brickle::css::Color;
 use brickle::font;
 use brickle::layout::{Edges, Rect};
 use brickle::net;
-use brickle::network::{LogEntry, Network, Outcome};
+use brickle::network::{Action, LogEntry, Network, Outcome};
 use brickle::page::Rendered;
 use brickle::paint::{Canvas, GlyphCache};
 use brickle::tab::Tab;
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 const BAR_H: f32 = 40.0;
@@ -51,7 +52,91 @@ struct Ui {
     flash: Option<String>,
 }
 
-pub fn run(start: &str, sandboxed: bool, mut net: Network, panel: bool) -> Result<(), String> {
+/// What the window knows about the current page. The `Tab` itself may be
+/// away on the loader thread, so this copy is what the UI reads.
+#[derive(Clone)]
+struct Info {
+    url: String,
+    opener: Option<String>,
+    title: String,
+    log: Vec<LogEntry>,
+    interstitial: Option<Action>,
+}
+
+impl Info {
+    fn of(tab: &Tab) -> Info {
+        Info {
+            url: tab.url.clone(),
+            opener: tab.opener.clone(),
+            title: tab.title.clone(),
+            log: tab.log.clone(),
+            interstitial: tab.interstitial.clone(),
+        }
+    }
+}
+
+/// Work done off the UI thread, so a slow site or a stuck renderer never
+/// freezes the window.
+enum Job {
+    Open {
+        url: String,
+        from: Option<String>,
+        w: f32,
+        h: f32,
+    },
+    Render {
+        tab: Box<Tab>,
+        w: f32,
+        h: f32,
+    },
+}
+
+struct Done {
+    tab: Tab,
+    rendered: Rendered,
+    new_page: bool,
+}
+
+fn spawn_loader(net: Arc<Mutex<Network>>, sandboxed: bool) -> (Sender<Job>, Receiver<Done>) {
+    let (job_tx, job_rx) = mpsc::channel::<Job>();
+    let (done_tx, done_rx) = mpsc::channel::<Done>();
+    std::thread::Builder::new()
+        .name("brickle-loader".into())
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            for job in job_rx {
+                let done = match job {
+                    Job::Open { url, from, w, h } => {
+                        let mut tab = {
+                            let mut n = net.lock().unwrap_or_else(|e| e.into_inner());
+                            Tab::open(&mut n, &url, from.as_deref(), sandboxed)
+                        };
+                        let rendered = tab.render(w, h);
+                        Done {
+                            tab,
+                            rendered,
+                            new_page: true,
+                        }
+                    }
+                    Job::Render { mut tab, w, h } => {
+                        let rendered = tab.render(w, h);
+                        Done {
+                            tab: *tab,
+                            rendered,
+                            new_page: false,
+                        }
+                    }
+                };
+                if done_tx.send(done).is_err() {
+                    break;
+                }
+            }
+        })
+        .expect("loader thread");
+    (job_tx, done_rx)
+}
+
+pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<(), String> {
     let (mut w, mut h) = (1100usize, 768usize);
     let mut window = Window::new(
         "Brickle Browser",
@@ -67,13 +152,36 @@ pub fn run(start: &str, sandboxed: bool, mut net: Network, panel: bool) -> Resul
     let typed = Arc::new(Mutex::new(Vec::new()));
     window.set_input_callback(Box::new(Chars(typed.clone())));
 
+    let net = Arc::new(Mutex::new(net));
+    let (jobs, done_rx) = spawn_loader(net.clone(), sandboxed);
+
     let mut history: Vec<Entry> = Vec::new();
     let mut forward: Vec<Entry> = Vec::new();
-    let mut page = Tab::open(&mut net, start, None, sandboxed);
-    let mut rendered: Option<Rendered> = None;
+    let mut tab: Option<Tab> = None;
+    let mut info = Info {
+        url: start.to_string(),
+        opener: None,
+        title: String::new(),
+        log: vec![],
+        interstitial: None,
+    };
+    let mut rendered = Rendered {
+        list: vec![],
+        height: 0.0,
+        background: Color::WHITE,
+        links: vec![],
+    };
+    // In flight: the URL being loaded (None for a re-layout).
+    let mut busy: Option<Option<String>>;
+    // Esc pressed: drop the result of the current load when it arrives.
+    let mut discard = false;
+    // Wanted while busy: a navigation, or a re-layout at a new size.
+    let mut queued: Option<Entry> = None;
+    let mut need_layout = false;
+    let mut laid_out_at = (0.0f32, 0.0f32);
     let mut scroll = 0.0f32;
     let mut ui = Ui {
-        address: page.url.clone(),
+        address: start.to_string(),
         editing: false,
         hover: None,
         panel,
@@ -83,37 +191,85 @@ pub fn run(start: &str, sandboxed: bool, mut net: Network, panel: bool) -> Resul
     let mut cache = GlyphCache::default();
     let mut was_down = false;
     let mut dirty = true;
+    let mut frame = 0u32;
     let mut canvas = Canvas::new(w, h, Color::WHITE);
 
+    let _ = jobs.send(Job::Open {
+        url: start.to_string(),
+        from: None,
+        w: w as f32,
+        h: h as f32 - BAR_H,
+    });
+    busy = Some(Some(start.to_string()));
+
     while window.is_open() {
+        frame = frame.wrapping_add(1);
         let (nw, nh) = window.get_size();
         if (nw, nh) != (w, h) && nw > 0 && nh > 0 {
             (w, h) = (nw, nh);
-            rendered = None;
+            dirty = true;
         }
         let page_w = if ui.panel {
             (w as f32 - PANEL_W).max(200.0)
         } else {
             w as f32
         };
-        if rendered.is_none() {
-            rendered = Some(page.render(page_w, h as f32 - BAR_H));
-            let title = if page.title.is_empty() {
-                &page.url
-            } else {
-                &page.title
-            };
-            window.set_title(&format!("{title} — Brickle Browser"));
+        let view_h = h as f32 - BAR_H;
+
+        // Results from the loader.
+        while let Ok(done) = done_rx.try_recv() {
+            let was_open = matches!(busy, Some(Some(_)));
+            busy = None;
+            if discard && was_open {
+                discard = false;
+                continue; // stopped: keep showing the old page
+            }
+            discard = false;
+            info = Info::of(&done.tab);
+            rendered = done.rendered;
+            laid_out_at = (page_w, view_h);
+            tab = Some(done.tab);
+            if done.new_page {
+                ui.address = info.url.clone();
+                ui.panel_scroll = 0.0;
+                ui.hover = None;
+                let title = if info.title.is_empty() {
+                    &info.url
+                } else {
+                    &info.title
+                };
+                window.set_title(&format!("{title} — Brickle Browser"));
+            }
             dirty = true;
         }
-        let r = rendered.as_ref().unwrap();
-        let view_h = h as f32 - BAR_H;
-        let max_scroll = (r.height - view_h).max(0.0);
+        // Start queued work once idle.
+        if busy.is_none() {
+            if let Some((url, from)) = queued.take() {
+                let _ = jobs.send(Job::Open {
+                    url: url.clone(),
+                    from,
+                    w: page_w,
+                    h: view_h,
+                });
+                busy = Some(Some(url));
+                scroll = 0.0;
+            } else if need_layout || laid_out_at != (page_w, view_h) {
+                need_layout = false;
+                if let Some(t) = tab.take() {
+                    let _ = jobs.send(Job::Render {
+                        tab: Box::new(t),
+                        w: page_w,
+                        h: view_h,
+                    });
+                    busy = Some(None);
+                }
+            }
+        }
+
+        let max_scroll = (rendered.height - view_h).max(0.0);
         let mut navigate: Option<Entry> = None;
         let mut reload = false;
         let mut hist = 0i32;
-        // Panel toggled: lay the page out again at the new width.
-        let mut relayout = false;
 
         // Keyboard
         let ctrl = window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl);
@@ -129,7 +285,7 @@ pub fn run(start: &str, sandboxed: bool, mut net: Network, panel: bool) -> Resul
                     }
                     Key::Escape => {
                         ui.editing = false;
-                        ui.address = page.url.clone();
+                        ui.address = info.url.clone();
                     }
                     Key::Backspace => {
                         ui.address.pop();
@@ -154,8 +310,15 @@ pub fn run(start: &str, sandboxed: bool, mut net: Network, panel: bool) -> Resul
                 }
                 Key::R if ctrl => reload = true,
                 Key::F5 => reload = true,
-                Key::F12 => relayout = true,
-                Key::E if ctrl && shift => relayout = true,
+                Key::F12 => ui.panel = !ui.panel,
+                Key::E if ctrl && shift => ui.panel = !ui.panel,
+                Key::Escape if matches!(busy, Some(Some(_))) => {
+                    discard = true;
+                    queued = None;
+                    ui.address = info.url.clone();
+                    ui.flash = Some("Stopped".into());
+                    dirty = true;
+                }
                 Key::Left if alt => hist = -1,
                 Key::Backspace => hist = -1,
                 Key::Right if alt => hist = 1,
@@ -184,26 +347,28 @@ pub fn run(start: &str, sandboxed: bool, mut net: Network, panel: bool) -> Resul
             dirty = true;
         }
         scroll = scroll.clamp(0.0, max_scroll);
-        let badge = badge_rect(&page.log, w as f32);
+        let badge = badge_rect(&info.log, w as f32);
         let down = window.get_mouse_down(MouseButton::Left);
         if let Some((mx, my)) = mouse {
             let row = if over_panel {
-                panel_row(&page.log, my, ui.panel_scroll)
+                panel_row(&info.log, my, ui.panel_scroll)
             } else {
                 None
             };
             let hover = if let Some(i) = row {
-                let e = &page.log[i];
-                let (rule, verb) = net.toggle_preview(e);
-                Some(if e.host().is_empty() {
-                    "local file".to_string()
-                } else {
-                    format!("Click to {verb} {}  ({rule})", e.host())
+                let e = &info.log[i];
+                Some(match net.try_lock() {
+                    _ if e.host().is_empty() => "local file".to_string(),
+                    Ok(n) => {
+                        let (rule, verb) = n.toggle_preview(e);
+                        format!("Click to {verb} {}  ({rule})", e.host())
+                    }
+                    Err(_) => "Loading…".to_string(),
                 })
             } else if badge.contains(mx, my) {
                 Some("Show every request this page made (F12)".into())
             } else if my > BAR_H && mx < page_w {
-                r.link_at(mx, my - BAR_H + scroll).map(|s| s.to_string())
+                rendered.link_at(mx, my - BAR_H + scroll).map(|s| s.to_string())
             } else {
                 None
             };
@@ -214,107 +379,116 @@ pub fn run(start: &str, sandboxed: bool, mut net: Network, panel: bool) -> Resul
             if down && !was_down {
                 ui.flash = None;
                 if badge.contains(mx, my) {
-                    relayout = true;
+                    ui.panel = !ui.panel;
                 } else if my < BAR_H {
                     ui.editing = true;
                     ui.address.clear();
-                    dirty = true;
                 } else if let Some(i) = row {
-                    let e = page.log[i].clone();
-                    ui.flash = Some(match net.toggle(&e) {
-                        Ok(msg) => {
-                            reload = true;
-                            msg
-                        }
-                        Err(err) => err,
+                    let e = info.log[i].clone();
+                    ui.flash = Some(match net.try_lock() {
+                        Ok(mut n) => match n.toggle(&e) {
+                            Ok(msg) => {
+                                reload = true;
+                                msg
+                            }
+                            Err(err) => err,
+                        },
+                        Err(_) => "Wait for the page to finish loading".into(),
                     });
-                    dirty = true;
                 } else if over_panel {
-                } else if let Some(l) = r.link_at(mx, my - BAR_H + scroll) {
-                    let url = page.link_url(l);
+                } else if let Some(l) = rendered.link_at(mx, my - BAR_H + scroll) {
+                    let url = net::resolve(&info.url, l);
                     if let Some(rest) = url.strip_prefix("brickle:") {
                         // Internal actions only work on our own warning pages.
-                        if let Some(action) = page.interstitial.clone() {
+                        if let Some(action) = info.interstitial.clone() {
                             match rest {
                                 "proceed" => {
-                                    navigate = Some((net.allow_action(&action), page.opener.clone()))
+                                    if let Ok(mut n) = net.try_lock() {
+                                        navigate = Some((n.allow_action(&action), info.opener.clone()));
+                                    }
                                 }
                                 "back" => hist = -1,
                                 _ => {}
                             }
                         }
                     } else {
-                        navigate = Some((url, Some(page.url.clone())));
+                        navigate = Some((url, Some(info.url.clone())));
                     }
                 } else if ui.editing {
                     ui.editing = false;
-                    ui.address = page.url.clone();
-                    dirty = true;
+                    ui.address = info.url.clone();
                 }
+                dirty = true;
             }
         }
         was_down = down;
-        if relayout {
-            ui.panel = !ui.panel;
-            rendered = None;
-            continue;
-        }
 
+        // Navigation requests are queued and started when the loader is free.
         let moved = match hist {
             -1 => history
                 .pop()
-                .inspect(|_| forward.push((page.url.clone(), page.opener.clone()))),
+                .inspect(|_| forward.push((info.url.clone(), info.opener.clone()))),
             1 => forward
                 .pop()
-                .inspect(|_| history.push((page.url.clone(), page.opener.clone()))),
+                .inspect(|_| history.push((info.url.clone(), info.opener.clone()))),
             _ => None,
         };
-        let target = if reload {
-            Some((page.url.clone(), page.opener.clone()))
-        } else {
-            moved
-        };
-        if let Some((url, from)) = target {
-            page = Tab::open(&mut net, &url, from.as_deref(), sandboxed);
-            ui.address = page.url.clone();
-            rendered = None;
-            if !reload {
-                scroll = 0.0;
+        if reload {
+            queued = Some((info.url.clone(), info.opener.clone()));
+        } else if let Some(entry) = moved {
+            queued = Some(entry);
+        } else if let Some((url, from)) = navigate {
+            if !(url.starts_with("mailto:") || url.starts_with("javascript:")) {
+                if url != info.url {
+                    history.push((info.url.clone(), info.opener.clone()));
+                    forward.clear();
+                }
+                ui.address = url.clone();
+                queued = Some((url, from));
             }
-            continue;
         }
-        if let Some((url, from)) = navigate {
-            if url.starts_with("mailto:") || url.starts_with("javascript:") {
-                continue;
-            }
-            if url != page.url {
-                history.push((page.url.clone(), page.opener.clone()));
-                forward.clear();
-            }
-            page = Tab::open(&mut net, &url, from.as_deref(), sandboxed);
-            ui.address = page.url.clone();
-            rendered = None;
-            scroll = 0.0;
-            ui.hover = None;
-            ui.panel_scroll = 0.0;
-            continue;
+        if queued.is_some() && matches!(busy, Some(Some(_))) {
+            discard = true; // superseded by the newer navigation
         }
 
-        if dirty {
-            canvas = Canvas::new(w, h, r.background);
-            canvas.paint(&r.list, scroll, BAR_H, &mut cache);
+        let loading = matches!(busy, Some(Some(_))) || queued.is_some();
+        if dirty || loading {
+            canvas = Canvas::new(w, h, rendered.background);
+            canvas.paint(&rendered.list, scroll, BAR_H, &mut cache);
             draw_chrome(
                 &mut canvas,
                 &ui,
-                &page.log,
+                &info.log,
                 scroll,
                 max_scroll,
                 view_h,
                 page_w,
                 &mut cache,
             );
+            if loading {
+                // Indeterminate progress bar under the address bar.
+                let x = (frame % 120) as f32 / 120.0 * (w as f32 + 200.0) - 200.0;
+                canvas.fill(
+                    Rect {
+                        x,
+                        y: BAR_H - 3.0,
+                        w: 200.0,
+                        h: 3.0,
+                    },
+                    Color::rgb(0x3b, 0x82, 0xf6),
+                    0.0,
+                );
+            }
             if ui.panel {
-                draw_panel(&mut canvas, &page.log, &net, ui.panel_scroll, page_w, &mut cache);
+                let n = net.try_lock().ok();
+                draw_panel(
+                    &mut canvas,
+                    &info.log,
+                    n.as_deref(),
+                    ui.panel_scroll,
+                    page_w,
+                    &mut cache,
+                );
             }
             draw_status(&mut canvas, &ui, page_w, &mut cache);
             dirty = false;
@@ -463,7 +637,7 @@ fn draw_chrome(
         // Anti-spoofing: the real (punycode) host in bold, the rest dimmed,
         // and a warning on unencrypted pages.
         let mut x = field.x + 10.0;
-        if net::scheme(&ui.address) == "http" {
+        if net::scheme(&ui.address) == "http" && !net::is_local_host(&brickle::filter::host_of(&ui.address)) {
             text(c, x, base, "Not secure", BOLD, 13.0, RED, cache, 0.0);
             x += font::measure(BOLD, 13.0, "Not secure") + 6.0;
             c.fill(
@@ -511,7 +685,7 @@ fn draw_chrome(
 fn draw_panel(
     c: &mut Canvas,
     log: &[LogEntry],
-    net: &Network,
+    net: Option<&Network>,
     panel_scroll: f32,
     x0: f32,
     cache: &mut GlyphCache,
@@ -550,15 +724,17 @@ fn draw_panel(
         cache,
         BAR_H,
     );
-    let stats = net.filter_stats();
-    let sub = if net.lists_loaded == 0 {
-        "No filter lists. Run `brickle filters update`.".to_string()
-    } else {
-        format!(
-            "{} lists, {}k rules · click a row to block/allow",
-            net.lists_loaded,
-            (stats.network + stats.cosmetic) / 1000
-        )
+    let sub = match net {
+        None => "Loading…".to_string(),
+        Some(n) if n.lists_loaded == 0 => "No filter lists. Run `brickle filters update`.".to_string(),
+        Some(n) => {
+            let stats = n.filter_stats();
+            format!(
+                "{} lists, {}k rules · click a row to block/allow",
+                n.lists_loaded,
+                (stats.network + stats.cosmetic) / 1000
+            )
+        }
     };
     let sub = fit(&sub, pw - 28.0, SANS, 11.0);
     text(c, x0 + 14.0, BAR_H + 42.0, &sub, SANS, 11.0, GRAY, cache, BAR_H);
@@ -584,7 +760,8 @@ fn draw_panel(
             Outcome::Blocked { .. }
             | Outcome::Denied { .. }
             | Outcome::MixedContent
-            | Outcome::NotAllowed => RED,
+            | Outcome::NotAllowed
+            | Outcome::LocalNetwork => RED,
             Outcome::NeedsHttpConsent | Outcome::Failed(_) | Outcome::OverLimit => AMBER,
             _ if e.insecure => AMBER,
             _ => GREEN,

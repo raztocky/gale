@@ -44,7 +44,7 @@ libraries, run `sudo apt install build-essential libxkbcommon-dev`.
 | Request panel | `F12`, `Ctrl+Shift+E`, or click "N blocked · M requests" |
 | Scroll | mouse wheel, arrow keys, `Space`, `PgUp`/`PgDn` |
 | Back / forward | `Backspace` or `Alt+←` / `Alt+→` |
-| Reload | `Ctrl+R` or `F5` |
+| Reload / stop | `Ctrl+R` or `F5` / `Esc` |
 
 ## Architecture
 
@@ -88,12 +88,20 @@ described in [PRIVACY.md](PRIVACY.md). Security measures:
 
 - **Sandboxed renderer (Linux).** Each page is parsed in its own process, locked down with:
   - **Landlock:** no filesystem access, no TCP, no signals or abstract sockets outside the sandbox.
-  - **seccomp-bpf:** a syscall allowlist, so `open`, `socket`, `execve` and the like fail.
+  - **seccomp-bpf:** a syscall allowlist, so `open`, `socket` and the like fail. `clone` can only
+    create threads, memory can never be made executable, and attacker-only calls (`execve`,
+    `ptrace`, `mount`, `bpf`, …) kill the renderer outright.
   - **rlimits:** 4 GB of memory and 120 s of CPU time.
 
   The browser kills a renderer that hangs for 20 s or sends a malformed message, then shows an
   error page. Run `brickle sandbox-test` to see it block file reads, network and exec on your
   machine.
+- **Web pages can't reach your local network.** A public website can't make Brickle send
+  requests to your router, printer or other devices (`192.168.x.x`, `localhost`, …). This is
+  checked after the DNS lookup, on the exact address Brickle connects to, so a site can't sneak
+  past it by pointing its domain at your network (DNS rebinding). A link from a website to a
+  local device asks first. (Through a proxy, the proxy does the DNS lookup, so only literal local
+  addresses and names are caught.)
 - **Web pages can't read your files.** A page loaded over `http(s)` can never load or link to
   `file://` URLs. The rule also covers reload, back and forward. Only `http`, `https` and `file`
   are supported at all.
@@ -101,11 +109,14 @@ described in [PRIVACY.md](PRIVACY.md). Security measures:
   like `аpple.com` shows as `xn--pple-43d.com`. `user@` prefixes are hidden, so
   `google.com@evil.com` shows as `evil.com`. Pages can't draw over the browser's own UI.
 - **Resource limits against hostile pages:**
-  - Responses and files up to 8 MB, 5 redirects, 20 s timeout, text content types only.
+  - Responses and files up to 8 MB, 5 redirects, 20 s per request, text content types only.
+  - A page and its stylesheets get 30 s and 32 MB in total.
   - At most 16 external stylesheets and 5,000 rules per sheet.
   - Element nesting depth 256 and 100,000 nodes per page.
   - Selectors up to 32 parts, and matching can't blow up exponentially.
   - Fonts capped at 256 px, and the glyph cache is bounded.
+- **A slow or hostile page can't freeze the window.** Loading and layout run on a background
+  thread; `Esc` stops a load.
 - **No `unsafe` code** in Brickle itself (`#![forbid(unsafe_code)]`).
 - **Fuzzed.** `fuzz/` has [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets for the
   HTML parser, the CSS parser, the whole render pipeline, the IPC decoder and the filter engine.
@@ -113,7 +124,8 @@ described in [PRIVACY.md](PRIVACY.md). Security measures:
   `render`, `ipc`, `filter`).
 - **Dependency auditing.** [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) checks
   RustSec advisories, licenses and sources, and bans AI crates, in CI on every push and weekly
-  (config in `deny.toml`).
+  (config in `deny.toml`). CI actions are pinned to commit hashes, and Dependabot proposes
+  updates. To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 On non-Linux systems the sandbox isn't implemented yet, so you have to run with `--no-sandbox`.
 

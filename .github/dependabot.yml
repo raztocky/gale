@@ -1,0 +1,17 @@
+# Dependabot opens pull requests to update dependencies and the pinned
+# action commits. Nothing is merged automatically; CI runs on every PR.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+  - package-ecosystem: cargo
+    directory: /fuzz
+    schedule:
+      interval: monthly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

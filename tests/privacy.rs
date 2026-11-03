@@ -266,3 +266,61 @@ fn only_net_rs_talks_to_the_network() {
         }
     }
 }
+
+#[test]
+fn local_proxy_still_works_for_public_pages() {
+    // A proxy on 127.0.0.1 (like Tor or Privoxy) must not trip the
+    // local-network protection for a public page's subresources.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy = format!("http://{}", listener.local_addr().unwrap());
+    let connects = Arc::new(Mutex::new(Vec::new()));
+    let c2 = connects.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut first = String::new();
+            reader.read_line(&mut first).unwrap();
+            c2.lock().unwrap().push(first.trim().to_string());
+            let mut l = String::new();
+            while reader.read_line(&mut l).unwrap_or(0) > 0 && l != "\r\n" {
+                l.clear();
+            }
+            let mut s = stream;
+            if first.starts_with("CONNECT") {
+                let _ = s.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n");
+                // Then act as the origin server inside the tunnel.
+                loop {
+                    l.clear();
+                    if reader.read_line(&mut l).unwrap_or(0) == 0 || l == "\r\n" {
+                        break;
+                    }
+                }
+            }
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/css\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        }
+    });
+    std::env::set_var("HTTPS_PROXY", &proxy);
+    std::env::set_var("NO_PROXY", "");
+    let r = brickle::net::http_get(
+        "http://public.example/x.css",
+        brickle::net::Dest::Stylesheet,
+        Some("https://page.example/"),
+        true,
+    );
+    std::env::remove_var("HTTPS_PROXY");
+    assert_eq!(r.map(|r| r.body).unwrap(), "ok");
+    assert!(
+        connects.lock().unwrap()[0].contains("public.example"),
+        "{:?}",
+        connects.lock().unwrap()
+    );
+
+    // But a literal local address is still refused, proxy or not.
+    let r = brickle::net::http_get(
+        "http://192.168.0.1/x.css",
+        brickle::net::Dest::Stylesheet,
+        Some("https://page.example/"),
+        true,
+    );
+    assert_eq!(r.err().as_deref(), Some(brickle::net::LOCAL_NETWORK_ERR));
+}

@@ -14,16 +14,21 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# Third-party actions are pinned to full commit hashes (tags can be moved);
+# Dependabot keeps the pins up to date.
 jobs:
   test:
     name: fmt, clippy, tests, sandbox
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: System libraries for the window
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev
       - run: cargo fmt --check
@@ -33,11 +38,13 @@ jobs:
         run: cargo run --release --locked -- sandbox-test
 
   deny:
-    name: cargo-deny (advisories, licenses, sources)
+    name: cargo-deny (advisories, licenses, sources, bans)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
 
   fuzz:
     name: fuzz (${{ matrix.target }})
@@ -47,17 +54,33 @@ jobs:
       matrix:
         target: [html, css, render, ipc, filter]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: fuzz
+      # Keep the corpus between runs so each run builds on the last instead
+      # of rediscovering the same inputs.
+      - name: Restore fuzz corpus
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
       - run: cargo install cargo-fuzz --locked
       - name: Fuzz for 3 minutes
         run: cargo fuzz run -O ${{ matrix.target }} -- -max_total_time=180 -max_len=8192 -timeout=10 -rss_limit_mb=4096
+      - name: Shrink the corpus
+        if: success()
+        run: |
+          cargo fuzz cmin -O ${{ matrix.target }} 2>/dev/null || true
       - name: Upload crashing inputs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: fuzz-artifacts-${{ matrix.target }}
           path: fuzz/artifacts

@@ -168,6 +168,9 @@ pub struct GlyphCache {
     bytes: usize,
 }
 
+/// Smallest text size the painter will rasterize, in px.
+pub const MIN_TEXT_SIZE: f32 = 1.0;
+
 const GLYPH_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 impl Canvas {
@@ -235,10 +238,14 @@ impl Canvas {
         cache: &mut GlyphCache,
         clip_top: f32,
     ) {
+        // fontdue corrupts memory when rasterizing at tiny (subnormal) sizes
+        // (found by fuzzing). Text under MIN_TEXT_SIZE is invisible anyway.
+        if !(MIN_TEXT_SIZE..=crate::style::MAX_FONT_SIZE).contains(&size) || font_idx >= font::fonts().len() {
+            return;
+        }
         let f = &font::fonts()[font_idx];
         let mut pen = x;
         for ch in text.chars() {
-            let size = size.clamp(0.0, crate::style::MAX_FONT_SIZE);
             let key = (font_idx, ch, (size * 4.0) as u32);
             if !cache.map.contains_key(&key) {
                 if cache.bytes > GLYPH_CACHE_BYTES {
@@ -315,4 +322,30 @@ impl Canvas {
 
 fn pack(c: Color) -> u32 {
     ((c.r as u32) << 16) | ((c.g as u32) << 8) | c.b as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tiny_and_odd_text_sizes_are_safe() {
+        // Found by fuzzing: subnormal sizes made fontdue write out of bounds.
+        let mut c = Canvas::new(32, 32, Color::WHITE);
+        let mut cache = GlyphCache::default();
+        for size in [1e-45, 9.18e-41, 1e-7, 0.5, 0.0, -3.0, f32::NAN, 1e9] {
+            c.text(
+                1.0,
+                20.0,
+                "Xa\u{1}\u{10}g",
+                0,
+                size,
+                Color::BLACK,
+                true,
+                &mut cache,
+                0.0,
+            );
+        }
+        c.text(1.0, 20.0, "x", 99, 12.0, Color::BLACK, false, &mut cache, 0.0);
+    }
 }

@@ -61,17 +61,63 @@ pub fn read_file(path: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// Loopback and private-network hosts, which HTTPS-only mode doesn't
-/// upgrade (as in Firefox).
+/// Loopback, private, link-local and similar non-public addresses.
+pub fn is_local_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || (o[0] == 100 && (o[1] & 0xc0) == 64) // carrier-grade NAT 100.64/10
+                || o[0] == 0
+        }
+        std::net::IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (seg[0] & 0xfe00) == 0xfc00 // unique local
+                || (seg[0] & 0xffc0) == 0xfe80 // link local
+                || v6.to_ipv4_mapped().is_some_and(|v4| is_local_ip(v4.into()))
+        }
+    }
+}
+
+/// Loopback and private-network hosts, judged by name or literal address
+/// (no DNS lookup). HTTPS-only mode doesn't upgrade these (as in Firefox).
 pub fn is_local_host(host: &str) -> bool {
     let h = host.trim_matches(['[', ']']).to_ascii_lowercase();
     if h == "localhost" || h.ends_with(".localhost") || h.ends_with(".local") {
         return true;
     }
-    match h.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
-        Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback() || (ip.segments()[0] & 0xfe00) == 0xfc00,
-        Err(_) => false,
+    h.parse::<std::net::IpAddr>().is_ok_and(is_local_ip)
+}
+
+/// Prefix of the error returned when a public page's request resolves to a
+/// local-network address.
+pub const LOCAL_NETWORK_ERR: &str = "blocked: resolves to a local network address";
+
+/// DNS resolver that drops local-network addresses. ureq connects to
+/// exactly the addresses it returns, so a site can't pass this check and
+/// then re-point its DNS at your router (DNS rebinding).
+struct PublicOnly;
+
+impl ureq::Resolver for PublicOnly {
+    fn resolve(&self, netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        use std::net::ToSocketAddrs;
+        let addrs: Vec<_> = netloc
+            .to_socket_addrs()?
+            .filter(|a| !is_local_ip(a.ip()))
+            .collect();
+        if addrs.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                LOCAL_NETWORK_ERR,
+            ));
+        }
+        Ok(addrs)
     }
 }
 
@@ -110,17 +156,36 @@ pub struct Response {
 
 /// One HTTP GET. Redirects are returned, not followed, so the caller can
 /// check every hop. HTTP error statuses are returned with their body.
-pub fn http_get(url: &str, dest: Dest, initiator: Option<&str>) -> Result<Response, String> {
+///
+/// With `public_only`, the request is refused if the host is (or resolves
+/// to) a local-network address: a website must not be able to reach your
+/// router, printer or other devices through your browser.
+pub fn http_get(
+    url: &str,
+    dest: Dest,
+    initiator: Option<&str>,
+    public_only: bool,
+) -> Result<Response, String> {
     let host = url::Url::parse(url)
         .ok()
         .and_then(|u| u.host_str().map(str::to_string))
         .unwrap_or_default();
-    let agent = ureq::AgentBuilder::new()
+    if public_only && is_local_host(&host) {
+        return Err(LOCAL_NETWORK_ERR.into());
+    }
+    let proxied = proxy_configured() && !bypass_proxy(&host);
+    let mut builder = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
         .timeout(Duration::from_secs(20))
         .redirects(0)
-        .try_proxy_from_env(!bypass_proxy(&host))
-        .build();
+        .try_proxy_from_env(!bypass_proxy(&host));
+    // Through a proxy, the proxy resolves the name (and our resolver would
+    // only see the proxy's own, often local, address), so only the literal
+    // check above applies.
+    if public_only && !proxied {
+        builder = builder.resolver(PublicOnly);
+    }
+    let agent = builder.build();
     let site = fetch_site(initiator, url);
     // Header names, values and order as sent by Firefox.
     let mut req = agent.get(url).set("User-Agent", &user_agent());
@@ -158,7 +223,14 @@ pub fn http_get(url: &str, dest: Dest, initiator: Option<&str>) -> Result<Respon
     let resp = match req.call() {
         Ok(r) => r,
         Err(ureq::Error::Status(_, r)) => r,
-        Err(e) => return Err(e.to_string()),
+        Err(e) => {
+            let msg = e.to_string();
+            return Err(if msg.contains(LOCAL_NETWORK_ERR) {
+                LOCAL_NETWORK_ERR.into()
+            } else {
+                msg
+            });
+        }
     };
     let status = resp.status();
     if (300..400).contains(&status) {
@@ -205,6 +277,19 @@ pub fn http_get(url: &str, dest: Dest, initiator: Option<&str>) -> Result<Respon
         location: None,
         body: String::from_utf8_lossy(&bytes).into_owned(),
     })
+}
+
+fn proxy_configured() -> bool {
+    [
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ]
+    .iter()
+    .any(|v| std::env::var(v).is_ok_and(|x| !x.trim().is_empty()))
 }
 
 /// Honour NO_PROXY (ureq 2 doesn't): comma-separated hosts, `.suffix` or
@@ -372,7 +457,22 @@ mod tests {
         ] {
             assert!(is_local_host(h), "{h}");
         }
-        for h in ["example.com", "8.8.8.8", "localhost.example.com"] {
+        for h in [
+            "100.64.0.1",
+            "169.254.1.1",
+            "0.0.0.0",
+            "[fd00::1]",
+            "[fe80::1]",
+            "[::ffff:192.168.0.1]",
+        ] {
+            assert!(is_local_host(h), "{h}");
+        }
+        for h in [
+            "example.com",
+            "8.8.8.8",
+            "localhost.example.com",
+            "[2606:4700::1111]",
+        ] {
             assert!(!is_local_host(h), "{h}");
         }
         assert_eq!(fetch_site(None, "https://a.com/"), "none");
@@ -385,6 +485,14 @@ mod tests {
             "same-site"
         );
         assert_eq!(fetch_site(Some("https://a.com/"), "https://b.com/"), "cross-site");
+    }
+
+    #[test]
+    fn resolver_drops_local_addresses() {
+        use ureq::Resolver;
+        // `localhost` resolves to loopback via /etc/hosts: no network needed.
+        let err = PublicOnly.resolve("localhost:80").unwrap_err();
+        assert!(err.to_string().contains(LOCAL_NETWORK_ERR));
     }
 
     #[test]

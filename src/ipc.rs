@@ -322,7 +322,14 @@ impl FromRenderer {
                             if font >= FONT_COUNT {
                                 return Err(format!("bad font index {font}"));
                             }
+                            // Sizes below 1px are invisible and unsafe to
+                            // rasterize (see paint::MIN_TEXT_SIZE): zero them.
                             let size = d.f32()?.clamp(0.0, MAX_FONT_SIZE);
+                            let size = if size < crate::paint::MIN_TEXT_SIZE {
+                                0.0
+                            } else {
+                                size
+                            };
                             let color = d.color()?;
                             let italic = d.u8()? != 0;
                             DisplayCommand::Text {

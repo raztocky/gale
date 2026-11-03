@@ -23,6 +23,10 @@ use std::path::PathBuf;
 const MAX_REDIRECTS: usize = 5;
 /// Most external stylesheets one page may pull in.
 pub const MAX_STYLESHEETS: usize = 16;
+/// Total time a page's subresources may take, however many there are.
+pub const PAGE_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+/// Total bytes a page and its subresources may download.
+pub const PAGE_BYTE_BUDGET: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outcome {
@@ -49,8 +53,10 @@ pub enum Outcome {
     NeedsHttpConsent,
     /// Not an allowed scheme, or a web page reaching for `file://`.
     NotAllowed,
-    /// Too many stylesheets on one page.
+    /// Over the page's stylesheet count, time or size budget.
     OverLimit,
+    /// A public website reaching for your local network (router, printer, ...).
+    LocalNetwork,
     Failed(String),
 }
 
@@ -86,6 +92,7 @@ impl LogEntry {
 pub enum Action {
     AllowHttp { host: String, url: String },
     AllowBlocked { host: String, url: String },
+    AllowLocal { host: String, url: String },
 }
 
 pub enum Nav {
@@ -115,6 +122,7 @@ enum Fetch {
     Stopped(String),
     NeedsHttp { host: String, url: String },
     FilterBlocked { host: String, url: String, rule: String },
+    LocalNetwork { host: String, url: String },
 }
 
 pub struct Network {
@@ -126,8 +134,12 @@ pub struct Network {
     http_allowed: HashSet<String>,
     /// Hosts you chose to visit despite a filter block this session.
     visit_allowed: HashSet<String>,
+    /// Local-network hosts you chose to open from a website this session.
+    local_allowed: HashSet<String>,
     log: Vec<LogEntry>,
     page_stylesheets: usize,
+    page_started: std::time::Instant,
+    page_bytes: usize,
     pub lists_loaded: usize,
 }
 
@@ -155,8 +167,11 @@ impl Network {
             rules_path: None,
             http_allowed: HashSet::new(),
             visit_allowed: HashSet::new(),
+            local_allowed: HashSet::new(),
             log: Vec::new(),
             page_stylesheets: 0,
+            page_started: std::time::Instant::now(),
+            page_bytes: 0,
             lists_loaded: 0,
         }
     }
@@ -234,8 +249,30 @@ impl Network {
     /// Load a top-level page. `from` is the page that linked here, if any.
     pub fn navigate(&mut self, url: &str, from: Option<&str>) -> Nav {
         self.page_stylesheets = 0;
+        self.page_started = std::time::Instant::now();
+        self.page_bytes = 0;
         match self.fetch(url, from, Dest::Document) {
-            Fetch::Done { url, body } => Nav::Page { url, html: body },
+            Fetch::Done { url, body } => {
+                self.page_bytes = body.len();
+                Nav::Page { url, html: body }
+            }
+            Fetch::LocalNetwork { host, url } => Nav::Interstitial {
+                html: interstitial(
+                    "A website is sending you to your local network",
+                    &format!(
+                        "This link leads to <b>{}</b>, a device on your own network (such as a router or \
+                         printer) rather than a website. Websites sometimes do this to change settings on \
+                         your devices. Only continue if you expected this.",
+                        esc(&host)
+                    ),
+                    "Open it anyway (this session)",
+                ),
+                action: Action::AllowLocal {
+                    host,
+                    url: url.clone(),
+                },
+                url,
+            },
             Fetch::Stopped(why) => Nav::Page {
                 url: url.to_string(),
                 html: error_page(url, &why),
@@ -281,12 +318,25 @@ impl Network {
     /// the browser's own state, never from the renderer.
     pub fn subresource(&mut self, page_url: &str, url: &str) -> Result<String, String> {
         self.page_stylesheets += 1;
-        if self.page_stylesheets > MAX_STYLESHEETS {
+        let why = if self.page_stylesheets > MAX_STYLESHEETS {
+            Some("too many stylesheets")
+        } else if self.page_started.elapsed() > PAGE_TIME_BUDGET {
+            Some("page took too long to load")
+        } else if self.page_bytes > PAGE_BYTE_BUDGET {
+            Some("page downloaded too much")
+        } else {
+            None
+        };
+        if let Some(why) = why {
             self.record(url, Dest::Stylesheet, Outcome::OverLimit, vec![]);
-            return Err(format!("too many stylesheets, skipped {url}"));
+            return Err(format!("{why}, skipped {url}"));
         }
         match self.fetch(url, Some(page_url), Dest::Stylesheet) {
-            Fetch::Done { body, .. } => Ok(body),
+            Fetch::Done { body, .. } => {
+                self.page_bytes += body.len();
+                Ok(body)
+            }
+            Fetch::LocalNetwork { url, .. } => Err(format!("blocked local-network request {url}")),
             Fetch::Stopped(why) => Err(why),
             Fetch::NeedsHttp { url, .. } => Err(format!("blocked insecure {url}")),
             Fetch::FilterBlocked { url, .. } => Err(format!("blocked {url}")),
@@ -301,6 +351,10 @@ impl Network {
             }
             Action::AllowBlocked { host, url } => {
                 self.visit_allowed.insert(host.clone());
+                url.clone()
+            }
+            Action::AllowLocal { host, url } => {
+                self.local_allowed.insert(host.clone());
                 url.clone()
             }
         }
@@ -383,7 +437,11 @@ impl Network {
                 return Fetch::Stopped(format!("blocked insecure {url} on a secure page"));
             }
 
-            let result = net::http_get(&target, dest, from.as_deref());
+            // A public page may not reach local-network addresses, unless
+            // you said so for this host (navigations only).
+            let public_only = from.as_deref().is_some_and(is_public_page)
+                && !(dest == Dest::Document && self.local_allowed.contains(&host));
+            let result = net::http_get(&target, dest, from.as_deref(), public_only);
             let entry_url = target.clone();
             match result {
                 Ok(resp) if (300..400).contains(&resp.status) && resp.location.is_some() => {
@@ -413,6 +471,14 @@ impl Network {
                     return Fetch::Done {
                         url: target,
                         body: resp.body,
+                    };
+                }
+                Err(err) if err == net::LOCAL_NETWORK_ERR => {
+                    self.record(&entry_url, dest, Outcome::LocalNetwork, stripped);
+                    return if dest == Dest::Document {
+                        Fetch::LocalNetwork { host, url }
+                    } else {
+                        Fetch::Stopped(format!("blocked local-network request {url}"))
                     };
                 }
                 Err(err) if upgraded => {
@@ -513,6 +579,11 @@ impl Network {
     }
 }
 
+/// A page served from the internet (not a local file or local device).
+fn is_public_page(url: &str) -> bool {
+    matches!(net::scheme(url), "http" | "https") && !net::is_local_host(&filter::host_of(url))
+}
+
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
@@ -596,6 +667,45 @@ mod tests {
             Nav::Page { html, .. } => assert!(html.contains("aren't allowed")),
             Nav::Interstitial { .. } => panic!(),
         }
+    }
+
+    #[test]
+    fn websites_cannot_reach_the_local_network() {
+        let mut n = Network::empty();
+        let before = net::requests_sent();
+        for target in [
+            "http://192.168.1.1/reboot.css",
+            "http://localhost:8080/x.css",
+            "http://[::1]/x.css",
+        ] {
+            assert!(n.subresource("https://evil.example/", target).is_err());
+            assert_eq!(
+                n.take_log().last().unwrap().outcome,
+                Outcome::LocalNetwork,
+                "{target}"
+            );
+        }
+        assert_eq!(net::requests_sent(), before, "nothing was sent");
+        match n.navigate("http://192.168.1.1/admin", Some("https://evil.example/")) {
+            Nav::Interstitial {
+                action: Action::AllowLocal { host, .. },
+                ..
+            } => assert_eq!(host, "192.168.1.1"),
+            _ => panic!("expected the local-network warning"),
+        }
+    }
+
+    #[test]
+    fn page_time_budget() {
+        let mut n = Network::empty();
+        n.page_started = std::time::Instant::now() - PAGE_TIME_BUDGET - std::time::Duration::from_secs(1);
+        let before = net::requests_sent();
+        assert!(n
+            .subresource("https://a.example/", "https://a.example/late.css")
+            .unwrap_err()
+            .contains("too long"));
+        assert_eq!(n.take_log()[0].outcome, Outcome::OverLimit);
+        assert_eq!(net::requests_sent(), before);
     }
 
     #[test]

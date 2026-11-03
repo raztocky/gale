@@ -7,8 +7,10 @@
 //! - **rlimits:** bounded memory and CPU time, no core dumps.
 //! - **Landlock:** no filesystem access at all, no TCP bind/connect, no
 //!   signals or abstract UNIX sockets outside the sandbox.
-//! - **seccomp-bpf:** a syscall allowlist. Everything else (open, socket,
-//!   connect, execve, ptrace, ...) fails with EPERM.
+//! - **seccomp-bpf:** a syscall allowlist; everything else (open, socket,
+//!   connect, ...) fails with EPERM. `clone` is limited to threads, memory
+//!   can never be made executable, and attacker-only calls (execve, ptrace,
+//!   mount, bpf, ...) kill the process.
 //!
 //! Fonts are compiled into the binary, so the renderer never needs to open a
 //! file after it starts.
@@ -34,7 +36,10 @@ mod linux {
     use super::Report;
     use landlock::{Access, AccessFs, AccessNet, Ruleset, RulesetAttr, RulesetStatus, Scope, ABI};
     use rlimit::Resource;
-    use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, TargetArch};
+    use seccompiler::{
+        BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
+        SeccompRule, TargetArch,
+    };
     use std::collections::BTreeMap;
 
     const MEMORY_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
@@ -87,10 +92,8 @@ mod linux {
         libc::SYS_exit,
         libc::SYS_exit_group,
         libc::SYS_brk,
-        libc::SYS_mmap,
         libc::SYS_munmap,
         libc::SYS_mremap,
-        libc::SYS_mprotect,
         libc::SYS_madvise,
         libc::SYS_futex,
         libc::SYS_rt_sigaction,
@@ -103,72 +106,177 @@ mod linux {
         libc::SYS_clock_gettime,
         libc::SYS_clock_nanosleep,
         libc::SYS_nanosleep,
-        libc::SYS_clone,
-        libc::SYS_clone3,
         libc::SYS_set_robust_list,
         libc::SYS_rseq,
-        libc::SYS_prctl,
         libc::SYS_gettid,
         libc::SYS_getpid,
         libc::SYS_tgkill,
         libc::SYS_membarrier,
     ];
 
+    /// Syscalls that only an attacker would make: the renderer is killed on
+    /// the spot rather than just refused.
+    const KILL: &[i64] = &[
+        libc::SYS_execve,
+        libc::SYS_execveat,
+        libc::SYS_ptrace,
+        libc::SYS_process_vm_readv,
+        libc::SYS_process_vm_writev,
+        libc::SYS_bpf,
+        libc::SYS_perf_event_open,
+        libc::SYS_keyctl,
+        libc::SYS_add_key,
+        libc::SYS_request_key,
+        libc::SYS_userfaultfd,
+        libc::SYS_mount,
+        libc::SYS_umount2,
+        libc::SYS_unshare,
+        libc::SYS_setns,
+        libc::SYS_init_module,
+        libc::SYS_finit_module,
+        libc::SYS_delete_module,
+        libc::SYS_pivot_root,
+        libc::SYS_chroot,
+        libc::SYS_kexec_load,
+        libc::SYS_reboot,
+        libc::SYS_swapon,
+    ];
+
+    fn cond(
+        arg: u8,
+        len: SeccompCmpArgLen,
+        op: SeccompCmpOp,
+        value: u64,
+    ) -> Result<SeccompCondition, String> {
+        SeccompCondition::new(arg, len, op, value).map_err(|e| format!("seccomp: {e}"))
+    }
+
+    fn rule(conds: Vec<SeccompCondition>) -> Result<SeccompRule, String> {
+        SeccompRule::new(conds).map_err(|e| format!("seccomp: {e}"))
+    }
+
+    fn install(
+        rules: BTreeMap<i64, Vec<SeccompRule>>,
+        mismatch: SeccompAction,
+        matched: SeccompAction,
+        arch: TargetArch,
+    ) -> Result<(), String> {
+        let filter =
+            SeccompFilter::new(rules, mismatch, matched, arch).map_err(|e| format!("seccomp: {e}"))?;
+        let prog: BpfProgram = filter.try_into().map_err(|e| format!("seccomp: {e:?}"))?;
+        seccompiler::apply_filter_all_threads(&prog).map_err(|e| format!("seccomp: {e}"))
+    }
+
+    /// Three stacked filters. The kernel applies the strictest result
+    /// (kill > errno > allow). The allowlist goes on last, because once it is
+    /// active no further filters can be installed.
     fn apply_seccomp() -> Result<(), String> {
+        use SeccompCmpArgLen::{Dword, Qword};
         let arch = TargetArch::try_from(std::env::consts::ARCH).map_err(|e| format!("seccomp: {e}"))?;
-        let rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> =
-            ALLOWED.iter().map(|&n| (n, Vec::new())).collect();
-        let filter = SeccompFilter::new(
-            rules,
+
+        // 1. Kill outright on attacker-only syscalls.
+        install(
+            KILL.iter().map(|&n| (n, Vec::new())).collect(),
+            SeccompAction::Allow,
+            SeccompAction::KillProcess,
+            arch,
+        )?;
+
+        // 2. clone3 passes its flags in memory, which seccomp can't inspect.
+        //    Report it as unsupported so the C library falls back to clone,
+        //    whose flags are checked below.
+        install(
+            BTreeMap::from([(libc::SYS_clone3, Vec::new())]),
+            SeccompAction::Allow,
+            SeccompAction::Errno(libc::ENOSYS as u32),
+            arch,
+        )?;
+
+        // 3. Allowlist: everything else fails with EPERM.
+        let mut allow: BTreeMap<i64, Vec<SeccompRule>> = ALLOWED.iter().map(|&n| (n, Vec::new())).collect();
+        // (Answered with ENOSYS by filter 2, which takes precedence.)
+        allow.insert(libc::SYS_clone3, Vec::new());
+        // Threads only: clone must carry CLONE_THREAD (no new processes).
+        let thread = libc::CLONE_THREAD as u64;
+        allow.insert(
+            libc::SYS_clone,
+            vec![rule(vec![cond(
+                0,
+                Qword,
+                SeccompCmpOp::MaskedEq(thread),
+                thread,
+            )?])?],
+        );
+        // Never executable memory: no JIT, no injected code.
+        let exec = libc::PROT_EXEC as u64;
+        allow.insert(
+            libc::SYS_mmap,
+            vec![rule(vec![cond(2, Dword, SeccompCmpOp::MaskedEq(exec), 0)?])?],
+        );
+        allow.insert(
+            libc::SYS_mprotect,
+            vec![rule(vec![cond(2, Dword, SeccompCmpOp::MaskedEq(exec), 0)?])?],
+        );
+        // prctl only for naming threads and memory regions.
+        const PR_SET_VMA: u64 = 0x53564d41;
+        allow.insert(
+            libc::SYS_prctl,
+            vec![
+                rule(vec![cond(0, Dword, SeccompCmpOp::Eq, libc::PR_SET_NAME as u64)?])?,
+                rule(vec![cond(0, Dword, SeccompCmpOp::Eq, PR_SET_VMA)?])?,
+            ],
+        );
+        install(
+            allow,
             SeccompAction::Errno(libc::EPERM as u32),
             SeccompAction::Allow,
             arch,
         )
-        .map_err(|e| format!("seccomp: {e}"))?;
-        let prog: BpfProgram = filter.try_into().map_err(|e| format!("seccomp: {e:?}"))?;
-        seccompiler::apply_filter_all_threads(&prog).map_err(|e| format!("seccomp: {e}"))
     }
 }
 
-/// Try things a compromised renderer would want to do. Each entry is
-/// (what, true if it was blocked). Call only after [`enter`].
-pub fn probe() -> Vec<(&'static str, bool)> {
+/// Things a compromised renderer would want to do. `brickle sandbox-test`
+/// runs each in its own sandboxed process, because some of them (like
+/// running a program) kill the process outright.
+pub const PROBES: &[&str] = &[
+    "read /etc/passwd",
+    "list home directory",
+    "create a file in /tmp",
+    "open a TCP connection",
+    "open a UDP socket",
+    "run another program",
+    "replace itself with another program",
+];
+
+/// Run one probe (after [`enter`]). Returns true if it was blocked.
+pub fn probe(name: &str) -> bool {
     use std::io::Read;
-    let mut out = Vec::new();
-    let mut buf = String::new();
-    out.push((
-        "read /etc/passwd",
-        std::fs::File::open("/etc/passwd")
-            .and_then(|mut f| f.read_to_string(&mut buf))
-            .is_err(),
-    ));
-    out.push((
-        "list home directory",
-        std::fs::read_dir(std::env::var("HOME").unwrap_or("/root".into())).is_err(),
-    ));
-    out.push((
-        "create a file in /tmp",
-        std::fs::write(std::env::temp_dir().join("brickle-probe"), "x").is_err(),
-    ));
-    out.push((
-        "open a TCP connection",
-        std::net::TcpStream::connect_timeout(
+    match name {
+        "read /etc/passwd" => {
+            let mut buf = String::new();
+            std::fs::File::open("/etc/passwd")
+                .and_then(|mut f| f.read_to_string(&mut buf))
+                .is_err()
+        }
+        "list home directory" => std::fs::read_dir(std::env::var("HOME").unwrap_or("/root".into())).is_err(),
+        "create a file in /tmp" => std::fs::write(std::env::temp_dir().join("brickle-probe"), "x").is_err(),
+        "open a TCP connection" => std::net::TcpStream::connect_timeout(
             &"1.1.1.1:443".parse().unwrap(),
             std::time::Duration::from_secs(2),
         )
         .is_err(),
-    ));
-    out.push((
-        "open a UDP socket",
-        std::net::UdpSocket::bind("0.0.0.0:0").is_err(),
-    ));
-    out.push((
-        "run another program",
-        std::process::Command::new("/bin/sh")
+        "open a UDP socket" => std::net::UdpSocket::bind("0.0.0.0:0").is_err(),
+        "run another program" => std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg("true")
             .status()
             .is_err(),
-    ));
-    out
+        // execve in place: the kill filter should end this process (SIGSYS).
+        "replace itself with another program" => {
+            use std::os::unix::process::CommandExt;
+            let _ = std::process::Command::new("/bin/true").exec();
+            true
+        }
+        _ => false,
+    }
 }

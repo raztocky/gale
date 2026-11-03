@@ -61,6 +61,8 @@ fn main() {
     }
 
     if args.first().map(String::as_str) == Some("--sandbox-probe") {
+        // One probe per process: see sandbox::PROBES.
+        let name = args.get(1).cloned().unwrap_or_default();
         let report = match sandbox::enter() {
             Ok(r) => r,
             Err(e) => {
@@ -68,17 +70,21 @@ fn main() {
                 std::process::exit(3);
             }
         };
-        println!(
-            "landlock: {}\nseccomp: {}",
-            report.landlock,
-            if report.seccomp { "on" } else { "off" }
-        );
-        let mut all = true;
-        for (what, blocked) in sandbox::probe() {
-            all &= blocked;
-            println!("  {} {what}", if blocked { "blocked" } else { "ALLOWED" });
+        if name.is_empty() {
+            println!(
+                "landlock: {}\nseccomp: {}",
+                report.landlock,
+                if report.seccomp { "on" } else { "off" }
+            );
+            std::process::exit(0);
         }
-        std::process::exit(if all { 0 } else { 2 });
+        // Run on a thread, like the real renderer, so thread creation under
+        // the filter is exercised too.
+        let blocked = std::thread::spawn(move || sandbox::probe(&name))
+            .join()
+            .unwrap_or(false);
+        println!("{}", if blocked { "blocked" } else { "ALLOWED" });
+        std::process::exit(0);
     }
 
     let sandboxed = !args.iter().any(|a| a == "--no-sandbox");
@@ -134,13 +140,36 @@ fn run(args: Vec<String>, sandboxed: bool, filters: bool, panel: bool) -> Result
         }
         Some("render") => render(&args[1..], sandboxed, filters),
         Some("sandbox-test") => {
-            // Run the probe in a fresh process so this one stays unrestricted.
+            // Each probe runs in a fresh sandboxed process; this one stays
+            // unrestricted.
+            use std::os::unix::process::ExitStatusExt;
             let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-            let status = std::process::Command::new(exe)
-                .arg("--sandbox-probe")
-                .status()
-                .map_err(|e| e.to_string())?;
-            if status.success() {
+            let run = |probe: &str| {
+                std::process::Command::new(&exe)
+                    .arg("--sandbox-probe")
+                    .arg(probe)
+                    .output()
+            };
+            let info = run("").map_err(|e| e.to_string())?;
+            print!("{}", String::from_utf8_lossy(&info.stdout));
+            if !info.status.success() {
+                return Err("sandbox check FAILED: couldn't enter the sandbox".into());
+            }
+            let mut ok = true;
+            for probe in sandbox::PROBES {
+                let out = run(probe).map_err(|e| e.to_string())?;
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let verdict = if out.status.signal() == Some(31) {
+                    "killed".to_string() // SIGSYS: seccomp killed it
+                } else if stdout.trim() == "blocked" {
+                    "blocked".to_string()
+                } else {
+                    ok = false;
+                    format!("ALLOWED ({})", stdout.trim())
+                };
+                println!("  {verdict:<8} {probe}");
+            }
+            if ok {
                 println!("sandbox OK: the renderer can't touch files, the network or other programs");
                 Ok(())
             } else {
@@ -187,7 +216,8 @@ pub fn describe(e: &LogEntry) -> (&'static str, String) {
         Outcome::MixedContent => "BLOCKED (http on https page)",
         Outcome::NeedsHttpConsent => "no HTTPS",
         Outcome::NotAllowed => "BLOCKED (not allowed)",
-        Outcome::OverLimit => "SKIPPED (too many)",
+        Outcome::OverLimit => "SKIPPED (page budget)",
+        Outcome::LocalNetwork => "BLOCKED (local network)",
         Outcome::Failed(err) => {
             notes.push(err.clone());
             "failed"
