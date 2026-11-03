@@ -1157,10 +1157,10 @@ impl TableCols {
         let n = self.ncols();
         let mut w = vec![0.0f32; n];
         let mut rem = avail;
-        for c in 0..n {
+        for (c, wc) in w.iter_mut().enumerate() {
             if let Some(p) = self.pct[c] {
-                w[c] = (avail * p / 100.0).max(self.min[c]);
-                rem -= w[c];
+                *wc = (avail * p / 100.0).max(self.min[c]);
+                rem -= *wc;
             }
         }
         let auto: Vec<usize> = (0..n).filter(|&c| self.pct[c].is_none()).collect();
