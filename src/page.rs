@@ -8,7 +8,8 @@ use crate::style::{self, StyleContext};
 use crate::{font, html, net};
 
 use crate::js::{self, Runtime};
-use crate::net::Dest;
+use crate::net::{Dest, ScriptRequest};
+use crate::network::ScriptResponse;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -53,6 +54,72 @@ pub struct Rendered {
 /// renderer this asks the browser process, which applies the security policy.
 pub type Fetcher<'f> = dyn FnMut(&str, Dest) -> Result<String, String> + 'f;
 
+/// The browser's side of a page while its scripts run: everything that
+/// needs the network or the cookie jar is asked of it (over IPC in the
+/// sandboxed renderer), and it applies the policy.
+pub trait Host {
+    /// A stylesheet or script file for the page.
+    fn fetch(&mut self, url: &str, dest: Dest) -> Result<String, String>;
+    /// A script's `fetch`/`XMLHttpRequest`.
+    fn request(&mut self, url: &str, req: ScriptRequest) -> Result<ScriptResponse, String>;
+    /// A script set `document.cookie`.
+    fn set_cookie(&mut self, value: &str);
+    /// `document.cookie` as it stands.
+    fn cookies(&mut self) -> String;
+}
+
+/// A [`Host`] that only serves files (no script requests or cookies).
+pub struct FetchOnly<F>(pub F);
+
+impl<F: FnMut(&str, Dest) -> Result<String, String>> Host for FetchOnly<F> {
+    fn fetch(&mut self, url: &str, dest: Dest) -> Result<String, String> {
+        (self.0)(url, dest)
+    }
+    fn request(&mut self, _: &str, _: ScriptRequest) -> Result<ScriptResponse, String> {
+        Err("no network".into())
+    }
+    fn set_cookie(&mut self, _: &str) {}
+    fn cookies(&mut self) -> String {
+        String::new()
+    }
+}
+
+/// Send scripts' queued requests and cookie changes to the browser and
+/// hand back the answers, running the timers they set off, until nothing
+/// is waiting (or time is up).
+pub fn pump(rt: &mut Runtime, host: &mut dyn Host, until: Instant) {
+    for _ in 0..100 {
+        let sets = rt.take_cookie_sets();
+        let reqs = rt.take_requests();
+        if sets.is_empty() && reqs.is_empty() {
+            return;
+        }
+        for v in &sets {
+            host.set_cookie(v);
+        }
+        if !sets.is_empty() {
+            rt.set_cookies(host.cookies());
+        }
+        for (id, url, req) in reqs {
+            if Instant::now() >= until {
+                rt.deliver(id, Err("the page's scripts ran out of time".into()));
+                continue;
+            }
+            let r = host.request(&url, req);
+            rt.set_cookies(host.cookies());
+            rt.deliver(id, r);
+        }
+        rt.run_timers(until);
+        if Instant::now() >= until {
+            // Answer whatever is still queued so promises settle.
+            for (id, _, _) in rt.take_requests() {
+                rt.deliver(id, Err("the page's scripts ran out of time".into()));
+            }
+            return;
+        }
+    }
+}
+
 fn ua_sheet() -> &'static Stylesheet {
     static UA: OnceLock<Stylesheet> = OnceLock::new();
     UA.get_or_init(|| css::parse(style::UA_CSS))
@@ -75,14 +142,14 @@ impl Page {
         src: &str,
         blocker_css: &str,
         viewport: (f32, f32),
-        fetch: &mut Fetcher,
+        host: &mut dyn Host,
     ) -> (Page, Option<Runtime>, ScriptOutput) {
         let tree = html::parse(src);
         let mut rt = match Runtime::new(&tree, url, viewport) {
             Ok(rt) => rt,
             Err(e) => {
                 let mut page = Page::empty(url, blocker_css, false);
-                page.set_tree(tree, fetch);
+                page.set_tree(tree, &mut |u, d| host.fetch(u, d));
                 let out = ScriptOutput {
                     console: vec![format!("[brickle] {e}")],
                     navigate: None,
@@ -90,23 +157,26 @@ impl Page {
                 return (page, None, out);
             }
         };
+        rt.set_cookies(host.cookies());
         let until = Instant::now() + js::LOAD_BUDGET;
         let mut loader = ScriptLoader { fetched: 0, until };
         for (id, src, code) in rt.document_scripts() {
             if Instant::now() >= until {
                 break;
             }
-            loader.run(&mut rt, id, src, code, fetch);
-            loader.run_pending(&mut rt, fetch);
+            loader.run(&mut rt, id, src, code, host);
+            loader.run_pending(&mut rt, host);
+            pump(&mut rt, host, until);
         }
         rt.fire_load();
         for _ in 0..3 {
-            loader.run_pending(&mut rt, fetch);
+            loader.run_pending(&mut rt, host);
             rt.run_timers(until);
+            pump(&mut rt, host, until);
         }
-        loader.run_pending(&mut rt, fetch);
+        loader.run_pending(&mut rt, host);
         let mut page = Page::empty(url, blocker_css, true);
-        page.set_tree(rt.tree(), fetch);
+        page.set_tree(rt.tree(), &mut |u, d| host.fetch(u, d));
         let out = ScriptOutput {
             console: rt.take_console(),
             navigate: rt.take_navigate(),
@@ -271,11 +341,11 @@ struct ScriptLoader {
 }
 
 impl ScriptLoader {
-    fn run(&mut self, rt: &mut Runtime, id: u32, src: Option<String>, code: String, fetch: &mut Fetcher) {
+    fn run(&mut self, rt: &mut Runtime, id: u32, src: Option<String>, code: String, host: &mut dyn Host) {
         let (code, name) = match src {
             Some(url) if self.fetched < js::MAX_SCRIPTS => {
                 self.fetched += 1;
-                match fetch(&url, Dest::Script) {
+                match host.fetch(&url, Dest::Script) {
                     Ok(code) => (code, url),
                     Err(_) => return, // shown in the request log
                 }
@@ -287,14 +357,14 @@ impl ScriptLoader {
     }
 
     /// Scripts that scripts added to the document.
-    fn run_pending(&mut self, rt: &mut Runtime, fetch: &mut Fetcher) {
+    fn run_pending(&mut self, rt: &mut Runtime, host: &mut dyn Host) {
         for _ in 0..64 {
             let pending = rt.take_pending_scripts();
             if pending.is_empty() || Instant::now() >= self.until {
                 return;
             }
             for (id, src, code) in pending {
-                self.run(rt, id, src, code, fetch);
+                self.run(rt, id, src, code, host);
             }
         }
     }

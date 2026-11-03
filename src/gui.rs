@@ -158,7 +158,10 @@ fn spawn_loader(net: Arc<Mutex<Network>>, sandboxed: bool) -> (Sender<Job>, Rece
                         w,
                         h,
                     } => {
-                        let click = tab.click(x, y);
+                        let click = {
+                            let mut n = net.lock().unwrap_or_else(|e| e.into_inner());
+                            tab.click(&mut n, x, y)
+                        };
                         let rendered = tab.render(w, h);
                         Done {
                             tab: *tab,
@@ -1037,6 +1040,7 @@ fn draw_panel(
             net::Dest::Document => "page",
             net::Dest::Stylesheet => "css",
             net::Dest::Script => "js",
+            net::Dest::Xhr => "xhr",
             net::Dest::Download => "list",
         };
         let head = format!("{status} · {kind}");

@@ -8,7 +8,8 @@
 
 use crate::css::Color;
 use crate::layout::Rect;
-use crate::net::Dest;
+use crate::net::{Credentials, Dest, ScriptRequest};
+use crate::network::ScriptResponse;
 use crate::page::Rendered;
 use crate::paint::{DisplayCommand, GlyphBitmap, PlacedGlyph, MAX_ATLAS_BYTES, MAX_GLYPH_SIDE};
 use std::io::{self, Read, Write};
@@ -23,6 +24,8 @@ const MAX_COMMANDS: usize = 500_000;
 const MAX_GLYPHS: usize = 4_000_000;
 /// Console lines a renderer may report per message.
 const MAX_CONSOLE: usize = 200;
+/// Headers in one script request or response.
+const MAX_HEADERS: usize = 64;
 
 /// Browser -> renderer.
 #[derive(Debug, Clone, PartialEq)]
@@ -35,7 +38,16 @@ pub enum ToRenderer {
         scripts: bool,
         /// Window size, for scripts.
         viewport: (f32, f32),
+        /// `document.cookie` to start with (empty unless scripts run).
+        cookies: String,
     },
+    /// The answer to a script's request, and `document.cookie` after it.
+    Response {
+        result: Result<ScriptResponse, String>,
+        cookies: String,
+    },
+    /// `document.cookie` after a script set a cookie.
+    Cookies(String),
     FetchReply(Result<String, String>),
     /// You clicked the page at this page-space point.
     Click {
@@ -64,6 +76,13 @@ pub enum FromRenderer {
     },
     Rendered(Rendered),
     Dom(String),
+    /// A script's `fetch`/`XMLHttpRequest`.
+    Request {
+        url: String,
+        req: ScriptRequest,
+    },
+    /// A script set `document.cookie`.
+    SetCookie(String),
     Clicked {
         /// A script called `preventDefault()`: don't follow the link.
         prevented: bool,
@@ -140,6 +159,13 @@ impl Enc {
             None => self.u8(0),
         }
     }
+    fn pairs(&mut self, v: &[(String, String)]) {
+        self.u32(v.len() as u32);
+        for (a, b) in v {
+            self.str(a);
+            self.str(b);
+        }
+    }
     fn strs(&mut self, v: &[String]) {
         self.u32(v.len() as u32);
         for s in v {
@@ -195,6 +221,13 @@ impl<'a> Dec<'a> {
     }
     fn opt_str(&mut self) -> DecResult<Option<String>> {
         Ok(if self.bool()? { Some(self.str()?) } else { None })
+    }
+    fn pairs(&mut self, max: usize) -> DecResult<Vec<(String, String)>> {
+        let n = self.count(8)?;
+        if n > max {
+            return Err("too many headers".into());
+        }
+        (0..n).map(|_| Ok((self.str()?, self.str()?))).collect()
     }
     fn strs(&mut self, max: usize) -> DecResult<Vec<String>> {
         let n = self.count(4)?;
@@ -303,6 +336,7 @@ impl ToRenderer {
                 blocker_css,
                 scripts,
                 viewport,
+                cookies,
             } => {
                 e.u8(1);
                 e.str(url);
@@ -311,6 +345,29 @@ impl ToRenderer {
                 e.u8(*scripts as u8);
                 e.f32(viewport.0);
                 e.f32(viewport.1);
+                e.str(cookies);
+            }
+            ToRenderer::Response { result, cookies } => {
+                e.u8(6);
+                match result {
+                    Ok(r) => {
+                        e.u8(1);
+                        e.u32(r.status as u32);
+                        e.str(&r.url);
+                        e.u8(r.redirected as u8);
+                        e.pairs(&r.headers);
+                        e.str(&r.body);
+                    }
+                    Err(err) => {
+                        e.u8(0);
+                        e.str(err);
+                    }
+                }
+                e.str(cookies);
+            }
+            ToRenderer::Cookies(c) => {
+                e.u8(7);
+                e.str(c);
             }
             ToRenderer::Click { x, y } => {
                 e.u8(5);
@@ -349,7 +406,23 @@ impl ToRenderer {
                 blocker_css: d.str()?,
                 scripts: d.bool()?,
                 viewport: (d.f32()?, d.f32()?),
+                cookies: d.str()?,
             },
+            6 => ToRenderer::Response {
+                result: if d.bool()? {
+                    Ok(ScriptResponse {
+                        status: d.u32()?.min(999) as u16,
+                        url: d.str()?,
+                        redirected: d.bool()?,
+                        headers: d.pairs(256)?,
+                        body: d.str()?,
+                    })
+                } else {
+                    Err(d.str()?)
+                },
+                cookies: d.str()?,
+            },
+            7 => ToRenderer::Cookies(d.str()?),
             5 => ToRenderer::Click {
                 x: d.f32()?,
                 y: d.f32()?,
@@ -391,6 +464,22 @@ impl FromRenderer {
                 e.str(title);
                 e.opt_str(navigate);
                 e.strs(console);
+            }
+            FromRenderer::Request { url, req } => {
+                e.u8(6);
+                e.str(url);
+                e.str(&req.method);
+                e.pairs(&req.headers);
+                e.opt_str(&req.body);
+                e.u8(match req.credentials {
+                    Credentials::Omit => 0,
+                    Credentials::SameOrigin => 1,
+                    Credentials::Include => 2,
+                });
+            }
+            FromRenderer::SetCookie(v) => {
+                e.u8(7);
+                e.str(v);
             }
             FromRenderer::Clicked {
                 prevented,
@@ -467,6 +556,21 @@ impl FromRenderer {
                 navigate: d.opt_str()?,
                 console: d.strs(MAX_CONSOLE)?,
             },
+            6 => FromRenderer::Request {
+                url: d.str()?,
+                req: ScriptRequest {
+                    method: d.str()?,
+                    headers: d.pairs(MAX_HEADERS)?,
+                    body: d.opt_str()?,
+                    credentials: match d.u8()? {
+                        0 => Credentials::Omit,
+                        1 => Credentials::SameOrigin,
+                        2 => Credentials::Include,
+                        c => return Err(format!("invalid credentials mode {c}")),
+                    },
+                },
+            },
+            7 => FromRenderer::SetCookie(d.str()?),
             5 => FromRenderer::Clicked {
                 prevented: d.bool()?,
                 changed: d.bool()?,
@@ -632,6 +736,16 @@ mod tests {
                 navigate: Some("https://b/".into()),
                 console: vec!["[log] hi".into()],
             },
+            FromRenderer::Request {
+                url: "https://a/api".into(),
+                req: ScriptRequest {
+                    method: "POST".into(),
+                    headers: vec![("content-type".into(), "text/plain".into())],
+                    body: Some("hi".into()),
+                    credentials: Credentials::Include,
+                },
+            },
+            FromRenderer::SetCookie("x=1".into()),
             FromRenderer::Clicked {
                 prevented: true,
                 changed: false,
@@ -651,7 +765,23 @@ mod tests {
                 blocker_css: ".ad { display: none !important }".into(),
                 scripts: true,
                 viewport: (1000.0, 700.0),
+                cookies: "a=1".into(),
             },
+            ToRenderer::Response {
+                result: Ok(ScriptResponse {
+                    status: 200,
+                    url: "https://a/x".into(),
+                    redirected: false,
+                    headers: vec![("content-type".into(), "application/json".into())],
+                    body: "{}".into(),
+                }),
+                cookies: String::new(),
+            },
+            ToRenderer::Response {
+                result: Err("CORS".into()),
+                cookies: "b=2".into(),
+            },
+            ToRenderer::Cookies("c=3".into()),
             ToRenderer::Click { x: 10.0, y: 20.0 },
             ToRenderer::FetchReply(Ok("css".into())),
             ToRenderer::FetchReply(Err("nope".into())),

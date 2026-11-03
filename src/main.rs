@@ -358,6 +358,9 @@ pub fn describe(e: &LogEntry) -> (&'static str, String) {
     if !e.cookies_set.is_empty() {
         notes.push(format!("set cookies {}", e.cookies_set.join(", ")));
     }
+    if e.cors_blocked {
+        notes.push("response hidden from the page (CORS)".into());
+    }
     if !e.cookies_refused.is_empty() {
         notes.push(format!("refused cookies {}", e.cookies_refused.join(", ")));
     }
@@ -369,6 +372,7 @@ fn print_log(log: &[LogEntry]) {
         net::Dest::Document => "page",
         net::Dest::Stylesheet => "css",
         net::Dest::Script => "js",
+        net::Dest::Xhr => "xhr",
         net::Dest::Download => "list",
     };
     for e in log {

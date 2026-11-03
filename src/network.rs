@@ -15,7 +15,7 @@
 
 use crate::cookies::{self, Jar};
 use crate::filter::{self, Filters, Req, Verdict};
-use crate::net::{self, Cancel, Dest, NetError};
+use crate::net::{self, Cancel, Credentials, Dest, NetError, ScriptRequest};
 use crate::page::error_page;
 use crate::urlclean;
 use std::collections::HashSet;
@@ -82,6 +82,9 @@ pub struct LogEntry {
     pub cookies_set: Vec<String>,
     /// Cookies the response tried to set but weren't stored, with why.
     pub cookies_refused: Vec<String>,
+    /// A script's cross-origin request whose response the server didn't
+    /// allow the page to read (CORS), so it was withheld from the page.
+    pub cors_blocked: bool,
 }
 
 impl LogEntry {
@@ -127,12 +130,30 @@ pub enum Decision {
 }
 
 enum Fetch {
-    Done { url: String, body: String },
+    Done {
+        url: String,
+        body: String,
+        status: u16,
+        headers: Vec<(String, String)>,
+    },
     Stopped(String),
-    NeedsHttp { host: String, url: String },
-    FilterBlocked { host: String, url: String, rule: String },
-    LocalNetwork { host: String, url: String },
-    Certificate { host: String, err: String },
+    NeedsHttp {
+        host: String,
+        url: String,
+    },
+    FilterBlocked {
+        host: String,
+        url: String,
+        rule: String,
+    },
+    LocalNetwork {
+        host: String,
+        url: String,
+    },
+    Certificate {
+        host: String,
+        err: String,
+    },
 }
 
 pub struct Network {
@@ -149,6 +170,7 @@ pub struct Network {
     log: Vec<LogEntry>,
     page_stylesheets: usize,
     page_scripts: usize,
+    page_script_requests: usize,
     /// Sites where you allowed JavaScript (`~/.config/brickle/js-sites.txt`).
     js_sites: HashSet<String>,
     js_path: Option<PathBuf>,
@@ -193,6 +215,7 @@ impl Network {
             log: Vec::new(),
             page_stylesheets: 0,
             page_scripts: 0,
+            page_script_requests: 0,
             js_sites: HashSet::new(),
             js_path: None,
             js_everywhere: false,
@@ -313,6 +336,7 @@ impl Network {
         self.deadline = std::time::Instant::now() + PAGE_TIME_BUDGET;
         self.page_stylesheets = 0;
         self.page_scripts = 0;
+        self.page_script_requests = 0;
         self.page_bytes = 0;
     }
 
@@ -344,6 +368,7 @@ impl Network {
     pub fn navigate(&mut self, url: &str, from: Option<&str>) -> Nav {
         self.page_stylesheets = 0;
         self.page_scripts = 0;
+        self.page_script_requests = 0;
         self.deadline = std::time::Instant::now() + PAGE_TIME_BUDGET;
         self.page_bytes = 0;
         let fetched = self.fetch(url, from, Dest::Document);
@@ -351,7 +376,7 @@ impl Network {
             eprintln!("brickle: saving cookies: {e}");
         }
         match fetched {
-            Fetch::Done { url, body } => {
+            Fetch::Done { url, body, .. } => {
                 self.page_bytes = body.len();
                 Nav::Page { url, html: body }
             }
@@ -475,6 +500,136 @@ impl Network {
         }
     }
 
+    /// A request from a page's script (`fetch`, `XMLHttpRequest`). The page
+    /// URL is the browser's own record of the page, not the renderer's word.
+    ///
+    /// Same-origin requests go ahead; cross-origin ones only if they need no
+    /// CORS preflight (which Brickle doesn't do yet), and the page only sees
+    /// the response if the server allows it (`Access-Control-Allow-Origin`).
+    /// Every other rule (your rules, the blocker, HTTPS-only, the
+    /// local-network block, cookies) applies as for any request.
+    pub fn script_request(
+        &mut self,
+        page_url: &str,
+        url: &str,
+        req: ScriptRequest,
+    ) -> Result<ScriptResponse, String> {
+        let dest = Dest::Xhr;
+        if !self.scripts_allowed(page_url) {
+            self.record(url, dest, Outcome::NotAllowed, vec![]);
+            return Err("JavaScript is off for this site".into());
+        }
+        self.page_script_requests += 1;
+        if self.page_script_requests > MAX_SCRIPT_REQUESTS {
+            self.record(url, dest, Outcome::OverLimit, vec![]);
+            return Err("too many requests from this page's scripts".into());
+        }
+        let mut req = req;
+        req.method = req.method.to_ascii_uppercase();
+        if !matches!(
+            req.method.as_str(),
+            "GET" | "HEAD" | "POST" | "PUT" | "DELETE" | "PATCH" | "OPTIONS"
+        ) {
+            self.record(url, dest, Outcome::NotAllowed, vec![]);
+            return Err(format!("method {} isn't allowed", req.method));
+        }
+        if matches!(req.method.as_str(), "GET" | "HEAD") {
+            req.body = None;
+        }
+        if req.body.as_ref().is_some_and(|b| b.len() > MAX_SCRIPT_BODY) {
+            self.record(url, dest, Outcome::OverLimit, vec![]);
+            return Err("request body too large".into());
+        }
+        req.headers = allowed_script_headers(req.headers);
+        let Some((target, _)) = net::canonical(url) else {
+            self.record(url, dest, Outcome::NotAllowed, vec![]);
+            return Err(format!("not a valid address: {url}"));
+        };
+        let target: String = target.into();
+        let cross = !same_origin(page_url, &target);
+        if cross && !is_cors_simple(&req) {
+            self.record(&target, dest, Outcome::NotAllowed, vec![]);
+            return Err(
+                "this cross-origin request needs a CORS preflight, which Brickle doesn't support yet".into(),
+            );
+        }
+        // After the page has loaded, each script request gets its own time.
+        let now = std::time::Instant::now();
+        if now >= self.deadline {
+            self.deadline = now + SCRIPT_REQUEST_TIME;
+        }
+        let creds = req.credentials;
+        match self.fetch_with(&target, Some(page_url), dest, Some(&req)) {
+            Fetch::Done {
+                url: final_url,
+                body,
+                status,
+                headers,
+            } => {
+                self.page_bytes += body.len();
+                let header = |name: &str| {
+                    headers
+                        .iter()
+                        .find(|(k, _)| k == name)
+                        .map(|(_, v)| v.trim().to_string())
+                };
+                let cross = !same_origin(page_url, &final_url);
+                if cross {
+                    let origin = origin_of(page_url);
+                    let acao = header("access-control-allow-origin").unwrap_or_default();
+                    let ok = if creds == Credentials::Include {
+                        acao == origin
+                            && header("access-control-allow-credentials").as_deref() == Some("true")
+                    } else {
+                        acao == "*" || acao == origin
+                    };
+                    if !ok {
+                        if let Some(e) = self.log.last_mut() {
+                            e.cors_blocked = true;
+                        }
+                        return Err(format!(
+                            "CORS: {} didn't allow this page to read the response",
+                            filter::host_of(&final_url)
+                        ));
+                    }
+                }
+                Ok(ScriptResponse {
+                    redirected: final_url != target,
+                    headers: exposed_headers(headers, cross, creds == Credentials::Include),
+                    url: final_url,
+                    status,
+                    body,
+                })
+            }
+            Fetch::LocalNetwork { url, .. } => Err(format!("blocked local-network request {url}")),
+            Fetch::Stopped(why) => Err(why),
+            Fetch::NeedsHttp { url, .. } => Err(format!("blocked insecure {url}")),
+            Fetch::FilterBlocked { url, .. } => Err(format!("blocked {url}")),
+            Fetch::Certificate { host, err } => Err(format!("{host}: {err}")),
+        }
+    }
+
+    /// `document.cookie` for a page's scripts: its cookies, except HttpOnly
+    /// ones.
+    pub fn script_cookies(&mut self, page_url: &str) -> String {
+        if !self.scripts_allowed(page_url) {
+            return String::new();
+        }
+        self.cookies.script_string(page_url)
+    }
+
+    /// A page's script setting `document.cookie = value`.
+    pub fn set_script_cookie(&mut self, page_url: &str, value: &str) -> cookies::Stored {
+        if !self.scripts_allowed(page_url) {
+            return cookies::Stored::default();
+        }
+        let stored = self.cookies.script_set(page_url, value);
+        if let Err(e) = self.cookies.save() {
+            eprintln!("brickle: saving cookies: {e}");
+        }
+        stored
+    }
+
     pub fn allow_action(&mut self, action: &Action) -> String {
         match action {
             Action::AllowHttp { host, url } => {
@@ -504,12 +659,27 @@ impl Network {
             cookies_sent: vec![],
             cookies_set: vec![],
             cookies_refused: vec![],
+            cors_blocked: false,
         });
         self.log.last_mut().unwrap()
     }
 
     fn fetch(&mut self, url: &str, initiator: Option<&str>, dest: Dest) -> Fetch {
+        self.fetch_with(url, initiator, dest, None)
+    }
+
+    /// `script`: the method, headers, body and credentials of a page
+    /// script's request (`dest` is then `Xhr`).
+    fn fetch_with(
+        &mut self,
+        url: &str,
+        initiator: Option<&str>,
+        dest: Dest,
+        script: Option<&ScriptRequest>,
+    ) -> Fetch {
         let fdest = filter_dest(dest);
+        let mut method = script.map(|s| s.method.clone()).unwrap_or_else(|| "GET".into());
+        let mut body = script.and_then(|s| s.body.clone());
         let page = if dest == Dest::Document { None } else { initiator };
         let mut url = url.to_string();
         let mut from = initiator.map(str::to_string);
@@ -544,7 +714,12 @@ impl Network {
             if net::scheme(&url) == "file" {
                 self.record(&url, dest, Outcome::Local, stripped);
                 return match net::read_file(&url) {
-                    Ok(body) => Fetch::Done { url, body },
+                    Ok(body) => Fetch::Done {
+                        url,
+                        body,
+                        status: 200,
+                        headers: vec![],
+                    },
                     Err(e) => Fetch::Stopped(e),
                 };
             }
@@ -597,8 +772,31 @@ impl Network {
                 initiator: from.as_deref(),
                 navigation: dest == Dest::Document,
             };
-            let (cookie, sent) = self.cookies.header_for(&target, ctx).unzip();
-            let result = net::http_get_until(
+            // Script requests carry cookies per their `credentials`.
+            let cookies_ok = match script.map(|s| s.credentials) {
+                None | Some(Credentials::Include) => true,
+                Some(Credentials::Omit) => false,
+                Some(Credentials::SameOrigin) => page.is_some_and(|p| same_origin(p, &target)),
+            };
+            let (cookie, sent) = if cookies_ok {
+                self.cookies.header_for(&target, ctx).unzip()
+            } else {
+                (None, None)
+            };
+            let page_origin = page.map(origin_of).unwrap_or_default();
+            let cors = page.is_some_and(|p| !same_origin(p, &target));
+            let script_headers: Vec<(String, String)> = script.map(|s| s.headers.clone()).unwrap_or_default();
+            let outgoing = script.map(|_| net::Outgoing {
+                method: &method,
+                headers: &script_headers,
+                body: body.as_deref(),
+                // Firefox sends Origin on cross-origin requests and on
+                // same-origin ones that aren't GET/HEAD.
+                origin: (cors || !matches!(method.as_str(), "GET" | "HEAD")).then_some(page_origin.as_str()),
+                cors,
+            });
+            let result = net::http_request_until(
+                outgoing,
                 &target,
                 dest,
                 from.as_deref(),
@@ -608,6 +806,7 @@ impl Network {
                 &self.cancel,
             );
             let stored = match &result {
+                Ok(_) if !cookies_ok => cookies::Stored::default(),
                 Ok(resp) => {
                     let redirect = (300..400).contains(&resp.status);
                     self.cookies.store(&target, ctx, &resp.set_cookies, redirect)
@@ -634,6 +833,11 @@ impl Network {
                     e.upgraded = upgraded;
                     e.insecure = insecure;
                     e.allowed_by = allowed_by;
+                    // 303, and 301/302 after a POST, continue as a GET.
+                    if resp.status == 303 || (matches!(resp.status, 301 | 302) && method == "POST") {
+                        method = "GET".into();
+                        body = None;
+                    }
                     from = Some(target);
                     url = next;
                 }
@@ -651,6 +855,8 @@ impl Network {
                     return Fetch::Done {
                         url: target,
                         body: resp.body,
+                        status: resp.status,
+                        headers: resp.headers,
                     };
                 }
                 Err(NetError::LocalNetwork) => {
@@ -773,7 +979,141 @@ fn filter_dest(dest: Dest) -> filter::Dest {
     match dest {
         Dest::Document => filter::Dest::Document,
         Dest::Script => filter::Dest::Script,
+        Dest::Xhr => filter::Dest::Xhr,
         _ => filter::Dest::Stylesheet,
+    }
+}
+
+/// Most requests one page's scripts may make.
+pub const MAX_SCRIPT_REQUESTS: usize = 200;
+/// Largest body a script may send.
+pub const MAX_SCRIPT_BODY: usize = 1024 * 1024;
+/// Time for one script request made after the page loaded.
+const SCRIPT_REQUEST_TIME: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// What a script's request returned, as the page may see it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ScriptResponse {
+    pub status: u16,
+    /// The final URL, after redirects.
+    pub url: String,
+    pub redirected: bool,
+    /// Response headers the page may read (never `Set-Cookie`).
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+}
+
+/// Headers a script may set on a request; the rest are dropped. Cookies,
+/// origin, referrer, host and the like are the browser's to decide, and the
+/// fingerprint-relevant ones stay as Firefox sends them.
+fn allowed_script_headers(headers: Vec<(String, String)>) -> Vec<(String, String)> {
+    const FORBIDDEN: &[&str] = &[
+        "accept-charset",
+        "accept-encoding",
+        "connection",
+        "content-length",
+        "cookie",
+        "cookie2",
+        "date",
+        "dnt",
+        "expect",
+        "host",
+        "keep-alive",
+        "origin",
+        "referer",
+        "set-cookie",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "via",
+        "user-agent",
+        "accept-language",
+        "priority",
+        "x-http-method",
+        "x-http-method-override",
+        "x-method-override",
+    ];
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (k, v) in headers {
+        let name = k.trim().to_ascii_lowercase();
+        let token = !name.is_empty()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b));
+        if !token
+            || FORBIDDEN.contains(&name.as_str())
+            || name.starts_with("sec-")
+            || name.starts_with("proxy-")
+            || name.starts_with("access-control-")
+            || v.len() > 4096
+            || v.chars().any(|c| c == '\r' || c == '\n' || c == '\0')
+            || out.len() >= 32
+        {
+            continue;
+        }
+        out.retain(|(n, _)| *n != name);
+        out.push((name, v.trim().to_string()));
+    }
+    out
+}
+
+/// A cross-origin request that needs no preflight (Fetch spec "CORS-safelisted").
+fn is_cors_simple(req: &ScriptRequest) -> bool {
+    matches!(req.method.as_str(), "GET" | "HEAD" | "POST")
+        && req.headers.iter().all(|(k, v)| match k.as_str() {
+            "accept" | "accept-language" | "content-language" => v.len() <= 128,
+            "content-type" => {
+                let mime = v.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+                matches!(
+                    mime.as_str(),
+                    "application/x-www-form-urlencoded" | "multipart/form-data" | "text/plain"
+                )
+            }
+            _ => false,
+        })
+}
+
+/// Response headers a page may read: for cross-origin responses only the
+/// CORS-safelisted ones and those the server exposes.
+fn exposed_headers(headers: Vec<(String, String)>, cross: bool, creds: bool) -> Vec<(String, String)> {
+    const SAFE: &[&str] = &[
+        "cache-control",
+        "content-language",
+        "content-length",
+        "content-type",
+        "expires",
+        "last-modified",
+        "pragma",
+    ];
+    let expose: Vec<String> = headers
+        .iter()
+        .filter(|(k, _)| k == "access-control-expose-headers")
+        .flat_map(|(_, v)| {
+            v.split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let all = !creds && expose.iter().any(|e| e == "*");
+    headers
+        .into_iter()
+        .filter(|(k, _)| !matches!(k.as_str(), "set-cookie" | "set-cookie2"))
+        .filter(|(k, _)| !cross || all || SAFE.contains(&k.as_str()) || expose.contains(k))
+        .collect()
+}
+
+/// `scheme://host:port` of a URL ("null" if it has none).
+fn origin_of(url: &str) -> String {
+    url::Url::parse(url)
+        .map(|u| u.origin().ascii_serialization())
+        .unwrap_or_else(|_| "null".into())
+}
+
+fn same_origin(a: &str, b: &str) -> bool {
+    match (url::Url::parse(a), url::Url::parse(b)) {
+        (Ok(a), Ok(b)) => a.origin() == b.origin() && a.origin().is_tuple(),
+        _ => false,
     }
 }
 
@@ -941,6 +1281,7 @@ mod tests {
             cookies_sent: vec![],
             cookies_set: vec![],
             cookies_refused: vec![],
+            cors_blocked: false,
         };
         assert_eq!(n.toggle_preview(&e), ("||cdn.example^".into(), "block"));
         n.toggle(&e).unwrap();

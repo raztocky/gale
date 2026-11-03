@@ -22,6 +22,8 @@
 use crate::css;
 use crate::dom::{self, AttrMap, ElementData, Node, NodeType};
 use crate::layout::Rect;
+use crate::net::{Credentials, ScriptRequest};
+use crate::network::ScriptResponse;
 use boa_engine::context::HostHooks;
 use boa_engine::object::builtins::JsArray;
 use boa_engine::object::ObjectInitializer;
@@ -54,6 +56,8 @@ const TIMER_WINDOW_MS: f64 = 2000.0;
 const MAX_CALLBACKS: usize = 2000;
 /// Scripts a page may load from the network (asked of the browser).
 pub const MAX_SCRIPTS: usize = 32;
+/// Script requests that may wait for an answer at once.
+const MAX_QUEUED_REQUESTS: usize = 64;
 
 const PRELUDE: &str = include_str!("prelude.js");
 
@@ -424,6 +428,13 @@ struct State {
     pending_scripts: Vec<u32>,
     /// Boxes from the last layout, for `getBoundingClientRect`.
     boxes: Vec<(u32, Rect)>,
+    /// Requests scripts made, waiting to be sent to the browser.
+    requests: Vec<(u32, String, ScriptRequest)>,
+    next_request: u32,
+    /// `document.cookie` values scripts set, waiting for the browser.
+    cookie_sets: Vec<String>,
+    /// `document.cookie` as last reported by the browser (plus local sets).
+    cookies: String,
     warned_selectors: bool,
 }
 
@@ -821,7 +832,91 @@ fn n_resolve(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
     Ok(js_string!(with(|s| crate::net::resolve(&s.url, &href))).into())
 }
 
+fn n_request(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let method = arg_str(a, 0, c)?;
+    let url = arg_str(a, 1, c)?;
+    let mut headers = Vec::new();
+    if let Some(list) = a.get_or_undefined(2).as_object() {
+        let n = list.get(js_string!("length"), c)?.to_length(c)?.min(64);
+        let mut i = 0;
+        while i + 1 < n {
+            let k = list.get(i, c)?.to_string(c)?.to_std_string_escaped();
+            let v = list.get(i + 1, c)?.to_string(c)?.to_std_string_escaped();
+            headers.push((k, v));
+            i += 2;
+        }
+    }
+    let body = if a.get_or_undefined(3).is_null_or_undefined() {
+        None
+    } else {
+        Some(arg_str(a, 3, c)?)
+    };
+    let credentials = match arg_str(a, 4, c)?.as_str() {
+        "omit" => Credentials::Omit,
+        "include" => Credentials::Include,
+        _ => Credentials::SameOrigin,
+    };
+    let id = with(|s| {
+        if s.requests.len() >= MAX_QUEUED_REQUESTS {
+            return None;
+        }
+        s.next_request += 1;
+        let url = crate::net::resolve(&s.url, &url);
+        s.requests.push((
+            s.next_request,
+            url,
+            ScriptRequest {
+                method,
+                headers,
+                body,
+                credentials,
+            },
+        ));
+        Some(s.next_request)
+    });
+    match id {
+        Some(id) => Ok(id.into()),
+        None => Err(JsNativeError::range()
+            .with_message("too many requests waiting")
+            .into()),
+    }
+}
+
+fn n_cookie(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
+    Ok(js_string!(with(|s| s.cookies.clone())).into())
+}
+
+fn n_set_cookie(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let v = arg_str(a, 0, c)?;
+    if v.len() > 4096 {
+        return Ok(JsValue::undefined());
+    }
+    with(|s| {
+        if s.cookie_sets.len() < 100 {
+            // Show the change at once; the browser's answer replaces this.
+            if let Some((name, value)) = v.split(';').next().and_then(|p| p.split_once('=')) {
+                let (name, value) = (name.trim(), value.trim());
+                let mut parts: Vec<String> = s
+                    .cookies
+                    .split("; ")
+                    .filter(|p| !p.is_empty() && p.split('=').next() != Some(name))
+                    .map(str::to_string)
+                    .collect();
+                if !value.is_empty() && !v.to_ascii_lowercase().contains("max-age=0") {
+                    parts.push(format!("{name}={value}"));
+                }
+                s.cookies = parts.join("; ");
+            }
+            s.cookie_sets.push(v);
+        }
+    });
+    Ok(JsValue::undefined())
+}
+
 const NATIVES: &[(&str, Native, usize)] = &[
+    ("request", n_request, 5),
+    ("cookie", n_cookie, 0),
+    ("setCookie", n_set_cookie, 1),
     ("nodeType", n_node_type, 1),
     ("tag", n_tag, 1),
     ("parent", n_parent, 1),
@@ -877,6 +972,7 @@ struct Internals {
     dispatch: JsObject,
     fire_load: JsObject,
     set_viewport: JsObject,
+    deliver: JsObject,
 }
 
 /// What a click did.
@@ -967,6 +1063,7 @@ impl Runtime {
             dispatch: get("dispatch", &mut ctx)?,
             fire_load: get("fireLoad", &mut ctx)?,
             set_viewport: get("setViewport", &mut ctx)?,
+            deliver: get("deliver", &mut ctx)?,
         };
         let mut rt = Runtime {
             internals,
@@ -1045,6 +1142,47 @@ impl Runtime {
             prevented,
             changed: self.version() != before,
         }
+    }
+
+    /// Requests scripts made since last asked: (id, absolute URL, request).
+    pub fn take_requests(&mut self) -> Vec<(u32, String, ScriptRequest)> {
+        with(|s| std::mem::take(&mut s.requests))
+    }
+
+    /// `document.cookie` assignments since last asked.
+    pub fn take_cookie_sets(&mut self) -> Vec<String> {
+        with(|s| std::mem::take(&mut s.cookie_sets))
+    }
+
+    /// The browser's current `document.cookie` for the page.
+    pub fn set_cookies(&mut self, cookies: String) {
+        with(|s| s.cookies = cookies);
+    }
+
+    /// Hand a request's answer to the script that made it.
+    pub fn deliver(&mut self, id: u32, result: Result<ScriptResponse, String>) {
+        let f = self.internals.deliver.clone();
+        let args: Vec<JsValue> = match result {
+            Ok(r) => {
+                let mut flat = Vec::new();
+                for (k, v) in r.headers {
+                    flat.push(JsValue::from(js_string!(k)));
+                    flat.push(JsValue::from(js_string!(v)));
+                }
+                let headers = JsArray::from_iter(flat, &mut self.ctx);
+                vec![
+                    id.into(),
+                    JsValue::null(),
+                    (r.status as u32).into(),
+                    js_string!(r.url).into(),
+                    r.redirected.into(),
+                    headers.into(),
+                    js_string!(r.body).into(),
+                ]
+            }
+            Err(e) => vec![id.into(), js_string!(e).into()],
+        };
+        self.call(&f, &args);
     }
 
     pub fn version(&self) -> u64 {
@@ -1241,26 +1379,121 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(5));
     }
 
+    /// A stand-in browser: records requests and answers them.
+    struct FakeHost {
+        seen: Vec<(String, ScriptRequest)>,
+        cookies: String,
+    }
+
+    impl crate::page::Host for FakeHost {
+        fn fetch(&mut self, _: &str, _: crate::net::Dest) -> Result<String, String> {
+            Err("no files".into())
+        }
+        fn request(&mut self, url: &str, req: ScriptRequest) -> Result<ScriptResponse, String> {
+            self.seen.push((url.to_string(), req));
+            if url.contains("blocked") {
+                return Err("blocked by a filter".into());
+            }
+            Ok(ScriptResponse {
+                status: 200,
+                url: url.to_string(),
+                redirected: false,
+                headers: vec![("content-type".into(), "application/json".into())],
+                body: "{\"n\": 42}".into(),
+            })
+        }
+        fn set_cookie(&mut self, v: &str) {
+            let pair = v.split(';').next().unwrap_or("").trim();
+            self.cookies = if self.cookies.is_empty() {
+                pair.to_string()
+            } else {
+                format!("{}; {pair}", self.cookies)
+            };
+        }
+        fn cookies(&mut self) -> String {
+            self.cookies.clone()
+        }
+    }
+
     #[test]
-    fn no_network_no_cookies_no_storage() {
+    fn script_requests_go_through_the_browser() {
+        let tree = crate::html::parse("<p id=out></p>");
+        let mut rt = Runtime::new(&tree, "https://example.com/app/", (1000.0, 700.0)).unwrap();
+        let mut host = FakeHost {
+            seen: vec![],
+            cookies: "theme=dark".into(),
+        };
+        rt.set_cookies(host.cookies.clone());
+        rt.run_script(
+            r#"
+            console.log(document.cookie, navigator.cookieEnabled);
+            document.cookie = 'lang=en; Path=/';
+            fetch('api/data?x=1', { method: 'POST', headers: { 'X-Thing': 'a' }, body: JSON.stringify({a: 1}),
+                                    credentials: 'include' })
+              .then(r => r.json()).then(j => console.log('fetch', j.n));
+            fetch('https://blocked.example/t').catch(e => console.log('rejected', e instanceof TypeError));
+            const x = new XMLHttpRequest();
+            x.onload = () => console.log('xhr', x.status, x.getResponseHeader('Content-Type'), JSON.parse(x.responseText).n);
+            x.open('GET', '/other'); x.send();
+            const f = new FormData(); f.append('q', 'cats');
+            fetch('/form', { method: 'POST', body: f });
+            const c = new AbortController(); fetch('/aborted', { signal: c.signal }).catch(e => console.log('aborted'));
+            c.abort();
+            "#,
+            0,
+            "test",
+        );
+        crate::page::pump(&mut rt, &mut host, Instant::now() + Duration::from_secs(2));
+        rt.run_script("console.log(document.cookie)", 0, "after");
+        let c = rt.take_console();
+        assert_eq!(c[0], "[log] theme=dark true");
+        for want in [
+            "[log] fetch 42",
+            "[log] rejected true",
+            "[log] xhr 200 application/json 42",
+            "[log] aborted",
+        ] {
+            assert!(c.contains(&want.to_string()), "{want}: {c:?}");
+        }
+        assert_eq!(c.last().unwrap(), "[log] theme=dark; lang=en", "{c:?}");
+        let (url, req) = &host.seen[0];
+        assert_eq!(url, "https://example.com/app/api/data?x=1");
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.body.as_deref(), Some("{\"a\":1}"));
+        assert_eq!(req.credentials, Credentials::Include);
+        assert!(
+            req.headers.contains(&("x-thing".into(), "a".into())),
+            "{:?}",
+            req.headers
+        );
+        assert!(req
+            .headers
+            .iter()
+            .any(|(k, v)| k == "content-type" && v.starts_with("text/plain")));
+        let form = host.seen.iter().find(|(u, _)| u.ends_with("/form")).unwrap();
+        let body = form.1.body.as_deref().unwrap();
+        assert!(body.contains("name=\"q\"") && body.contains("cats"), "{body}");
+        assert!(form
+            .1
+            .headers
+            .iter()
+            .any(|(k, v)| k == "content-type" && v.starts_with("multipart/form-data; boundary=")));
+    }
+
+    #[test]
+    fn storage_lasts_only_for_the_page() {
         let (mut rt, _) = run(
             "",
             r#"
-            console.log(typeof fetch, document.cookie === '', navigator.userAgent.includes('Firefox'));
-            fetch('https://tracker.example/').catch(e => console.log('fetch failed'));
-            const x = new XMLHttpRequest(); x.onerror = () => console.log('xhr failed');
-            x.open('GET', 'https://tracker.example/'); x.send();
             localStorage.setItem('a', '1'); console.log(localStorage.getItem('a'));
-            document.cookie = 'id=1'; console.log(document.cookie === '');
             console.log(new Date(0).getTimezoneOffset(), innerWidth, innerHeight, screen.width);
+            navigator.sendBeacon('/beacon', 'x');
             "#,
         );
         let c = rt.take_console();
-        assert_eq!(c[0], "[log] function true true");
-        assert!(c.contains(&"[log] fetch failed".to_string()), "{c:?}");
-        assert!(c.contains(&"[log] xhr failed".to_string()), "{c:?}");
         assert!(c.contains(&"[log] 1".to_string()), "{c:?}");
         assert!(c.contains(&"[log] 0 1000 700 1920".to_string()), "{c:?}");
+        assert!(rt.take_requests().is_empty(), "sendBeacon sends nothing");
     }
 
     #[test]

@@ -126,20 +126,29 @@ in `src/cookies.rs`.
 - **Allowed per site.** Use the "JavaScript" button in the request panel, or
   `brickle js allow SITE`. The list is `~/.config/brickle/js-sites.txt`. `--js` allows it
   everywhere for one run.
-- **Scripts get no network access.** `fetch`, `XMLHttpRequest` and `sendBeacon` don't send
-  anything, and setting an image's `src` loads nothing. Script files themselves are fetched by
-  the browser like any other request: shown in the request panel, subject to the blocker, your
-  rules and HTTPS-only. The browser, not the page, decides whether a site may load scripts.
-- **No cookies or storage for scripts.** `document.cookie` is empty and can't be set.
-  `localStorage` and `sessionStorage` only last as long as the page.
+- **Scripts' requests go through the browser.** `fetch` and `XMLHttpRequest` work, but the
+  browser makes every request, with the same checks as for anything else: they're listed in the
+  request panel (as "xhr"), and your rules, the blocker (including `$xmlhttprequest` rules),
+  HTTPS-only and the local-network block all apply. Scripts can't set headers that are the
+  browser's business (cookies, origin, referrer, user agent and the like).
+- **Other sites' data stays theirs (CORS).** A script may ask another site for something, but only
+  sees the answer if that site allows it (`Access-Control-Allow-Origin`). Otherwise the response
+  is withheld and the panel says so. Requests that would need a CORS "preflight" aren't sent at
+  all yet.
+- **No beacons.** `navigator.sendBeacon` sends nothing, and setting an image's `src` loads
+  nothing.
+- **Cookies for scripts** follow the cookie rules (rule 8): no third-party cookies, ever.
+  `document.cookie` shows only the page's own non-HttpOnly cookies; scripts can't see, create or
+  replace HttpOnly ones (those are how sites keep you logged in). `localStorage` and
+  `sessionStorage` only last as long as the page.
 - **Navigation from scripts** (`location.href = ...`) goes through the same checks as a link,
   only to web addresses, and a page that keeps redirecting itself is stopped.
 - **Sandboxed, interpreted, bounded.** Scripts run in the sandboxed renderer, in Boa, a
   JavaScript interpreter written in Rust with no JIT. Loops and recursion are capped. If scripts
   hang or crash, the page is shown without them after at most 15 seconds.
 
-*Enforced by:* `javascript_is_off_by_default_and_has_no_network` in `tests/privacy.rs`, and the
-tests in `src/js.rs`.
+*Enforced by:* `javascript_is_off_by_default_and_its_requests_follow_the_rules` in
+`tests/privacy.rs`, and the tests in `src/js.rs` and `src/cookies.rs`.
 
 ## What Brickle does store
 

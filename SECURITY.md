@@ -50,8 +50,9 @@ network devices and blocked trackers. Security decisions about URLs all use one 
 
 Scripts run only in the sandboxed renderer, in Boa (an interpreter, no JIT: the sandbox forbids
 executable memory anyway). What a script can reach is the page's own DOM through a small set of
-native functions in `src/js.rs`, which validate every node id and string; there is no network,
-cookie or storage access. Loop-iteration and recursion limits can't be caught by scripts, work
+native functions in `src/js.rs`, which validate every node id and string. Scripts' network
+requests and cookie changes are queued and answered by the browser process, which applies the
+network policy and CORS using its own record of the page's origin (`Network::script_request`). Loop-iteration and recursion limits can't be caught by scripts, work
 runs in time-boxed batches, and a renderer that still hangs is killed and the page reloaded
 without JavaScript. The `js` fuzz target drives random DOM operations through the whole
 pipeline.

@@ -88,7 +88,7 @@ are only parsed when a page actually uses them.
 
 ## Security
 
-JavaScript is off unless you allow a site, and even then scripts get no network access. Cookies are first-party only and deleted on close unless you keep a site (see PRIVACY.md). Privacy protections are
+JavaScript is off unless you allow a site; its requests go through the same rules as everything else. Cookies are first-party only and deleted on close unless you keep a site (see PRIVACY.md). Privacy protections are
 described in [PRIVACY.md](PRIVACY.md). Security measures:
 
 - **Sandboxed renderer (Linux).** Each page is parsed, laid out and its text rasterized in its own
@@ -152,5 +152,5 @@ On non-Linux systems the sandbox isn't implemented yet, so you have to run with 
 
 ## Not yet
 
-Network access for scripts (`fetch`, XHR), JavaScript modules, forms, images, real table layout, floats, positioning (`absolute`/`fixed`), flex wrapping and
+JavaScript modules, CORS preflight, forms, images, real table layout, floats, positioning (`absolute`/`fixed`), flex wrapping and
 alignment, `calc()`/`var()`, web fonts, forms, and text selection.
