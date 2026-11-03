@@ -66,10 +66,17 @@ fn serve_dynamic(
                 .find(|(p, _, _)| *p == path)
                 .map(|(_, t, b)| (*t, b.clone()))
                 .unwrap_or(("text/plain", "not found".into()));
+            // A content type may start with a status code: "302 text/html".
+            let (status, ctype) = match ctype.split_once(' ') {
+                Some((code, rest)) if code.len() == 3 && code.bytes().all(|b| b.is_ascii_digit()) => {
+                    (code, rest)
+                }
+                _ => ("200", ctype),
+            };
             let mut s = stream;
             let _ = write!(
                 s,
-                "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {status} X\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
         }
@@ -332,7 +339,7 @@ fn local_proxy_still_works_for_public_pages() {
         true,
         None,
     );
-    assert_eq!(r.err().as_deref(), Some(brickle::net::LOCAL_NETWORK_ERR));
+    assert_eq!(r.err(), Some(brickle::net::NetError::LocalNetwork));
 }
 
 /// PRIVACY.md rule 8: first-party cookies work, third parties get nothing,
@@ -406,4 +413,106 @@ fn cookies_first_party_only_and_session_only() {
         .any(|r| cookie_of(r).is_some_and(|c| c.contains("track"))));
     let saved = std::fs::read_to_string(home.join("data/brickle/cookies.txt")).unwrap();
     assert!(saved.contains("sid") && !saved.contains("track"));
+}
+
+/// PRIVACY.md rule 5: a certificate that fails verification is an error,
+/// never a reason to offer plain HTTP.
+#[test]
+fn bad_certificates_are_refused_not_downgraded() {
+    use std::sync::Arc as A;
+    let cert = rustls::pki_types::CertificateDer::from(include_bytes!("data/selfsigned.crt.der").to_vec());
+    let key =
+        rustls::pki_types::PrivateKeyDer::Pkcs8(include_bytes!("data/selfsigned.key.der").to_vec().into());
+    let config = A::new(
+        rustls::ServerConfig::builder_with_provider(A::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let served = Arc::new(Mutex::new(0));
+    let served2 = served.clone();
+    std::thread::spawn(move || {
+        for mut tcp in listener.incoming().flatten() {
+            let mut conn = rustls::ServerConnection::new(config.clone()).unwrap();
+            let mut tls = rustls::Stream::new(&mut conn, &mut tcp);
+            let mut buf = [0u8; 1024];
+            if let Ok(n) = std::io::Read::read(&mut tls, &mut buf) {
+                if n > 0 {
+                    *served2.lock().unwrap() += 1; // the request got through
+                }
+            }
+        }
+    });
+    let home = temp_dir("cert");
+    let out = brickle(&home)
+        .args(["requests", &format!("https://localhost:{port}/")])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("BLOCKED (bad certificate)"), "{stdout}");
+    assert!(!stdout.contains("no HTTPS"), "{stdout}");
+    assert_eq!(
+        *served.lock().unwrap(),
+        0,
+        "no request was sent over the bad connection"
+    );
+    let page = brickle(&home)
+        .args(["dom", &format!("https://localhost:{port}/")])
+        .output()
+        .unwrap();
+    let dom = String::from_utf8_lossy(&page.stdout);
+    assert!(dom.contains("couldn't verify this site's identity"), "{dom}");
+    assert!(!dom.contains("brickle:proceed"), "no way around it: {dom}");
+}
+
+/// Cookies are worked out again at every redirect hop, and their values
+/// never appear in the request log.
+#[test]
+fn cookies_follow_redirect_hops_and_values_stay_out_of_logs() {
+    let home = temp_dir("cookie-redirect");
+    let (port, seen) = serve_dynamic(|port| {
+        vec![
+            (
+                "/login",
+                "302 text/html\r\nLocation: /home\r\nSet-Cookie: login=s3cretvalue; Path=/; HttpOnly",
+                String::new(),
+            ),
+            (
+                "/home",
+                // On to another site, which must not get 127.0.0.1's cookie.
+                Box::leak(
+                    format!("302 text/html\r\nLocation: http://localhost:{port}/other").into_boxed_str(),
+                ),
+                String::new(),
+            ),
+            ("/other", "text/html", "<p>done".into()),
+        ]
+    });
+    let out = brickle(&home)
+        .args(["requests", &format!("http://127.0.0.1:{port}/login")])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let seen = seen.lock().unwrap();
+    let cookie_of = |i: usize| seen[i].iter().find(|l| l.starts_with("Cookie: ")).cloned();
+    assert_eq!(seen.len(), 3, "{stdout}");
+    assert_eq!(cookie_of(0), None);
+    assert_eq!(
+        cookie_of(1).as_deref(),
+        Some("Cookie: login=s3cretvalue"),
+        "{stdout}"
+    );
+    assert_eq!(cookie_of(2), None, "another site: {stdout}");
+    assert!(
+        stdout.contains("set cookies login") && stdout.contains("sent cookies login"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("s3cretvalue"),
+        "values are never logged: {stdout}"
+    );
 }

@@ -15,7 +15,7 @@
 
 use crate::cookies::{self, Jar};
 use crate::filter::{self, Filters, Req, Verdict};
-use crate::net::{self, Dest};
+use crate::net::{self, Cancel, Dest, NetError};
 use crate::page::error_page;
 use crate::urlclean;
 use std::collections::HashSet;
@@ -58,6 +58,8 @@ pub enum Outcome {
     OverLimit,
     /// A public website reaching for your local network (router, printer, ...).
     LocalNetwork,
+    /// The server's certificate failed verification.
+    BadCertificate(String),
     Failed(String),
 }
 
@@ -130,6 +132,7 @@ enum Fetch {
     NeedsHttp { host: String, url: String },
     FilterBlocked { host: String, url: String, rule: String },
     LocalNetwork { host: String, url: String },
+    Certificate { host: String, err: String },
 }
 
 pub struct Network {
@@ -145,7 +148,11 @@ pub struct Network {
     local_allowed: HashSet<String>,
     log: Vec<LogEntry>,
     page_stylesheets: usize,
-    page_started: std::time::Instant,
+    /// When the current page's loading must be finished, document,
+    /// redirects and subresources together.
+    deadline: std::time::Instant,
+    /// Pressed by the window's Stop (Esc); set a fresh one per page.
+    pub cancel: Cancel,
     page_bytes: usize,
     pub lists_loaded: usize,
     /// The cookie jar (see `cookies.rs` for the policy).
@@ -179,7 +186,8 @@ impl Network {
             local_allowed: HashSet::new(),
             log: Vec::new(),
             page_stylesheets: 0,
-            page_started: std::time::Instant::now(),
+            deadline: std::time::Instant::now() + PAGE_TIME_BUDGET,
+            cancel: Cancel::new(),
             page_bytes: 0,
             lists_loaded: 0,
             cookies: Jar::new(),
@@ -238,6 +246,11 @@ impl Network {
         self.user = f;
     }
 
+    /// When the current page must have finished loading.
+    pub fn deadline(&self) -> std::time::Instant {
+        self.deadline
+    }
+
     pub fn take_log(&mut self) -> Vec<LogEntry> {
         std::mem::take(&mut self.log)
     }
@@ -260,7 +273,7 @@ impl Network {
     /// Load a top-level page. `from` is the page that linked here, if any.
     pub fn navigate(&mut self, url: &str, from: Option<&str>) -> Nav {
         self.page_stylesheets = 0;
-        self.page_started = std::time::Instant::now();
+        self.deadline = std::time::Instant::now() + PAGE_TIME_BUDGET;
         self.page_bytes = 0;
         let fetched = self.fetch(url, from, Dest::Document);
         if let Err(e) = self.cookies.save() {
@@ -287,6 +300,19 @@ impl Network {
                     url: url.clone(),
                 },
                 url,
+            },
+            Fetch::Certificate { host, err } => Nav::Page {
+                html: interstitial_page(
+                    "Brickle couldn't verify this site's identity",
+                    &format!(
+                        "The certificate presented by <b>{}</b> isn't valid (<code>{}</code>). Someone \
+                         may be impersonating the site or intercepting your connection, so Brickle \
+                         didn't load it, and won't fall back to an insecure connection.",
+                        esc(&host),
+                        esc(&err)
+                    ),
+                ),
+                url: url.to_string(),
             },
             Fetch::Stopped(why) => Nav::Page {
                 url: url.to_string(),
@@ -335,7 +361,7 @@ impl Network {
         self.page_stylesheets += 1;
         let why = if self.page_stylesheets > MAX_STYLESHEETS {
             Some("too many stylesheets")
-        } else if self.page_started.elapsed() > PAGE_TIME_BUDGET {
+        } else if std::time::Instant::now() >= self.deadline || self.cancel.is_cancelled() {
             Some("page took too long to load")
         } else if self.page_bytes > PAGE_BYTE_BUDGET {
             Some("page downloaded too much")
@@ -355,6 +381,7 @@ impl Network {
             Fetch::Stopped(why) => Err(why),
             Fetch::NeedsHttp { url, .. } => Err(format!("blocked insecure {url}")),
             Fetch::FilterBlocked { url, .. } => Err(format!("blocked {url}")),
+            Fetch::Certificate { host, err } => Err(format!("{host}: {err}")),
         }
     }
 
@@ -400,12 +427,23 @@ impl Network {
         let mut url = url.to_string();
         let mut from = initiator.map(str::to_string);
         for _ in 0..=MAX_REDIRECTS {
+            // 0. One parse, by the one URL parser; every check below sees
+            //    its serialization. Credentials are dropped.
+            let Some((parsed, had_credentials)) = net::canonical(&url) else {
+                self.record(&url, dest, Outcome::NotAllowed, vec![]);
+                return Fetch::Stopped(format!("Not a valid address: {}", esc(&url)));
+            };
+            url = parsed.into();
+
             // 1. Strip tracking parameters.
             let extra = self.filters.removeparam(&url, page, fdest);
-            let (clean, stripped) = urlclean::strip_params(&url, &|k| {
+            let (clean, mut stripped) = urlclean::strip_params(&url, &|k| {
                 urlclean::is_tracking_param(k) || extra.contains(&k.to_ascii_lowercase())
             });
             url = clean;
+            if had_credentials {
+                stripped.push("user:password@".into());
+            }
 
             // 2. Scheme policy.
             if !net::may_load(from.as_deref(), &url) {
@@ -446,8 +484,12 @@ impl Network {
             let mut upgraded = false;
             if net::scheme(&url) == "http" && !net::is_local_host(&host) && !self.http_allowed.contains(&host)
             {
-                target = format!("https://{}", &url["http://".len()..]);
-                upgraded = true;
+                if let Ok(mut u) = url::Url::parse(&url) {
+                    if u.set_scheme("https").is_ok() {
+                        target = u.into();
+                        upgraded = true;
+                    }
+                }
             }
             let insecure = net::scheme(&target) == "http" && !net::is_local_host(&host);
             if insecure && page.is_some_and(|p| net::scheme(p) == "https") {
@@ -469,7 +511,15 @@ impl Network {
                 navigation: dest == Dest::Document,
             };
             let (cookie, sent) = self.cookies.header_for(&target, ctx).unzip();
-            let result = net::http_get(&target, dest, from.as_deref(), public_only, cookie.as_deref());
+            let result = net::http_get_until(
+                &target,
+                dest,
+                from.as_deref(),
+                public_only,
+                cookie.as_deref(),
+                self.deadline,
+                &self.cancel,
+            );
             let stored = match &result {
                 Ok(resp) => {
                     let redirect = (300..400).contains(&resp.status);
@@ -516,13 +566,28 @@ impl Network {
                         body: resp.body,
                     };
                 }
-                Err(err) if err == net::LOCAL_NETWORK_ERR => {
+                Err(NetError::LocalNetwork) => {
                     self.record(&entry_url, dest, Outcome::LocalNetwork, stripped);
                     return if dest == Dest::Document {
                         Fetch::LocalNetwork { host, url }
                     } else {
                         Fetch::Stopped(format!("blocked local-network request {url}"))
                     };
+                }
+                Err(NetError::Certificate(err)) => {
+                    // A certificate that fails verification may mean someone
+                    // is intercepting the connection: never offer plain HTTP.
+                    let e = self.record(&entry_url, dest, Outcome::BadCertificate(err.clone()), stripped);
+                    e.upgraded = upgraded;
+                    return Fetch::Certificate { host, err };
+                }
+                Err(err @ (NetError::Cancelled | NetError::TimedOut)) => {
+                    let e = self.record(&entry_url, dest, Outcome::Failed(err.to_string()), stripped);
+                    e.upgraded = upgraded;
+                    return Fetch::Stopped(match err {
+                        NetError::Cancelled => "Stopped.".into(),
+                        _ => format!("{target}: the page took too long to load"),
+                    });
                 }
                 Err(err) if upgraded => {
                     // No HTTPS: a subresource of an HTTP page you already
@@ -540,7 +605,7 @@ impl Network {
                     return Fetch::NeedsHttp { host, url };
                 }
                 Err(err) => {
-                    self.record(&entry_url, dest, Outcome::Failed(err.clone()), stripped);
+                    self.record(&entry_url, dest, Outcome::Failed(err.to_string()), stripped);
                     return Fetch::Stopped(format!("{target}: {err}"));
                 }
             }
@@ -624,7 +689,7 @@ impl Network {
 
 /// A page served from the internet (not a local file or local device).
 fn is_public_page(url: &str) -> bool {
-    matches!(net::scheme(url), "http" | "https") && !net::is_local_host(&filter::host_of(url))
+    matches!(net::scheme(url).as_str(), "http" | "https") && !net::is_local_host(&filter::host_of(url))
 }
 
 fn esc(s: &str) -> String {
@@ -633,6 +698,16 @@ fn esc(s: &str) -> String {
 
 /// A warning page with a single "continue" link. The `brickle:proceed` link
 /// only works from an interstitial the browser itself generated.
+/// A warning page with no way to continue.
+fn interstitial_page(title: &str, body: &str) -> String {
+    format!(
+        "<title>{t}</title><body style='font-family: sans-serif; margin: 0; background: #fdf6e3'>\
+         <div style='max-width: 640px; margin: 60px auto; padding: 0 24px; color: #333'>\
+         <h1 style='color: #9a3412'>{t}</h1><p style='line-height: 1.5'>{body}</p></div></body>",
+        t = esc(title)
+    )
+}
+
 fn interstitial(title: &str, body: &str, proceed: &str) -> String {
     format!(
         "<title>{t}</title><body style='font-family: sans-serif; margin: 0; background: #fdf6e3'>\
@@ -741,7 +816,7 @@ mod tests {
     #[test]
     fn page_time_budget() {
         let mut n = Network::empty();
-        n.page_started = std::time::Instant::now() - PAGE_TIME_BUDGET - std::time::Duration::from_secs(1);
+        n.deadline = std::time::Instant::now() - std::time::Duration::from_secs(1);
         let before = net::requests_sent();
         assert!(n
             .subresource("https://a.example/", "https://a.example/late.css")

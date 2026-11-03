@@ -63,7 +63,12 @@ load insecure stylesheets (mixed content). Redirects are re-checked at every hop
 can't redirect you down to HTTP. Local network addresses (`localhost`, `192.168.x.x`, …) are
 exempt, as in Firefox.
 
-*Enforced by:* `https_only_asks_before_using_plain_http` in `tests/privacy.rs`.
+A certificate that fails verification is not the same as "no HTTPS": it can mean someone is
+intercepting the connection. Brickle shows a certificate error page with no way to continue,
+and never offers plain HTTP instead.
+
+*Enforced by:* `https_only_asks_before_using_plain_http` and
+`bad_certificates_are_refused_not_downgraded` in `tests/privacy.rs`.
 
 ## 6. Content blocking
 
@@ -81,7 +86,8 @@ It tries the official sources first, then uBlock Origin's GitHub mirror, and pri
 
 Before any request, Brickle removes known tracking parameters (`utm_*`, `fbclid`, `gclid`,
 `msclkid`, `mc_eid`, `igshid`, `_hsenc`, … see `src/urlclean.rs`), plus any `$removeparam`
-rules from the filter lists. The request panel shows what was removed.
+rules from the filter lists. The request panel shows what was removed. Credentials embedded in
+a link (`https://user:pass@host/`) are removed too, and never sent.
 
 ## 8. Cookies
 

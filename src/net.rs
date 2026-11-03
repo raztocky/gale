@@ -5,8 +5,56 @@
 //! network connections; a test enforces that.
 
 use std::io::Read;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// Longest a single request may take.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Why a request failed. Kept typed so policy can tell, for example, a bad
+/// certificate (never a reason to fall back to HTTP) from a site that just
+/// doesn't speak HTTPS.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NetError {
+    /// A public website reaching for a local-network address.
+    LocalNetwork,
+    /// The server's TLS certificate couldn't be verified.
+    Certificate(String),
+    /// You pressed Stop.
+    Cancelled,
+    /// Ran past the request or page deadline.
+    TimedOut,
+    Other(String),
+}
+
+impl std::fmt::Display for NetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            NetError::LocalNetwork => f.write_str(LOCAL_NETWORK_ERR),
+            NetError::Certificate(e) => write!(f, "certificate error: {e}"),
+            NetError::Cancelled => f.write_str("stopped"),
+            NetError::TimedOut => f.write_str("timed out"),
+            NetError::Other(e) => f.write_str(e),
+        }
+    }
+}
+
+/// A Stop button: shared between the window and whatever is loading.
+#[derive(Debug, Clone, Default)]
+pub struct Cancel(Arc<AtomicBool>);
+
+impl Cancel {
+    pub fn new() -> Cancel {
+        Cancel::default()
+    }
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
 
 /// Largest document or stylesheet we will read.
 pub const MAX_BYTES: u64 = 8 * 1024 * 1024;
@@ -30,14 +78,33 @@ pub fn requests_sent() -> usize {
     REQUESTS.load(Ordering::SeqCst)
 }
 
-pub fn scheme(url: &str) -> &str {
-    url.split_once("://").map(|(s, _)| s).unwrap_or("")
+/// The scheme of a URL, as the URL parser sees it ("" if it doesn't parse).
+pub fn scheme(url: &str) -> String {
+    url::Url::parse(url)
+        .map(|u| u.scheme().to_string())
+        .unwrap_or_default()
+}
+
+/// The one way Brickle turns a string into a URL for security decisions:
+/// the WHATWG parser from the `url` crate. Everything downstream (filters,
+/// cookies, HTTPS-only, the local-network check) sees its serialization, so
+/// no two parts of the browser can disagree about which host a URL means.
+/// Credentials (`user:pass@`) are removed: they are a classic way to
+/// disguise a link's real host, and Brickle never sends them.
+pub fn canonical(url: &str) -> Option<(url::Url, bool)> {
+    let mut u = url::Url::parse(url.trim()).ok()?;
+    let had_credentials = !u.username().is_empty() || u.password().is_some();
+    if had_credentials {
+        u.set_username("").ok()?;
+        u.set_password(None).ok()?;
+    }
+    Some((u, had_credentials))
 }
 
 /// May a document at `from` load `to`? `from` is `None` for user-initiated
 /// loads (typed address, command line), which may open local files.
 pub fn may_load(from: Option<&str>, to: &str) -> bool {
-    match scheme(to) {
+    match scheme(to).as_str() {
         "http" | "https" => true,
         "file" => from.is_none_or(|f| scheme(f) == "file"),
         _ => false,
@@ -45,19 +112,23 @@ pub fn may_load(from: Option<&str>, to: &str) -> bool {
 }
 
 pub fn read_file(path: &str) -> Result<String, String> {
-    let path = path.trim_start_matches("file://");
-    let path = path.split(['?', '#']).next().unwrap_or(path);
-    let meta = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?;
+    let path = url::Url::parse(path)
+        .ok()
+        .filter(|u| u.scheme() == "file")
+        .and_then(|u| u.to_file_path().ok())
+        .ok_or_else(|| format!("{path}: not a local file address"))?;
+    let shown = path.display();
+    let meta = std::fs::metadata(&path).map_err(|e| format!("{shown}: {e}"))?;
     if !meta.is_file() {
-        return Err(format!("{path}: not a regular file"));
+        return Err(format!("{shown}: not a regular file"));
     }
     if meta.len() > MAX_BYTES {
         return Err(format!(
-            "{path}: file is larger than {} MB",
+            "{shown}: file is larger than {} MB",
             MAX_BYTES / 1024 / 1024
         ));
     }
-    let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    let bytes = std::fs::read(&path).map_err(|e| format!("{shown}: {e}"))?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
@@ -175,18 +246,140 @@ pub fn http_get(
     initiator: Option<&str>,
     public_only: bool,
     cookie: Option<&str>,
-) -> Result<Response, String> {
+) -> Result<Response, NetError> {
+    http_get_timeout(url, dest, initiator, public_only, cookie, REQUEST_TIMEOUT)
+}
+
+/// [`http_get`] that gives up at `deadline` or when `cancel` is pressed,
+/// whichever comes first. The request runs on its own thread, which is
+/// abandoned (and ends at its own timeout) if we stop waiting.
+#[allow(clippy::too_many_arguments)]
+pub fn http_get_until(
+    url: &str,
+    dest: Dest,
+    initiator: Option<&str>,
+    public_only: bool,
+    cookie: Option<&str>,
+    deadline: Instant,
+    cancel: &Cancel,
+) -> Result<Response, NetError> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if cancel.is_cancelled() {
+        return Err(NetError::Cancelled);
+    }
+    if left.is_zero() {
+        return Err(NetError::TimedOut);
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let (url, initiator, cookie) = (
+        url.to_string(),
+        initiator.map(str::to_string),
+        cookie.map(str::to_string),
+    );
+    std::thread::Builder::new()
+        .name("brickle-http".into())
+        .spawn(move || {
+            let r = http_get_timeout(
+                &url,
+                dest,
+                initiator.as_deref(),
+                public_only,
+                cookie.as_deref(),
+                left.min(REQUEST_TIMEOUT),
+            );
+            let _ = tx.send(r);
+        })
+        .map_err(|e| NetError::Other(format!("can't start request: {e}")))?;
+    loop {
+        match rx.recv_timeout(Duration::from_millis(25)) {
+            Ok(r) => return r,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(NetError::Other("request thread failed".into()))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if cancel.is_cancelled() {
+                    return Err(NetError::Cancelled);
+                }
+                if Instant::now() >= deadline {
+                    return Err(NetError::TimedOut);
+                }
+            }
+        }
+    }
+}
+
+/// Find a certificate verification failure anywhere in an error chain.
+fn certificate_error(e: &(dyn std::error::Error + 'static)) -> Option<String> {
+    let mut cur = Some(e);
+    while let Some(err) = cur {
+        if let Some(r) = err.downcast_ref::<rustls::Error>() {
+            if matches!(
+                r,
+                rustls::Error::InvalidCertificate(_)
+                    | rustls::Error::NoCertificatesPresented
+                    | rustls::Error::InvalidCertRevocationList(_)
+            ) {
+                return Some(r.to_string());
+            }
+        }
+        if let Some(inner) = err.downcast_ref::<std::io::Error>().and_then(|io| io.get_ref()) {
+            if let Some(found) = certificate_error(inner) {
+                return Some(found);
+            }
+        }
+        cur = err.source();
+    }
+    None
+}
+
+fn timed_out(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur = Some(e);
+    while let Some(err) = cur {
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ) {
+                return true;
+            }
+        }
+        cur = err.source();
+    }
+    false
+}
+
+fn classify(e: &ureq::Error) -> NetError {
+    let msg = e.to_string();
+    if msg.contains(LOCAL_NETWORK_ERR) {
+        NetError::LocalNetwork
+    } else if let Some(c) = certificate_error(e) {
+        NetError::Certificate(c)
+    } else if timed_out(e) {
+        NetError::TimedOut
+    } else {
+        NetError::Other(msg)
+    }
+}
+
+fn http_get_timeout(
+    url: &str,
+    dest: Dest,
+    initiator: Option<&str>,
+    public_only: bool,
+    cookie: Option<&str>,
+    timeout: Duration,
+) -> Result<Response, NetError> {
     let host = url::Url::parse(url)
         .ok()
         .and_then(|u| u.host_str().map(str::to_string))
         .unwrap_or_default();
     if public_only && is_local_host(&host) {
-        return Err(LOCAL_NETWORK_ERR.into());
+        return Err(NetError::LocalNetwork);
     }
     let proxied = proxy_configured() && !bypass_proxy(&host);
     let mut builder = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout(Duration::from_secs(20))
+        .timeout_connect(timeout.min(Duration::from_secs(10)))
+        .timeout(timeout)
         .redirects(0)
         .try_proxy_from_env(!bypass_proxy(&host));
     // Through a proxy, the proxy resolves the name (and our resolver would
@@ -239,14 +432,7 @@ pub fn http_get(
     let resp = match req.call() {
         Ok(r) => r,
         Err(ureq::Error::Status(_, r)) => r,
-        Err(e) => {
-            let msg = e.to_string();
-            return Err(if msg.contains(LOCAL_NETWORK_ERR) {
-                LOCAL_NETWORK_ERR.into()
-            } else {
-                msg
-            });
-        }
+        Err(e) => return Err(classify(&e)),
     };
     let status = resp.status();
     let set_cookies: Vec<String> = resp.all("set-cookie").into_iter().map(str::to_string).collect();
@@ -265,7 +451,7 @@ pub fn http_get(
         || ctype.contains("css")
         || ctype.is_empty();
     if !texty {
-        return Err(format!("can't display content of type {ctype}"));
+        return Err(NetError::Other(format!("can't display content of type {ctype}")));
     }
     // ureq decodes gzip and brotli itself; deflate and zstd are done here.
     let encoding = resp
@@ -276,9 +462,10 @@ pub fn http_get(
     let reader: Box<dyn Read> = Box::new(resp.into_reader().take(MAX_BYTES * 4));
     let mut decoded: Box<dyn Read> = match encoding.as_str() {
         "deflate" => Box::new(flate2::read::ZlibDecoder::new(reader)),
-        "zstd" => {
-            Box::new(ruzstd::decoding::StreamingDecoder::new(reader).map_err(|e| format!("zstd: {e}"))?)
-        }
+        "zstd" => Box::new(
+            ruzstd::decoding::StreamingDecoder::new(reader)
+                .map_err(|e| NetError::Other(format!("zstd: {e}")))?,
+        ),
         _ => reader,
     };
     let mut bytes = Vec::new();
@@ -286,9 +473,21 @@ pub fn http_get(
     (&mut decoded)
         .take(MAX_BYTES + 1)
         .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ) {
+                NetError::TimedOut
+            } else {
+                NetError::Other(e.to_string())
+            }
+        })?;
     if bytes.len() as u64 > MAX_BYTES {
-        return Err(format!("response is larger than {} MB", MAX_BYTES / 1024 / 1024));
+        return Err(NetError::Other(format!(
+            "response is larger than {} MB",
+            MAX_BYTES / 1024 / 1024
+        )));
     }
     Ok(Response {
         status,
@@ -370,70 +569,32 @@ pub fn display_parts(input: &str) -> (String, String) {
 /// Turn a user-typed address or a path into an absolute URL.
 pub fn normalize(input: &str) -> String {
     let input = input.trim();
-    if input.contains("://") || input.starts_with("about:") {
+    if input.starts_with("about:") {
         return input.to_string();
     }
-    if let Ok(p) = std::fs::canonicalize(input) {
-        return format!("file://{}", p.display());
+    if input.contains("://") {
+        return url::Url::parse(input)
+            .map(String::from)
+            .unwrap_or_else(|_| input.to_string());
     }
-    format!("https://{input}")
+    if let Ok(p) = std::fs::canonicalize(input) {
+        if let Ok(u) = url::Url::from_file_path(&p) {
+            return u.into();
+        }
+    }
+    url::Url::parse(&format!("https://{input}"))
+        .map(String::from)
+        .unwrap_or_else(|_| format!("https://{input}"))
 }
 
-/// Resolve `href` relative to `base`.
+/// Resolve `href` relative to `base`, with the URL parser. Anything that
+/// doesn't resolve becomes `about:invalid`, which nothing will load.
 pub fn resolve(base: &str, href: &str) -> String {
-    let href = href.trim();
-    if href.contains("://")
-        || href.starts_with("about:")
-        || href.starts_with("brickle:")
-        || href.starts_with("mailto:")
-        || href.starts_with("data:")
-    {
-        return href.to_string();
-    }
-    let base = base.split('#').next().unwrap_or(base);
-    let (scheme, rest) = base.split_once("://").unwrap_or(("file", base));
-    if let Some(h) = href.strip_prefix("//") {
-        return format!("{scheme}://{h}");
-    }
-    if href.starts_with('#') {
-        return format!("{base}{href}");
-    }
-    // Split authority from path ("host/path" or "/abs/path" for file URLs).
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
-    };
-    let path = path.split('?').next().unwrap_or(path);
-    let joined = if href.starts_with('/') {
-        href.to_string()
-    } else if href.starts_with('?') {
-        format!("{path}{href}")
-    } else {
-        let dir = &path[..path.rfind('/').map(|i| i + 1).unwrap_or(0)];
-        format!("{dir}{href}")
-    };
-    // Normalize dot segments.
-    let (p, query) = match joined.split_once('?') {
-        Some((p, q)) => (p.to_string(), format!("?{q}")),
-        None => (joined.clone(), String::new()),
-    };
-    let mut out: Vec<&str> = Vec::new();
-    let segs: Vec<&str> = p.split('/').collect();
-    for (i, seg) in segs.iter().enumerate() {
-        match *seg {
-            "." => {}
-            ".." => {
-                if out.len() > 1 {
-                    out.pop();
-                }
-            }
-            s => out.push(s),
-        }
-        if i == segs.len() - 1 && (*seg == "." || *seg == "..") {
-            out.push("");
-        }
-    }
-    format!("{scheme}://{authority}{}{query}", out.join("/"))
+    url::Url::parse(base)
+        .and_then(|b| b.join(href.trim()))
+        .or_else(|_| url::Url::parse(href.trim()))
+        .map(String::from)
+        .unwrap_or_else(|_| "about:invalid".into())
 }
 
 #[cfg(test)]
@@ -451,6 +612,81 @@ mod tests {
         assert_eq!(resolve("https://a.com", "b"), "https://a.com/b");
         assert_eq!(resolve("file:///tmp/a/b.html", "c.css"), "file:///tmp/a/c.css");
         assert_eq!(resolve("https://a.com/p", "//cdn.x/y"), "https://cdn.x/y");
+        assert_eq!(resolve("https://a.com/p#x", "#y"), "https://a.com/p#y");
+        assert_eq!(resolve("https://a.com/p", "brickle:proceed"), "brickle:proceed");
+    }
+
+    /// Tricky URLs: whatever host the URL parser sees is the host every
+    /// security check sees.
+    #[test]
+    fn one_parser_for_tricky_urls() {
+        let host = |u: &str| crate::filter::host_of(&resolve("https://page.example/dir/", u));
+        // Backslashes are slashes in web URLs.
+        assert_eq!(host("https://evil.example\\@good.example/"), "evil.example");
+        assert_eq!(host("\\\\evil.example/x"), "evil.example");
+        // Encoded dot segments can't climb out of the path or change host.
+        assert_eq!(
+            resolve("https://a.example/x/y/", "%2e%2e/%2E%2e/z"),
+            "https://a.example/z"
+        );
+        // Credentials don't hide the real host, and are removed.
+        assert_eq!(host("https://good.example@evil.example/"), "evil.example");
+        let (u, had) = canonical("https://user:pw@evil.example/x").unwrap();
+        assert!(had);
+        assert_eq!(u.as_str(), "https://evil.example/x");
+        // Unusual IPv4 notation is normalized before the local-network check.
+        for local in [
+            "http://0x7f.1/",
+            "http://2130706433/",
+            "http://0177.0.0.1/",
+            "http://192.168.1/",
+        ] {
+            let h = host(local);
+            assert!(is_local_host(&h), "{local} -> {h}");
+        }
+        // Case, whitespace and tabs are normalized.
+        assert_eq!(host("  HTTPS://EVIL.EXAMPLE/  "), "evil.example");
+        assert_eq!(host("https://ev\til.example/"), "evil.example");
+        // Schemes are what the parser says.
+        assert_eq!(scheme("FILE:///etc/passwd"), "file");
+        assert!(!may_load(
+            Some("https://a.example/"),
+            &resolve("https://a.example/", "FiLe:///etc/passwd")
+        ));
+        assert!(!may_load(
+            Some("https://a.example/"),
+            &resolve("https://a.example/", " javascript:alert(1)")
+        ));
+        assert_eq!(resolve("https://a.example/", "http://[::1"), "about:invalid");
+    }
+
+    #[test]
+    fn stop_and_deadline_interrupt_a_stalled_request() {
+        // A server that accepts connections and never answers.
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}/", l.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            let held: Vec<_> = l.incoming().take(4).collect();
+            std::thread::sleep(Duration::from_secs(30));
+            drop(held);
+        });
+        let cancel = Cancel::new();
+        let c = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            c.cancel();
+        });
+        let far = Instant::now() + Duration::from_secs(30);
+        let start = Instant::now();
+        let r = http_get_until(&url, Dest::Stylesheet, None, false, None, far, &cancel);
+        assert_eq!(r.err(), Some(NetError::Cancelled));
+        assert!(start.elapsed() < Duration::from_secs(2));
+
+        let start = Instant::now();
+        let soon = Instant::now() + Duration::from_millis(300);
+        let r = http_get_until(&url, Dest::Stylesheet, None, false, None, soon, &Cancel::new());
+        assert_eq!(r.err(), Some(NetError::TimedOut));
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

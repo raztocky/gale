@@ -87,7 +87,7 @@ fn download(url: &str, log: &mut dyn FnMut(&str)) -> Result<String, String> {
             }
             Err(e) => {
                 log(&format!("  GET {url} -> failed: {e}"));
-                return Err(e);
+                return Err(e.to_string());
             }
         }
     }

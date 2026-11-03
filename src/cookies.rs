@@ -23,6 +23,8 @@ const MAX_AGE: u64 = 400 * 86_400;
 const MAX_COOKIE_SIZE: usize = 4096;
 const MAX_PER_SITE: usize = 180;
 const MAX_TOTAL: usize = 3000;
+/// Most `Set-Cookie` headers looked at in one response.
+const MAX_SET_PER_RESPONSE: usize = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SameSite {
@@ -261,7 +263,8 @@ fn parse(header: &str, url: &str, now: u64) -> Result<Cookie, (String, &'static 
                     .trim_start_matches('.')
                     .trim_end_matches('.')
                     .to_ascii_lowercase();
-                if !domain_match(&host, &d) {
+                let is_ip = host.trim_matches(['[', ']']).parse::<std::net::IpAddr>().is_ok();
+                if !domain_match(&host, &d) || (is_ip && d != host) {
                     return refuse("domain doesn't match");
                 }
                 // A cookie for a whole public suffix (`.com`, `.co.uk`,
@@ -410,7 +413,12 @@ impl Jar {
             None
         };
         let t = now();
-        for h in headers {
+        for h in headers.iter().skip(MAX_SET_PER_RESPONSE) {
+            let name = h.split(['=', ';']).next().unwrap_or("").trim();
+            out.refused
+                .push(format!("{name} (too many cookies in one response)"));
+        }
+        for h in headers.iter().take(MAX_SET_PER_RESPONSE) {
             let c = match parse(h, url, t) {
                 Ok(c) => c,
                 Err((name, reason)) => {
@@ -776,6 +784,84 @@ mod tests {
     }
 
     #[test]
+    fn domain_and_path_boundaries() {
+        let mut j = Jar::new();
+        let u = "https://example.com/foo";
+        set(
+            &mut j,
+            u,
+            nav(u, None),
+            &["d=1; Domain=example.com; Path=/foo", "h=1; Path=/"],
+        );
+        let send = |j: &mut Jar, url: &str| j.header_for(url, nav(url, None)).map(|h| h.0);
+        // Same suffix but a different site: nothing (and a different
+        // partition anyway).
+        assert_eq!(send(&mut j, "https://evilexample.com/foo"), None);
+        // Path "/foo" covers "/foo" and "/foo/..." but not "/foobar".
+        assert_eq!(
+            send(&mut j, "https://example.com/foo/x").as_deref(),
+            Some("d=1; h=1")
+        );
+        assert_eq!(send(&mut j, "https://example.com/foobar").as_deref(), Some("h=1"));
+        // Host-only cookies stay on their host; domain cookies reach subdomains.
+        assert_eq!(send(&mut j, "https://a.example.com/foo").as_deref(), Some("d=1"));
+        // A subdomain can't set a cookie for a sibling.
+        let sub = "https://a.example.com/";
+        let s = set(&mut j, sub, nav(sub, None), &["x=1; Domain=b.example.com"]);
+        assert!(s.refused[0].contains("doesn't match"), "{s:?}");
+        // IP hosts: no Domain tricks.
+        let ip = "http://10.1.2.3/";
+        let s = set(&mut j, ip, nav(ip, None), &["x=1; Domain=1.2.3"]);
+        assert!(s.refused[0].contains("doesn't match"), "{s:?}");
+    }
+
+    #[test]
+    fn http_only_and_injection() {
+        let mut j = Jar::new();
+        let u = "https://example.com/";
+        set(&mut j, u, nav(u, None), &["sid=abc; HttpOnly"]);
+        assert!(
+            j.for_site(u)[0].http_only,
+            "kept for when scripts can read cookies"
+        );
+        // Header injection and junk.
+        let s = set(&mut j, u, nav(u, None), &["a=1\r\nX-Evil: 1", "=", "b=\u{7}"]);
+        assert_eq!(s.set.len(), 0, "{s:?}");
+        assert_eq!(s.refused.len(), 3, "{s:?}");
+    }
+
+    #[test]
+    fn count_and_size_limits() {
+        let mut j = Jar::new();
+        let u = "https://example.com/";
+        let big = format!("big={}", "x".repeat(MAX_COOKIE_SIZE));
+        let s = set(&mut j, u, nav(u, None), &[&big]);
+        assert!(s.refused[0].contains("too large"));
+        // Floods are capped per response and per site, oldest evicted first.
+        for round in 0..5 {
+            let hs: Vec<String> = (0..100).map(|i| format!("c{round}_{i}=1")).collect();
+            let s = j.store(u, nav(u, None), &hs, false);
+            assert_eq!(s.set.len(), MAX_SET_PER_RESPONSE);
+            assert_eq!(s.refused.len(), 100 - MAX_SET_PER_RESPONSE);
+        }
+        let kept = j.for_site(u);
+        assert_eq!(kept.len(), MAX_PER_SITE);
+        assert!(!kept.iter().any(|c| c.name == "c0_0"), "oldest went first");
+        assert!(kept.iter().any(|c| c.name == "c4_49"));
+        // And in total, across sites.
+        for site_n in 0..20 {
+            let u = format!("https://site{site_n}.example/");
+            for round in 0..4 {
+                let hs: Vec<String> = (0..MAX_SET_PER_RESPONSE)
+                    .map(|i| format!("c{round}_{i}=1"))
+                    .collect();
+                j.store(&u, nav(&u, None), &hs, false);
+            }
+        }
+        assert_eq!(j.cookies.len(), MAX_TOTAL, "20 sites x 180 > the total cap");
+    }
+
+    #[test]
     fn only_kept_sites_are_saved() {
         let dir = std::env::temp_dir().join(format!("brickle-jar-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -786,6 +872,10 @@ mod tests {
         set(&mut j, b, nav(b, None), &["cart=1; Max-Age=3600"]);
         j.save().unwrap();
         let text = std::fs::read_to_string(dir.join("cookies.txt")).unwrap();
+        assert!(
+            !dir.join("cookies.tmp").exists(),
+            "saved atomically, no leftovers"
+        );
         assert!(text.contains("login") && !text.contains("tmp") && !text.contains("cart"));
         #[cfg(unix)]
         {

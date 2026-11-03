@@ -67,6 +67,7 @@ dependencies = [
  "psl",
  "read-fonts",
  "rlimit",
+ "rustls",
  "ruzstd",
  "seccompiler",
  "unicode-linebreak",

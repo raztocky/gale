@@ -83,6 +83,7 @@ enum Job {
         from: Option<String>,
         w: f32,
         h: f32,
+        cancel: net::Cancel,
     },
     Render {
         tab: Box<Tab>,
@@ -106,9 +107,16 @@ fn spawn_loader(net: Arc<Mutex<Network>>, sandboxed: bool) -> (Sender<Job>, Rece
         .spawn(move || {
             for job in job_rx {
                 let done = match job {
-                    Job::Open { url, from, w, h } => {
+                    Job::Open {
+                        url,
+                        from,
+                        w,
+                        h,
+                        cancel,
+                    } => {
                         let mut tab = {
                             let mut n = net.lock().unwrap_or_else(|e| e.into_inner());
+                            n.cancel = cancel;
                             Tab::open(&mut n, &url, from.as_deref(), sandboxed)
                         };
                         let rendered = tab.render(w, h);
@@ -197,11 +205,14 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
     let mut frame = 0u32;
     let mut canvas = Canvas::new(w, h, Color::WHITE);
 
+    // Stop button for the load in flight.
+    let mut stop = net::Cancel::new();
     let _ = jobs.send(Job::Open {
         url: start.to_string(),
         from: None,
         w: w as f32,
         h: h as f32 - BAR_H,
+        cancel: stop.clone(),
     });
     busy = Some(Some(start.to_string()));
 
@@ -249,11 +260,13 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         // Start queued work once idle.
         if busy.is_none() {
             if let Some((url, from)) = queued.take() {
+                stop = net::Cancel::new();
                 let _ = jobs.send(Job::Open {
                     url: url.clone(),
                     from,
                     w: page_w,
                     h: view_h,
+                    cancel: stop.clone(),
                 });
                 busy = Some(Some(url));
                 scroll = 0.0;
@@ -317,6 +330,9 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 Key::F12 => ui.panel = !ui.panel,
                 Key::E if ctrl && shift => ui.panel = !ui.panel,
                 Key::Escape if matches!(busy, Some(Some(_))) => {
+                    // Kills the renderer and abandons network requests, so
+                    // the loader is free again almost at once.
+                    stop.cancel();
                     discard = true;
                     queued = None;
                     ui.address = info.url.clone();
@@ -484,6 +500,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             }
         }
         if queued.is_some() && matches!(busy, Some(Some(_))) {
+            stop.cancel();
             discard = true; // superseded by the newer navigation
         }
 
@@ -890,7 +907,8 @@ fn draw_panel(
             | Outcome::Denied { .. }
             | Outcome::MixedContent
             | Outcome::NotAllowed
-            | Outcome::LocalNetwork => RED,
+            | Outcome::LocalNetwork
+            | Outcome::BadCertificate(_) => RED,
             Outcome::NeedsHttpConsent | Outcome::Failed(_) | Outcome::OverLimit => AMBER,
             _ if e.insecure => AMBER,
             _ => GREEN,

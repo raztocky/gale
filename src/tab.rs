@@ -6,16 +6,25 @@
 //! a validated display list. If the renderer crashes, hangs or sends garbage,
 //! it is killed and an error page is shown; the browser keeps running.
 
-use crate::ipc::{read_frame, write_frame, FromRenderer, ToRenderer};
-use crate::net;
-use crate::network::{Action, LogEntry, Nav, Network};
+use crate::ipc::{read_frame, write_frame, FromRenderer, ToRenderer, MAX_FRAME};
+use crate::net::{self, Cancel};
+use crate::network::{Action, LogEntry, Nav, Network, MAX_STYLESHEETS};
 use crate::page::{error_page, Page, Rendered};
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
-use std::time::Duration;
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
+use std::time::{Duration, Instant};
 
-/// How long a renderer may take to answer before it is killed.
+/// How long a renderer may take to lay out and paint a page.
 const RENDERER_TIMEOUT: Duration = Duration::from_secs(20);
+/// Time for parsing and styling on top of the page's network deadline.
+const LOAD_EXTRA: Duration = Duration::from_secs(10);
+/// Most subresource requests a renderer may make for one page. The network
+/// service refuses anything past its own budget; a renderer that keeps
+/// asking anyway is misbehaving.
+const MAX_FETCHES: usize = MAX_STYLESHEETS + 8;
+/// Total bytes a renderer may send while a page loads (subresource
+/// requests and the title): a few kilobytes is normal.
+const LOAD_BYTES: usize = 1024 * 1024;
 
 pub struct Tab {
     pub url: String,
@@ -69,6 +78,7 @@ impl Tab {
         };
         let blocker_css = net.cosmetic_css(url);
         let page_url = url.to_string();
+        let (cancel, net_deadline) = (net.cancel.clone(), net.deadline());
         {
             let mut fetch = |target: &str| net.subresource(&page_url, target);
             if !sandbox {
@@ -76,22 +86,10 @@ impl Tab {
                 tab.title = page.title.clone();
                 tab.backend = Backend::InProcess(page);
             } else {
-                let result = Renderer::spawn().and_then(|mut r| {
-                    r.send(ToRenderer::Load {
-                        url: url.to_string(),
-                        html: html.to_string(),
-                        blocker_css,
-                    })?;
-                    loop {
-                        match r.recv()? {
-                            FromRenderer::Fetch { url } => r.send(ToRenderer::FetchReply(fetch(&url)))?,
-                            FromRenderer::Loaded { title } => {
-                                tab.title = title;
-                                return Ok(r);
-                            }
-                            _ => return Err("renderer sent an unexpected message".into()),
-                        }
-                    }
+                let deadline = net_deadline.max(Instant::now()) + LOAD_EXTRA;
+                let result = Renderer::spawn(cancel).and_then(|mut r| {
+                    tab.title = r.load(url, html, blocker_css, deadline, &mut fetch)?;
+                    Ok(r)
                 });
                 tab.backend = match result {
                     Ok(r) => Backend::Sandboxed(r),
@@ -107,13 +105,12 @@ impl Tab {
         let result = match &mut self.backend {
             Backend::InProcess(p) => return p.render(width, height),
             Backend::Failed(e) => Err(e.clone()),
-            Backend::Sandboxed(r) => {
-                r.send(ToRenderer::Render { width, height })
-                    .and_then(|_| match r.recv()? {
-                        FromRenderer::Rendered(out) => Ok(out),
-                        _ => Err("renderer sent an unexpected message".into()),
-                    })
-            }
+            Backend::Sandboxed(r) => r.send(ToRenderer::Render { width, height }).and_then(|_| {
+                match r.recv(Instant::now() + RENDERER_TIMEOUT, &mut { MAX_FRAME })? {
+                    FromRenderer::Rendered(out) => Ok(out),
+                    _ => Err(r.kill("renderer sent an unexpected message and was killed")),
+                }
+            }),
         };
         result.unwrap_or_else(|e| {
             self.backend = Backend::Failed(e.clone());
@@ -132,9 +129,9 @@ impl Tab {
             Backend::Failed(e) => Err(e.clone()),
             Backend::Sandboxed(r) => {
                 r.send(ToRenderer::Dom)?;
-                match r.recv()? {
+                match r.recv(Instant::now() + RENDERER_TIMEOUT, &mut { MAX_FRAME })? {
                     FromRenderer::Dom(s) => Ok(s),
-                    _ => Err("renderer sent an unexpected message".into()),
+                    _ => Err(r.kill("renderer sent an unexpected message and was killed")),
                 }
             }
         }
@@ -153,26 +150,44 @@ fn crashed_page(url: &str, err: &str) -> Page {
     Page::trusted(url, &error_page(url, &msg))
 }
 
+/// The browser's end of a renderer process.
+///
+/// The protocol is strictly request/response, and everything the renderer
+/// sends is treated as hostile:
+/// - frames are read on a separate thread into a channel that holds none
+///   (a rendezvous), so a renderer can't queue up messages in our memory;
+/// - a message that arrives when none was asked for gets it killed;
+/// - each exchange has a deadline and a byte budget;
+/// - writes happen on their own thread, so a renderer that stops reading
+///   can't block the browser either;
+/// - Stop (the [`Cancel`]) kills it immediately.
 struct Renderer {
     child: Child,
-    stdin: ChildStdin,
+    to_child: Option<SyncSender<Vec<u8>>>,
     rx: Receiver<Result<Vec<u8>, String>>,
+    cancel: Cancel,
 }
 
 impl Renderer {
-    fn spawn() -> Result<Renderer, String> {
+    fn spawn(cancel: Cancel) -> Result<Renderer, String> {
         let exe = std::env::current_exe().map_err(|e| format!("can't find own executable: {e}"))?;
-        let mut child = Command::new(exe)
-            .arg("--renderer")
+        let mut cmd = Command::new(exe);
+        cmd.arg("--renderer");
+        Renderer::spawn_command(cmd, cancel)
+    }
+
+    /// Start `cmd` as a renderer (tests use stand-in programs).
+    fn spawn_command(mut cmd: Command, cancel: Cancel) -> Result<Renderer, String> {
+        let mut child = cmd
             .env_clear()
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
             .map_err(|e| format!("can't start renderer: {e}"))?;
-        let stdin = child.stdin.take().ok_or("no renderer stdin")?;
+        let mut stdin = child.stdin.take().ok_or("no renderer stdin")?;
         let mut stdout = child.stdout.take().ok_or("no renderer stdout")?;
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(0);
         std::thread::spawn(move || loop {
             let msg = match read_frame(&mut stdout) {
                 Ok(Some(frame)) => Ok(frame),
@@ -184,25 +199,110 @@ impl Renderer {
                 break;
             }
         });
-        Ok(Renderer { child, stdin, rx })
+        let (to_child, frames) = mpsc::sync_channel::<Vec<u8>>(1);
+        std::thread::spawn(move || {
+            for frame in frames {
+                if write_frame(&mut stdin, &frame).is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Renderer {
+            child,
+            to_child: Some(to_child),
+            rx,
+            cancel,
+        })
+    }
+
+    /// Hand the renderer a document and serve its subresource requests
+    /// until it reports the page loaded. Returns the page title.
+    fn load(
+        &mut self,
+        url: &str,
+        html: &str,
+        blocker_css: String,
+        deadline: Instant,
+        fetch: &mut dyn FnMut(&str) -> Result<String, String>,
+    ) -> Result<String, String> {
+        self.send(ToRenderer::Load {
+            url: url.to_string(),
+            html: html.to_string(),
+            blocker_css,
+        })?;
+        let mut budget = LOAD_BYTES;
+        let mut fetches = 0;
+        loop {
+            match self.recv(deadline, &mut budget)? {
+                FromRenderer::Fetch { url } if fetches < MAX_FETCHES => {
+                    fetches += 1;
+                    self.send(ToRenderer::FetchReply(fetch(&url)))?
+                }
+                FromRenderer::Fetch { .. } => {
+                    return Err(self.kill("renderer made too many requests and was killed"))
+                }
+                FromRenderer::Loaded { title } => return Ok(title),
+                _ => return Err(self.kill("renderer sent an unexpected message and was killed")),
+            }
+        }
+    }
+
+    /// Kill the renderer and return `why` as the error.
+    fn kill(&mut self, why: &str) -> String {
+        let _ = self.child.kill();
+        self.to_child = None;
+        why.to_string()
     }
 
     fn send(&mut self, msg: ToRenderer) -> Result<(), String> {
-        write_frame(&mut self.stdin, &msg.encode()).map_err(|e| format!("renderer pipe: {e}"))
+        match self.rx.try_recv() {
+            Ok(Ok(_)) => return Err(self.kill("renderer sent a message nobody asked for and was killed")),
+            Ok(Err(e)) => return Err(self.kill(&e)),
+            Err(_) => {}
+        }
+        let frame = msg.encode();
+        if frame.len() > MAX_FRAME {
+            return Err(self.kill("message to renderer too large"));
+        }
+        // Never block: if the previous message is still waiting to be
+        // written, the renderer has stopped reading.
+        let sent = match &self.to_child {
+            Some(tx) => tx.try_send(frame),
+            None => return Err("renderer was stopped".into()),
+        };
+        match sent {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => {
+                Err(self.kill("renderer stopped reading its input and was killed"))
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(self.kill("renderer pipe closed")),
+        }
     }
 
-    fn recv(&mut self) -> Result<FromRenderer, String> {
-        let frame = match self.rx.recv_timeout(RENDERER_TIMEOUT) {
-            Ok(r) => r?,
-            Err(_) => {
-                let _ = self.child.kill();
-                return Err("renderer stopped responding and was killed".into());
+    /// Wait for the next message, until `deadline`. Each frame is charged to
+    /// `budget`.
+    fn recv(&mut self, deadline: Instant, budget: &mut usize) -> Result<FromRenderer, String> {
+        let frame = loop {
+            if self.cancel.is_cancelled() {
+                return Err(self.kill("stopped"));
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(self.kill("renderer stopped responding and was killed"));
+            }
+            match self.rx.recv_timeout(left.min(Duration::from_millis(25))) {
+                Ok(Ok(frame)) => break frame,
+                Ok(Err(e)) => return Err(self.kill(&e)),
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => return Err(self.kill("renderer exited")),
             }
         };
-        FromRenderer::decode(&frame).map_err(|e| {
-            let _ = self.child.kill();
-            format!("renderer sent a malformed message ({e}) and was killed")
-        })
+        if frame.len() > *budget {
+            return Err(self.kill("renderer sent more data than allowed and was killed"));
+        }
+        *budget -= frame.len();
+        FromRenderer::decode(&frame)
+            .map_err(|e| self.kill(&format!("renderer sent a malformed message ({e}) and was killed")))
     }
 }
 
@@ -210,5 +310,297 @@ impl Drop for Renderer {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// The browser/renderer boundary against renderers that misbehave on
+/// purpose. Each fake renderer is a small Python script that speaks the
+/// frame protocol and does one hostile thing.
+#[cfg(test)]
+mod hostile_renderer_tests {
+    use super::*;
+    use crate::ipc::FromRenderer as F;
+
+    const FAKE: &str = r#"
+import sys, time, struct
+out = sys.stdout.buffer
+def frame(b): return struct.pack('<I', len(b)) + b
+def read_frame():
+    n = sys.stdin.buffer.read(4)
+    if len(n) < 4: sys.exit(0)
+    sys.stdin.buffer.read(struct.unpack('<I', n)[0])
+try:
+    for a in sys.argv[1:]:
+        k, _, v = a.partition(':')
+        if k == 'raw': out.write(bytes.fromhex(v)); out.flush()
+        elif k == 'send': out.write(frame(bytes.fromhex(v))); out.flush()
+        elif k == 'flood':
+            f = frame(bytes.fromhex(v))
+            while True: out.write(f); out.flush()
+        elif k == 'zeros': out.write(bytes(int(v))); out.flush()
+        elif k == 'read': read_frame()
+        elif k == 'sleep': time.sleep(float(v))
+except BrokenPipeError:
+    pass
+"#;
+
+    fn hex(m: F) -> String {
+        m.encode().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// A renderer that runs `script` (see FAKE), or None without python3.
+    fn fake(script: &[String], cancel: Cancel) -> Option<Renderer> {
+        if Command::new("python3").arg("-c").arg("").status().is_err() {
+            eprintln!("python3 not found: skipping hostile renderer test");
+            return None;
+        }
+        let mut cmd = Command::new("python3");
+        cmd.arg("-I").arg("-c").arg(FAKE).args(script);
+        Some(Renderer::spawn_command(cmd, cancel).expect("spawn fake renderer"))
+    }
+
+    fn fetch_msg(url: &str) -> String {
+        hex(F::Fetch { url: url.into() })
+    }
+    fn loaded() -> String {
+        hex(F::Loaded { title: "t".into() })
+    }
+
+    fn load(
+        r: &mut Renderer,
+        secs: f32,
+        fetch: &mut dyn FnMut(&str) -> Result<String, String>,
+    ) -> Result<String, String> {
+        let deadline = Instant::now() + Duration::from_secs_f32(secs);
+        r.load("https://page.example/", "<p>hi", String::new(), deadline, fetch)
+    }
+
+    fn no_fetch(_: &str) -> Result<String, String> {
+        Err("no".into())
+    }
+
+    #[test]
+    fn well_behaved_renderer_works() {
+        let s = vec![
+            "read".into(),
+            format!("send:{}", fetch_msg("https://page.example/a.css")),
+            "read".into(),
+            format!("send:{}", loaded()),
+        ];
+        let Some(mut r) = fake(&s, Cancel::new()) else {
+            return;
+        };
+        let mut asked = vec![];
+        let title = load(&mut r, 5.0, &mut |u| {
+            asked.push(u.to_string());
+            Ok(String::new())
+        });
+        assert_eq!(title.as_deref(), Ok("t"));
+        assert_eq!(asked, vec!["https://page.example/a.css"]);
+    }
+
+    #[test]
+    fn flood_of_requests_is_cut_off() {
+        // Asks for stylesheets forever without reading the replies.
+        let s = vec![
+            "read".into(),
+            format!("flood:{}", fetch_msg("https://page.example/x.css")),
+        ];
+        let Some(mut r) = fake(&s, Cancel::new()) else {
+            return;
+        };
+        let mut n = 0;
+        let start = Instant::now();
+        let err = load(&mut r, 10.0, &mut |_| {
+            n += 1;
+            Err("over budget".into())
+        })
+        .unwrap_err();
+        assert!(
+            err.contains("too many requests")
+                || err.contains("nobody asked")
+                || err.contains("stopped reading"),
+            "{err}"
+        );
+        assert!(n <= MAX_FETCHES);
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn unsolicited_messages_get_it_killed() {
+        // Reports "loaded" three times in a row.
+        let l = loaded();
+        let s = vec![
+            "read".into(),
+            format!("send:{l}"),
+            format!("send:{l}"),
+            format!("send:{l}"),
+            "sleep:5".into(),
+        ];
+        let Some(mut r) = fake(&s, Cancel::new()) else {
+            return;
+        };
+        assert!(load(&mut r, 5.0, &mut no_fetch).is_ok());
+        std::thread::sleep(Duration::from_millis(200)); // let the extras arrive
+        let err = r
+            .send(ToRenderer::Render {
+                width: 100.0,
+                height: 100.0,
+            })
+            .unwrap_err();
+        assert!(err.contains("nobody asked"), "{err}");
+    }
+
+    #[test]
+    fn out_of_order_replies_get_it_killed() {
+        // Answers a load with a DOM dump.
+        let s = vec![
+            "read".into(),
+            format!("send:{}", hex(F::Dom("x".into()))),
+            "sleep:5".into(),
+        ];
+        let Some(mut r) = fake(&s, Cancel::new()) else {
+            return;
+        };
+        let err = load(&mut r, 5.0, &mut no_fetch).unwrap_err();
+        assert!(err.contains("unexpected message"), "{err}");
+    }
+
+    #[test]
+    fn stalling_and_partial_frames_time_out() {
+        for script in [
+            vec!["read".to_string(), "sleep:30".into()],
+            // Promises 1000 bytes, sends 3, then goes quiet.
+            vec!["read".to_string(), "raw:e8030000616263".into(), "sleep:30".into()],
+        ] {
+            let Some(mut r) = fake(&script, Cancel::new()) else {
+                return;
+            };
+            let start = Instant::now();
+            let err = load(&mut r, 0.5, &mut no_fetch).unwrap_err();
+            assert!(err.contains("stopped responding"), "{err}");
+            assert!(start.elapsed() < Duration::from_secs(3));
+        }
+        // A partial frame followed by exit is an error, not a hang.
+        let s = vec!["read".to_string(), "raw:e8030000616263".into()];
+        let Some(mut r) = fake(&s, Cancel::new()) else {
+            return;
+        };
+        let err = load(&mut r, 5.0, &mut no_fetch).unwrap_err();
+        assert!(err.contains("truncated") || err.contains("exited"), "{err}");
+    }
+
+    #[test]
+    fn oversized_and_garbage_frames_are_refused() {
+        // Claims a 4 GB frame.
+        let s = vec!["read".to_string(), "raw:ffffffff".into(), "sleep:5".into()];
+        let Some(mut r) = fake(&s, Cancel::new()) else {
+            return;
+        };
+        let err = load(&mut r, 5.0, &mut no_fetch).unwrap_err();
+        assert!(err.contains("too large"), "{err}");
+        // More than a page load's byte budget, in one frame (refused
+        // before it is even decoded).
+        let len = (LOAD_BYTES as u32 + 1).to_le_bytes();
+        let s = vec![
+            "read".to_string(),
+            format!(
+                "raw:{}",
+                len.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            ),
+            format!("zeros:{}", LOAD_BYTES + 1),
+            "sleep:5".into(),
+        ];
+        let Some(mut r) = fake(&s, Cancel::new()) else {
+            return;
+        };
+        let err = load(&mut r, 5.0, &mut no_fetch).unwrap_err();
+        assert!(err.contains("more data than allowed"), "{err}");
+        // Not a message at all.
+        let s = vec!["read".to_string(), "send:ff00ff00".into(), "sleep:5".into()];
+        let Some(mut r) = fake(&s, Cancel::new()) else {
+            return;
+        };
+        let err = load(&mut r, 5.0, &mut no_fetch).unwrap_err();
+        assert!(err.contains("malformed"), "{err}");
+    }
+
+    #[test]
+    fn renderer_that_stops_reading_cant_block_the_browser() {
+        let Some(mut r) = fake(&["sleep:30".to_string()], Cancel::new()) else {
+            return;
+        };
+        let html = "x".repeat(4 * 1024 * 1024); // far more than a pipe holds
+        let start = Instant::now();
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let err = r
+            .load(
+                "https://page.example/",
+                &html,
+                String::new(),
+                deadline,
+                &mut no_fetch,
+            )
+            .unwrap_err();
+        assert!(err.contains("stopped responding"), "{err}");
+        let err = r.send(ToRenderer::Dom).unwrap_err();
+        assert!(err.contains("stopped"), "{err}");
+        assert!(start.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn stop_kills_it_at_once() {
+        let cancel = Cancel::new();
+        let Some(mut r) = fake(&["read".to_string(), "sleep:30".into()], cancel.clone()) else {
+            return;
+        };
+        let c = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            c.cancel();
+        });
+        let start = Instant::now();
+        let err = load(&mut r, 30.0, &mut no_fetch).unwrap_err();
+        assert_eq!(err, "stopped");
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn forbidden_requests_go_through_browser_policy() {
+        // The renderer asks for a local file, a device on your network and a
+        // tracker; the browser's policy (not the renderer) refuses all three.
+        let targets = [
+            "file:///etc/passwd",
+            "http://192.168.1.1/admin.css",
+            "https://tracker.example/t.css",
+        ];
+        let mut s = vec!["read".to_string()];
+        for t in targets {
+            s.push(format!("send:{}", fetch_msg(t)));
+            s.push("read".into());
+        }
+        s.push(format!("send:{}", loaded()));
+        let Some(mut r) = fake(&s, Cancel::new()) else {
+            return;
+        };
+        let mut net = Network::with_filters(crate::filter::Filters::parse("||tracker.example^\n"));
+        let before = net::requests_sent();
+        let mut replies = vec![];
+        load(&mut r, 5.0, &mut |u| {
+            let res = net.subresource("https://page.example/", u);
+            replies.push(res.clone());
+            res
+        })
+        .unwrap();
+        assert!(replies.iter().all(|r| r.is_err()), "{replies:?}");
+        assert_eq!(net::requests_sent(), before, "nothing left the browser");
+        let log = net.take_log();
+        use crate::network::Outcome;
+        assert!(matches!(log[0].outcome, Outcome::NotAllowed));
+        assert!(matches!(
+            log[1].outcome,
+            Outcome::LocalNetwork | Outcome::MixedContent
+        ));
+        assert!(matches!(log[2].outcome, Outcome::Blocked { .. }));
     }
 }

@@ -32,3 +32,15 @@ Planned work, roughly in priority order. Items marked *discuss* need a decision 
 - [ ] Choose a license
 - [ ] App icon and home-page art of Brickle the cat; `.desktop` file for the Linux menu
 - [ ] Bump `FIREFOX_VERSION` in `src/net.rs` with Firefox releases
+
+## JavaScript (decided: Boa, off by default, allowed per site, no JIT)
+
+Rules for the design, before any code:
+- Boa runs only inside the sandboxed renderer, with DOM access and nothing else at first.
+- Cookie selection and network authorization stay in the browser process, using the browser's
+  own record of the page's origin, never what the renderer claims.
+- Script network access (`fetch`, XHR) only together with same-origin policy, CORS and
+  credential rules, each request shown in the request panel and subject to the blocker.
+- `document.cookie` only for non-HttpOnly cookies, answered by the browser.
+- Boa's loop-iteration, recursion and stack limits set, on top of the renderer's deadline,
+  address-space and CPU limits.

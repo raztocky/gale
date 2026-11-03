@@ -27,6 +27,25 @@ The ones we most want to hear about:
 - address-bar spoofing
 - crashes, hangs or memory blow-ups from hostile HTML, CSS or filter lists
 
+## How the renderer boundary is defended
+
+Each page is parsed and laid out by a sandboxed renderer process (see `src/sandbox.rs`). The
+browser treats everything it sends as hostile (`src/tab.rs`, `src/ipc.rs`):
+- messages are validated on decode and capped in size, count and painting cost;
+- the protocol is strictly request/response: incoming frames go through a channel that holds
+  none, an unsolicited message gets the renderer killed, and each exchange has a deadline and a
+  byte budget;
+- writes go through their own thread, so a renderer that stops reading can't block the browser;
+- Stop (Esc) kills the renderer and abandons its network requests;
+- all of a page's loading (document, redirects, stylesheets) shares one deadline;
+- the renderer can only *ask* for subresources; the browser applies every policy to each request
+  and holds the cookies.
+
+`hostile_renderer_tests` in `src/tab.rs` runs fake renderers that flood, stall, send partial,
+oversized, out-of-order and unsolicited messages, stop reading, and ask for local files, local
+network devices and blocked trackers. Security decisions about URLs all use one parser (the
+`url` crate's WHATWG implementation, via `net::canonical`).
+
 ## Supported versions
 
 Only the latest commit on `main`.

@@ -13,6 +13,7 @@ gui = ["dep:minifb"]
 fontdue = "0.9"
 png = "0.17"
 url = "2"
+rustls = { version = "0.23", default-features = false }
 ureq = { version = "2", features = ["native-certs", "gzip", "brotli"] }
 minifb = { version = "0.27", optional = true }
 psl = "2.1.246"
@@ -31,3 +32,7 @@ nix = { version = "0.31.3", default-features = false, features = ["sched", "user
 
 [profile.dev]
 opt-level = 1
+
+[dev-dependencies]
+# A TLS server with a self-signed certificate, for tests/privacy.rs.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

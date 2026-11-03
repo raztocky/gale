@@ -287,6 +287,10 @@ pub fn describe(e: &LogEntry) -> (&'static str, String) {
         Outcome::NotAllowed => "BLOCKED (not allowed)",
         Outcome::OverLimit => "SKIPPED (page budget)",
         Outcome::LocalNetwork => "BLOCKED (local network)",
+        Outcome::BadCertificate(err) => {
+            notes.push(err.clone());
+            "BLOCKED (bad certificate)"
+        }
         Outcome::Failed(err) => {
             notes.push(err.clone());
             "failed"
