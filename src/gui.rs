@@ -9,7 +9,7 @@ use brickle::lineedit::LineEdit;
 use brickle::net;
 use brickle::network::{Action, LogEntry, Network, Outcome};
 use brickle::page::{Key as PageKey, Rendered};
-use brickle::paint::{Canvas, GlyphCache, TileCache};
+use brickle::paint::{Canvas, DisplayList, GlyphCache, Layer, TileCache};
 use brickle::select::{self, Bands, FindText, Pos};
 use brickle::tab::{Input, Tab};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
@@ -129,14 +129,48 @@ impl Find {
 struct PageIndex {
     text: Bands,
     links: Bands,
+    /// The page's display list without its fixed and sticky layers, and
+    /// each layer's own list.
+    page: DisplayList,
+    layers: Vec<(Layer, DisplayList)>,
 }
 
 impl PageIndex {
     fn new(r: &Rendered) -> PageIndex {
+        let mut page = Vec::with_capacity(r.list.len());
+        let mut layers = Vec::new();
+        let mut at = 0;
+        for l in &r.layers {
+            page.extend_from_slice(&r.list[at.min(l.start)..l.start]);
+            layers.push((*l, r.list[l.start..l.end].to_vec()));
+            at = l.end;
+        }
+        page.extend_from_slice(&r.list[at.min(r.list.len())..]);
         PageIndex {
             text: Bands::new(r.texts.iter().map(|t| t.rect)),
             links: Bands::new(r.links.iter().map(|(rect, _)| *rect)),
+            page,
+            layers,
         }
+    }
+
+    /// The page point under window point (`mx`, `my`): on a fixed or sticky
+    /// layer if one is there (topmost first), else on the scrolled page.
+    fn page_point(&self, mx: f32, my: f32, scroll: f32) -> (f32, f32) {
+        let vy = my - BAR_H;
+        for (l, _) in self.layers.iter().rev() {
+            let y = vy + scroll - l.shift(scroll);
+            if l.bounds.contains(mx, y) {
+                return (mx, y);
+            }
+        }
+        (mx, vy + scroll)
+    }
+
+    /// The topmost link at a window point.
+    fn link_at_window<'r>(&self, r: &'r Rendered, mx: f32, my: f32, scroll: f32) -> Option<&'r str> {
+        let (x, y) = self.page_point(mx, my, scroll);
+        self.link_at(r, x, y)
     }
 
     /// Topmost link under a page-space point.
@@ -389,6 +423,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         background: Color::WHITE,
         links: vec![],
         texts: vec![],
+        layers: vec![],
     };
     // In flight: the URL being loaded (None for a re-layout).
     let mut busy: Option<Option<String>>;
@@ -1015,7 +1050,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             } else if badge.contains(mx, my) {
                 Some("Show every request this page made (F12)".into())
             } else if my > BAR_H && mx < page_w {
-                ix.link_at(&rendered, mx, my - BAR_H + scroll)
+                ix.link_at_window(&rendered, mx, my, scroll)
                     .map(|s| s.to_string())
             } else {
                 None
@@ -1026,7 +1061,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             }
             let mid = window.get_mouse_down(MouseButton::Middle);
             if mid && !was_mid && my > BAR_H && mx < page_w {
-                if let Some(l) = ix.link_at(&rendered, mx, my - BAR_H + scroll) {
+                if let Some(l) = ix.link_at_window(&rendered, mx, my, scroll) {
                     let url = net::resolve(&info.url, l);
                     if matches!(net::scheme(&url).as_str(), "http" | "https" | "file") {
                         tab_action = Some(TabAction::Background(url));
@@ -1036,7 +1071,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             was_mid = mid;
             let link_under = (my > BAR_H && mx < page_w)
                 .then(|| {
-                    ix.link_at(&rendered, mx, my - BAR_H + scroll)
+                    ix.link_at_window(&rendered, mx, my, scroll)
                         .map(|l| net::resolve(&info.url, l))
                 })
                 .flatten();
@@ -1183,7 +1218,10 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                                 cur_id,
                                 Job::Input {
                                     tab: Box::new(t),
-                                    input: Input::Click(mx, my - BAR_H + scroll),
+                                    input: {
+                                        let (cx, cy) = ix.page_point(mx, my, scroll);
+                                        Input::Click(cx, cy)
+                                    },
                                     link,
                                     w: page_w,
                                     h: view_h,
@@ -1191,7 +1229,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                             ));
                             busy = Some(None);
                         }
-                    } else if let Some(l) = ix.link_at(&rendered, mx, my - BAR_H + scroll) {
+                    } else if let Some(l) = ix.link_at_window(&rendered, mx, my, scroll) {
                         let url = net::resolve(&info.url, l);
                         if let Some(rest) = url.strip_prefix("brickle:") {
                             // Internal actions only work on our own warning pages.
@@ -1331,20 +1369,18 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             }
             let tc = tiles.get_or_insert_with(|| {
                 TileCache::new(
-                    &rendered.list,
+                    &ix.page,
                     &rendered.atlas,
                     page_w as usize,
                     rendered.height,
                     rendered.background,
                 )
             });
-            tc.draw(
-                &mut canvas,
-                &rendered.list,
-                &rendered.atlas,
-                scroll,
-                BAR_H as usize,
-            );
+            tc.draw(&mut canvas, &ix.page, &rendered.atlas, scroll, BAR_H as usize);
+            // Fixed and sticky boxes, where scrolling puts them.
+            for (l, list) in &ix.layers {
+                canvas.paint(list, &rendered.atlas, scroll - l.shift(scroll), BAR_H);
+            }
             if let Some(f) = &find {
                 let shown = |(a, _): &(Pos, Pos)| {
                     rendered.texts.get(a.0).is_some_and(|r| {
@@ -1562,6 +1598,7 @@ fn blank_rendered() -> Rendered {
         background: Color::WHITE,
         links: vec![],
         texts: vec![],
+        layers: vec![],
     }
 }
 

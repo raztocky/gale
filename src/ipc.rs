@@ -15,7 +15,8 @@ use crate::network::ScriptResponse;
 use crate::page::Key;
 use crate::page::{Rendered, MAX_LINKS, MAX_TEXT_CHARS, MAX_TEXT_RUNS};
 use crate::paint::{
-    DisplayCommand, GlyphBitmap, PlacedGlyph, MAX_ATLAS_BYTES, MAX_FRAME_IMAGE_BYTES, MAX_GLYPH_SIDE,
+    DisplayCommand, GlyphBitmap, Layer, LayerKind, PlacedGlyph, MAX_ATLAS_BYTES, MAX_FRAME_IMAGE_BYTES,
+    MAX_GLYPH_SIDE, MAX_LAYERS,
 };
 use crate::select::TextRun;
 use std::io::{self, Read, Write};
@@ -628,6 +629,21 @@ impl FromRenderer {
                         e.f32(*o);
                     }
                 }
+                e.u32(r.layers.len() as u32);
+                for l in &r.layers {
+                    match l.kind {
+                        LayerKind::Fixed => e.u8(0),
+                        LayerKind::Sticky { top, y0, max_dy } => {
+                            e.u8(1);
+                            e.f32(top);
+                            e.f32(y0);
+                            e.f32(max_dy);
+                        }
+                    }
+                    e.rect(l.bounds);
+                    e.u32(l.start as u32);
+                    e.u32(l.end as u32);
+                }
                 e.u32(r.atlas.len() as u32);
                 for g in &r.atlas {
                     e.0.extend_from_slice(&g.w.to_le_bytes());
@@ -792,6 +808,37 @@ impl FromRenderer {
                     }
                     texts.push(TextRun { rect, text, offsets });
                 }
+                // Fixed and sticky layers: ranges of the list, in order and
+                // not overlapping.
+                let n = d.count(25)?;
+                if n > MAX_LAYERS {
+                    return Err("too many layers".into());
+                }
+                let mut layers = Vec::with_capacity(n);
+                let mut last_end = 0usize;
+                for _ in 0..n {
+                    let kind = match d.u8()? {
+                        0 => LayerKind::Fixed,
+                        1 => LayerKind::Sticky {
+                            top: d.f32()?,
+                            y0: d.f32()?,
+                            max_dy: d.f32()?,
+                        },
+                        k => return Err(format!("unknown layer kind {k}")),
+                    };
+                    let bounds = d.rect()?;
+                    let (start, end) = (d.u32()? as usize, d.u32()? as usize);
+                    if start < last_end || end < start || end > list.len() {
+                        return Err("layer out of range".into());
+                    }
+                    last_end = end;
+                    layers.push(Layer {
+                        kind,
+                        bounds,
+                        start,
+                        end,
+                    });
+                }
                 let n = d.count(4)?;
                 let mut atlas = Vec::with_capacity(n);
                 let mut atlas_bytes = 0usize;
@@ -828,6 +875,7 @@ impl FromRenderer {
                     background,
                     links,
                     texts,
+                    layers,
                 })
             }
             4 => FromRenderer::Dom(d.str()?),
@@ -902,6 +950,21 @@ mod tests {
                 },
                 text: "héy".into(),
                 offsets: vec![0.0, 5.0, 10.0, 15.0],
+            }],
+            layers: vec![Layer {
+                kind: LayerKind::Sticky {
+                    top: 0.0,
+                    y0: 40.0,
+                    max_dy: 300.0,
+                },
+                bounds: Rect {
+                    x: 0.0,
+                    y: 40.0,
+                    w: 100.0,
+                    h: 20.0,
+                },
+                start: 0,
+                end: 1,
             }],
         }
     }
@@ -1019,6 +1082,24 @@ mod tests {
         let run = r.texts[0].clone();
         r.texts = vec![run; 1000];
         assert!(FromRenderer::decode(&FromRenderer::Rendered(r).encode()).is_ok());
+    }
+
+    #[test]
+    fn layers_are_checked() {
+        let bad = |f: &dyn Fn(&mut Layer)| {
+            let mut r = sample();
+            f(&mut r.layers[0]);
+            FromRenderer::decode(&FromRenderer::Rendered(r).encode()).is_err()
+        };
+        assert!(!bad(&|_| {}));
+        assert!(bad(&|l| l.end = 999), "past the list");
+        assert!(
+            bad(&|l| {
+                l.start = 1;
+                l.end = 0
+            }),
+            "backwards"
+        );
     }
 
     #[test]

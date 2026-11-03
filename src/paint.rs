@@ -4,6 +4,7 @@ use crate::css::Color;
 use crate::font;
 use crate::image::{self, Bitmap};
 use crate::layout::{BoxKind, LayoutBox, Rect};
+use crate::style::Position;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -92,6 +93,14 @@ fn contains(outer: Rect, inner: Rect) -> bool {
 }
 
 pub fn rasterize(ops: Vec<DrawOp>) -> (DisplayList, Vec<GlyphBitmap>) {
+    let (list, atlas, _) = rasterize_indexed(ops);
+    (list, atlas)
+}
+
+/// `rasterize`, also returning where each op's commands start in the list
+/// (and, last, the list's length).
+pub fn rasterize_indexed(ops: Vec<DrawOp>) -> (DisplayList, Vec<GlyphBitmap>, Vec<usize>) {
+    let mut starts = Vec::with_capacity(ops.len() + 1);
     let mut atlas: Vec<GlyphBitmap> = Vec::new();
     let mut atlas_bytes = 0usize;
     let mut ids: HashMap<AtlasKey, Option<(u32, fontdue::Metrics)>> = HashMap::new();
@@ -101,6 +110,7 @@ pub fn rasterize(ops: Vec<DrawOp>) -> (DisplayList, Vec<GlyphBitmap>) {
     let mut scaled: HashMap<(usize, u32, u32), Arc<Bitmap>> = HashMap::new();
     let mut image_bytes = 0usize;
     for op in ops {
+        starts.push(list.len());
         match op {
             DrawOp::Rect { rect, color } => list.push(DisplayCommand::Rect { rect, color }),
             DrawOp::Image { rect, image, clip } => {
@@ -220,7 +230,8 @@ pub fn rasterize(ops: Vec<DrawOp>) -> (DisplayList, Vec<GlyphBitmap>) {
             }
         }
     }
-    (list, atlas)
+    starts.push(list.len());
+    (list, atlas, starts)
 }
 
 /// Synthetic italics: shear the bitmap to the right, more at the top.
@@ -242,16 +253,118 @@ fn skew(m: &fontdue::Metrics, bitmap: &[u8]) -> GlyphBitmap {
 }
 
 pub fn build_display_list(root: &LayoutBox) -> Vec<DrawOp> {
+    build_layered(root).0
+}
+
+/// How a layer moves as the page scrolls.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LayerKind {
+    /// `position: fixed`: stays where it is in the window.
+    Fixed,
+    /// `position: sticky`: scrolls with the page until its top would go
+    /// above `top`, then stays there, but moves at most `max_dy` (to the end
+    /// of its containing block). `y0` is where it was laid out.
+    Sticky { top: f32, y0: f32, max_dy: f32 },
+}
+
+/// A fixed or sticky box with everything in it: the display commands
+/// `start..end`, which the browser paints on top of the page at a place
+/// that depends on scrolling. `bounds` is the box's border box as laid out.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Layer {
+    pub kind: LayerKind,
+    pub bounds: Rect,
+    pub start: usize,
+    pub end: usize,
+}
+
+impl Layer {
+    /// How far down from where it was laid out the layer is drawn, at
+    /// `scroll`. Fixed layers are laid out in window coordinates.
+    pub fn shift(&self, scroll: f32) -> f32 {
+        match self.kind {
+            LayerKind::Fixed => scroll,
+            LayerKind::Sticky { top, y0, max_dy } => (scroll + top - y0).clamp(0.0, max_dy.max(0.0)),
+        }
+    }
+}
+
+/// Fixed and sticky boxes, by address, as layer roots: every box inside one
+/// maps to the index of its outermost layer.
+fn layer_map(root: &LayoutBox) -> (HashMap<usize, usize>, Vec<(LayerKind, Rect)>) {
+    fn walk(
+        b: &LayoutBox,
+        layer: Option<usize>,
+        map: &mut HashMap<usize, usize>,
+        kinds: &mut Vec<(LayerKind, Rect)>,
+    ) {
+        for c in &b.children {
+            let mut id = layer;
+            if id.is_none() && kinds.len() < MAX_LAYERS {
+                if let BoxKind::Block(n) = c.kind {
+                    let s = &n.style;
+                    let bb = c.dims.border_box();
+                    let kind = match (s.position, s.inset[0].resolve(0.0)) {
+                        (Position::Fixed, _) => Some(LayerKind::Fixed),
+                        (Position::Sticky, Some(top)) => {
+                            let cb = b.dims.content;
+                            Some(LayerKind::Sticky {
+                                top,
+                                y0: bb.y,
+                                max_dy: (cb.y + cb.h) - (bb.y + bb.h),
+                            })
+                        }
+                        _ => None,
+                    };
+                    if let Some(k) = kind {
+                        kinds.push((k, bb));
+                        id = Some(kinds.len() - 1);
+                    }
+                }
+            }
+            if let Some(i) = id {
+                map.insert(crate::layout::box_addr(c), i);
+            }
+            walk(c, id, map, kinds);
+        }
+    }
+    let (mut map, mut kinds) = (HashMap::new(), Vec::new());
+    walk(root, None, &mut map, &mut kinds);
+    (map, kinds)
+}
+
+/// Most fixed and sticky layers per page.
+pub const MAX_LAYERS: usize = 64;
+
+/// The display list, and each fixed or sticky layer in it as a range of
+/// ops (a layer's boxes are painted one after another).
+/// A layer as a range of draw ops, before rasterizing.
+pub type LayerOps = (LayerKind, Rect, std::ops::Range<usize>);
+
+pub fn build_layered(root: &LayoutBox) -> (Vec<DrawOp>, Vec<LayerOps>) {
     let clips = crate::layout::clip_map(root);
+    let (in_layer, kinds) = layer_map(root);
     let mut list = Vec::new();
+    let mut layers: Vec<LayerOps> = Vec::new();
+    let mut open: Option<(usize, usize)> = None;
     for b in crate::layout::paint_order(root) {
+        let id = in_layer.get(&crate::layout::box_addr(b)).copied();
+        if open.map(|(i, _)| i) != id {
+            if let Some((i, start)) = open.take() {
+                layers.push((kinds[i].0, kinds[i].1, start..list.len()));
+            }
+            open = id.map(|i| (i, list.len()));
+        }
         let start = list.len();
         render_box(&mut list, b);
         if let Some(&c) = clips.get(&crate::layout::box_addr(b)) {
             clip_ops(&mut list, start, c);
         }
     }
-    list
+    if let Some((i, start)) = open {
+        layers.push((kinds[i].0, kinds[i].1, start..list.len()));
+    }
+    (list, layers)
 }
 
 /// Clip the ops from `start` on to `c`: rectangles exactly, text and images

@@ -87,6 +87,9 @@ pub struct Rendered {
     pub links: Vec<(Rect, String)>,
     /// The page's text in reading order, for selecting and copying it.
     pub texts: Vec<TextRun>,
+    /// Fixed and sticky boxes: ranges of `list` the browser paints on top,
+    /// moved for scrolling.
+    pub layers: Vec<paint::Layer>,
 }
 
 /// Fetches a subresource (absolute URL) for the page. In the sandboxed
@@ -571,7 +574,17 @@ impl Page {
             background = Color::WHITE;
         }
 
-        let (list, atlas) = paint::rasterize(paint::build_display_list(&root));
+        let (ops, layer_ops) = paint::build_layered(&root);
+        let (list, atlas, starts) = paint::rasterize_indexed(ops);
+        let layers = layer_ops
+            .into_iter()
+            .map(|(kind, bounds, r)| paint::Layer {
+                kind,
+                bounds,
+                start: starts[r.start],
+                end: starts[r.end],
+            })
+            .collect();
         let mut links = Vec::new();
         let order = layout::paint_order(&root);
         // What's clipped away can't be clicked either.
@@ -613,6 +626,7 @@ impl Page {
             background,
             links,
             texts,
+            layers,
         }
     }
 }
@@ -743,6 +757,11 @@ fn contains(outer: Rect, inner: Rect) -> bool {
 fn collect_text(b: &LayoutBox, seen: &Seen, mut under: Color, out: &mut Vec<TextRun>, chars: &mut usize) {
     if let BoxKind::Block(_) = b.kind {
         let s = b.style();
+        // Fixed and sticky boxes move with scrolling, so their text isn't
+        // where selection looks for it.
+        if matches!(s.position, Position::Fixed | Position::Sticky) {
+            return;
+        }
         if s.background.a == 255 {
             under = s.background;
         }
@@ -1379,5 +1398,61 @@ mod clip_tests {
              <div style='position:absolute;top:30px;{red}'></div></div>"
         ));
         assert!(red_rects(&r).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod layer_tests {
+    use super::*;
+    use crate::paint::{DisplayCommand, LayerKind};
+
+    fn render(html: &str) -> Rendered {
+        let page = Page::parse("https://example.com/", html, "", &mut |_, _| Err("none".into()));
+        page.render(800.0, 600.0)
+    }
+
+    #[test]
+    fn fixed_header_is_a_layer() {
+        let r = render(
+            "<body style='margin:0'><div style='position:fixed;top:0;width:100%;height:40px;background-color:red'>\
+             <b>menu</b></div><p style='margin-top:60px'>content</p>",
+        );
+        assert_eq!(r.layers.len(), 1);
+        let l = r.layers[0];
+        assert_eq!(l.kind, LayerKind::Fixed);
+        // The red background is inside the layer, the page text outside.
+        let red = r
+            .list
+            .iter()
+            .position(|c| matches!(c, DisplayCommand::Rect { color, .. } if color.r == 255 && color.g == 0));
+        assert!(red.is_some_and(|i| (l.start..l.end).contains(&i)), "{l:?}");
+        assert!(
+            l.start > 0,
+            "the page's own text is painted before it, outside the layer"
+        );
+        // Drawn in place whatever the scroll.
+        assert_eq!(l.shift(0.0), 0.0);
+        assert_eq!(l.shift(500.0), 500.0);
+        // Its text isn't offered for selection (it moves with scrolling).
+        assert!(r.texts.iter().all(|t| t.text != "menu"));
+    }
+
+    #[test]
+    fn sticky_sticks_within_its_container() {
+        let r = render(
+            "<body style='margin:0'><div style='height:1000px'><p style='margin:0;height:300px'>x</p>\
+             <div style='position:sticky;top:10px;height:50px'>bar</div></div><div style='height:2000px'></div>",
+        );
+        let l = r.layers[0];
+        let LayerKind::Sticky { top, y0, max_dy } = l.kind else {
+            panic!("{l:?}")
+        };
+        assert_eq!((top, y0, max_dy), (10.0, 300.0, 650.0));
+        assert_eq!(l.shift(0.0), 0.0, "in place until it reaches the top");
+        assert_eq!(l.shift(390.0), 100.0, "then stays 10px from the top");
+        assert_eq!(l.shift(5000.0), 650.0, "but not past its container");
+        // No `top`: it never sticks, so it isn't a layer.
+        let r = render("<div style='position:sticky'>x</div>");
+        assert!(r.layers.is_empty());
     }
 }
