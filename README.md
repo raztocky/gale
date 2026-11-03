@@ -63,8 +63,8 @@ libraries, run `sudo apt install build-essential libxkbcommon-dev`.
 
 The browser fetches everything and enforces the security rules. Untrusted HTML and CSS are parsed
 and laid out only in the renderer, which can't open files, use the network or run programs.
-It sends back rectangles and pre-rasterized glyph bitmaps, which the browser validates before
-painting.
+It sends back rectangles, pre-rasterized glyph bitmaps and decoded image pixels, which the
+browser validates before painting.
 
 | Module | What it does |
 |---|---|
@@ -73,6 +73,7 @@ painting.
 | `style.rs` | Selector matching, specificity, the cascade (UA < author < inline), inheritance, shorthand expansion and computed values. The UA sheet is `ua.css` |
 | `layout.rs` | Block and inline formatting contexts, box model, auto margins, `max-width`, margin collapsing between siblings, Unicode line breaking (UAX #14), `text-align`, `<pre>`, list markers, inline-blocks (baseline-aligned), a basic row flexbox, and tables (automatic column widths, `colspan`/`rowspan`, `border-spacing`, `vertical-align`, captions, CSS `display: table-*`) |
 | `font.rs` | Bundled fonts, per-character fallback, lazy loading |
+| `image.rs` | PNG, JPEG, GIF and WebP decoding (in the renderer only), with size checks before decoding, and resizing |
 | `paint.rs` | Draw ops, glyph-atlas rasterization (in the renderer, via fontdue), and the browser's software painter: alpha-blended rects and glyph bitmaps, cached in 512px tiles so scrolling just copies pixels |
 | `net.rs` | The only code that touches the network: single HTTP exchanges with Firefox's headers, decompression, URL helpers |
 | `network.rs` | The network service: applies tracking stripping, your rules, the filter lists, HTTPS-only and redirect checks to every request, and keeps the request log |
@@ -124,7 +125,9 @@ described in [PRIVACY.md](PRIVACY.md). Security measures:
   like `аpple.com` shows as `xn--pple-43d.com`. `user@` prefixes are hidden, so
   `google.com@evil.com` shows as `evil.com`. Pages can't draw over the browser's own UI.
 - **Resource limits against hostile pages:**
-  - Responses and files up to 8 MB, 5 redirects, 20 s per request, text content types only.
+  - Responses and files up to 8 MB, 5 redirects, 20 s per request, text content types only
+    (and images, for `<img>`).
+  - At most 300 images and 64 MB of them per page; images over 40 megapixels aren't decoded.
   - A page and its stylesheets get 30 s and 32 MB in total.
   - At most 16 external stylesheets and 5,000 rules per sheet.
   - Element nesting depth 256 and 100,000 nodes per page.
@@ -134,9 +137,9 @@ described in [PRIVACY.md](PRIVACY.md). Security measures:
   thread; `Esc` stops a load.
 - **No `unsafe` code** in Brickle itself (`#![forbid(unsafe_code)]`).
 - **Fuzzed.** `fuzz/` has [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets for the
-  HTML parser, the CSS parser, the whole render pipeline, the IPC decoder and the filter engine.
-  CI fuzzes each one on every push. To run them locally: `cargo +nightly fuzz run html` (or `css`,
-  `render`, `ipc`, `filter`).
+  HTML parser, the CSS parser, the whole render pipeline, the IPC decoder, the filter engine,
+  JavaScript and the image decoders. CI fuzzes each one on every push. To run them locally:
+  `cargo +nightly fuzz run html` (or `css`, `render`, `ipc`, `filter`, `js`, `image`).
 - **Dependency auditing.** [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) checks
   RustSec advisories, licenses and sources, and bans AI crates, in CI on every push and weekly
   (config in `deny.toml`). CI actions are pinned to commit hashes. Dependabot proposes updates,
@@ -156,5 +159,5 @@ On non-Linux systems the sandbox isn't implemented yet, so you have to run with 
 
 ## Not yet
 
-JavaScript modules, CORS preflight, file uploads, images, collapsed table borders (`border-collapse` only removes the spacing), floats, positioning (`absolute`/`fixed`), flex wrapping and
+JavaScript modules, CORS preflight, file uploads, CSS background images, SVG, animated images, collapsed table borders (`border-collapse` only removes the spacing), floats, positioning (`absolute`/`fixed`), flex wrapping and
 alignment, `calc()`/`var()`, web fonts, forms, and text selection.

@@ -39,7 +39,12 @@ browser treats everything it sends as hostile (`src/tab.rs`, `src/ipc.rs`):
 - Stop (Esc) kills the renderer and abandons its network requests;
 - all of a page's loading (document, redirects, stylesheets) shares one deadline;
 - the renderer can only *ask* for subresources; the browser applies every policy to each request
-  and holds the cookies.
+  and holds the cookies;
+- images are decoded only in the renderer (`src/image.rs`): image decoders are a classic source
+  of memory-safety bugs, so the browser never runs one on a website's bytes. It only receives
+  finished RGBA pixels, which it checks (sizes, references, total pixels, painting cost) before
+  painting. Image sizes are checked from their headers before decoding, every decoder gets a
+  memory limit, and a decoder panic only loses that image.
 
 `hostile_renderer_tests` in `src/tab.rs` runs fake renderers that flood, stall, send partial,
 oversized, out-of-order and unsolicited messages, stop reading, and ask for local files, local
@@ -55,7 +60,7 @@ requests and cookie changes are queued and answered by the browser process, whic
 network policy and CORS using its own record of the page's origin (`Network::script_request`). Loop-iteration and recursion limits can't be caught by scripts, work
 runs in time-boxed batches, and a renderer that still hangs is killed and the page reloaded
 without JavaScript. The `js` fuzz target drives random DOM operations through the whole
-pipeline.
+pipeline. The `image` fuzz target feeds arbitrary bytes to the image decoders and resizer.
 
 ## Supported versions
 

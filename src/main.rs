@@ -374,6 +374,7 @@ fn print_log(log: &[LogEntry]) {
         net::Dest::Stylesheet => "css",
         net::Dest::Script => "js",
         net::Dest::Xhr => "xhr",
+        net::Dest::Image => "img",
         net::Dest::Download => "list",
     };
     for e in log {

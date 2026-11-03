@@ -56,3 +56,9 @@ name = "js"
 path = "fuzz_targets/js.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "image"
+path = "fuzz_targets/image.rs"
+test = false
+doc = false

@@ -29,6 +29,10 @@ pub const MAX_STYLESHEETS: usize = 16;
 pub const PAGE_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 /// Total bytes a page and its subresources may download.
 pub const PAGE_BYTE_BUDGET: usize = 32 * 1024 * 1024;
+/// Images per page.
+pub const MAX_IMAGES: usize = 300;
+/// A page's images in total (separate from [`PAGE_BYTE_BUDGET`]).
+pub const IMAGE_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outcome {
@@ -134,6 +138,8 @@ enum Fetch {
     Done {
         url: String,
         body: String,
+        /// An image's bytes.
+        bytes: Vec<u8>,
         status: u16,
         headers: Vec<(String, String)>,
     },
@@ -172,6 +178,8 @@ pub struct Network {
     page_stylesheets: usize,
     page_scripts: usize,
     page_script_requests: usize,
+    page_images: usize,
+    image_bytes: usize,
     /// Sites where you allowed JavaScript (`~/.config/brickle/js-sites.txt`).
     js_sites: HashSet<String>,
     js_path: Option<PathBuf>,
@@ -217,6 +225,8 @@ impl Network {
             page_stylesheets: 0,
             page_scripts: 0,
             page_script_requests: 0,
+            page_images: 0,
+            image_bytes: 0,
             js_sites: HashSet::new(),
             js_path: None,
             js_everywhere: false,
@@ -338,6 +348,8 @@ impl Network {
         self.page_stylesheets = 0;
         self.page_scripts = 0;
         self.page_script_requests = 0;
+        self.page_images = 0;
+        self.image_bytes = 0;
         self.page_bytes = 0;
     }
 
@@ -393,6 +405,8 @@ impl Network {
         self.page_stylesheets = 0;
         self.page_scripts = 0;
         self.page_script_requests = 0;
+        self.page_images = 0;
+        self.image_bytes = 0;
         self.deadline = std::time::Instant::now() + PAGE_TIME_BUDGET;
         self.page_bytes = 0;
         let fetched = self.fetch_with(url, from, Dest::Document, post);
@@ -524,6 +538,37 @@ impl Network {
         }
     }
 
+    /// Fetch an image for the page at `page_url` (the browser's own record
+    /// of the page). Only its bytes come back: it is decoded in the renderer.
+    pub fn image(&mut self, page_url: &str, url: &str) -> Result<Vec<u8>, String> {
+        self.page_images += 1;
+        let why = if self.page_images > MAX_IMAGES {
+            Some("too many images")
+        } else if std::time::Instant::now() >= self.deadline || self.cancel.is_cancelled() {
+            Some("page took too long to load")
+        } else if self.image_bytes > IMAGE_BYTE_BUDGET {
+            Some("page's images are too large")
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            self.record(url, Dest::Image, Outcome::OverLimit, vec![]);
+            return Err(format!("{why}, skipped {url}"));
+        }
+        match self.fetch(url, Some(page_url), Dest::Image) {
+            Fetch::Done { bytes, status, .. } if (200..300).contains(&status) => {
+                self.image_bytes += bytes.len();
+                Ok(bytes)
+            }
+            Fetch::Done { status, .. } => Err(format!("{url}: HTTP {status}")),
+            Fetch::LocalNetwork { url, .. } => Err(format!("blocked local-network request {url}")),
+            Fetch::Stopped(why) => Err(why),
+            Fetch::NeedsHttp { url, .. } => Err(format!("blocked insecure {url}")),
+            Fetch::FilterBlocked { url, .. } => Err(format!("blocked {url}")),
+            Fetch::Certificate { host, err } => Err(format!("{host}: {err}")),
+        }
+    }
+
     /// A request from a page's script (`fetch`, `XMLHttpRequest`). The page
     /// URL is the browser's own record of the page, not the renderer's word.
     ///
@@ -589,6 +634,7 @@ impl Network {
                 body,
                 status,
                 headers,
+                ..
             } => {
                 self.page_bytes += body.len();
                 let header = |name: &str| {
@@ -737,10 +783,16 @@ impl Network {
             }
             if net::scheme(&url) == "file" {
                 self.record(&url, dest, Outcome::Local, stripped);
-                return match net::read_file(&url) {
-                    Ok(body) => Fetch::Done {
+                let read = if dest == Dest::Image {
+                    net::read_file_bytes(&url).map(|b| (String::new(), b))
+                } else {
+                    net::read_file(&url).map(|s| (s, vec![]))
+                };
+                return match read {
+                    Ok((body, bytes)) => Fetch::Done {
                         url,
                         body,
+                        bytes,
                         status: 200,
                         headers: vec![],
                     },
@@ -881,6 +933,7 @@ impl Network {
                     return Fetch::Done {
                         url: target,
                         body: resp.body,
+                        bytes: resp.bytes,
                         status: resp.status,
                         headers: resp.headers,
                     };
@@ -1006,6 +1059,7 @@ fn filter_dest(dest: Dest) -> filter::Dest {
         Dest::Document => filter::Dest::Document,
         Dest::Script => filter::Dest::Script,
         Dest::Xhr => filter::Dest::Xhr,
+        Dest::Image => filter::Dest::Image,
         _ => filter::Dest::Stylesheet,
     }
 }
@@ -1291,6 +1345,45 @@ mod tests {
             .contains("too long"));
         assert_eq!(n.take_log()[0].outcome, Outcome::OverLimit);
         assert_eq!(net::requests_sent(), before);
+    }
+
+    #[test]
+    fn images_have_their_own_limits_and_rules() {
+        let dir = std::env::temp_dir().join(format!("brickle-img-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.png");
+        std::fs::write(&file, b"\x89PNG\r\n\x1a\nnot really").unwrap();
+        let img = format!("file://{}", file.display());
+        let page = format!("file://{}/page.html", dir.display());
+        let mut n = Network::empty();
+        // A local page's images are read as bytes, untouched.
+        assert_eq!(n.image(&page, &img).unwrap(), b"\x89PNG\r\n\x1a\nnot really");
+        // A website's are not.
+        assert!(n.image("https://evil.example/", &img).is_err());
+        assert_eq!(n.take_log().last().unwrap().outcome, Outcome::NotAllowed);
+        // Past the per-page count, nothing more is fetched.
+        n.page_images = MAX_IMAGES;
+        let before = net::requests_sent();
+        assert!(n
+            .image("https://a.example/", "https://a.example/x.png")
+            .unwrap_err()
+            .contains("too many images"));
+        assert_eq!(n.take_log()[0].outcome, Outcome::OverLimit);
+        // A new page starts again; its images get their own byte budget.
+        n.restart_page_budget();
+        n.image_bytes = IMAGE_BYTE_BUDGET + 1;
+        assert!(n
+            .image("https://a.example/", "https://a.example/x.png")
+            .unwrap_err()
+            .contains("too large"));
+        assert_eq!(net::requests_sent(), before);
+        // Images can't come from the local network either.
+        n.restart_page_budget();
+        assert!(n
+            .image("https://evil.example/", "http://192.168.1.1/cam.jpg")
+            .is_err());
+        assert_eq!(n.take_log().last().unwrap().outcome, Outcome::LocalNetwork);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -8,13 +8,17 @@
 
 use crate::css::Color;
 use crate::forms::Submission;
+use crate::image::{Bitmap, MAX_DRAW_SIDE};
 use crate::layout::Rect;
 use crate::net::{Credentials, Dest, ScriptRequest};
 use crate::network::ScriptResponse;
 use crate::page::Key;
 use crate::page::Rendered;
-use crate::paint::{DisplayCommand, GlyphBitmap, PlacedGlyph, MAX_ATLAS_BYTES, MAX_GLYPH_SIDE};
+use crate::paint::{
+    DisplayCommand, GlyphBitmap, PlacedGlyph, MAX_ATLAS_BYTES, MAX_FRAME_IMAGE_BYTES, MAX_GLYPH_SIDE,
+};
 use std::io::{self, Read, Write};
+use std::sync::Arc;
 
 /// Largest frame either side will accept.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
@@ -51,6 +55,8 @@ pub enum ToRenderer {
     /// `document.cookie` after a script set a cookie.
     Cookies(String),
     FetchReply(Result<String, String>),
+    /// An image's bytes, for the renderer to decode.
+    ImageReply(Result<Vec<u8>, String>),
     /// You clicked the page at this page-space point.
     Click {
         x: f32,
@@ -324,7 +330,9 @@ fn check_paint_budget(list: &[DisplayCommand], atlas: &[GlyphBitmap], height: f3
     };
     for cmd in list {
         match cmd {
-            DisplayCommand::Rect { rect, .. } => add(rect.x, rect.y, rect.w, rect.h)?,
+            DisplayCommand::Rect { rect, .. } | DisplayCommand::Image { rect, .. } => {
+                add(rect.x, rect.y, rect.w, rect.h)?
+            }
             DisplayCommand::Glyphs { glyphs, .. } => {
                 for g in glyphs {
                     let bmp = &atlas[g.id as usize];
@@ -416,6 +424,20 @@ impl ToRenderer {
                 e.f32(*height);
             }
             ToRenderer::Dom => e.u8(4),
+            ToRenderer::ImageReply(r) => {
+                e.u8(10);
+                match r {
+                    Ok(bytes) => {
+                        e.u8(1);
+                        e.u32(bytes.len() as u32);
+                        e.0.extend_from_slice(bytes);
+                    }
+                    Err(err) => {
+                        e.u8(0);
+                        e.str(err);
+                    }
+                }
+            }
         }
         e.0
     }
@@ -467,6 +489,13 @@ impl ToRenderer {
                 height: d.f32()?,
             },
             4 => ToRenderer::Dom,
+            10 => match d.u8()? {
+                1 => {
+                    let n = d.u32()? as usize;
+                    ToRenderer::ImageReply(Ok(d.take(n)?.to_vec()))
+                }
+                _ => ToRenderer::ImageReply(Err(d.str()?)),
+            },
             t => return Err(format!("unknown message type {t}")),
         };
         d.done()?;
@@ -483,6 +512,7 @@ impl FromRenderer {
                 e.str(url);
                 e.u8(match dest {
                     Dest::Script => 2,
+                    Dest::Image => 3,
                     _ => 1,
                 });
             }
@@ -541,6 +571,23 @@ impl FromRenderer {
                 e.u8(3);
                 e.f32(r.height);
                 e.color(r.background);
+                // Each distinct image once, then commands refer to it by index.
+                let mut index: std::collections::HashMap<*const Bitmap, u32> = Default::default();
+                let mut table: Vec<&Bitmap> = Vec::new();
+                for cmd in &r.list {
+                    if let DisplayCommand::Image { image, .. } = cmd {
+                        index.entry(Arc::as_ptr(image)).or_insert_with(|| {
+                            table.push(image);
+                            (table.len() - 1) as u32
+                        });
+                    }
+                }
+                e.u32(table.len() as u32);
+                for b in &table {
+                    e.u32(b.w);
+                    e.u32(b.h);
+                    e.0.extend_from_slice(&b.rgba);
+                }
                 e.u32(r.list.len() as u32);
                 for cmd in &r.list {
                     match cmd {
@@ -558,6 +605,11 @@ impl FromRenderer {
                                 e.f32(g.y);
                                 e.u32(g.id);
                             }
+                        }
+                        DisplayCommand::Image { rect, image } => {
+                            e.u8(3);
+                            e.rect(*rect);
+                            e.u32(index[&Arc::as_ptr(image)]);
                         }
                     }
                 }
@@ -592,6 +644,7 @@ impl FromRenderer {
                 dest: match d.u8()? {
                     1 => Dest::Stylesheet,
                     2 => Dest::Script,
+                    3 => Dest::Image,
                     t => return Err(format!("invalid request type {t}")),
                 },
             },
@@ -635,6 +688,25 @@ impl FromRenderer {
             3 => {
                 let height = d.f32()?.max(0.0);
                 let background = d.color()?;
+                let n = d.count(8)?;
+                let mut images = Vec::with_capacity(n);
+                let mut image_bytes = 0usize;
+                for _ in 0..n {
+                    let (w, h) = (d.u32()?, d.u32()?);
+                    if w == 0 || h == 0 || w > MAX_DRAW_SIDE || h > MAX_DRAW_SIDE {
+                        return Err(format!("image bitmap has a bad size: {w}x{h}"));
+                    }
+                    let len = w as usize * h as usize * 4;
+                    image_bytes += len;
+                    if image_bytes > MAX_FRAME_IMAGE_BYTES {
+                        return Err("too many image pixels".into());
+                    }
+                    images.push(Arc::new(Bitmap {
+                        w,
+                        h,
+                        rgba: d.take(len)?.to_vec(),
+                    }));
+                }
                 let n = d.count(9)?;
                 if n > MAX_COMMANDS {
                     return Err("too many display commands".into());
@@ -663,6 +735,12 @@ impl FromRenderer {
                                 });
                             }
                             DisplayCommand::Glyphs { color, glyphs }
+                        }
+                        3 => {
+                            let rect = d.rect()?;
+                            let id = d.u32()? as usize;
+                            let image = images.get(id).ok_or("image id out of range")?.clone();
+                            DisplayCommand::Image { rect, image }
                         }
                         t => return Err(format!("unknown display command {t}")),
                     });
@@ -786,6 +864,10 @@ mod tests {
                 url: "https://a/b.js".into(),
                 dest: Dest::Script,
             },
+            FromRenderer::Fetch {
+                url: "https://a/b.png".into(),
+                dest: Dest::Image,
+            },
             FromRenderer::Loaded {
                 title: "T".into(),
                 navigate: Some("https://b/".into()),
@@ -857,6 +939,8 @@ mod tests {
             ToRenderer::Key(Key::Enter),
             ToRenderer::FetchReply(Ok("css".into())),
             ToRenderer::FetchReply(Err("nope".into())),
+            ToRenderer::ImageReply(Ok(vec![0x89, b'P', 0, 255])),
+            ToRenderer::ImageReply(Err("404".into())),
             ToRenderer::Render {
                 width: 800.0,
                 height: 600.0,
@@ -866,6 +950,98 @@ mod tests {
         for m in msgs {
             assert_eq!(ToRenderer::decode(&m.encode()).unwrap(), m);
         }
+    }
+
+    fn with_image(w: u32, h: u32) -> Rendered {
+        let image = Arc::new(Bitmap {
+            w,
+            h,
+            rgba: (0..w * h * 4).map(|i| i as u8).collect(),
+        });
+        let mut r = sample();
+        for y in [0.0, 50.0] {
+            r.list.push(DisplayCommand::Image {
+                rect: Rect {
+                    x: 1.0,
+                    y,
+                    w: w as f32,
+                    h: h as f32,
+                },
+                image: image.clone(),
+            });
+        }
+        r
+    }
+
+    #[test]
+    fn images_are_sent_once_and_checked() {
+        let r = with_image(3, 2);
+        let bytes = FromRenderer::Rendered(r.clone()).encode();
+        let FromRenderer::Rendered(back) = FromRenderer::decode(&bytes).unwrap() else {
+            panic!("not a frame");
+        };
+        assert_eq!(back, r);
+        // Drawn twice, sent once (and shared again after decoding).
+        assert_eq!(
+            bytes.len(),
+            FromRenderer::Rendered(sample()).encode().len() + 8 + 24 + 2 * (1 + 16 + 4)
+        );
+        let ptrs: Vec<_> = back
+            .list
+            .iter()
+            .filter_map(|c| match c {
+                DisplayCommand::Image { image, .. } => Some(Arc::as_ptr(image)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ptrs[0], ptrs[1]);
+
+        // A bitmap larger than any image is drawn.
+        let err = FromRenderer::decode(&FromRenderer::Rendered(with_image(MAX_DRAW_SIDE + 1, 1)).encode());
+        assert!(err.unwrap_err().contains("bad size"));
+        // Fewer pixels than the size says.
+        let mut short = with_image(4, 4);
+        if let DisplayCommand::Image { image, .. } = &mut short.list[2] {
+            *image = Arc::new(Bitmap {
+                w: 4,
+                h: 4,
+                rgba: vec![1; 10],
+            });
+        }
+        assert!(FromRenderer::decode(&FromRenderer::Rendered(short).encode()).is_err());
+        // A command pointing past the image table.
+        // (The last image command: type 3, a rect starting x = 1.0, the id.)
+        let mut bad = bytes.clone();
+        let id_at = bytes
+            .windows(5)
+            .rposition(|w| w[0] == 3 && w[1..5] == 1.0f32.to_le_bytes())
+            .expect("image command")
+            + 17;
+        bad[id_at..id_at + 4].copy_from_slice(&5u32.to_le_bytes());
+        assert!(FromRenderer::decode(&bad)
+            .unwrap_err()
+            .contains("image id out of range"));
+        // Images count against the paint budget like rectangles.
+        let mut r = sample();
+        let image = Arc::new(Bitmap {
+            w: 1,
+            h: 1,
+            rgba: vec![0; 4],
+        });
+        r.list = (0..5000)
+            .map(|_| DisplayCommand::Image {
+                rect: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 1200.0,
+                    h: 900.0,
+                },
+                image: image.clone(),
+            })
+            .collect();
+        assert!(FromRenderer::decode(&FromRenderer::Rendered(r).encode())
+            .unwrap_err()
+            .contains("too much painting"));
     }
 
     #[test]

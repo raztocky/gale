@@ -8,7 +8,9 @@
 use crate::css::Color;
 use crate::dom::NodeType;
 use crate::font;
+use crate::image::Decoded;
 use crate::style::{ComputedStyle, Display, Len, ListStyle, StyledNode, TextAlign, VAlign};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -106,6 +108,8 @@ pub struct LayoutBox<'a> {
     pub link: Option<String>,
     /// The DOM node this box is for (0 for anonymous boxes).
     pub uid: u32,
+    /// A decoded `<img>`: the box is sized from it and paints it.
+    pub image: Option<Decoded>,
 }
 
 impl<'a> LayoutBox<'a> {
@@ -121,6 +125,7 @@ impl<'a> LayoutBox<'a> {
             marker: None,
             link: None,
             uid: kind_uid.unwrap_or(0),
+            image: None,
         }
     }
 
@@ -442,9 +447,37 @@ fn build_cell<'a>(
 // ---------------------------------------------------------------------------
 
 pub fn layout_tree<'a>(root: &'a StyledNode<'a>, viewport_w: f32) -> LayoutBox<'a> {
+    layout_tree_with_images(root, viewport_w, &HashMap::new())
+}
+
+/// Lay out with decoded images for `<img>` elements, by node.
+pub fn layout_tree_with_images<'a>(
+    root: &'a StyledNode<'a>,
+    viewport_w: f32,
+    images: &HashMap<u32, Decoded>,
+) -> LayoutBox<'a> {
     let mut b = build_layout_tree(root);
+    if !images.is_empty() {
+        attach_images(&mut b, images);
+    }
     b.layout(0.0, viewport_w, 0.0);
     b
+}
+
+fn attach_images(b: &mut LayoutBox, images: &HashMap<u32, Decoded>) {
+    if let BoxKind::Block(n) = b.kind {
+        if n.node.tag() == Some("img") {
+            if let Some(d) = images.get(&b.uid) {
+                // The image replaces the alt text.
+                b.image = Some(d.clone());
+                b.children.clear();
+                return;
+            }
+        }
+    }
+    for c in &mut b.children {
+        attach_images(c, images);
+    }
 }
 
 impl<'a> LayoutBox<'a> {
@@ -532,6 +565,15 @@ impl<'a> LayoutBox<'a> {
                 (Some(w), Some(l), Some(r)) => (w, l, r + under),
             }
         };
+        let replaced = self
+            .image
+            .as_ref()
+            .map(|i| replaced_size(&s, i.natural, cb_w, forced_w.map(|f| f - hz)));
+        if let Some((rw, _)) = replaced {
+            if forced_w.is_none() {
+                width = Some(rw);
+            }
+        }
         let (mut w, mut l, mut r) = solve(width, ml, mr);
         if let Some(max) = s.max_width.resolve(cb_w) {
             if w > max {
@@ -547,7 +589,16 @@ impl<'a> LayoutBox<'a> {
         d.content.x = cb_x + l + d.border.l + d.padding.l;
         d.content.y = y + d.margin.t + d.border.t + d.padding.t;
 
-        if let Some(t) = table {
+        if let Some((_, rh)) = replaced {
+            // Height follows the width actually used, keeping the aspect
+            // ratio unless a height was given.
+            let w = self.dims.content.w;
+            self.dims.content.h = match (s.height, self.image.as_ref()) {
+                (Len::Px(_), _) => rh,
+                (_, Some(i)) if i.natural.0 > 0 => w * i.natural.1 as f32 / i.natural.0 as f32,
+                _ => rh,
+            };
+        } else if let Some(t) = table {
             self.layout_table(t);
         } else if s.display == Display::Flex && s.flex_row {
             self.layout_flex_row();
@@ -648,6 +699,10 @@ impl<'a> LayoutBox<'a> {
             _ => (0.0, 0.0),
         };
         let hz = pb + m;
+        if let Some(i) = &self.image {
+            let (w, _) = replaced_size(s, i.natural, cb_w, None);
+            return (w + hz, w + hz);
+        }
         if let BoxKind::Block(_) = self.kind {
             if matches!(s.display, Display::Table | Display::InlineTable) {
                 let (min, max) = self.table_columns(cb_w).content_widths();
@@ -1484,6 +1539,33 @@ fn break_between(a: char, b: char) -> bool {
 fn margins_h(b: &LayoutBox, cb_w: f32) -> f32 {
     let s = b.style();
     s.margin[1].or_zero(cb_w) + s.margin[3].or_zero(cb_w)
+}
+
+/// Content size of an image: its natural size, or the width/height given in
+/// CSS or attributes, keeping its aspect ratio where only one is given;
+/// limited by `max-width`. `forced_w` is a width imposed by the parent.
+fn replaced_size(s: &ComputedStyle, natural: (u32, u32), cb_w: f32, forced_w: Option<f32>) -> (f32, f32) {
+    let (nw, nh) = (natural.0.max(1) as f32, natural.1.max(1) as f32);
+    let css_h = match s.height {
+        Len::Px(h) => Some(h),
+        _ => None,
+    };
+    let css_w = forced_w.or_else(|| s.width.resolve(cb_w));
+    let (mut w, mut h) = match (css_w, css_h) {
+        (Some(w), Some(h)) => (w, h),
+        (Some(w), None) => (w, w * nh / nw),
+        (None, Some(h)) => (h * nw / nh, h),
+        (None, None) => (nw, nh),
+    };
+    if let Some(max) = s.max_width.resolve(cb_w) {
+        if w > max {
+            if css_h.is_none() {
+                h = h * max / w;
+            }
+            w = max;
+        }
+    }
+    (w.max(0.0), h.max(0.0))
 }
 
 /// Ascent/descent of a line-height box for this style (CSS half-leading).

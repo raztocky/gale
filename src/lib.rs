@@ -8,6 +8,7 @@ pub mod filter;
 pub mod font;
 pub mod forms;
 pub mod html;
+pub mod image;
 pub mod ipc;
 pub mod js;
 pub mod layout;
