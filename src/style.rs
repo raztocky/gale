@@ -28,6 +28,21 @@ pub enum Display {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Float {
+    None,
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Clear {
+    None,
+    Left,
+    Right,
+    Both,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum VAlign {
     Top,
     Middle,
@@ -111,6 +126,11 @@ pub struct ComputedStyle {
     pub border_collapse: bool,
     /// Only used for table cells.
     pub vertical_align: VAlign,
+    pub float: Float,
+    pub clear: Clear,
+    /// `overflow` other than `visible`, or `display: flow-root`: the box
+    /// contains its floats and doesn't wrap around outside ones.
+    pub contain_floats: bool,
 }
 
 impl ComputedStyle {
@@ -146,6 +166,9 @@ impl ComputedStyle {
             border_spacing: [0.0; 2],
             border_collapse: false,
             vertical_align: VAlign::Middle,
+            float: Float::None,
+            clear: Clear::None,
+            contain_floats: false,
         }
     }
 
@@ -461,6 +484,21 @@ fn compute(
             hint("margin-right", "auto");
         }
     }
+    if matches!(e.tag.as_str(), "img" | "table") {
+        match e.attrs.get("align").map(|a| a.to_ascii_lowercase()).as_deref() {
+            Some("left") => hint("float", "left"),
+            Some("right") => hint("float", "right"),
+            _ => {}
+        }
+    }
+    if e.tag == "br" {
+        match e.attrs.get("clear").map(|a| a.to_ascii_lowercase()).as_deref() {
+            Some("all" | "both") => hint("clear", "both"),
+            Some("left") => hint("clear", "left"),
+            Some("right") => hint("clear", "right"),
+            _ => {}
+        }
+    }
     if matches!(e.tag.as_str(), "td" | "th") {
         if let Some(v) = table.and_then(|t| t.attrs.get("cellpadding")).and_then(|v| px(v)) {
             hint("padding", &v);
@@ -568,7 +606,11 @@ fn compute(
         match name.as_str() {
             "display" => {
                 s.display = match kw {
-                    "block" | "grid" | "flow-root" => Display::Block,
+                    "block" | "grid" => Display::Block,
+                    "flow-root" => {
+                        s.contain_floats = true;
+                        Display::Block
+                    }
                     "inline" => Display::Inline,
                     "inline-block" | "inline-flex" | "inline-grid" => Display::InlineBlock,
                     "list-item" => Display::ListItem,
@@ -709,6 +751,26 @@ fn compute(
                 }
             }
             "border-collapse" => s.border_collapse = kw == "collapse",
+            "float" => {
+                s.float = match kw {
+                    "left" | "inline-start" => Float::Left,
+                    "right" | "inline-end" => Float::Right,
+                    _ => Float::None,
+                }
+            }
+            "clear" => {
+                s.clear = match kw {
+                    "left" | "inline-start" => Clear::Left,
+                    "right" | "inline-end" => Clear::Right,
+                    "both" => Clear::Both,
+                    _ => Clear::None,
+                }
+            }
+            "overflow" | "overflow-x" | "overflow-y" => {
+                if matches!(kw, "hidden" | "auto" | "scroll" | "clip") {
+                    s.contain_floats = true;
+                }
+            }
             "vertical-align" => {
                 s.vertical_align = match kw {
                     "top" | "text-top" | "baseline" => VAlign::Top,
@@ -766,6 +828,14 @@ fn compute(
     s.line_height = s.line_height.clamp(0.0, MAX_FONT_SIZE * 4.0);
     if is_root && s.display == Display::Inline {
         s.display = Display::Block;
+    }
+    // Floats are always block-level.
+    if s.float != Float::None {
+        s.display = match s.display {
+            Display::InlineTable => Display::Table,
+            Display::Table | Display::Flex | Display::ListItem | Display::None => s.display,
+            _ => Display::Block,
+        };
     }
     s
 }

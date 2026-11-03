@@ -71,7 +71,7 @@ browser validates before painting.
 | `html.rs` | Tokenizer and tree builder. Handles implied end tags (`<p>`, `<li>`, `<td>`…), void elements, raw text (`<script>`/`<style>`), entities, and `<html>/<head>/<body>` normalization |
 | `css.rs` | Rules, selectors (type, `.class`, `#id`, `*`, `[attr]`, `:root`, `:link`, descendant and `>` combinators), `@media`, `!important`, colors, units |
 | `style.rs` | Selector matching, specificity, the cascade (UA < author < inline), inheritance, shorthand expansion and computed values. The UA sheet is `ua.css` |
-| `layout.rs` | Block and inline formatting contexts, box model, auto margins, `max-width`, margin collapsing between siblings, Unicode line breaking (UAX #14), `text-align`, `<pre>`, list markers, inline-blocks (baseline-aligned), a basic row flexbox, and tables (automatic column widths, `colspan`/`rowspan`, `border-spacing`, `vertical-align`, captions, CSS `display: table-*`) |
+| `layout.rs` | Block and inline formatting contexts, box model, auto margins, `max-width`, margin collapsing between siblings, Unicode line breaking (UAX #14), `text-align`, `<pre>`, list markers, inline-blocks (baseline-aligned), a basic row flexbox, floats (`float`, `clear`, `<br clear>`, `align=left/right`, with `overflow`/`flow-root` containing them), and tables (automatic column widths, `colspan`/`rowspan`, `border-spacing`, `vertical-align`, captions, CSS `display: table-*`) |
 | `font.rs` | Bundled fonts, per-character fallback, lazy loading |
 | `image.rs` | PNG, JPEG, GIF and WebP decoding (in the renderer only), with size checks before decoding, and resizing |
 | `paint.rs` | Draw ops, glyph-atlas rasterization (in the renderer, via fontdue), and the browser's software painter: alpha-blended rects and glyph bitmaps, cached in 512px tiles so scrolling just copies pixels |
@@ -159,5 +159,5 @@ On non-Linux systems the sandbox isn't implemented yet, so you have to run with 
 
 ## Not yet
 
-JavaScript modules, CORS preflight, file uploads, CSS background images, SVG, animated images, collapsed table borders (`border-collapse` only removes the spacing), floats, positioning (`absolute`/`fixed`), flex wrapping and
+JavaScript modules, CORS preflight, file uploads, CSS background images, SVG, animated images, collapsed table borders (`border-collapse` only removes the spacing), floats painting above later blocks' backgrounds, positioning (`absolute`/`fixed`), flex wrapping and
 alignment, `calc()`/`var()`, web fonts, forms, and text selection.
