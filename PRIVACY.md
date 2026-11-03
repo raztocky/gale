@@ -102,7 +102,9 @@ a link (`https://user:pass@host/`) are removed too, and never sent.
 - **No bounce tracking.** Cookies set while a link redirects you through another site on the way
   to the real page are dropped.
 - **Safer defaults.** A cookie without `SameSite` is treated as `Lax`; `Secure` cookies only go
-  over HTTPS; lifetimes are capped at 400 days; cookies for a whole public suffix (like
+  over HTTPS (plain HTTP to your own computer, `localhost`, is the one exception; other
+  local-network devices don't count); a plain-HTTP response can't overwrite, shadow or delete a
+  `Secure` cookie; lifetimes are capped at 400 days; cookies for a whole public suffix (like
   `.co.uk` or `.github.io`) are refused.
 - **Visible.** The request panel shows the cookies each request sent, set and was refused, and a
   "Forget" button deletes a site's cookies.
