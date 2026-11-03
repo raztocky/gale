@@ -21,12 +21,13 @@ struct InFlight;
 
 impl InFlight {
     fn start() -> Option<InFlight> {
-        IN_FLIGHT
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                (n < MAX_IN_FLIGHT).then_some(n + 1)
-            })
-            .ok()
-            .map(|_| InFlight)
+        // Take a slot, and give it back if there wasn't one.
+        if IN_FLIGHT.fetch_add(1, Ordering::SeqCst) < MAX_IN_FLIGHT {
+            Some(InFlight)
+        } else {
+            IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+            None
+        }
     }
 }
 
