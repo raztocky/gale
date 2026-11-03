@@ -304,6 +304,27 @@ fn only_net_rs_talks_to_the_network() {
 
 #[test]
 fn local_proxy_still_works_for_public_pages() {
+    // The check sets HTTPS_PROXY, which is process-wide: run it in a
+    // process of its own so it can't send other tests' requests through
+    // the fake proxy.
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "local_proxy_check", "--ignored", "--test-threads=1"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("1 passed"));
+}
+
+/// The body of `local_proxy_still_works_for_public_pages`, run in its own
+/// process.
+#[test]
+#[ignore]
+fn local_proxy_check() {
     // A proxy on 127.0.0.1 (like Tor or Privoxy) must not trip the
     // local-network protection for a public page's subresources.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
