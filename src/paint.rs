@@ -82,16 +82,16 @@ pub fn rasterize(ops: Vec<DrawOp>) -> (DisplayList, Vec<GlyphBitmap>) {
                 color,
                 italic,
             } => {
-                if !(MIN_TEXT_SIZE..=crate::style::MAX_FONT_SIZE).contains(&size)
-                    || font >= font::fonts().len()
-                {
+                if !(MIN_TEXT_SIZE..=crate::style::MAX_FONT_SIZE).contains(&size) || font >= font::COUNT {
                     continue;
                 }
-                let f = &font::fonts()[font];
                 let mut pen = x;
                 let mut glyphs = Vec::new();
                 for ch in text.chars() {
-                    let key = (font, ch, (size * 4.0) as u32, italic);
+                    // Per character: the style's font, or a fallback that has it.
+                    let fi = font::resolve(font, ch);
+                    let f = font::font(fi);
+                    let key = (fi, ch, (size * 4.0) as u32, italic);
                     let entry = ids.entry(key).or_insert_with(|| {
                         if atlas_bytes > MAX_ATLAS_BYTES {
                             return None;
@@ -393,13 +393,14 @@ impl Canvas {
     ) {
         // fontdue corrupts memory when rasterizing at tiny (subnormal) sizes
         // (found by fuzzing). Text under MIN_TEXT_SIZE is invisible anyway.
-        if !(MIN_TEXT_SIZE..=crate::style::MAX_FONT_SIZE).contains(&size) || font_idx >= font::fonts().len() {
+        if !(MIN_TEXT_SIZE..=crate::style::MAX_FONT_SIZE).contains(&size) || font_idx >= font::COUNT {
             return;
         }
-        let f = &font::fonts()[font_idx];
         let mut pen = x;
         for ch in text.chars() {
-            let key = (font_idx, ch, (size * 4.0) as u32);
+            let fi = font::resolve(font_idx, ch);
+            let f = font::font(fi);
+            let key = (fi, ch, (size * 4.0) as u32);
             if !cache.map.contains_key(&key) {
                 if cache.bytes > GLYPH_CACHE_BYTES {
                     cache.map.clear();

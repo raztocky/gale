@@ -13,11 +13,16 @@ Planned work, roughly in priority order. Items marked *discuss* need a decision 
 ## Text
 - [ ] Text shaping with **HarfRust** (the HarfBuzz project's safe-Rust port), in the renderer:
       kerning, ligatures, Arabic/Indic/Thai shaping (*discuss*)
-- [ ] Font fallback for scripts DejaVu lacks (CJK, Devanagari, emoji): bundled Noto subset or
-      system fonts passed safely into the sandbox
+- [x] Font fallback: bundled Noto subsets for CJK, Korean, Devanagari, Thai, emoji, symbols
+- [ ] More fallback scripts on request (Bengali, Tamil, Ethiopic, ...); color emoji
 - [ ] Bidirectional text (Arabic, Hebrew) with `unicode-bidi`
-- [ ] Unicode line breaking (UAX #14) with `unicode-linebreak`
+- [x] Unicode line breaking (UAX #14) with `unicode-linebreak`
+- [ ] Thai/Lao/Khmer word breaking (needs a dictionary)
 - [ ] Draw the browser's own UI text in a sandboxed helper too
+
+- [ ] Replace fontdue: it depends on `ttf-parser`, which is now unmaintained (RUSTSEC-2026-0192).
+      A rasterizer on Google's maintained fontations stack (`skrifa` outlines) would also line up
+      with HarfRust, which uses the same font-reading crates
 
 ## Performance / robustness
 - [x] Paint pages into tiles once and scroll by copying pixels

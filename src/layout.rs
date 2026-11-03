@@ -564,6 +564,8 @@ impl<'a> LayoutBox<'a> {
                 bg: Color,
                 link: Option<String>,
                 w: f32,
+                /// No line break allowed between this and the previous piece.
+                glue: bool,
             },
             Space {
                 style: Rc<ComputedStyle>,
@@ -576,6 +578,9 @@ impl<'a> LayoutBox<'a> {
         }
         let mut pieces = Vec::new();
         let mut last_space = true;
+        // Last character of the previous word, if nothing (no space, break
+        // or inline-block) separates it from the next one.
+        let mut prev_tail: Option<char> = None;
         for item in &items {
             match item {
                 InlineItem::Text {
@@ -590,12 +595,13 @@ impl<'a> LayoutBox<'a> {
                     } else {
                         text.clone()
                     };
-                    let mk_word = |t: &str| Piece::Word {
+                    let mk_word = |t: &str, glue: bool| Piece::Word {
                         text: t.to_string(),
                         style: style.clone(),
                         bg: *bg,
                         link: link.clone(),
                         w: font::measure(f, style.font_size, t),
+                        glue,
                     };
                     if style.pre {
                         for (i, line) in text.split('\n').enumerate() {
@@ -604,10 +610,11 @@ impl<'a> LayoutBox<'a> {
                             }
                             let line = line.replace('\t', "        ");
                             if !line.is_empty() {
-                                pieces.push(mk_word(&line));
+                                pieces.push(mk_word(&line, false));
                             }
                         }
                         last_space = false;
+                        prev_tail = None;
                         continue;
                     }
                     if style.nowrap {
@@ -616,18 +623,37 @@ impl<'a> LayoutBox<'a> {
                             t.insert(0, ' ');
                         }
                         if !t.trim().is_empty() {
-                            pieces.push(mk_word(&t));
+                            pieces.push(mk_word(&t, false));
                             last_space = text.ends_with(|c: char| c.is_ascii_whitespace());
                         }
+                        prev_tail = None;
                         continue;
                     }
+                    // A run of non-space text is split further wherever the
+                    // Unicode line-breaking rules (UAX #14) allow: between
+                    // CJK characters, after hyphens and slashes, and so on.
+                    let push_word = |word: &str, pieces: &mut Vec<Piece>, prev_tail: &mut Option<char>| {
+                        let first = word.chars().next().unwrap_or(' ');
+                        let mut glue = prev_tail.is_some_and(|a| !break_between(a, first));
+                        let mut start = 0;
+                        for (i, _) in unicode_linebreak::linebreaks(word) {
+                            if i > start && i < word.len() {
+                                pieces.push(mk_word(&word[start..i], glue));
+                                glue = false;
+                                start = i;
+                            }
+                        }
+                        pieces.push(mk_word(&word[start..], glue));
+                        *prev_tail = word.chars().last();
+                    };
                     let mut word = String::new();
                     for c in text.chars() {
                         if c.is_ascii_whitespace() {
                             if !word.is_empty() {
-                                pieces.push(mk_word(&word));
+                                push_word(&word, &mut pieces, &mut prev_tail);
                                 word.clear();
                             }
+                            prev_tail = None;
                             if !last_space {
                                 pieces.push(Piece::Space {
                                     style: style.clone(),
@@ -643,17 +669,19 @@ impl<'a> LayoutBox<'a> {
                         }
                     }
                     if !word.is_empty() {
-                        pieces.push(mk_word(&word));
+                        push_word(&word, &mut pieces, &mut prev_tail);
                     }
                 }
                 InlineItem::Break(s) => {
                     pieces.push(Piece::Break(s.clone()));
                     last_space = true;
+                    prev_tail = None;
                 }
                 InlineItem::Atomic(i) => {
                     let w = self.children[*i].dims.margin_box().w;
                     pieces.push(Piece::Atomic(*i, w));
                     last_space = false;
+                    prev_tail = None;
                 }
             }
         }
@@ -680,7 +708,26 @@ impl<'a> LayoutBox<'a> {
                 lines.push((std::mem::take(cur), *x, br));
                 *x = 0.0;
             };
-        for p in pieces {
+        // Width of each glued group of words starting at piece i: a group
+        // moves to the next line as a whole.
+        let mut group_w = vec![0.0f32; pieces.len()];
+        {
+            let mut i = pieces.len();
+            let mut acc = 0.0;
+            while i > 0 {
+                i -= 1;
+                if let Piece::Word { w, glue, .. } = &pieces[i] {
+                    acc += w;
+                    group_w[i] = acc;
+                    if !glue {
+                        acc = 0.0;
+                    }
+                } else {
+                    acc = 0.0;
+                }
+            }
+        }
+        for (pi, p) in pieces.into_iter().enumerate() {
             match p {
                 Piece::Word {
                     text,
@@ -688,8 +735,10 @@ impl<'a> LayoutBox<'a> {
                     bg,
                     link,
                     w,
+                    glue,
                 } => {
-                    if x + w > avail && !cur.is_empty() && !(style.pre && style.nowrap) {
+                    let gw = group_w[pi];
+                    if !glue && x + gw > avail && !cur.is_empty() && !(style.pre && style.nowrap) {
                         finish(&mut cur, &mut x, &mut lines, None);
                     }
                     cur.push(Placed::Text(TextFrag {
@@ -802,6 +851,15 @@ impl LayoutBox<'_> {
     }
 }
 
+/// Does UAX #14 allow a line break between characters `a` and `b`?
+fn break_between(a: char, b: char) -> bool {
+    let mut s = String::with_capacity(8);
+    s.push(a);
+    s.push(b);
+    let found = unicode_linebreak::linebreaks(&s).any(|(i, _)| i == a.len_utf8());
+    found
+}
+
 fn margins_h(b: &LayoutBox, cb_w: f32) -> f32 {
     let s = b.style();
     s.margin[1].or_zero(cb_w) + s.margin[3].or_zero(cb_w)
@@ -812,4 +870,87 @@ fn half_leading(s: &ComputedStyle) -> (f32, f32) {
     let (a, d) = font::vmetrics(font::index(s), s.font_size);
     let lead = (s.line_height - (a + d)) / 2.0;
     (a + lead, d + lead)
+}
+
+#[cfg(test)]
+mod line_break_tests {
+    use crate::css;
+    use crate::html;
+    use crate::layout::{layout_tree, BoxKind, LayoutBox};
+    use crate::style::{self, StyleContext};
+
+    /// Lay out `body` at `width` and return the text of each line.
+    fn lines(body: &str, width: f32) -> Vec<String> {
+        let dom = html::parse(&format!(
+            "<body style='margin:0;font-family:sans-serif;font-size:16px'>{body}"
+        ));
+        let ua = css::parse(style::UA_CSS);
+        let ctx = StyleContext {
+            sheets: vec![(0, &ua)],
+            viewport: (width, 600.0),
+        };
+        let styled = style::style_tree(&dom, &ctx);
+        let root = layout_tree(&styled, width);
+        let mut frags = Vec::new();
+        fn walk(b: &LayoutBox, out: &mut Vec<(f32, f32, f32, String)>) {
+            if let BoxKind::Anonymous { frags, .. } = &b.kind {
+                out.extend(frags.iter().map(|f| (f.baseline, f.x, f.w, f.text.clone())));
+            }
+            for c in &b.children {
+                walk(c, out);
+            }
+        }
+        walk(&root, &mut frags);
+        frags.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+        let mut out: Vec<(f32, String, f32)> = Vec::new();
+        for (base, x, w, t) in frags {
+            match out.last_mut() {
+                Some((b, s, right)) if (*b - base).abs() < 0.5 => {
+                    s.push_str(&t);
+                    *right = right.max(x + w);
+                }
+                _ => out.push((base, t, x + w)),
+            }
+        }
+        for (_, s, right) in &out {
+            // A line may only overflow if it's a single unbreakable piece.
+            assert!(
+                *right <= width + 0.5 || !s.trim().contains(' '),
+                "overflow: {s:?} ({right} > {width})"
+            );
+        }
+        out.into_iter()
+            .map(|(_, s, _)| s.trim_end().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn cjk_wraps_between_characters() {
+        let l = lines("猫咪是最好的浏览器吉祥物。我们喜欢它。", 120.0);
+        assert!(l.len() > 1, "{l:?}");
+        assert!(
+            l.iter().all(|line| !line.starts_with('。')),
+            "no line starts with 。: {l:?}"
+        );
+    }
+
+    #[test]
+    fn style_changes_dont_split_words() {
+        // "foo" + bold "bar" is one word: it must stay together.
+        let l = lines("aaaa bbbb foo<b>bar</b>", 95.0);
+        assert!(l.iter().any(|line| line.contains("foobar")), "{l:?}");
+    }
+
+    #[test]
+    fn punctuation_and_urls() {
+        let l = lines("Hello world!", 50.0);
+        assert!(l.iter().all(|line| line != "!"), "! stays with its word: {l:?}");
+        let l = lines("see https://example.com/some/long/path/to/a/page now", 120.0);
+        assert!(l.len() >= 3, "a long URL may break: {l:?}");
+        let l = lines("well-known state-of-the-art", 80.0);
+        assert!(
+            l.iter().any(|line| line.ends_with('-')),
+            "breaks after hyphens: {l:?}"
+        );
+    }
 }

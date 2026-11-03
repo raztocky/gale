@@ -51,7 +51,7 @@ mod linux {
     pub fn enter() -> Result<Report, String> {
         // Touch the bundled fonts now so nothing lazily allocates or reads
         // after the filters are on.
-        let _ = crate::font::fonts();
+        crate::font::preload();
 
         let set = |r: Resource, v: u64| r.set(v, v).map_err(|e| format!("setrlimit {r:?}: {e}"));
         set(Resource::AS, MEMORY_LIMIT)?;

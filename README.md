@@ -67,7 +67,8 @@ painting.
 | `html.rs` | Tokenizer and tree builder. Handles implied end tags (`<p>`, `<li>`, `<td>`…), void elements, raw text (`<script>`/`<style>`), entities, and `<html>/<head>/<body>` normalization |
 | `css.rs` | Rules, selectors (type, `.class`, `#id`, `*`, `[attr]`, `:root`, `:link`, descendant and `>` combinators), `@media`, `!important`, colors, units |
 | `style.rs` | Selector matching, specificity, the cascade (UA < author < inline), inheritance, shorthand expansion and computed values. The UA sheet is `ua.css` |
-| `layout.rs` | Block and inline formatting contexts, box model, auto margins, `max-width`, margin collapsing between siblings, word wrapping, `text-align`, `<pre>`, list markers, inline-blocks (baseline-aligned) and a basic row flexbox |
+| `layout.rs` | Block and inline formatting contexts, box model, auto margins, `max-width`, margin collapsing between siblings, Unicode line breaking (UAX #14), `text-align`, `<pre>`, list markers, inline-blocks (baseline-aligned) and a basic row flexbox |
+| `font.rs` | Bundled fonts, per-character fallback, lazy loading |
 | `paint.rs` | Draw ops, glyph-atlas rasterization (in the renderer, via fontdue), and the browser's software painter: alpha-blended rects and glyph bitmaps, cached in 512px tiles so scrolling just copies pixels |
 | `net.rs` | The only code that touches the network: single HTTP exchanges with Firefox's headers, decompression, URL helpers |
 | `network.rs` | The network service: applies tracking stripping, your rules, the filter lists, HTTPS-only and redirect checks to every request, and keeps the request log |
@@ -80,7 +81,10 @@ painting.
 | `sandbox.rs` | Landlock + seccomp + rlimits for the renderer, and the `sandbox-test` probes |
 | `gui.rs` | Browser window: address bar, scrolling, link hover and click, history |
 
-Fonts are bundled DejaVu (see `assets/fonts/LICENSE-DejaVu.txt`).
+Fonts: DejaVu (see `assets/fonts/LICENSE-DejaVu.txt`), plus Noto subsets for Chinese, Japanese,
+Korean, Devanagari, Thai, emoji and symbols, under the SIL Open Font License
+(`assets/fonts/fallback/OFL.txt`). Rebuild them with `assets/fonts/fallback/build.sh`. Fallback fonts
+are only parsed when a page actually uses them.
 
 ## Security
 

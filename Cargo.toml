@@ -18,6 +18,8 @@ minifb = { version = "0.27", optional = true }
 psl = "2.1.246"
 flate2 = "1.1.10"
 ruzstd = "0.9.1"
+unicode-linebreak = "0.1.5"
+read-fonts = "0.46.0"
 
 # The renderer sandbox (Landlock + seccomp + rlimits) is Linux-only.
 [target.'cfg(target_os = "linux")'.dependencies]
