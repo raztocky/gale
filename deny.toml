@@ -26,6 +26,33 @@ allow = [
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# PRIVACY.md rule 3: no AI. Keep AI/LLM clients and inference runtimes out
+# of the dependency tree.
+deny = [
+    { crate = "async-openai", reason = "no AI (PRIVACY.md)" },
+    { crate = "openai", reason = "no AI (PRIVACY.md)" },
+    { crate = "openai-api-rs", reason = "no AI (PRIVACY.md)" },
+    { crate = "ollama-rs", reason = "no AI (PRIVACY.md)" },
+    { crate = "anthropic", reason = "no AI (PRIVACY.md)" },
+    { crate = "genai", reason = "no AI (PRIVACY.md)" },
+    { crate = "rig-core", reason = "no AI (PRIVACY.md)" },
+    { crate = "llm", reason = "no AI (PRIVACY.md)" },
+    { crate = "llm-chain", reason = "no AI (PRIVACY.md)" },
+    { crate = "langchain-rust", reason = "no AI (PRIVACY.md)" },
+    { crate = "kalosm", reason = "no AI (PRIVACY.md)" },
+    { crate = "mistralrs", reason = "no AI (PRIVACY.md)" },
+    { crate = "llama-cpp-2", reason = "no AI (PRIVACY.md)" },
+    { crate = "llama_cpp", reason = "no AI (PRIVACY.md)" },
+    { crate = "candle-core", reason = "no AI (PRIVACY.md)" },
+    { crate = "candle-transformers", reason = "no AI (PRIVACY.md)" },
+    { crate = "ort", reason = "no AI (PRIVACY.md)" },
+    { crate = "tch", reason = "no AI (PRIVACY.md)" },
+    { crate = "burn", reason = "no AI (PRIVACY.md)" },
+    { crate = "tract-onnx", reason = "no AI (PRIVACY.md)" },
+    { crate = "rust-bert", reason = "no AI (PRIVACY.md)" },
+    { crate = "tokenizers", reason = "no AI (PRIVACY.md)" },
+    { crate = "whisper-rs", reason = "no AI (PRIVACY.md)" },
+]
 
 [sources]
 unknown-registry = "deny"

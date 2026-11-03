@@ -43,3 +43,10 @@ bench = false
 
 [profile.release]
 debug = 1
+
+[[bin]]
+name = "filter"
+path = "fuzz_targets/filter.rs"
+test = false
+doc = false
+bench = false

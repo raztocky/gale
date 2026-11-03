@@ -178,7 +178,71 @@ pub struct StyleContext<'s> {
 pub fn style_tree<'a>(root: &'a Node, ctx: &StyleContext) -> StyledNode<'a> {
     let base = ComputedStyle::root(ctx.viewport);
     let mut ancestors = Vec::new();
-    style_node(root, &base, &mut ancestors, ctx, true)
+    let index = RuleIndex::new(&ctx.sheets);
+    style_node(root, &base, &mut ancestors, ctx, &index, true)
+}
+
+/// Selectors bucketed by their subject's id, first class or tag, so each
+/// element is only tested against selectors that could possibly match it.
+/// (Content-blocker lists add over ten thousand hiding selectors.)
+struct RuleIndex<'s> {
+    /// (rule order, origin, rule, selector)
+    entries: Vec<(usize, u8, &'s css::Rule, &'s css::Selector)>,
+    by_id: HashMap<&'s str, Vec<usize>>,
+    by_class: HashMap<&'s str, Vec<usize>>,
+    by_tag: HashMap<&'s str, Vec<usize>>,
+    any: Vec<usize>,
+}
+
+impl<'s> RuleIndex<'s> {
+    fn new(sheets: &[(u8, &'s Stylesheet)]) -> Self {
+        let mut ix = RuleIndex {
+            entries: Vec::new(),
+            by_id: HashMap::new(),
+            by_class: HashMap::new(),
+            by_tag: HashMap::new(),
+            any: Vec::new(),
+        };
+        let mut order = 0;
+        for (origin, sheet) in sheets {
+            for rule in &sheet.rules {
+                for sel in &rule.selectors {
+                    let i = ix.entries.len();
+                    ix.entries.push((order, *origin, rule, sel));
+                    let subject = &sel.parts[0].0;
+                    if let Some(id) = &subject.id {
+                        ix.by_id.entry(id.as_str()).or_default().push(i);
+                    } else if let Some(c) = subject.classes.first() {
+                        ix.by_class.entry(c.as_str()).or_default().push(i);
+                    } else if let Some(t) = &subject.tag {
+                        ix.by_tag.entry(t.as_str()).or_default().push(i);
+                    } else {
+                        ix.any.push(i);
+                    }
+                }
+                order += 1;
+            }
+        }
+        ix
+    }
+
+    fn candidates(&self, e: &ElementData) -> Vec<usize> {
+        let mut out: Vec<usize> = self.any.clone();
+        if let Some(v) = e.id().and_then(|id| self.by_id.get(id)) {
+            out.extend(v);
+        }
+        for c in e.classes() {
+            if let Some(v) = self.by_class.get(c) {
+                out.extend(v);
+            }
+        }
+        if let Some(v) = self.by_tag.get(e.tag.as_str()) {
+            out.extend(v);
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
 }
 
 fn style_node<'a>(
@@ -186,6 +250,7 @@ fn style_node<'a>(
     parent: &ComputedStyle,
     ancestors: &mut Vec<&'a ElementData>,
     ctx: &StyleContext,
+    index: &RuleIndex,
     is_root: bool,
 ) -> StyledNode<'a> {
     let style = match &node.node_type {
@@ -194,14 +259,14 @@ fn style_node<'a>(
             s.display = Display::Inline;
             s
         }
-        NodeType::Element(e) => compute(e, parent, ancestors, ctx, is_root),
+        NodeType::Element(e) => compute(e, parent, ancestors, ctx, index, is_root),
     };
     let style = Rc::new(style);
     let mut children = Vec::new();
     if let NodeType::Element(e) = &node.node_type {
         ancestors.push(e);
         for c in &node.children {
-            children.push(style_node(c, &style, ancestors, ctx, false));
+            children.push(style_node(c, &style, ancestors, ctx, index, false));
         }
         ancestors.pop();
     }
@@ -256,27 +321,30 @@ fn compute(
     parent: &ComputedStyle,
     ancestors: &[&ElementData],
     ctx: &StyleContext,
+    index: &RuleIndex,
     is_root: bool,
 ) -> ComputedStyle {
     let mut matched: Vec<MatchedRule> = Vec::new();
     let mut order = 0;
-    for (origin, sheet) in &ctx.sheets {
-        for rule in &sheet.rules {
-            let best = rule
-                .selectors
-                .iter()
-                .filter(|s| matches(e, ancestors, s))
-                .map(|s| s.specificity())
-                .max();
-            if let Some(spec) = best {
-                for d in &rule.declarations {
-                    order += 1;
-                    matched.push(MatchedRule {
-                        key: (d.important, *origin, spec, order),
-                        decl: d,
-                    });
-                }
-            }
+    // Best specificity per matching rule, in stylesheet order.
+    let mut hits: std::collections::BTreeMap<usize, (u8, &css::Rule, css::Specificity)> = Default::default();
+    for i in index.candidates(e) {
+        let (rule_order, origin, rule, sel) = index.entries[i];
+        if matches(e, ancestors, sel) {
+            let spec = sel.specificity();
+            hits.entry(rule_order)
+                .and_modify(|h| h.2 = h.2.max(spec))
+                .or_insert((origin, rule, spec));
+        }
+    }
+    let _ = &ctx.sheets;
+    for (origin, rule, spec) in hits.into_values() {
+        for d in &rule.declarations {
+            order += 1;
+            matched.push(MatchedRule {
+                key: (d.important, origin, spec, order),
+                decl: d,
+            });
         }
     }
     let inline = e

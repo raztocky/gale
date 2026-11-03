@@ -1,23 +1,33 @@
-//! Loading resources: local files, file:// and http(s):// URLs.
+//! Low-level loading: local files and single HTTP(S) exchanges.
 //!
-//! Security rules enforced here:
-//! - Only `http`, `https` and `file` are fetchable; everything else is refused.
-//! - A page served over the network may never load `file://` resources
-//!   (see [`may_load`]).
-//! - Plain `http://` is tried over `https://` first (HTTPS-first).
-//! - Response size, redirects and time are bounded.
+//! Policy (blocking, HTTPS-only, redirects, logging) lives in
+//! [`crate::network`]. This module is the only place in Brickle that opens
+//! network connections; a test enforces that.
 
 use std::io::Read;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// Largest document or stylesheet we will read.
 pub const MAX_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_REDIRECTS: u32 = 5;
 
-pub struct Fetched {
-    /// The URL actually loaded (after HTTPS upgrade and redirects).
-    pub url: String,
-    pub body: String,
+/// Brickle presents itself as stock Firefox on Linux, sending the same
+/// headers in the same order, so it doesn't stand out. Bump this with
+/// Firefox releases (see `browser/config/version_display.txt` in Firefox).
+pub const FIREFOX_VERSION: &str = "159.0";
+
+pub fn user_agent() -> String {
+    format!(
+        "Mozilla/5.0 (X11; Linux x86_64; rv:{v}) Gecko/20100101 Firefox/{v}",
+        v = FIREFOX_VERSION
+    )
+}
+
+static REQUESTS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many HTTP requests this process has sent (for privacy tests).
+pub fn requests_sent() -> usize {
+    REQUESTS.load(Ordering::SeqCst)
 }
 
 pub fn scheme(url: &str) -> &str {
@@ -34,32 +44,9 @@ pub fn may_load(from: Option<&str>, to: &str) -> bool {
     }
 }
 
-pub fn fetch(url: &str) -> Result<Fetched, String> {
-    match scheme(url) {
-        "file" => {
-            let path = url.trim_start_matches("file://");
-            let path = path.split(['?', '#']).next().unwrap_or(path);
-            read_file(path).map(|body| Fetched {
-                url: url.to_string(),
-                body,
-            })
-        }
-        "https" => fetch_http(url),
-        "http" => {
-            // HTTPS-first: quietly upgrade, fall back to plain HTTP only if
-            // the secure attempt fails.
-            let upgraded = format!("https://{}", &url["http://".len()..]);
-            fetch_http(&upgraded).or_else(|_| fetch_http(url))
-        }
-        "" => read_file(url).map(|body| Fetched {
-            url: url.to_string(),
-            body,
-        }),
-        s => Err(format!("{url}: the \"{s}\" scheme is not supported")),
-    }
-}
-
-fn read_file(path: &str) -> Result<String, String> {
+pub fn read_file(path: &str) -> Result<String, String> {
+    let path = path.trim_start_matches("file://");
+    let path = path.split(['?', '#']).next().unwrap_or(path);
     let meta = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?;
     if !meta.is_file() {
         return Err(format!("{path}: not a regular file"));
@@ -74,7 +61,56 @@ fn read_file(path: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-fn fetch_http(url: &str) -> Result<Fetched, String> {
+/// Loopback and private-network hosts, which HTTPS-only mode doesn't
+/// upgrade (as in Firefox).
+pub fn is_local_host(host: &str) -> bool {
+    let h = host.trim_matches(['[', ']']).to_ascii_lowercase();
+    if h == "localhost" || h.ends_with(".localhost") || h.ends_with(".local") {
+        return true;
+    }
+    match h.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback() || (ip.segments()[0] & 0xfe00) == 0xfc00,
+        Err(_) => false,
+    }
+}
+
+/// What kind of request, which decides the headers Firefox would send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dest {
+    Document,
+    Stylesheet,
+    /// `brickle filters update`.
+    Download,
+}
+
+/// Value for `Sec-Fetch-Site` given the requesting page (None = typed).
+pub fn fetch_site(initiator: Option<&str>, target: &str) -> &'static str {
+    let Some(from) = initiator else { return "none" };
+    let (Ok(a), Ok(b)) = (url::Url::parse(from), url::Url::parse(target)) else {
+        return "cross-site";
+    };
+    if a.origin() == b.origin() {
+        "same-origin"
+    } else if a.scheme() == b.scheme()
+        && psl::domain_str(a.host_str().unwrap_or("")) == psl::domain_str(b.host_str().unwrap_or(""))
+    {
+        "same-site"
+    } else {
+        "cross-site"
+    }
+}
+
+pub struct Response {
+    pub status: u16,
+    /// `Location` header of a redirect, unresolved.
+    pub location: Option<String>,
+    pub body: String,
+}
+
+/// One HTTP GET. Redirects are returned, not followed, so the caller can
+/// check every hop. HTTP error statuses are returned with their body.
+pub fn http_get(url: &str, dest: Dest, initiator: Option<&str>) -> Result<Response, String> {
     let host = url::Url::parse(url)
         .ok()
         .and_then(|u| u.host_str().map(str::to_string))
@@ -82,15 +118,55 @@ fn fetch_http(url: &str) -> Result<Fetched, String> {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
         .timeout(Duration::from_secs(20))
-        .redirects(MAX_REDIRECTS)
+        .redirects(0)
         .try_proxy_from_env(!bypass_proxy(&host))
-        .user_agent("Brickle/0.1 (toy browser engine)")
         .build();
-    let resp = agent.get(url).call().map_err(|e| format!("{url}: {e}"))?;
-    let final_url = resp.get_url().to_string();
-    // A redirect may only land on http(s).
-    if !matches!(scheme(&final_url), "http" | "https") {
-        return Err(format!("{url}: redirected to a disallowed URL"));
+    let site = fetch_site(initiator, url);
+    // Header names, values and order as sent by Firefox.
+    let mut req = agent.get(url).set("User-Agent", &user_agent());
+    req = match dest {
+        Dest::Document => req
+            .set(
+                "Accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            )
+            .set("Accept-Language", "en-US,en;q=0.5")
+            .set("Accept-Encoding", "gzip, deflate, br, zstd")
+            .set("Connection", "keep-alive")
+            .set("Upgrade-Insecure-Requests", "1")
+            .set("Sec-Fetch-Dest", "document")
+            .set("Sec-Fetch-Mode", "navigate")
+            .set("Sec-Fetch-Site", site)
+            .set("Sec-Fetch-User", "?1")
+            .set("Priority", "u=0, i"),
+        Dest::Stylesheet => req
+            .set("Accept", "text/css,*/*;q=0.1")
+            .set("Accept-Language", "en-US,en;q=0.5")
+            .set("Accept-Encoding", "gzip, deflate, br, zstd")
+            .set("Connection", "keep-alive")
+            .set("Sec-Fetch-Dest", "style")
+            .set("Sec-Fetch-Mode", "no-cors")
+            .set("Sec-Fetch-Site", site)
+            .set("Priority", "u=2"),
+        Dest::Download => req
+            .set("Accept", "*/*")
+            .set("Accept-Language", "en-US,en;q=0.5")
+            .set("Accept-Encoding", "gzip, deflate, br, zstd")
+            .set("Connection", "keep-alive"),
+    };
+    REQUESTS.fetch_add(1, Ordering::SeqCst);
+    let resp = match req.call() {
+        Ok(r) => r,
+        Err(ureq::Error::Status(_, r)) => r,
+        Err(e) => return Err(e.to_string()),
+    };
+    let status = resp.status();
+    if (300..400).contains(&status) {
+        return Ok(Response {
+            status,
+            location: resp.header("location").map(str::to_string),
+            body: String::new(),
+        });
     }
     let ctype = resp.content_type().to_ascii_lowercase();
     let texty = ctype.starts_with("text/")
@@ -99,21 +175,34 @@ fn fetch_http(url: &str) -> Result<Fetched, String> {
         || ctype.contains("css")
         || ctype.is_empty();
     if !texty {
-        return Err(format!("{url}: can't display content of type {ctype}"));
+        return Err(format!("can't display content of type {ctype}"));
     }
+    // ureq decodes gzip and brotli itself; deflate and zstd are done here.
+    let encoding = resp
+        .header("content-encoding")
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let reader: Box<dyn Read> = Box::new(resp.into_reader().take(MAX_BYTES * 4));
+    let mut decoded: Box<dyn Read> = match encoding.as_str() {
+        "deflate" => Box::new(flate2::read::ZlibDecoder::new(reader)),
+        "zstd" => {
+            Box::new(ruzstd::decoding::StreamingDecoder::new(reader).map_err(|e| format!("zstd: {e}"))?)
+        }
+        _ => reader,
+    };
     let mut bytes = Vec::new();
-    resp.into_reader()
+    // Bounded after decompression too, so a compression bomb can't blow up.
+    (&mut decoded)
         .take(MAX_BYTES + 1)
         .read_to_end(&mut bytes)
-        .map_err(|e| format!("{url}: {e}"))?;
+        .map_err(|e| e.to_string())?;
     if bytes.len() as u64 > MAX_BYTES {
-        return Err(format!(
-            "{url}: response is larger than {} MB",
-            MAX_BYTES / 1024 / 1024
-        ));
+        return Err(format!("response is larger than {} MB", MAX_BYTES / 1024 / 1024));
     }
-    Ok(Fetched {
-        url: final_url,
+    Ok(Response {
+        status,
+        location: None,
         body: String::from_utf8_lossy(&bytes).into_owned(),
     })
 }
@@ -191,6 +280,7 @@ pub fn resolve(base: &str, href: &str) -> String {
     let href = href.trim();
     if href.contains("://")
         || href.starts_with("about:")
+        || href.starts_with("brickle:")
         || href.starts_with("mailto:")
         || href.starts_with("data:")
     {
@@ -268,6 +358,33 @@ mod tests {
         assert!(may_load(Some("https://a.com/"), "https://b.com/"));
         assert!(!may_load(Some("https://a.com/"), "javascript:alert(1)"));
         assert!(!may_load(None, "ftp://x/"));
+    }
+
+    #[test]
+    fn local_hosts_and_fetch_site() {
+        for h in [
+            "localhost",
+            "127.0.0.1",
+            "192.168.1.10",
+            "10.0.0.2",
+            "[::1]",
+            "printer.local",
+        ] {
+            assert!(is_local_host(h), "{h}");
+        }
+        for h in ["example.com", "8.8.8.8", "localhost.example.com"] {
+            assert!(!is_local_host(h), "{h}");
+        }
+        assert_eq!(fetch_site(None, "https://a.com/"), "none");
+        assert_eq!(
+            fetch_site(Some("https://a.com/x"), "https://a.com/y"),
+            "same-origin"
+        );
+        assert_eq!(
+            fetch_site(Some("https://www.a.co.uk/"), "https://img.a.co.uk/"),
+            "same-site"
+        );
+        assert_eq!(fetch_site(Some("https://a.com/"), "https://b.com/"), "cross-site");
     }
 
     #[test]

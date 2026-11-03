@@ -14,6 +14,9 @@ pub struct Page {
     pub title: String,
     pub dom: Node,
     pub sheets: Vec<Stylesheet>,
+    /// Hiding rules from the content blocker. Applied with user-level
+    /// priority, so pages can't override them with `!important`.
+    pub blocker: Stylesheet,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -35,7 +38,7 @@ fn ua_sheet() -> &'static Stylesheet {
 
 impl Page {
     /// Parse a document. External stylesheets are requested through `fetch`.
-    pub fn parse(url: &str, src: &str, fetch: &mut Fetcher) -> Page {
+    pub fn parse(url: &str, src: &str, blocker_css: &str, fetch: &mut Fetcher) -> Page {
         let dom = html::parse(src);
         let mut sheets = Vec::new();
         let mut found = Vec::new();
@@ -58,9 +61,9 @@ impl Page {
                     if media.contains("print") {
                         continue;
                     }
-                    match fetch(&net::resolve(url, href)) {
-                        Ok(text) => sheets.push(css::parse(&text)),
-                        Err(err) => eprintln!("brickle: stylesheet: {err}"),
+                    // Failures are shown in the request log.
+                    if let Ok(text) = fetch(&net::resolve(url, href)) {
+                        sheets.push(css::parse(&text));
                     }
                 }
             }
@@ -76,17 +79,19 @@ impl Page {
             title,
             dom,
             sheets,
+            blocker: css::parse(blocker_css),
         }
     }
 
     /// Parse a document we generated ourselves (error pages); no subresources.
     pub fn trusted(url: &str, src: &str) -> Page {
-        Page::parse(url, src, &mut |_| Err("subresources disabled".into()))
+        Page::parse(url, src, "", &mut |_| Err("subresources disabled".into()))
     }
 
     pub fn render(&self, width: f32, viewport_h: f32) -> Rendered {
         let mut all = vec![(0u8, ua_sheet())];
         all.extend(self.sheets.iter().map(|s| (1u8, s)));
+        all.push((3u8, &self.blocker));
         let ctx = StyleContext {
             sheets: all,
             viewport: (width, viewport_h),

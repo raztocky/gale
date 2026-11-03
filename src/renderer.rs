@@ -28,7 +28,11 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
     let mut page: Option<Page> = None;
     while let Some(msg) = recv(input)? {
         match msg {
-            ToRenderer::Load { url, html } => {
+            ToRenderer::Load {
+                url,
+                html,
+                blocker_css,
+            } => {
                 let mut fetch = |target: &str| -> Result<String, String> {
                     send(
                         output,
@@ -41,7 +45,7 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                         _ => Err("protocol error: expected a fetch reply".into()),
                     }
                 };
-                let p = Page::parse(&url, &html, &mut fetch);
+                let p = Page::parse(&url, &html, &blocker_css, &mut fetch);
                 send(
                     output,
                     FromRenderer::Loaded {

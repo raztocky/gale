@@ -22,9 +22,16 @@ const FONT_COUNT: u8 = 6;
 /// Browser -> renderer.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ToRenderer {
-    Load { url: String, html: String },
+    Load {
+        url: String,
+        html: String,
+        blocker_css: String,
+    },
     FetchReply(Result<String, String>),
-    Render { width: f32, height: f32 },
+    Render {
+        width: f32,
+        height: f32,
+    },
     Dom,
 }
 
@@ -175,10 +182,15 @@ impl ToRenderer {
     pub fn encode(&self) -> Vec<u8> {
         let mut e = Enc::default();
         match self {
-            ToRenderer::Load { url, html } => {
+            ToRenderer::Load {
+                url,
+                html,
+                blocker_css,
+            } => {
                 e.u8(1);
                 e.str(url);
                 e.str(html);
+                e.str(blocker_css);
             }
             ToRenderer::FetchReply(r) => {
                 e.u8(2);
@@ -209,6 +221,7 @@ impl ToRenderer {
             1 => ToRenderer::Load {
                 url: d.str()?,
                 html: d.str()?,
+                blocker_css: d.str()?,
             },
             2 => match d.u8()? {
                 1 => ToRenderer::FetchReply(Ok(d.str()?)),
@@ -402,6 +415,7 @@ mod tests {
             ToRenderer::Load {
                 url: "u".into(),
                 html: "<p>".into(),
+                blocker_css: ".ad { display: none !important }".into(),
             },
             ToRenderer::FetchReply(Ok("css".into())),
             ToRenderer::FetchReply(Err("nope".into())),

@@ -3,7 +3,8 @@
 #[cfg(feature = "gui")]
 mod gui;
 
-use brickle::{net, paint, renderer, sandbox, tab::Tab};
+use brickle::network::{LogEntry, Network, Outcome};
+use brickle::{lists, net, paint, renderer, sandbox, tab::Tab};
 
 const USAGE: &str = "\
 brickle — Brickle Browser, a tiny from-scratch browser engine
@@ -12,11 +13,20 @@ USAGE:
   brickle [URL|FILE]                                open a browser window
   brickle render URL|FILE [-o out.png] [-w WIDTH]   render a full page to PNG
   brickle dom URL|FILE                              print the parsed DOM tree
+  brickle requests URL|FILE                         list every request a page makes
+  brickle filters update                            download the filter lists (prints each request)
+  brickle filters status                            show installed filter lists
   brickle sandbox-test                              check the renderer sandbox works here
 
 OPTIONS:
   --no-sandbox   parse pages in the browser process instead of a sandboxed
                  renderer (for debugging; less safe)
+  --no-filters   don't load filter lists or your rules (for debugging)
+  --panel        open the window with the request panel showing
+
+Your rules live in ~/.config/brickle/rules.txt; filter lists in
+~/.local/share/brickle/filters/. See PRIVACY.md for what Brickle will
+and won't do on the network.
 ";
 
 const HOME: &str = include_str!("../pages/home.html");
@@ -72,8 +82,10 @@ fn main() {
     }
 
     let sandboxed = !args.iter().any(|a| a == "--no-sandbox");
-    args.retain(|a| a != "--no-sandbox");
-    with_big_stack(move || match run(args, sandboxed) {
+    let filters = !args.iter().any(|a| a == "--no-filters");
+    let panel = args.iter().any(|a| a == "--panel");
+    args.retain(|a| a != "--no-sandbox" && a != "--no-filters" && a != "--panel");
+    with_big_stack(move || match run(args, sandboxed, filters, panel) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("{e}");
@@ -82,13 +94,45 @@ fn main() {
     })
 }
 
-fn run(args: Vec<String>, sandboxed: bool) -> Result<(), String> {
+fn network(filters: bool) -> Network {
+    if !filters {
+        return Network::empty();
+    }
+    let n = Network::from_disk();
+    if n.lists_loaded == 0 {
+        eprintln!("brickle: no filter lists installed; run `brickle filters update` to download them");
+    }
+    n
+}
+
+fn run(args: Vec<String>, sandboxed: bool, filters: bool, panel: bool) -> Result<(), String> {
     match args.first().map(String::as_str) {
+        Some("filters") => match args.get(1).map(String::as_str) {
+            Some("update") => {
+                println!("Downloading filter lists. Every request is listed:");
+                lists::update(&mut |l| println!("{l}"))
+            }
+            Some("status") | None => {
+                for l in lists::status() {
+                    println!("{l}");
+                }
+                Ok(())
+            }
+            _ => Err(USAGE.to_string()),
+        },
+        Some("requests") => {
+            let u = args.get(1).ok_or(USAGE)?;
+            let mut net = network(filters);
+            let mut tab = open_tab(&mut net, u, sandboxed);
+            let _ = tab.render(1024.0, 768.0);
+            print_log(&tab.log);
+            Ok(())
+        }
         Some("-h") | Some("--help") => {
             print!("{USAGE}");
             Ok(())
         }
-        Some("render") => render(&args[1..], sandboxed),
+        Some("render") => render(&args[1..], sandboxed, filters),
         Some("sandbox-test") => {
             // Run the probe in a fresh process so this one stays unrestricted.
             let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -105,21 +149,95 @@ fn run(args: Vec<String>, sandboxed: bool) -> Result<(), String> {
         }
         Some("dom") => {
             let u = args.get(1).ok_or(USAGE)?;
-            print!("{}", open_tab(u, sandboxed).dom()?);
+            print!("{}", open_tab(&mut network(filters), u, sandboxed).dom()?);
             Ok(())
         }
-        other => open_window(other.unwrap_or("about:home"), sandboxed),
+        other => open_window(other.unwrap_or("about:home"), sandboxed, network(filters), panel),
     }
 }
 
-fn open_tab(input: &str, sandboxed: bool) -> Tab {
+fn open_tab(net: &mut Network, input: &str, sandboxed: bool) -> Tab {
     if input == "about:home" {
-        return Tab::with_html("about:home", None, HOME, sandboxed);
+        return Tab::with_html(net, "about:home", None, HOME, sandboxed);
     }
-    Tab::open(&net::normalize(input), None, sandboxed)
+    Tab::open(net, &net::normalize(input), None, sandboxed)
 }
 
-fn render(args: &[String], sandboxed: bool) -> Result<(), String> {
+/// One line per request, as in the window's request panel.
+pub fn describe(e: &LogEntry) -> (&'static str, String) {
+    let mut notes = Vec::new();
+    let status = match &e.outcome {
+        Outcome::Loaded { status } => {
+            notes.push(format!("HTTP {status}"));
+            "sent"
+        }
+        Outcome::Local => "local",
+        Outcome::Redirected { to } => {
+            notes.push(format!("redirect to {to}"));
+            "sent"
+        }
+        Outcome::Blocked { rule } => {
+            notes.push(format!("filter rule {rule}"));
+            "BLOCKED"
+        }
+        Outcome::Denied { rule } => {
+            notes.push(format!("your rule {rule}"));
+            "DENIED"
+        }
+        Outcome::MixedContent => "BLOCKED (http on https page)",
+        Outcome::NeedsHttpConsent => "no HTTPS",
+        Outcome::NotAllowed => "BLOCKED (not allowed)",
+        Outcome::OverLimit => "SKIPPED (too many)",
+        Outcome::Failed(err) => {
+            notes.push(err.clone());
+            "failed"
+        }
+    };
+    if e.upgraded {
+        notes.push("upgraded to https".into());
+    }
+    if e.insecure {
+        notes.push("INSECURE http".into());
+    }
+    if !e.stripped.is_empty() {
+        notes.push(format!("stripped {}", e.stripped.join(", ")));
+    }
+    if let Some(r) = &e.allowed_by {
+        notes.push(format!("allowed by {r}"));
+    }
+    (status, notes.join("; "))
+}
+
+fn print_log(log: &[LogEntry]) {
+    let kind = |e: &LogEntry| match e.dest {
+        net::Dest::Document => "page",
+        net::Dest::Stylesheet => "css",
+        net::Dest::Download => "list",
+    };
+    for e in log {
+        let (status, notes) = describe(e);
+        println!(
+            "{:<8} {:<5} {}{}",
+            status,
+            kind(e),
+            e.url,
+            if notes.is_empty() {
+                String::new()
+            } else {
+                format!("\n               {notes}")
+            }
+        );
+    }
+    let sent = log.iter().filter(|e| e.was_sent()).count();
+    println!(
+        "{} requests: {} sent, {} blocked or denied",
+        log.len(),
+        sent,
+        log.len() - sent
+    );
+}
+
+fn render(args: &[String], sandboxed: bool, filters: bool) -> Result<(), String> {
     let mut url = None;
     let mut out = "out.png".to_string();
     let mut width = 1024.0f32;
@@ -137,7 +255,7 @@ fn render(args: &[String], sandboxed: bool) -> Result<(), String> {
             u => url = Some(u.to_string()),
         }
     }
-    let mut tab = open_tab(&url.ok_or(USAGE)?, sandboxed);
+    let mut tab = open_tab(&mut network(filters), &url.ok_or(USAGE)?, sandboxed);
     let r = tab.render(width, 768.0);
     let height = (r.height.ceil() as usize).clamp(1, 20_000);
     let mut canvas = paint::Canvas::new(width as usize, height, r.background);
@@ -148,7 +266,7 @@ fn render(args: &[String], sandboxed: bool) -> Result<(), String> {
 }
 
 #[cfg(feature = "gui")]
-fn open_window(input: &str, sandboxed: bool) -> Result<(), String> {
+fn open_window(input: &str, sandboxed: bool, net: Network, panel: bool) -> Result<(), String> {
     let start = if input == "about:home" {
         let p = std::env::temp_dir().join("brickle-home.html");
         std::fs::write(&p, HOME).map_err(|e| e.to_string())?;
@@ -156,10 +274,10 @@ fn open_window(input: &str, sandboxed: bool) -> Result<(), String> {
     } else {
         net::normalize(input)
     };
-    gui::run(&start, sandboxed)
+    gui::run(&start, sandboxed, net, panel)
 }
 
 #[cfg(not(feature = "gui"))]
-fn open_window(_: &str, _: bool) -> Result<(), String> {
+fn open_window(_: &str, _: bool, _: Network, _: bool) -> Result<(), String> {
     Err(format!("built without the `gui` feature\n\n{USAGE}"))
 }

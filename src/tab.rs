@@ -8,13 +8,12 @@
 
 use crate::ipc::{read_frame, write_frame, FromRenderer, ToRenderer};
 use crate::net;
+use crate::network::{Action, LogEntry, Nav, Network};
 use crate::page::{error_page, Page, Rendered};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
-/// Most external stylesheets one page may pull in.
-pub const MAX_STYLESHEETS: usize = 16;
 /// How long a renderer may take to answer before it is killed.
 const RENDERER_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -24,6 +23,11 @@ pub struct Tab {
     /// Kept so reload/back/forward re-apply the same security checks.
     pub opener: Option<String>,
     pub title: String,
+    /// Every request made (or refused) for this page.
+    pub log: Vec<LogEntry>,
+    /// Set when this is a browser-generated warning page; its
+    /// `brickle:proceed` link performs this action.
+    pub interstitial: Option<Action>,
     backend: Backend,
 }
 
@@ -35,48 +39,67 @@ enum Backend {
 
 impl Tab {
     /// Navigate to `url`. `from` is the page that linked here, if any.
-    pub fn open(url: &str, from: Option<&str>, sandbox: bool) -> Tab {
-        let (final_url, html) = load_document(url, from);
-        Tab::with_html(&final_url, from, &html, sandbox)
+    pub fn open(net: &mut Network, url: &str, from: Option<&str>, sandbox: bool) -> Tab {
+        match net.navigate(url, from) {
+            Nav::Page { url, html } => Tab::with_html(net, &url, from, &html, sandbox),
+            Nav::Interstitial { url, html, action } => {
+                // Our own trusted HTML: no renderer or subresources needed.
+                let page = Page::trusted(&url, &html);
+                Tab {
+                    url,
+                    opener: from.map(str::to_string),
+                    title: page.title.clone(),
+                    log: net.take_log(),
+                    interstitial: Some(action),
+                    backend: Backend::InProcess(page),
+                }
+            }
+        }
     }
 
     /// Show `html` as the document at `url`.
-    pub fn with_html(url: &str, from: Option<&str>, html: &str, sandbox: bool) -> Tab {
+    pub fn with_html(net: &mut Network, url: &str, from: Option<&str>, html: &str, sandbox: bool) -> Tab {
         let mut tab = Tab {
             url: url.to_string(),
             opener: from.map(str::to_string),
             title: String::new(),
+            log: Vec::new(),
+            interstitial: None,
             backend: Backend::Failed(String::new()),
         };
-        let mut fetched = 0;
+        let blocker_css = net.cosmetic_css(url);
         let page_url = url.to_string();
-        let mut fetch = move |target: &str| subresource(&page_url, target, &mut fetched);
-        if !sandbox {
-            let page = Page::parse(url, html, &mut fetch);
-            tab.title = page.title.clone();
-            tab.backend = Backend::InProcess(page);
-            return tab;
-        }
-        let result = Renderer::spawn().and_then(|mut r| {
-            r.send(ToRenderer::Load {
-                url: url.to_string(),
-                html: html.to_string(),
-            })?;
-            loop {
-                match r.recv()? {
-                    FromRenderer::Fetch { url } => r.send(ToRenderer::FetchReply(fetch(&url)))?,
-                    FromRenderer::Loaded { title } => {
-                        tab.title = title;
-                        return Ok(r);
+        {
+            let mut fetch = |target: &str| net.subresource(&page_url, target);
+            if !sandbox {
+                let page = Page::parse(url, html, &blocker_css, &mut fetch);
+                tab.title = page.title.clone();
+                tab.backend = Backend::InProcess(page);
+            } else {
+                let result = Renderer::spawn().and_then(|mut r| {
+                    r.send(ToRenderer::Load {
+                        url: url.to_string(),
+                        html: html.to_string(),
+                        blocker_css,
+                    })?;
+                    loop {
+                        match r.recv()? {
+                            FromRenderer::Fetch { url } => r.send(ToRenderer::FetchReply(fetch(&url)))?,
+                            FromRenderer::Loaded { title } => {
+                                tab.title = title;
+                                return Ok(r);
+                            }
+                            _ => return Err("renderer sent an unexpected message".into()),
+                        }
                     }
-                    _ => return Err("renderer sent an unexpected message".into()),
-                }
+                });
+                tab.backend = match result {
+                    Ok(r) => Backend::Sandboxed(r),
+                    Err(e) => Backend::Failed(e),
+                };
             }
-        });
-        tab.backend = match result {
-            Ok(r) => Backend::Sandboxed(r),
-            Err(e) => Backend::Failed(e),
-        };
+        }
+        tab.log = net.take_log();
         tab
     }
 
@@ -120,36 +143,6 @@ impl Tab {
     pub fn link_url(&self, href: &str) -> String {
         net::resolve(&self.url, href)
     }
-}
-
-/// Fetch the main document, applying the navigation policy. Failures become
-/// an error page so there's always something to show.
-pub fn load_document(url: &str, from: Option<&str>) -> (String, String) {
-    if !net::may_load(from, url) {
-        let why = if net::scheme(url) == "file" {
-            "Web pages aren't allowed to open files on your computer."
-        } else {
-            "Brickle can only open http, https and local file addresses."
-        };
-        return (url.to_string(), error_page(url, why));
-    }
-    match net::fetch(url) {
-        Ok(f) => (f.url, f.body),
-        Err(e) => (url.to_string(), error_page(url, &e)),
-    }
-}
-
-/// Fetch a stylesheet for the page at `page_url`. The page URL comes from the
-/// browser's own state, never from the renderer.
-pub fn subresource(page_url: &str, target: &str, fetched: &mut usize) -> Result<String, String> {
-    if !net::may_load(Some(page_url), target) {
-        return Err(format!("blocked {target}"));
-    }
-    *fetched += 1;
-    if *fetched > MAX_STYLESHEETS {
-        return Err(format!("too many stylesheets, skipped {target}"));
-    }
-    net::fetch(target).map(|f| f.body)
 }
 
 fn crashed_page(url: &str, err: &str) -> Page {
@@ -217,46 +210,5 @@ impl Drop for Renderer {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn web_page_links_to_local_files_are_blocked() {
-        let path = std::env::temp_dir().join("brickle-test-secret.html");
-        std::fs::write(&path, "<title>SECRET</title>").unwrap();
-        let file_url = format!("file://{}", path.display());
-
-        // Clicked from a web page (also how reload/back replay it): blocked.
-        let (_, html) = load_document(&file_url, Some("https://evil.example/"));
-        assert!(!html.contains("SECRET") && html.contains("aren't allowed"));
-        let tab = Tab::open(&file_url, Some("https://evil.example/"), false);
-        assert_eq!(tab.title, "Error");
-        assert_eq!(tab.opener.as_deref(), Some("https://evil.example/"));
-
-        // Typed by the user, or linked from another local file: allowed.
-        assert_eq!(Tab::open(&file_url, None, false).title, "SECRET");
-        assert_eq!(
-            Tab::open(&file_url, Some("file:///tmp/x.html"), false).title,
-            "SECRET"
-        );
-    }
-
-    #[test]
-    fn stylesheet_policy() {
-        let mut n = 0;
-        assert!(subresource("https://a.com/", "file:///etc/passwd", &mut n)
-            .unwrap_err()
-            .contains("blocked"));
-        assert_eq!(n, 0);
-        let mut n = MAX_STYLESHEETS;
-        assert!(
-            subresource("file:///tmp/a.html", "file:///nonexistent.css", &mut n)
-                .unwrap_err()
-                .contains("too many")
-        );
     }
 }
