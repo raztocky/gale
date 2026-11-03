@@ -49,6 +49,7 @@ libraries, run `sudo apt install build-essential libxkbcommon-dev`.
 | Switch tabs | `Ctrl+Tab`, `Ctrl+Shift+Tab`, `Ctrl+PgDn`/`PgUp`, `Ctrl+1`…`Ctrl+9` |
 | Open a link in a new tab | middle-click, or `Ctrl`+click |
 | Forms | click a field to type; `Tab` next field, `Enter` submit, `Esc` leave the field |
+| Find in page | `Ctrl+F`, then `Enter`/`Shift+Enter` (or `F3`, `Ctrl+G`) for the next/previous match, `Esc` to close |
 | Select text | drag, double-click a word, `Ctrl+A` for the page, `Esc` to clear |
 | Copy / paste | `Ctrl+C` copies the selection (or the address); `Ctrl+V` or `Shift+Insert` pastes into the address bar or a form field |
 

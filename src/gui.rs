@@ -10,7 +10,7 @@ use brickle::net;
 use brickle::network::{Action, LogEntry, Network, Outcome};
 use brickle::page::{Key as PageKey, Rendered};
 use brickle::paint::{Canvas, GlyphCache, TileCache};
-use brickle::select::{self, Bands, Pos};
+use brickle::select::{self, Bands, FindText, Pos};
 use brickle::tab::{Input, Tab};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -40,6 +40,21 @@ const CHROME: Color = Color::rgb(0xec, 0xee, 0xf1);
 const RED: Color = Color::rgb(0xc0, 0x1c, 0x1c);
 const GREEN: Color = Color::rgb(0x15, 0x80, 0x3d);
 const AMBER: Color = Color::rgb(0xb4, 0x53, 0x09);
+/// Drawn over find-in-page matches, and over the current one.
+const MATCH: Color = Color {
+    r: 0xff,
+    g: 0xd5,
+    b: 0x4f,
+    a: 0x90,
+};
+const CURRENT_MATCH: Color = Color {
+    r: 0xff,
+    g: 0x8c,
+    b: 0x1a,
+    a: 0xb0,
+};
+const FIND_W: f32 = 340.0;
+const FIND_H: f32 = 30.0;
 /// Drawn over selected text.
 const SELECTION: Color = Color {
     r: 0x33,
@@ -54,6 +69,58 @@ impl minifb::InputCallback for Chars {
         if let Some(c) = char::from_u32(c) {
             self.0.lock().unwrap().push(c);
         }
+    }
+}
+
+/// The find-in-page bar (Ctrl+F): what you're looking for and where it is.
+struct Find {
+    query: LineEdit,
+    matches: Vec<(Pos, Pos)>,
+    current: usize,
+    /// The page's text, flattened for searching; built when first needed.
+    text: Option<FindText>,
+}
+
+impl Find {
+    fn new() -> Find {
+        Find {
+            query: LineEdit::new(1024),
+            matches: Vec::new(),
+            current: 0,
+            text: None,
+        }
+    }
+
+    /// Search again (the query or the page changed).
+    fn search(&mut self, r: &Rendered) {
+        let text = self.text.get_or_insert_with(|| FindText::new(&r.texts));
+        self.matches = text.find(&r.texts, &self.query.text);
+        self.current = self.current.min(self.matches.len().saturating_sub(1));
+    }
+
+    /// The page changed under the bar.
+    fn page_changed(&mut self, r: &Rendered) {
+        self.text = None;
+        self.search(r);
+    }
+
+    fn step(&mut self, back: bool) {
+        let n = self.matches.len();
+        if n > 0 {
+            self.current = if back {
+                (self.current + n - 1) % n
+            } else {
+                (self.current + 1) % n
+            };
+        }
+    }
+
+    /// A scroll position that shows the current match, if it's off screen.
+    fn scroll_to(&self, r: &Rendered, scroll: f32, view_h: f32, max_scroll: f32) -> Option<f32> {
+        let (start, _) = *self.matches.get(self.current)?;
+        let rect = r.texts.get(start.0)?.rect;
+        let visible = rect.y >= scroll && rect.y + rect.h <= scroll + view_h - FIND_H - STATUS_H;
+        (!visible).then(|| (rect.y - view_h / 3.0).clamp(0.0, max_scroll))
     }
 }
 
@@ -362,6 +429,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
     // dragged to select. A second press soon after selects a word.
     let mut sel: Option<(Pos, Pos)> = None;
     let mut ix = PageIndex::new(&rendered);
+    let mut find: Option<Find> = None;
     let mut press: Option<(f32, f32)> = None;
     let mut dragged = false;
     let mut word_press = false;
@@ -433,6 +501,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             rendered = p.rendered;
             sel = None;
             ix = PageIndex::new(&rendered);
+            find = None;
             history = p.history;
             forward = p.forward;
             scroll = p.scroll;
@@ -556,6 +625,9 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 rendered = r;
                 sel = None;
                 ix = PageIndex::new(&rendered);
+                if let Some(f) = &mut find {
+                    f.page_changed(&rendered);
+                }
                 tiles = None; // new content: repaint tiles on demand
                 laid_out_at = (page_w, view_h);
             }
@@ -668,12 +740,38 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     continue;
                 }
             }
-            // Paste into the address bar or the focused form field.
+            if ctrl && key == Key::F {
+                let f = find.get_or_insert_with(Find::new);
+                f.query.select_all();
+                ui.editing = false;
+                page_focus = false;
+                dirty = true;
+                continue;
+            }
+            if let (Some(f), true) = (&mut find, key == Key::F3 || (ctrl && key == Key::G)) {
+                f.step(shift);
+                if let Some(y) = f.scroll_to(&rendered, scroll, view_h, max_scroll) {
+                    scroll = y;
+                }
+                dirty = true;
+                continue;
+            }
+            // Paste into the address bar, the find bar or the focused form field.
             if (ctrl && key == Key::V) || (shift && key == Key::Insert) {
-                if !ui.editing && !page_focus {
+                if !ui.editing && !page_focus && find.is_none() {
                     continue;
                 }
                 match clip.paste() {
+                    Some(t) if !ui.editing && find.is_some() => {
+                        let line: String = t.trim().chars().filter(|c| !c.is_control()).collect();
+                        if let Some(f) = &mut find {
+                            f.query.insert(&line);
+                            f.search(&rendered);
+                            if let Some(y) = f.scroll_to(&rendered, scroll, view_h, max_scroll) {
+                                scroll = y;
+                            }
+                        }
+                    }
                     Some(t) if ui.editing => {
                         // One line: newlines and tabs are dropped.
                         let line: String = t.trim().chars().filter(|c| !c.is_control()).collect();
@@ -744,6 +842,42 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 dirty = true;
                 continue;
             }
+            if let Some(f) = &mut find {
+                let q = &mut f.query;
+                let end = q.text.chars().count();
+                let before = q.text.clone();
+                let mut handled = true;
+                match key {
+                    Key::Enter | Key::NumPadEnter => f.step(shift),
+                    Key::Escape => {
+                        find = None;
+                        dirty = true;
+                        continue;
+                    }
+                    Key::Backspace => q.backspace(ctrl),
+                    Key::Delete => q.delete(ctrl),
+                    Key::Left => q.left(ctrl, shift),
+                    Key::Right => q.right(ctrl, shift),
+                    Key::Home => q.move_to(0, shift),
+                    Key::End => q.move_to(end, shift),
+                    Key::A if ctrl => q.select_all(),
+                    // Anything else (scrolling, shortcuts) works as usual.
+                    _ => handled = false,
+                }
+                if handled {
+                    if f.query.text != before {
+                        f.search(&rendered);
+                    }
+                    if let Some(y) = f.scroll_to(&rendered, scroll, view_h, max_scroll) {
+                        scroll = y;
+                    }
+                    dirty = true;
+                    continue;
+                }
+                if key == Key::Space || key == Key::Backspace {
+                    continue; // typed into the bar, not a scroll or "back"
+                }
+            }
             if page_focus {
                 // A form field has the keyboard.
                 let k = match key {
@@ -810,6 +944,16 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             let typed: String = chars.into_iter().filter(|c| !c.is_control()).collect();
             if !typed.is_empty() {
                 ui.address.insert(&typed);
+                dirty = true;
+            }
+        } else if let Some(f) = &mut find {
+            let typed: String = chars.into_iter().filter(|c| !c.is_control()).collect();
+            if !typed.is_empty() {
+                f.query.insert(&typed);
+                f.search(&rendered);
+                if let Some(y) = f.scroll_to(&rendered, scroll, view_h, max_scroll) {
+                    scroll = y.clamp(0.0, max_scroll);
+                }
                 dirty = true;
             }
         } else if page_focus {
@@ -1201,6 +1345,25 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 scroll,
                 BAR_H as usize,
             );
+            if let Some(f) = &find {
+                let shown = |(a, _): &(Pos, Pos)| {
+                    rendered.texts.get(a.0).is_some_and(|r| {
+                        r.rect.y + r.rect.h + 200.0 > scroll && r.rect.y < scroll + view_h + 200.0
+                    })
+                };
+                for (k, m) in f.matches.iter().enumerate().filter(|(_, m)| shown(m)) {
+                    let color = if k == f.current { CURRENT_MATCH } else { MATCH };
+                    for r in select::highlights(&rendered.texts, &ix.text, m.0, m.1, scroll, scroll + view_h)
+                    {
+                        let r = Rect {
+                            y: r.y - scroll + BAR_H,
+                            w: r.w.min(page_w - r.x),
+                            ..r
+                        };
+                        canvas.fill(r, color, BAR_H);
+                    }
+                }
+            }
             if let Some((a, b)) = sel {
                 for r in select::highlights(&rendered.texts, &ix.text, a, b, scroll, scroll + view_h) {
                     let r = Rect {
@@ -1265,6 +1428,9 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 );
             }
             draw_status(&mut canvas, &ui, page_w, &mut cache);
+            if let Some(f) = &find {
+                draw_find(&mut canvas, f, page_w, &mut cache);
+            }
             dirty = false;
         }
         window
@@ -1910,6 +2076,94 @@ fn draw_panel(
             clip,
         );
     }
+}
+
+/// The find bar, at the bottom right of the page: the query with its
+/// cursor, and which match you're on.
+fn draw_find(c: &mut Canvas, f: &Find, page_w: f32, cache: &mut GlyphCache) {
+    let h = c.height as f32;
+    let bar = Rect {
+        x: (page_w - FIND_W - 10.0).max(0.0),
+        y: h - STATUS_H - FIND_H - 6.0,
+        w: FIND_W.min(page_w),
+        h: FIND_H,
+    };
+    c.fill(
+        bar.expand(Edges {
+            t: 1.0,
+            r: 1.0,
+            b: 1.0,
+            l: 1.0,
+        }),
+        Color::rgb(0x3b, 0x82, 0xf6),
+        BAR_H,
+    );
+    c.fill(bar, Color::WHITE, BAR_H);
+    let base = bar.y + 20.0;
+    text(c, bar.x + 8.0, base, "Find", BOLD, 13.0, GRAY, cache, BAR_H);
+    let count = match (f.query.text.is_empty(), f.matches.len()) {
+        (true, _) => String::new(),
+        (false, 0) => "No matches".into(),
+        (false, n) if n >= select::MAX_MATCHES => format!("{} of {n}+", f.current + 1),
+        (false, n) => format!("{} of {n}", f.current + 1),
+    };
+    let count_w = font::measure(SANS, 12.0, &count);
+    let color = if count == "No matches" { RED } else { GRAY };
+    text(
+        c,
+        bar.x + bar.w - 8.0 - count_w,
+        base,
+        &count,
+        SANS,
+        12.0,
+        color,
+        cache,
+        BAR_H,
+    );
+    let x0 = bar.x + 46.0;
+    let avail = bar.w - 46.0 - count_w - 20.0;
+    let q = &f.query;
+    let start = address_window(q, avail);
+    let chars: Vec<char> = q.text.chars().collect();
+    let x_of = |i: usize| {
+        let s: String = chars[start..i.clamp(start, chars.len())].iter().collect();
+        x0 + font::measure(SANS, 14.0, &s)
+    };
+    if let Some((lo, hi)) = q.selection() {
+        let (a, b) = (x_of(lo), x_of(hi).min(x0 + avail));
+        c.fill(
+            Rect {
+                x: a,
+                y: bar.y + 6.0,
+                w: (b - a).max(0.0),
+                h: bar.h - 12.0,
+            },
+            Color::rgb(0xbf, 0xdb, 0xfe),
+            BAR_H,
+        );
+    }
+    let shown: String = chars[start..].iter().collect();
+    text(
+        c,
+        x0,
+        base,
+        &fit(&shown, avail, SANS, 14.0),
+        SANS,
+        14.0,
+        DARK,
+        cache,
+        BAR_H,
+    );
+    c.fill(
+        Rect {
+            x: x_of(q.cursor).min(x0 + avail),
+            y: bar.y + 6.0,
+            w: 1.0,
+            h: bar.h - 12.0,
+        },
+        DARK,
+        BAR_H,
+    );
 }
 
 fn draw_status(c: &mut Canvas, ui: &Ui, page_w: f32, cache: &mut GlyphCache) {
