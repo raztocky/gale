@@ -133,11 +133,15 @@ fn decode_png(bytes: &[u8]) -> Result<Bitmap, String> {
     let rgba = match out.color_type {
         png::ColorType::Rgba => buf,
         png::ColorType::Rgb => buf
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .flat_map(|p| [p[0], p[1], p[2], 255])
             .collect(),
         png::ColorType::GrayscaleAlpha => buf
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .flat_map(|p| [p[0], p[0], p[0], p[1]])
             .collect(),
         png::ColorType::Grayscale => buf.iter().flat_map(|&g| [g, g, g, 255]).collect(),
@@ -223,7 +227,9 @@ fn decode_webp(bytes: &[u8]) -> Result<Bitmap, String> {
     let rgba = if d.has_alpha() {
         buf
     } else {
-        buf.chunks_exact(3)
+        buf.as_chunks::<3>()
+            .0
+            .iter()
             .flat_map(|p| [p[0], p[1], p[2], 255])
             .collect()
     };
@@ -252,7 +258,9 @@ pub fn resize(src: &Bitmap, w: u32, h: u32) -> Bitmap {
     }
     let premul: Vec<f32> = src
         .rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|p| {
             let a = p[3] as f32 / 255.0;
             [p[0] as f32 * a, p[1] as f32 * a, p[2] as f32 * a, p[3] as f32]
@@ -262,7 +270,9 @@ pub fn resize(src: &Bitmap, w: u32, h: u32) -> Bitmap {
     let tmp = resample(&premul, src.w as usize, src.h as usize, w as usize, true);
     let out = resample(&tmp, w as usize, src.h as usize, h as usize, false);
     let rgba = out
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|p| {
             let a = p[3].clamp(0.0, 255.0);
             if a < 0.5 {
@@ -296,7 +306,7 @@ fn box_reduce(src: &Bitmap, kx: u32, ky: u32) -> Bitmap {
             let row = &src.rgba[y * sw * 4..(y + 1) * sw * 4];
             for ox in 0..w as usize {
                 let a = &mut acc[ox * 4..ox * 4 + 4];
-                for p in row[ox * kx * 4..(ox * kx + kx) * 4].chunks_exact(4) {
+                for p in row[ox * kx * 4..(ox * kx + kx) * 4].as_chunks::<4>().0.iter() {
                     let al = p[3] as u64;
                     a[0] += p[0] as u64 * al;
                     a[1] += p[1] as u64 * al;
@@ -305,7 +315,7 @@ fn box_reduce(src: &Bitmap, kx: u32, ky: u32) -> Bitmap {
                 }
             }
         }
-        for a in acc.chunks_exact(4) {
+        for a in acc.as_chunks::<4>().0.iter() {
             // Colour weighted by alpha; fully transparent stays black.
             let c = |v: u64| v.checked_div(a[3]).unwrap_or(0) as u8;
             rgba.extend_from_slice(&[c(a[0]), c(a[1]), c(a[2]), ((a[3] + n / 2) / n) as u8]);
