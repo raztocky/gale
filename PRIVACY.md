@@ -63,7 +63,11 @@ Limits, honestly:
 - JavaScript is off unless you allow a site (rule 9). With it off there is very little else to
   fingerprint. With it on, scripts see Firefox's `navigator` values, a fixed 1920x1080 screen,
   UTC as the time zone, and the window size rounded down to steps of 200x100 px (like Firefox's
-  letterboxing). There's no canvas, WebGL, audio or font list to probe. A determined script can
+  letterboxing). There's no canvas, WebGL, audio or font list to probe.
+- Fonts are the same for everyone. Brickle draws every page with its own bundled fonts and never
+  reads the ones installed on your computer, and it doesn't download web fonts (`@font-face`), so
+  neither which fonts you have nor which ones a page fetches can identify you. Pages asking for
+  Arial, Times New Roman, Courier New or system fonts get look-alikes with the same letter widths. A determined script can
   still tell Brickle from Firefox, for example by which APIs exist.
 
 ## 5. HTTPS-only

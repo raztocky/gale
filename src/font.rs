@@ -1,8 +1,14 @@
 //! Bundled fonts and text measurement.
 //!
-//! Six primary fonts (DejaVu Sans/Serif/Mono, regular and bold) cover Latin,
-//! Greek, Cyrillic, Hebrew, Arabic and many symbols. Characters they lack
-//! fall back, in order, to Noto subsets for Chinese/Japanese, Korean,
+//! Sixteen primary fonts: Liberation Sans, Serif and Mono (the same letter
+//! widths as Arial, Times New Roman and Courier New, so pages lay out as
+//! their authors expect) and Inter (for `system-ui` and friends), each in
+//! regular, bold, italic and bold italic. Every copy of Brickle has exactly
+//! these fonts and never looks at the system's, so fonts can't tell users
+//! apart.
+//!
+//! Characters they lack fall back, in order, to DejaVu Sans (Greek, Hebrew,
+//! Arabic, many symbols), then Noto subsets for Chinese/Japanese, Korean,
 //! Devanagari, Thai, (monochrome) emoji and symbols; see
 //! `assets/fonts/fallback/build.sh`. Fonts are parsed lazily, so a page only
 //! pays for the CJK font (about 250 ms) if it actually contains CJK text.
@@ -11,17 +17,32 @@ use crate::style::{ComputedStyle, Family};
 use fontdue::{Font, FontSettings};
 use std::sync::OnceLock;
 
-/// Number of fonts: indices 0..PRIMARY are DejaVu, the rest are fallbacks.
-pub const COUNT: usize = 12;
-pub const PRIMARY: usize = 6;
+/// Number of fonts: indices 0..PRIMARY are the styled families (four per
+/// family: regular, bold, italic, bold italic), the rest are fallbacks.
+pub const COUNT: usize = 24;
+pub const PRIMARY: usize = 16;
+/// DejaVu Sans, the first fallback (regular; bold follows it).
+const DEJAVU: usize = PRIMARY;
 
 static FONT_DATA: [&[u8]; COUNT] = [
+    include_bytes!("../assets/fonts/LiberationSans-Regular.ttf"),
+    include_bytes!("../assets/fonts/LiberationSans-Bold.ttf"),
+    include_bytes!("../assets/fonts/LiberationSans-Italic.ttf"),
+    include_bytes!("../assets/fonts/LiberationSans-BoldItalic.ttf"),
+    include_bytes!("../assets/fonts/LiberationSerif-Regular.ttf"),
+    include_bytes!("../assets/fonts/LiberationSerif-Bold.ttf"),
+    include_bytes!("../assets/fonts/LiberationSerif-Italic.ttf"),
+    include_bytes!("../assets/fonts/LiberationSerif-BoldItalic.ttf"),
+    include_bytes!("../assets/fonts/LiberationMono-Regular.ttf"),
+    include_bytes!("../assets/fonts/LiberationMono-Bold.ttf"),
+    include_bytes!("../assets/fonts/LiberationMono-Italic.ttf"),
+    include_bytes!("../assets/fonts/LiberationMono-BoldItalic.ttf"),
+    include_bytes!("../assets/fonts/Inter-Regular.ttf"),
+    include_bytes!("../assets/fonts/Inter-Bold.ttf"),
+    include_bytes!("../assets/fonts/Inter-Italic.ttf"),
+    include_bytes!("../assets/fonts/Inter-BoldItalic.ttf"),
     include_bytes!("../assets/fonts/DejaVuSans.ttf"),
     include_bytes!("../assets/fonts/DejaVuSans-Bold.ttf"),
-    include_bytes!("../assets/fonts/DejaVuSerif.ttf"),
-    include_bytes!("../assets/fonts/DejaVuSerif-Bold.ttf"),
-    include_bytes!("../assets/fonts/DejaVuSansMono.ttf"),
-    include_bytes!("../assets/fonts/DejaVuSansMono-Bold.ttf"),
     include_bytes!("../assets/fonts/fallback/NotoSansCJK-Subset.ttf"),
     include_bytes!("../assets/fonts/fallback/NotoSansKR-Subset.ttf"),
     include_bytes!("../assets/fonts/fallback/NotoSansDevanagari.ttf"),
@@ -38,10 +59,11 @@ pub fn font(i: usize) -> &'static Font {
     FONTS[i].get_or_init(|| Font::from_bytes(FONT_DATA[i], FontSettings::default()).expect("bundled font"))
 }
 
-/// Parse the primary fonts now (the renderer does this before its sandbox
-/// is sealed, so normal pages never parse fonts later).
+/// Parse the most used fonts now (the renderer does this before its
+/// sandbox is sealed): regular and bold Sans and Serif. The rest are
+/// parsed when a page first needs them.
 pub fn preload() {
-    for i in 0..PRIMARY {
+    for i in [0, 1, 4, 5] {
         font(i);
     }
 }
@@ -67,21 +89,28 @@ pub fn resolve(primary: usize, ch: char) -> usize {
     if font(primary).lookup_glyph_index(ch) != 0 {
         return primary;
     }
-    // DejaVu Sans covers more scripts than Serif or Mono.
-    let sans = primary & 1; // regular or bold sans
-    if sans != primary && font(sans).lookup_glyph_index(ch) != 0 {
-        return sans;
+    // DejaVu Sans, keeping bold text bold.
+    let dejavu = DEJAVU + (primary & 1);
+    if has_glyph(dejavu, ch) {
+        return dejavu;
     }
-    (PRIMARY..COUNT).find(|&i| has_glyph(i, ch)).unwrap_or(primary)
+    (DEJAVU + 2..COUNT).find(|&i| has_glyph(i, ch)).unwrap_or(primary)
+}
+
+/// Whether italic text drawn in font `i` needs slanting by hand: the
+/// fallbacks have no italic versions.
+pub fn fake_italic(i: usize) -> bool {
+    i >= PRIMARY
 }
 
 pub fn index(style: &ComputedStyle) -> usize {
     let fam = match style.family {
         Family::Sans => 0,
-        Family::Serif => 2,
-        Family::Mono => 4,
+        Family::Serif => 4,
+        Family::Mono => 8,
+        Family::System => 12,
     };
-    fam + style.bold as usize
+    fam + 2 * style.italic as usize + style.bold as usize
 }
 
 pub fn measure(font_idx: usize, size: f32, text: &str) -> f32 {
@@ -104,23 +133,41 @@ mod tests {
 
     #[test]
     fn fallback_picks_a_font_that_has_the_glyph() {
-        assert_eq!(resolve(2, 'a'), 2);
-        assert_eq!(resolve(0, 'ж'), 0, "DejaVu has Cyrillic");
-        assert_eq!(resolve(0, 'ש'), 0, "DejaVu has Hebrew");
+        assert_eq!(resolve(4, 'a'), 4);
+        assert_eq!(resolve(0, 'ж'), 0, "Liberation has Cyrillic");
+        assert_eq!(resolve(4, 'ש'), 4, "Liberation Serif has Hebrew");
+        assert_eq!(resolve(1, 'ش'), 17, "bold Arabic from bold DejaVu Sans");
         for (ch, want) in [
-            ('中', 6),
-            ('の', 6),
-            ('한', 7),
-            ('क', 8),
-            ('ก', 9),
-            ('🐈', 10),
-            ('⌖', 11),
+            ('中', 18),
+            ('の', 18),
+            ('한', 19),
+            ('क', 20),
+            ('ก', 21),
+            ('🐈', 22),
+            ('⌖', 23),
         ] {
             let got = resolve(0, ch);
             assert_eq!(got, want, "{ch}");
             assert_ne!(font(got).lookup_glyph_index(ch), 0, "{ch} has a glyph");
         }
-        // Serif text missing a glyph still gets the sans-serif fallback chain.
-        assert_eq!(resolve(3, '中'), 6);
+        // Any family missing a glyph gets the same fallback chain.
+        assert_eq!(resolve(15, '中'), 18);
+    }
+
+    #[test]
+    fn every_style_has_its_own_font() {
+        let mut s = ComputedStyle::root((800.0, 600.0));
+        let mut seen = std::collections::HashSet::new();
+        for family in [Family::Sans, Family::Serif, Family::Mono, Family::System] {
+            for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
+                s.family = family;
+                s.bold = bold;
+                s.italic = italic;
+                let i = index(&s);
+                assert!(i < PRIMARY && !fake_italic(i));
+                assert!(seen.insert(i));
+                assert_ne!(font(i).lookup_glyph_index('g'), 0);
+            }
+        }
     }
 }

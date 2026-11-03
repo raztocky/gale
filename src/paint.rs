@@ -197,7 +197,7 @@ pub fn rasterize_indexed(ops: Vec<DrawOp>) -> (DisplayList, Vec<GlyphBitmap>, Ve
                             return None;
                         }
                         let (m, bitmap) = f.rasterize(ch, size);
-                        let bmp = if italic {
+                        let bmp = if italic && font::fake_italic(fi) {
                             skew(&m, &bitmap)
                         } else {
                             GlyphBitmap {
@@ -770,7 +770,7 @@ impl Canvas {
             let gx = (pen + m.xmin as f32).round() as i64;
             let gy = (baseline - (m.height as i32 + m.ymin) as f32).round() as i64;
             for row in 0..m.height {
-                let skew = if italic {
+                let skew = if italic && font::fake_italic(fi) {
                     ((m.height - row) as f32 * 0.2) as i64
                 } else {
                     0

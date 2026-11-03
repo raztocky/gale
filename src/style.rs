@@ -101,11 +101,53 @@ pub enum TextAlign {
     Right,
 }
 
+/// Which bundled family stands in for a `font-family` name (lowercase);
+/// None for names we know nothing about, so the next one in the list is
+/// tried.
+fn family_of(name: &str) -> Option<Family> {
+    let has = |words: &[&str]| words.iter().any(|w| name.contains(w));
+    if has(&["mono", "courier", "consol", "menlo", "monaco", "code"]) {
+        Some(Family::Mono)
+    } else if has(&[
+        "system-ui",
+        "-apple-system",
+        "blinkmacsystemfont",
+        "segoe",
+        "roboto",
+        "inter",
+        "ubuntu",
+        "cantarell",
+    ]) || name == "ui-sans-serif"
+    {
+        Some(Family::System)
+    } else if has(&[
+        "serif",
+        "times",
+        "georgia",
+        "garamond",
+        "cambria",
+        "palatino",
+        "baskerville",
+    ]) && !has(&["sans"])
+    {
+        Some(Family::Serif)
+    } else if has(&["sans", "arial", "helvetica", "verdana", "tahoma", "trebuchet"]) {
+        Some(Family::Sans)
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Family {
+    /// Arial and Helvetica's widths.
     Sans,
+    /// Times New Roman's.
     Serif,
+    /// Courier New's.
     Mono,
+    /// Modern interface fonts: `system-ui`, Segoe UI, San Francisco, Roboto.
+    System,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -864,32 +906,7 @@ fn compute(
                         Value::Str(st) => st.to_ascii_lowercase(),
                         _ => continue,
                     };
-                    let fam = if name.contains("mono")
-                        || name.contains("courier")
-                        || name.contains("consol")
-                        || name == "menlo"
-                    {
-                        Some(Family::Mono)
-                    } else if name == "serif"
-                        || name.contains("times")
-                        || name.contains("georgia")
-                        || name.contains("garamond")
-                    {
-                        Some(Family::Serif)
-                    } else if name.contains("sans")
-                        || name.contains("arial")
-                        || name.contains("helvetica")
-                        || name.contains("system-ui")
-                        || name.contains("inter")
-                        || name.contains("verdana")
-                        || name.contains("roboto")
-                        || name.contains("segoe")
-                        || name.contains("apple")
-                    {
-                        Some(Family::Sans)
-                    } else {
-                        None
-                    };
+                    let fam = family_of(&name);
                     if let Some(f) = fam {
                         s.family = f;
                         break;

@@ -89,10 +89,14 @@ browser validates before painting.
 | `sandbox.rs` | Landlock + seccomp + rlimits for the renderer, and the `sandbox-test` probes |
 | `gui.rs` | Browser window: address bar, scrolling, link hover and click, history |
 
-Fonts: DejaVu (see `assets/fonts/LICENSE-DejaVu.txt`), plus Noto subsets for Chinese, Japanese,
-Korean, Devanagari, Thai, emoji and symbols, under the SIL Open Font License
-(`assets/fonts/fallback/OFL.txt`). Rebuild them with `assets/fonts/fallback/build.sh`. Fallback fonts
-are only parsed when a page actually uses them.
+Fonts: Liberation Sans, Serif and Mono 2.1.5 (Arial, Times New Roman and Courier New's letter
+widths) and Inter 4.1 (for `system-ui`, Segoe UI, Roboto and similar), each in regular, bold, italic
+and bold italic, unmodified, under the SIL Open Font License (`assets/fonts/LICENSE-Liberation.txt`,
+`assets/fonts/LICENSE-Inter.txt`). Characters they lack come from DejaVu Sans
+(`assets/fonts/LICENSE-DejaVu.txt`), then Noto subsets for Chinese, Japanese, Korean, Devanagari,
+Thai, emoji and symbols, also under the OFL (`assets/fonts/fallback/OFL.txt`). Rebuild those with
+`assets/fonts/fallback/build.sh`. Fonts other than regular and bold Sans and Serif are only parsed
+when a page actually uses them.
 
 ## Security
 
