@@ -22,6 +22,12 @@ allow = [
     "Unicode-3.0",
     "CDLA-Permissive-2.0",
 ]
+# The Boost license (permissive, OSI-approved), allowed only for arboard's
+# Windows clipboard backend. Linux builds don't include these crates.
+exceptions = [
+    { crate = "clipboard-win", allow = ["BSL-1.0"] },
+    { crate = "error-code", allow = ["BSL-1.0"] },
+]
 
 [bans]
 multiple-versions = "warn"
