@@ -68,7 +68,7 @@ painting.
 | `css.rs` | Rules, selectors (type, `.class`, `#id`, `*`, `[attr]`, `:root`, `:link`, descendant and `>` combinators), `@media`, `!important`, colors, units |
 | `style.rs` | Selector matching, specificity, the cascade (UA < author < inline), inheritance, shorthand expansion and computed values. The UA sheet is `ua.css` |
 | `layout.rs` | Block and inline formatting contexts, box model, auto margins, `max-width`, margin collapsing between siblings, word wrapping, `text-align`, `<pre>`, list markers, inline-blocks (baseline-aligned) and a basic row flexbox |
-| `paint.rs` | Draw ops, glyph-atlas rasterization (in the renderer, via fontdue), and the browser's software painter: alpha-blended rects and glyph bitmaps |
+| `paint.rs` | Draw ops, glyph-atlas rasterization (in the renderer, via fontdue), and the browser's software painter: alpha-blended rects and glyph bitmaps, cached in 512px tiles so scrolling just copies pixels |
 | `net.rs` | The only code that touches the network: single HTTP exchanges with Firefox's headers, decompression, URL helpers |
 | `network.rs` | The network service: applies tracking stripping, your rules, the filter lists, HTTPS-only and redirect checks to every request, and keeps the request log |
 | `filter.rs` | EasyList/uBlock filter engine: network rules, exceptions, options, cosmetic hiding, `$removeparam` |

@@ -7,7 +7,7 @@ use brickle::layout::{Edges, Rect};
 use brickle::net;
 use brickle::network::{Action, LogEntry, Network, Outcome};
 use brickle::page::Rendered;
-use brickle::paint::{Canvas, GlyphCache};
+use brickle::paint::{Canvas, GlyphCache, TileCache};
 use brickle::tab::Tab;
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -165,6 +165,8 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         log: vec![],
         interstitial: None,
     };
+    // Painted tiles of the current page; rebuilt when the page changes.
+    let mut tiles: Option<TileCache> = None;
     let mut rendered = Rendered {
         list: vec![],
         atlas: vec![],
@@ -228,6 +230,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             discard = false;
             info = Info::of(&done.tab);
             rendered = done.rendered;
+            tiles = None; // new content: repaint tiles on demand
             laid_out_at = (page_w, view_h);
             tab = Some(done.tab);
             if done.new_page {
@@ -455,7 +458,25 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         let loading = matches!(busy, Some(Some(_))) || queued.is_some();
         if dirty || loading {
             canvas = Canvas::new(w, h, rendered.background);
-            canvas.paint(&rendered.list, &rendered.atlas, scroll, BAR_H);
+            if tiles.as_ref().is_some_and(|t| t.width() != page_w as usize) {
+                tiles = None; // window resized: tiles are the wrong width
+            }
+            let tc = tiles.get_or_insert_with(|| {
+                TileCache::new(
+                    &rendered.list,
+                    &rendered.atlas,
+                    page_w as usize,
+                    rendered.height,
+                    rendered.background,
+                )
+            });
+            tc.draw(
+                &mut canvas,
+                &rendered.list,
+                &rendered.atlas,
+                scroll,
+                BAR_H as usize,
+            );
             draw_chrome(
                 &mut canvas,
                 &ui,

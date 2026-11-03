@@ -309,24 +309,28 @@ impl Canvas {
     /// Paint a display list. Glyph ids must index `atlas` (the IPC decoder
     /// checks this); out-of-range ids are skipped anyway.
     pub fn paint(&mut self, list: &DisplayList, atlas: &[GlyphBitmap], scroll_y: f32, offset_y: f32) {
-        let dy = offset_y - scroll_y;
         for cmd in list {
-            match cmd {
-                DisplayCommand::Rect { rect, color } => self.fill(
-                    Rect {
-                        y: rect.y + dy,
-                        ..*rect
-                    },
-                    *color,
-                    offset_y,
-                ),
-                DisplayCommand::Glyphs { color, glyphs } => {
-                    for g in glyphs {
-                        let Some(bmp) = atlas.get(g.id as usize) else {
-                            continue;
-                        };
-                        self.blit(g.x, g.y + dy, bmp, *color, offset_y);
-                    }
+            self.paint_cmd(cmd, atlas, offset_y - scroll_y, offset_y);
+        }
+    }
+
+    /// Paint one command shifted down by `dy`, clipped above `clip_top`.
+    pub fn paint_cmd(&mut self, cmd: &DisplayCommand, atlas: &[GlyphBitmap], dy: f32, clip_top: f32) {
+        match cmd {
+            DisplayCommand::Rect { rect, color } => self.fill(
+                Rect {
+                    y: rect.y + dy,
+                    ..*rect
+                },
+                *color,
+                clip_top,
+            ),
+            DisplayCommand::Glyphs { color, glyphs } => {
+                for g in glyphs {
+                    let Some(bmp) = atlas.get(g.id as usize) else {
+                        continue;
+                    };
+                    self.blit(g.x, g.y + dy, bmp, *color, clip_top);
                 }
             }
         }
@@ -469,6 +473,121 @@ impl Canvas {
     }
 }
 
+/// Height of a page tile, in px.
+pub const TILE_H: usize = 512;
+/// Memory the tile cache may use before evicting tiles far from view.
+const TILE_CACHE_BYTES: usize = 96 * 1024 * 1024;
+
+/// A page painted into horizontal tiles of finished pixels. Each tile is
+/// painted once, the first time it scrolls into view; after that, scrolling
+/// only copies pixels, so a page's display list (however heavy) isn't
+/// replayed on every frame.
+pub struct TileCache {
+    width: usize,
+    bg: Color,
+    /// Vertical extent (top, bottom) of each display command, so a tile only
+    /// paints the commands that overlap it.
+    extents: Vec<(f32, f32)>,
+    tiles: HashMap<usize, Vec<u32>>,
+    count: usize,
+    max_tiles: usize,
+}
+
+impl TileCache {
+    pub fn new(
+        list: &DisplayList,
+        atlas: &[GlyphBitmap],
+        width: usize,
+        page_height: f32,
+        bg: Color,
+    ) -> TileCache {
+        let extents = list
+            .iter()
+            .map(|cmd| match cmd {
+                DisplayCommand::Rect { rect, .. } => (rect.y, rect.y + rect.h),
+                DisplayCommand::Glyphs { glyphs, .. } => {
+                    glyphs.iter().fold((f32::MAX, f32::MIN), |(lo, hi), g| {
+                        let h = atlas.get(g.id as usize).map(|b| b.h as f32).unwrap_or(0.0);
+                        (lo.min(g.y), hi.max(g.y + h))
+                    })
+                }
+            })
+            .collect();
+        // Content may hang below the page; cover a screenful extra.
+        let count = ((page_height.max(0.0) + 4096.0) / TILE_H as f32).ceil() as usize;
+        let tile_bytes = (width * TILE_H * 4).max(1);
+        TileCache {
+            width,
+            bg,
+            extents,
+            tiles: HashMap::new(),
+            count,
+            max_tiles: (TILE_CACHE_BYTES / tile_bytes).max(4),
+        }
+    }
+
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    fn paint_tile(&self, i: usize, list: &DisplayList, atlas: &[GlyphBitmap]) -> Vec<u32> {
+        let top = (i * TILE_H) as f32;
+        let bottom = top + TILE_H as f32;
+        let mut c = Canvas::new(self.width, TILE_H, self.bg);
+        for (cmd, &(lo, hi)) in list.iter().zip(&self.extents) {
+            if hi >= top && lo <= bottom {
+                c.paint_cmd(cmd, atlas, -top, 0.0);
+            }
+        }
+        c.pixels
+    }
+
+    /// Composite the page, scrolled by `scroll`, into `canvas` from row
+    /// `top` down. Missing tiles are painted on demand.
+    pub fn draw(
+        &mut self,
+        canvas: &mut Canvas,
+        list: &DisplayList,
+        atlas: &[GlyphBitmap],
+        scroll: f32,
+        top: usize,
+    ) {
+        let scroll = scroll.max(0.0).round() as usize;
+        let view_h = canvas.height.saturating_sub(top);
+        let first = scroll / TILE_H;
+        let last = ((scroll + view_h) / TILE_H).min(self.count.saturating_sub(1));
+        if first >= self.count {
+            return;
+        }
+        for i in first..=last {
+            if !self.tiles.contains_key(&i) {
+                if self.tiles.len() >= self.max_tiles {
+                    // Evict the tile farthest from what's on screen.
+                    if let Some(&far) = self.tiles.keys().max_by_key(|&&k| k.abs_diff(first)) {
+                        self.tiles.remove(&far);
+                    }
+                }
+                let t = self.paint_tile(i, list, atlas);
+                self.tiles.insert(i, t);
+            }
+            let tile = &self.tiles[&i];
+            let w = self.width.min(canvas.width);
+            for row in 0..TILE_H {
+                let page_y = i * TILE_H + row;
+                if page_y < scroll {
+                    continue;
+                }
+                let y = top + (page_y - scroll);
+                if y >= canvas.height {
+                    break;
+                }
+                let dst = y * canvas.width;
+                canvas.pixels[dst..dst + w].copy_from_slice(&tile[row * self.width..row * self.width + w]);
+            }
+        }
+    }
+}
+
 fn pack(c: Color) -> u32 {
     ((c.r as u32) << 16) | ((c.g as u32) << 8) | c.b as u32
 }
@@ -514,6 +633,52 @@ mod tests {
         assert_eq!(list.len(), 1, "only the 16px run is drawn");
         assert_eq!(atlas.len(), 2);
         c.paint(&list, &atlas, 0.0, 0.0);
+    }
+
+    #[test]
+    fn tiles_match_direct_painting() {
+        // Rects and text straddling tile boundaries, painted both ways.
+        let mut ops = Vec::new();
+        for i in 0..40 {
+            let y = i as f32 * 97.0;
+            ops.push(DrawOp::Rect {
+                rect: Rect {
+                    x: (i * 13 % 200) as f32,
+                    y,
+                    w: 300.0,
+                    h: 140.0,
+                },
+                color: Color {
+                    r: (i * 6) as u8,
+                    g: 100,
+                    b: 200,
+                    a: if i % 3 == 0 { 128 } else { 255 },
+                },
+            });
+            ops.push(DrawOp::Text {
+                x: 20.0,
+                baseline: y + 30.0,
+                text: format!("line {i} across a tile edge"),
+                font: (i % 6) as usize,
+                size: 14.0 + (i % 5) as f32 * 7.0,
+                color: Color::BLACK,
+                italic: i % 2 == 0,
+            });
+        }
+        let (list, atlas) = rasterize(ops);
+        let (w, h, top) = (420usize, 700usize, 40usize);
+        let bg = Color::rgb(250, 250, 240);
+        let mut tiles = TileCache::new(&list, &atlas, w, 4000.0, bg);
+        for scroll in [0usize, 1, 300, 511, 512, 513, 1500, 3333] {
+            let mut direct = Canvas::new(w, h, bg);
+            direct.paint(&list, &atlas, scroll as f32, top as f32);
+            let mut tiled = Canvas::new(w, h, bg);
+            tiles.draw(&mut tiled, &list, &atlas, scroll as f32, top);
+            assert!(
+                direct.pixels[top * w..] == tiled.pixels[top * w..],
+                "scroll {scroll}"
+            );
+        }
     }
 
     #[test]
