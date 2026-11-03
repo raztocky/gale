@@ -42,8 +42,30 @@ fn with_big_stack(f: impl FnOnce() -> i32 + Send + 'static) -> ! {
     std::process::exit(worker.join().unwrap_or(101))
 }
 
+/// Hidden easter egg (not in --help): a red cap, worn backwards.
+const NOOKIE: &str = r#"
+                 _.-'''''-._
+               .'  BRICKLE  '.
+              /    _______    \
+             |   .'       '.   |=================.
+              \_/  (=^.^=)  \_/__________________/
+                '-.._____..-'
+
+   red cap on backwards. sandbox on forwards.
+   0 trackers got through tonight. turn it up.
+"#;
+
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--nookie") {
+        use std::io::IsTerminal;
+        if std::io::stdout().is_terminal() {
+            println!("\x1b[1;31m{NOOKIE}\x1b[0m");
+        } else {
+            println!("{NOOKIE}");
+        }
+        return;
+    }
 
     if args.first().map(String::as_str) == Some("--renderer") {
         // Lock the process down *before* touching any untrusted input.
