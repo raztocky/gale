@@ -71,7 +71,7 @@ browser validates before painting.
 | Module | What it does |
 |---|---|
 | `html.rs` | Tokenizer and tree builder. Handles implied end tags (`<p>`, `<li>`, `<td>`…), void elements, raw text (`<script>`/`<style>`), entities, and `<html>/<head>/<body>` normalization |
-| `css.rs` | Rules, selectors (type, `.class`, `#id`, `*`, `[attr]`, `:root`, `:link`, descendant and `>` combinators), `@media`, `!important`, colors, units |
+| `css.rs` | Rules, selectors (type, `.class`, `#id`, `*`, `[attr]`, `:root`, `:link`, descendant and `>` combinators), `@media`, `!important`, colors, units, custom properties (`--name`, `var()`) and `calc()`/`min()`/`max()`/`clamp()` |
 | `style.rs` | Selector matching, specificity, the cascade (UA < author < inline), inheritance, shorthand expansion and computed values. The UA sheet is `ua.css` |
 | `layout.rs` | Block and inline formatting contexts, box model, auto margins, `max-width`, margin collapsing between siblings, Unicode line breaking (UAX #14), `text-align`, `<pre>`, list markers, inline-blocks (baseline-aligned), flexbox (grow/shrink/basis, wrapping, `justify-content`, `align-items`/`align-self`/`align-content`, columns, `order`, gaps, `inline-flex`), floats (`float`, `clear`, `<br clear>`, `align=left/right`, with `overflow`/`flow-root` containing them), positioning (`relative`, `absolute`, `fixed`, insets, `z-index` stacking order), and tables (automatic column widths, `colspan`/`rowspan`, `border-spacing`, `vertical-align`, captions, CSS `display: table-*`) |
 | `font.rs` | Bundled fonts, per-character fallback, lazy loading |
@@ -161,4 +161,4 @@ On non-Linux systems the sandbox isn't implemented yet, so you have to run with 
 
 ## Not yet
 
-JavaScript modules, CORS preflight, file uploads, CSS background images, SVG, animated images, collapsed table borders (`border-collapse` only removes the spacing), `position: fixed` staying put while scrolling, `position: sticky` (laid out as static), relative offsets and horizontal margins on inline elements, `calc()`/`var()`, web fonts, and selecting text inside form fields.
+JavaScript modules, CORS preflight, file uploads, CSS background images, SVG, animated images, collapsed table borders (`border-collapse` only removes the spacing), `position: fixed` staying put while scrolling, `position: sticky` (laid out as static), relative offsets and horizontal margins on inline elements, web fonts, and selecting text inside form fields.

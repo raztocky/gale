@@ -67,6 +67,31 @@ pub enum Value {
     Comma,
 }
 
+impl Value {
+    /// The value written back as CSS, for substituting `var()`.
+    pub fn to_css(&self) -> String {
+        match self {
+            Value::Keyword(k) => k.clone(),
+            Value::Length(n, u) => format!(
+                "{n}{}",
+                match u {
+                    Unit::Px => "px",
+                    Unit::Em => "em",
+                    Unit::Rem => "rem",
+                    Unit::Pt => "pt",
+                    Unit::Vw => "vw",
+                    Unit::Vh => "vh",
+                }
+            ),
+            Value::Percent(n) => format!("{n}%"),
+            Value::Number(n) => format!("{n}"),
+            Value::Color(c) => format!("rgba({}, {}, {}, {})", c.r, c.g, c.b, c.a as f32 / 255.0),
+            Value::Str(s) => format!("\"{}\"", s.replace('"', "")),
+            Value::Comma => ",".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Unit {
     Px,
@@ -282,7 +307,7 @@ impl Parser {
                     important = true;
                     value = value[..i].trim();
                 }
-                if !name.is_empty() && !name.starts_with("--") {
+                if !name.is_empty() {
                     decls.push(Declaration {
                         name,
                         values: parse_values(value),
@@ -482,7 +507,8 @@ fn parse_value_token(tok: &str) -> Option<Value> {
         return None;
     }
     if lower.contains('(') {
-        // calc(), var(), url(), etc. — unsupported for now.
+        // calc(), var() and the like are worked out when computing styles;
+        // url() and others aren't supported.
         return Some(Value::Keyword(lower));
     }
     let num_end = lower

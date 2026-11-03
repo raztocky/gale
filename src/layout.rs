@@ -3118,3 +3118,90 @@ mod flex_tests {
         assert!(d[0].x > 30.0 && d[0].w < 100.0, "{d:?}");
     }
 }
+
+#[cfg(test)]
+mod calc_var_tests {
+    use super::table_tests::{boxes, close};
+    use crate::css;
+    use crate::html;
+    use crate::style::{self, StyleContext};
+
+    fn div(style: &str) -> crate::layout::Rect {
+        boxes(&format!("<div style='{style}'>x</div>"), 400.0, "div")[0]
+    }
+
+    #[test]
+    fn calc_widths() {
+        assert!(close(div("width:calc(100% - 50px)").w, 350.0));
+        assert!(close(div("width:calc(50% + 2em)").w, 232.0));
+        assert!(close(div("width:calc((100% - 20px) / 2)").w, 190.0));
+        assert!(close(div("width:calc(3 * 10px)").w, 30.0));
+        assert!(close(div("margin-left:calc(25%)").x, 100.0));
+        // Invalid: mixing a length and a plain number.
+        assert!(close(div("width:calc(100% + 3)").w, 400.0));
+    }
+
+    #[test]
+    fn min_max_clamp() {
+        assert!(close(div("width:min(100px, 300px)").w, 100.0));
+        assert!(close(div("width:max(100px, 2em)").w, 100.0));
+        assert!(close(div("width:clamp(50px, 10px, 200px)").w, 50.0));
+        assert!(close(div("width:clamp(50px, 1000px, 200px)").w, 200.0));
+    }
+
+    #[test]
+    fn custom_properties() {
+        let page = "<div style='--w: 120px; --m: 10px 30px'>\
+             <p style='width: var(--w); margin: var(--m)'>a</p>\
+             <p style='width: var(--missing, 80px)'>b</p>\
+             <p style='--w: calc(var(--w) + 30px); width: var(--w)'>c</p></div>";
+        let p = boxes(page, 400.0, "p");
+        assert!(
+            close(p[0].w, 120.0) && close(p[0].x, 30.0),
+            "inherited, and in a shorthand: {p:?}"
+        );
+        assert!(close(p[1].w, 80.0), "fallback: {p:?}");
+        assert!(close(p[2].w, 150.0), "built from the inherited value: {p:?}");
+    }
+
+    /// The computed style of the first `<b>`, with `sheet` as the page's CSS.
+    fn b_style(html_src: &str, sheet: &str) -> std::rc::Rc<style::ComputedStyle> {
+        let dom = html::parse(html_src);
+        let ua = css::parse(style::UA_CSS);
+        let author = css::parse(sheet);
+        let ctx = StyleContext {
+            sheets: vec![(0, &ua), (1, &author)],
+            viewport: (400.0, 600.0),
+        };
+        let styled = style::style_tree(&dom, &ctx);
+        fn find(n: &style::StyledNode) -> Option<std::rc::Rc<style::ComputedStyle>> {
+            if n.node.element().is_some_and(|e| e.tag == "b") {
+                return Some(n.style.clone());
+            }
+            n.children.iter().find_map(find)
+        }
+        find(&styled).unwrap()
+    }
+
+    #[test]
+    fn colors_from_variables_in_stylesheets() {
+        let s = b_style("<b>x</b>", ":root { --fg: #123456 } b { color: var(--fg) }");
+        assert_eq!((s.color.r, s.color.g, s.color.b), (0x12, 0x34, 0x56));
+    }
+
+    #[test]
+    fn nested_variables_cant_blow_up() {
+        // Each level doubles the last: 2^40 values if expanded fully.
+        let mut css = String::from("--v0: aaaaaaaa;");
+        for i in 1..=40 {
+            css.push_str(&format!("--v{i}: var(--v{}) var(--v{});", i - 1, i - 1));
+        }
+        let start = std::time::Instant::now();
+        let s = b_style(
+            &format!("<div style='{css}'><b style='width: var(--v40)'>x</b></div>"),
+            "",
+        );
+        assert!(start.elapsed().as_secs() < 2, "{:?}", start.elapsed());
+        assert!(s.vars.values().all(|v| v.len() <= 1024));
+    }
+}

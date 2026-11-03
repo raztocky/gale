@@ -102,6 +102,8 @@ pub enum Family {
 pub enum Len {
     Px(f32),
     Percent(f32),
+    /// `calc()`: px plus a percentage of the container.
+    Calc(f32, f32),
     Auto,
 }
 
@@ -110,6 +112,7 @@ impl Len {
         match self {
             Len::Px(v) => Some(v),
             Len::Percent(p) => Some(container * p / 100.0),
+            Len::Calc(px, p) => Some(px + container * p / 100.0),
             Len::Auto => None,
         }
     }
@@ -176,6 +179,9 @@ pub struct ComputedStyle {
     pub border_collapse: bool,
     /// Only used for table cells.
     pub vertical_align: VAlign,
+    /// Custom properties (`--name: value`), inherited, with any `var()`
+    /// in them already substituted.
+    pub vars: Rc<HashMap<String, Vec<Value>>>,
     pub float: Float,
     pub clear: Clear,
     /// `overflow` other than `visible`, or `display: flow-root`: the box
@@ -236,6 +242,7 @@ impl ComputedStyle {
             border_spacing: [0.0; 2],
             border_collapse: false,
             vertical_align: VAlign::Middle,
+            vars: Rc::default(),
             float: Float::None,
             clear: Clear::None,
             contain_floats: false,
@@ -264,6 +271,7 @@ impl ComputedStyle {
         s.list_style = self.list_style;
         s.visible = self.visible;
         s.border_spacing = self.border_spacing;
+        s.vars = self.vars.clone();
         s.border_collapse = self.border_collapse;
         s.display = Display::Inline;
         s
@@ -629,12 +637,51 @@ fn compute(
     }
     matched.sort_by_key(|m| m.key);
 
+    // Custom properties first, in cascade order, each with `var()` in it
+    // resolved against the ones before.
+    let mut vars = parent.vars.clone();
+    let customs: Vec<&Declaration> = matched
+        .iter()
+        .map(|m| m.decl)
+        .filter(|d| d.name.starts_with("--"))
+        .collect();
+    if !customs.is_empty() {
+        let mut map = (*vars).clone();
+        for d in customs {
+            match substitute(&d.values, &map) {
+                Some(v) if map.len() < MAX_VARS || map.contains_key(&d.name) => {
+                    map.insert(d.name.clone(), v);
+                }
+                _ => {
+                    map.remove(&d.name);
+                }
+            }
+        }
+        vars = Rc::new(map);
+    }
+
     let mut props: HashMap<String, Vec<Value>> = HashMap::new();
     for m in &matched {
-        expand(m.decl, &mut props);
+        if m.decl.name.starts_with("--") {
+            continue;
+        }
+        if !m.decl.values.iter().any(has_var) {
+            expand(m.decl, &mut props);
+        } else if let Some(values) = substitute(&m.decl.values, &vars) {
+            // Before shorthands are expanded, so `margin: var(--m)` works.
+            expand(
+                &Declaration {
+                    name: m.decl.name.clone(),
+                    values,
+                    important: m.decl.important,
+                },
+                &mut props,
+            );
+        }
     }
 
     let mut s = parent.inherit();
+    s.vars = vars;
     s.display = Display::Inline;
     let ctxv = Ctx {
         parent,
@@ -996,6 +1043,288 @@ fn align(kw: &str) -> Option<Align> {
     })
 }
 
+/// Most custom properties per element, values per substituted property,
+/// and characters per `var()` expansion: nesting variables in variables
+/// can't make values blow up.
+const MAX_VARS: usize = 1024;
+const MAX_VAR_VALUES: usize = 1024;
+const MAX_VAR_TEXT: usize = 16 * 1024;
+
+fn has_var(v: &Value) -> bool {
+    matches!(v, Value::Keyword(k) if k.contains("var("))
+}
+
+/// `values` with each `var(--name[, fallback])` replaced by the variable's
+/// value, or its fallback. `None` if one has neither, or it gets too big.
+fn substitute(values: &[Value], vars: &HashMap<String, Vec<Value>>) -> Option<Vec<Value>> {
+    let mut out = Vec::new();
+    for v in values {
+        match v {
+            Value::Keyword(k) if has_var(v) => out.extend(css::parse_values(&replace_vars(k, vars, 0)?)),
+            v => out.push(v.clone()),
+        }
+        if out.len() > MAX_VAR_VALUES {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+/// `text` with its `var()`s written out.
+fn replace_vars(text: &str, vars: &HashMap<String, Vec<Value>>, depth: usize) -> Option<String> {
+    if depth > 8 {
+        return None;
+    }
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("var(") {
+        out.push_str(&rest[..at]);
+        let inner_start = at + 4;
+        // The matching `)`.
+        let mut level = 1;
+        let mut end = None;
+        for (i, c) in rest[inner_start..].char_indices() {
+            match c {
+                '(' => level += 1,
+                ')' => {
+                    level -= 1;
+                    if level == 0 {
+                        end = Some(inner_start + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end?;
+        let inner = &rest[inner_start..end];
+        let (name, fallback) = match inner.split_once(',') {
+            Some((n, f)) => (n.trim(), Some(f.trim())),
+            None => (inner.trim(), None),
+        };
+        match (vars.get(name), fallback) {
+            (Some(v), _) => {
+                let parts: Vec<String> = v.iter().map(Value::to_css).collect();
+                out.push_str(&parts.join(" "));
+            }
+            (None, Some(f)) => out.push_str(&replace_vars(f, vars, depth + 1)?),
+            (None, None) => return None,
+        }
+        if out.len() > MAX_VAR_TEXT {
+            return None;
+        }
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+/// A `calc()` result: a plain number, or a length as px plus a percentage.
+#[derive(Clone, Copy)]
+enum Calc {
+    Num(f32),
+    Len(f32, f32),
+}
+
+/// Evaluates `calc()`, `min()`, `max()` and `clamp()` (as written, already
+/// lowercased): `+ - * /`, parentheses, and the length units Brickle knows.
+struct CalcParser<'a> {
+    s: &'a [u8],
+    i: usize,
+    depth: usize,
+    font_size: f32,
+    viewport: (f32, f32),
+}
+
+impl CalcParser<'_> {
+    fn skip_ws(&mut self) {
+        while self.s.get(self.i).is_some_and(|c| c.is_ascii_whitespace()) {
+            self.i += 1;
+        }
+    }
+
+    fn eat(&mut self, c: u8) -> bool {
+        self.skip_ws();
+        if self.s.get(self.i) == Some(&c) {
+            self.i += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn sum(&mut self) -> Option<Calc> {
+        let mut acc = self.product()?;
+        loop {
+            let neg = if self.eat(b'+') {
+                false
+            } else if self.eat(b'-') {
+                true
+            } else {
+                return Some(acc);
+            };
+            let rhs = self.product()?;
+            let k = if neg { -1.0 } else { 1.0 };
+            acc = match (acc, rhs) {
+                (Calc::Num(a), Calc::Num(b)) => Calc::Num(a + k * b),
+                (Calc::Len(a, p), Calc::Len(b, q)) => Calc::Len(a + k * b, p + k * q),
+                // `0` may stand for a length.
+                (Calc::Len(a, p), Calc::Num(0.0)) => Calc::Len(a, p),
+                (Calc::Num(0.0), Calc::Len(b, q)) => Calc::Len(k * b, k * q),
+                _ => return None,
+            };
+        }
+    }
+
+    fn product(&mut self) -> Option<Calc> {
+        let mut acc = self.unary()?;
+        loop {
+            let div = if self.eat(b'*') {
+                false
+            } else if self.eat(b'/') {
+                true
+            } else {
+                return Some(acc);
+            };
+            let rhs = self.unary()?;
+            acc = match (acc, rhs, div) {
+                (Calc::Num(a), Calc::Num(b), false) => Calc::Num(a * b),
+                (Calc::Num(a), Calc::Num(b), true) if b != 0.0 => Calc::Num(a / b),
+                (Calc::Len(a, p), Calc::Num(b), false) | (Calc::Num(b), Calc::Len(a, p), false) => {
+                    Calc::Len(a * b, p * b)
+                }
+                (Calc::Len(a, p), Calc::Num(b), true) if b != 0.0 => Calc::Len(a / b, p / b),
+                _ => return None,
+            };
+        }
+    }
+
+    fn unary(&mut self) -> Option<Calc> {
+        self.depth += 1;
+        if self.depth > 32 {
+            return None;
+        }
+        self.skip_ws();
+        let r = if self.eat(b'(') {
+            let v = self.sum()?;
+            self.eat(b')').then_some(v)
+        } else if self.eat(b'-') {
+            match self.unary()? {
+                Calc::Num(n) => Some(Calc::Num(-n)),
+                Calc::Len(a, p) => Some(Calc::Len(-a, -p)),
+            }
+        } else if self.s[self.i..].first().is_some_and(|c| c.is_ascii_alphabetic()) {
+            self.function()
+        } else {
+            self.number()
+        };
+        self.depth -= 1;
+        r
+    }
+
+    fn function(&mut self) -> Option<Calc> {
+        let start = self.i;
+        while self
+            .s
+            .get(self.i)
+            .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'-')
+        {
+            self.i += 1;
+        }
+        let name = std::str::from_utf8(&self.s[start..self.i]).ok()?.to_string();
+        if !self.eat(b'(') {
+            return None;
+        }
+        let mut args = vec![self.sum()?];
+        while self.eat(b',') {
+            args.push(self.sum()?);
+        }
+        if !self.eat(b')') {
+            return None;
+        }
+        // With percentages, min/max can't be worked out yet: take the
+        // preferred (middle) value of clamp(), or the first.
+        let px = |c: &Calc| match c {
+            Calc::Num(n) => Some(*n),
+            Calc::Len(a, p) if *p == 0.0 => Some(*a),
+            _ => None,
+        };
+        let all_px: Option<Vec<f32>> = args.iter().map(px).collect();
+        let same_kind = |v: f32| match args[0] {
+            Calc::Num(_) => Calc::Num(v),
+            Calc::Len(..) => Calc::Len(v, 0.0),
+        };
+        match (name.as_str(), all_px) {
+            ("calc", _) if args.len() == 1 => Some(args[0]),
+            ("min", Some(v)) => Some(same_kind(v.into_iter().fold(f32::INFINITY, f32::min))),
+            ("max", Some(v)) => Some(same_kind(v.into_iter().fold(f32::NEG_INFINITY, f32::max))),
+            ("clamp", Some(v)) if v.len() == 3 => Some(same_kind(v[1].min(v[2]).max(v[0]))),
+            ("clamp", None) if args.len() == 3 => Some(args[1]),
+            ("min" | "max", None) => Some(args[0]),
+            _ => None,
+        }
+    }
+
+    fn number(&mut self) -> Option<Calc> {
+        self.skip_ws();
+        let start = self.i;
+        while self
+            .s
+            .get(self.i)
+            .is_some_and(|c| c.is_ascii_digit() || *c == b'.')
+        {
+            self.i += 1;
+        }
+        let n: f32 = std::str::from_utf8(&self.s[start..self.i]).ok()?.parse().ok()?;
+        let ustart = self.i;
+        while self
+            .s
+            .get(self.i)
+            .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'%')
+        {
+            self.i += 1;
+        }
+        let fs = self.font_size;
+        Some(match &self.s[ustart..self.i] {
+            b"" => Calc::Num(n),
+            b"%" => Calc::Len(0.0, n),
+            b"px" => Calc::Len(n, 0.0),
+            b"em" => Calc::Len(n * fs, 0.0),
+            b"ex" | b"ch" => Calc::Len(n * fs * 0.5, 0.0),
+            b"rem" => Calc::Len(n * 16.0, 0.0),
+            b"pt" => Calc::Len(n * 4.0 / 3.0, 0.0),
+            b"vw" => Calc::Len(n * self.viewport.0 / 100.0, 0.0),
+            b"vh" => Calc::Len(n * self.viewport.1 / 100.0, 0.0),
+            _ => return None,
+        })
+    }
+}
+
+/// A `calc()`-like value, as written, worked out.
+fn eval_calc(text: &str, font_size: f32, viewport: (f32, f32)) -> Option<Calc> {
+    if text.len() > 4096
+        || !["calc(", "min(", "max(", "clamp("]
+            .iter()
+            .any(|f| text.starts_with(f))
+    {
+        return None;
+    }
+    let mut p = CalcParser {
+        s: text.as_bytes(),
+        i: 0,
+        depth: 0,
+        font_size,
+        viewport,
+    };
+    let v = p.unary()?;
+    p.skip_ws();
+    let finite = match v {
+        Calc::Num(n) => n.is_finite(),
+        Calc::Len(a, b) => a.is_finite() && b.is_finite(),
+    };
+    (p.i == text.len() && finite).then_some(v)
+}
+
 struct Ctx<'p> {
     parent: &'p ComputedStyle,
     viewport: (f32, f32),
@@ -1014,6 +1343,11 @@ impl Ctx<'_> {
                 Unit::Vh => n * self.viewport.1 / 100.0,
             }),
             Value::Number(n) if *n == 0.0 => Some(0.0),
+            Value::Keyword(k) => match eval_calc(k, font_size, self.viewport)? {
+                Calc::Len(px, 0.0) => Some(px),
+                Calc::Num(0.0) => Some(0.0),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -1021,6 +1355,13 @@ impl Ctx<'_> {
     fn len(&self, v: Option<&Value>, font_size: f32) -> Len {
         match v {
             Some(Value::Percent(p)) => Len::Percent(*p),
+            Some(Value::Keyword(k)) => match eval_calc(k, font_size, self.viewport) {
+                Some(Calc::Len(px, 0.0)) => Len::Px(px),
+                Some(Calc::Len(0.0, p)) => Len::Percent(p),
+                Some(Calc::Len(px, p)) => Len::Calc(px, p),
+                Some(Calc::Num(0.0)) => Len::Px(0.0),
+                _ => Len::Auto,
+            },
             Some(v) => self.length(v, font_size).map(Len::Px).unwrap_or(Len::Auto),
             None => Len::Auto,
         }
