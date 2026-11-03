@@ -15,6 +15,7 @@
 
 use crate::cookies::{self, Jar};
 use crate::filter::{self, Filters, Req, Verdict};
+use crate::forms::Submission;
 use crate::net::{self, Cancel, Credentials, Dest, NetError, ScriptRequest};
 use crate::page::error_page;
 use crate::urlclean;
@@ -366,12 +367,35 @@ impl Network {
 
     /// Load a top-level page. `from` is the page that linked here, if any.
     pub fn navigate(&mut self, url: &str, from: Option<&str>) -> Nav {
+        self.navigate_with(url, from, None)
+    }
+
+    /// Submit a form: a GET is a plain navigation to its URL; a POST sends
+    /// its body (with your cookies, under the usual cookie rules).
+    pub fn submit_form(&mut self, sub: &Submission, from: Option<&str>) -> Nav {
+        if !sub.post {
+            return self.navigate(&sub.url, from);
+        }
+        let req = ScriptRequest {
+            method: "POST".into(),
+            headers: sub
+                .content_type
+                .iter()
+                .map(|c| ("content-type".to_string(), c.clone()))
+                .collect(),
+            body: sub.body.clone(),
+            credentials: Credentials::Include,
+        };
+        self.navigate_with(&sub.url, from, Some(&req))
+    }
+
+    fn navigate_with(&mut self, url: &str, from: Option<&str>, post: Option<&ScriptRequest>) -> Nav {
         self.page_stylesheets = 0;
         self.page_scripts = 0;
         self.page_script_requests = 0;
         self.deadline = std::time::Instant::now() + PAGE_TIME_BUDGET;
         self.page_bytes = 0;
-        let fetched = self.fetch(url, from, Dest::Document);
+        let fetched = self.fetch_with(url, from, Dest::Document, post);
         if let Err(e) = self.cookies.save() {
             eprintln!("brickle: saving cookies: {e}");
         }
@@ -783,8 +807,10 @@ impl Network {
             } else {
                 (None, None)
             };
-            let page_origin = page.map(origin_of).unwrap_or_default();
-            let cors = page.is_some_and(|p| !same_origin(p, &target));
+            // A form POST's Origin is the page it was submitted from.
+            let origin_page = if dest == Dest::Document { initiator } else { page };
+            let page_origin = origin_page.map(origin_of).unwrap_or_else(|| "null".into());
+            let cors = dest != Dest::Document && page.is_some_and(|p| !same_origin(p, &target));
             let script_headers: Vec<(String, String)> = script.map(|s| s.headers.clone()).unwrap_or_default();
             let outgoing = script.map(|_| net::Outgoing {
                 method: &method,

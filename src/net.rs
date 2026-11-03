@@ -549,8 +549,21 @@ fn http_get_timeout(
                     "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 )
                 .set("Accept-Language", "en-US,en;q=0.5")
-                .set("Accept-Encoding", "gzip, deflate, br, zstd")
-                .set("Connection", "keep-alive");
+                .set("Accept-Encoding", "gzip, deflate, br, zstd");
+            // A form POST: its content type and origin, as Firefox sends.
+            if let Some(o) = script {
+                if let Some((_, v)) = o
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                {
+                    req = req.set("Content-Type", v);
+                }
+                if let Some(origin) = o.origin {
+                    req = req.set("Origin", origin);
+                }
+            }
+            req = req.set("Connection", "keep-alive");
             req = with_cookie(req, cookie);
             req.set("Upgrade-Insecure-Requests", "1")
                 .set("Sec-Fetch-Dest", "document")

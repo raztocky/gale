@@ -128,7 +128,28 @@ impl Dom {
         self.nodes.get(id as usize)
     }
 
-    fn element(&self, id: u32) -> Option<&ElementData> {
+    /// The parent of a node (None for the document and detached nodes).
+    pub fn parent(&self, id: u32) -> Option<u32> {
+        self.get(id)?.parent
+    }
+
+    /// Set an attribute (lower-case name) on an element.
+    pub fn set_attr(&mut self, id: u32, name: &str, value: &str) {
+        if let Some(e) = self.element_mut(id) {
+            e.attrs.insert(name.to_string(), value.to_string());
+            self.version += 1;
+        }
+    }
+
+    pub fn remove_attr(&mut self, id: u32, name: &str) {
+        if let Some(e) = self.element_mut(id) {
+            if e.attrs.remove(name).is_some() {
+                self.version += 1;
+            }
+        }
+    }
+
+    pub fn element(&self, id: u32) -> Option<&ElementData> {
         match &self.get(id)?.data {
             NodeType::Element(e) => Some(e),
             _ => None,
@@ -219,7 +240,7 @@ impl Dom {
         Ok(())
     }
 
-    fn text_content(&self, id: u32, out: &mut String) {
+    pub fn text_content(&self, id: u32, out: &mut String) {
         match &self.nodes[id as usize].data {
             NodeType::Text(t) => out.push_str(t),
             NodeType::Element(_) => {
@@ -230,7 +251,7 @@ impl Dom {
         }
     }
 
-    fn set_text_content(&mut self, id: u32, s: String) -> Result<(), &'static str> {
+    pub fn set_text_content(&mut self, id: u32, s: String) -> Result<(), &'static str> {
         if let NodeType::Text(t) = &mut self.nodes[id as usize].data {
             *t = s;
             self.version += 1;
@@ -352,7 +373,7 @@ impl Dom {
     }
 
     /// Descendants of `root` in tree order.
-    fn descendants(&self, root: u32, out: &mut Vec<u32>) {
+    pub fn descendants(&self, root: u32, out: &mut Vec<u32>) {
         let mut stack: Vec<u32> = self.nodes[root as usize].children.iter().rev().copied().collect();
         while let Some(n) = stack.pop() {
             out.push(n);
@@ -435,6 +456,8 @@ struct State {
     cookie_sets: Vec<String>,
     /// `document.cookie` as last reported by the browser (plus local sets).
     cookies: String,
+    /// `form.submit()`: (form, submitter).
+    submit: Option<(u32, Option<u32>)>,
     warned_selectors: bool,
 }
 
@@ -913,7 +936,19 @@ fn n_set_cookie(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue
     Ok(JsValue::undefined())
 }
 
+fn n_submit(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let form = arg_id(a, 0, c)?;
+    let submitter = if a.get_or_undefined(1).is_null_or_undefined() {
+        None
+    } else {
+        Some(arg_id(a, 1, c)?)
+    };
+    with(|s| s.submit = Some((form, submitter)));
+    Ok(JsValue::undefined())
+}
+
 const NATIVES: &[(&str, Native, usize)] = &[
+    ("submit", n_submit, 2),
     ("request", n_request, 5),
     ("cookie", n_cookie, 0),
     ("setCookie", n_set_cookie, 1),
@@ -971,6 +1006,7 @@ struct Internals {
     step_timers: JsObject,
     dispatch: JsObject,
     fire_load: JsObject,
+    fire_event: JsObject,
     set_viewport: JsObject,
     deliver: JsObject,
 }
@@ -1062,6 +1098,7 @@ impl Runtime {
             step_timers: get("stepTimers", &mut ctx)?,
             dispatch: get("dispatch", &mut ctx)?,
             fire_load: get("fireLoad", &mut ctx)?,
+            fire_event: get("fireEvent", &mut ctx)?,
             set_viewport: get("setViewport", &mut ctx)?,
             deliver: get("deliver", &mut ctx)?,
         };
@@ -1183,6 +1220,32 @@ impl Runtime {
             Err(e) => vec![id.into(), js_string!(e).into()],
         };
         self.call(&f, &args);
+    }
+
+    /// Use the page's DOM directly (forms: typed text, checkboxes).
+    pub fn with_dom<R>(&mut self, f: impl FnOnce(&mut Dom) -> R) -> R {
+        with(|s| f(&mut s.dom))
+    }
+
+    /// Dispatch a plain event (`input`, `change`, `submit`, `focus`) on a
+    /// node. Returns whether a handler called `preventDefault()`.
+    pub fn fire(&mut self, uid: u32, event: &str, bubbles: bool, cancelable: bool) -> bool {
+        let f = self.internals.fire_event.clone();
+        self.call(
+            &f,
+            &[
+                uid.into(),
+                js_string!(event).into(),
+                bubbles.into(),
+                cancelable.into(),
+            ],
+        )
+        .is_some_and(|v| v.to_boolean())
+    }
+
+    /// A form a script asked to submit (`form.submit()`), and its submitter.
+    pub fn take_submit(&mut self) -> Option<(u32, Option<u32>)> {
+        with(|s| s.submit.take())
     }
 
     pub fn version(&self) -> u64 {

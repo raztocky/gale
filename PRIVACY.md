@@ -16,6 +16,10 @@ link, reloading, going back or forward) and for that page's own resources, or wh
 `brickle filters update`. It doesn't prefetch or preconnect, it doesn't update anything in the
 background, and it makes no requests at startup.
 
+What you type into a page's form is only sent when you submit the form (pressing Enter in a field,
+or clicking its submit button), as a request you see in the request panel like any other. Brickle
+doesn't save form data or passwords anywhere.
+
 Every request a page makes is listed in the **request panel** (F12 or Ctrl+Shift+E, or click the
 "N blocked · M requests" button). Each entry shows whether it was sent, blocked by a filter, or
 denied by you, plus any tracking parameters removed and any HTTPS upgrade. Click a row to block
