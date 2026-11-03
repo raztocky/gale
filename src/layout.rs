@@ -11,7 +11,8 @@ use crate::dom::NodeType;
 use crate::font;
 use crate::image::Decoded;
 use crate::style::{
-    Clear, ComputedStyle, Display, Float, Len, ListStyle, Position, StyledNode, TextAlign, VAlign,
+    Align, Clear, ComputedStyle, Display, Float, Justify, Len, ListStyle, Position, StyledNode, TextAlign,
+    VAlign,
 };
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -208,9 +209,7 @@ fn build_block<'a>(node: &'a StyledNode<'a>, link: Option<String>) -> LayoutBox<
         let link = child_link(child, &link);
         match child.display() {
             Display::None => {}
-            _ if out_of_flow(child)
-                || (child.style.float != Float::None && node.style.display != Display::Flex) =>
-            {
+            _ if out_of_flow(child) || (child.style.float != Float::None && !is_flex(node.style.display)) => {
                 let anon = run.get_or_insert_with(|| {
                     LayoutBox::new(BoxKind::Anonymous {
                         items: Vec::new(),
@@ -249,14 +248,22 @@ fn build_block<'a>(node: &'a StyledNode<'a>, link: Option<String>) -> LayoutBox<
                 b.children.push(cb);
             }
             // Flex items are blockified: each element child is its own item.
-            Display::Inline | Display::InlineBlock | Display::InlineTable | Display::TableCell
-                if node.style.display == Display::Flex && child.node.element().is_some() =>
+            Display::Inline
+            | Display::InlineBlock
+            | Display::InlineFlex
+            | Display::InlineTable
+            | Display::TableCell
+                if is_flex(node.style.display) && child.node.element().is_some() =>
             {
                 flush_run(&mut b, &mut run);
                 b.children.push(build_block(child, link));
             }
             // A cell outside a row is approximated as an inline-block.
-            Display::Inline | Display::InlineBlock | Display::InlineTable | Display::TableCell => {
+            Display::Inline
+            | Display::InlineBlock
+            | Display::InlineFlex
+            | Display::InlineTable
+            | Display::TableCell => {
                 let anon = run.get_or_insert_with(|| {
                     LayoutBox::new(BoxKind::Anonymous {
                         items: Vec::new(),
@@ -270,6 +277,10 @@ fn build_block<'a>(node: &'a StyledNode<'a>, link: Option<String>) -> LayoutBox<
     }
     flush_run(&mut b, &mut run);
     b
+}
+
+fn is_flex(d: Display) -> bool {
+    matches!(d, Display::Flex | Display::InlineFlex)
 }
 
 fn out_of_flow(n: &StyledNode) -> bool {
@@ -335,7 +346,7 @@ fn flatten_inline<'a>(node: &'a StyledNode<'a>, anon: &mut LayoutBox<'a>, bg: Co
                 || oof
                 || matches!(
                     node.display(),
-                    Display::InlineBlock | Display::InlineTable | Display::TableCell
+                    Display::InlineBlock | Display::InlineFlex | Display::InlineTable | Display::TableCell
                 )
                 || e.tag == "img"
             {
@@ -608,6 +619,7 @@ impl<'a> LayoutBox<'a> {
                     || matches!(
                         s.display,
                         Display::Flex
+                            | Display::InlineFlex
                             | Display::Table
                             | Display::InlineTable
                             | Display::TableCell
@@ -738,8 +750,12 @@ impl<'a> LayoutBox<'a> {
             };
         } else if let Some(t) = table {
             self.layout_table(t);
-        } else if s.display == Display::Flex && s.flex_row {
-            self.layout_flex_row();
+        } else if is_flex(s.display) {
+            let definite_h = match s.height {
+                Len::Px(h) => Some(h),
+                _ => None,
+            };
+            self.layout_flex(definite_h);
         } else {
             self.layout_block_children(floats);
         }
@@ -904,35 +920,300 @@ impl<'a> LayoutBox<'a> {
         self.dims.content.h = cursor - content.y;
     }
 
-    fn layout_flex_row(&mut self) {
+    /// Flexbox, simplified from CSS Flexible Box Layout: items start at
+    /// their basis, grow or shrink to fill each line (never below their
+    /// content's minimum), wrap onto more lines if allowed, and are then
+    /// placed along each line (`justify-content`) and across it
+    /// (`align-items`, `align-self`), with lines placed by `align-content`.
+    /// `definite_h` is the container's `height`, if set.
+    fn layout_flex(&mut self, definite_h: Option<f32>) {
         let content = self.dims.content;
-        let gap = self.style().gap;
-        let n = self.children.len();
-        if n == 0 {
-            return;
+        let s = self.style().clone();
+        let (items, others): (Vec<usize>, Vec<usize>) =
+            (0..self.children.len()).partition(|&i| self.children[i].is_flex_item());
+        // Placeholders for absolutely positioned children sit at the start.
+        for i in others {
+            self.children[i].layout_at(content.x, content.y, content.w);
         }
-        let avail = content.w - gap * (n.saturating_sub(1)) as f32;
-        let prefs: Vec<f32> = self
-            .children
-            .iter()
-            .map(|c| c.max_content_width(content.w))
-            .collect();
-        let total: f32 = prefs.iter().sum();
-        let scale = if total > avail && total > 0.0 {
-            avail / total
+        let mut items = items;
+        items.sort_by_key(|&i| self.children[i].flex().order);
+        if s.flex_row {
+            self.layout_flex_row(items, &s, definite_h);
         } else {
-            1.0
-        };
-        let mut x = content.x;
-        let mut h = 0.0f32;
-        for (child, pref) in self.children.iter_mut().zip(prefs) {
-            let w = (pref * scale).max(0.0);
-            child.layout_at(x, content.y, w);
-            let mb = child.dims.margin_box();
-            x = mb.x + mb.w + gap;
-            h = h.max(mb.h);
+            if s.flex_reverse {
+                items.reverse();
+            }
+            self.layout_flex_column(items, &s, definite_h);
         }
-        self.dims.content.h = h;
+    }
+
+    fn layout_flex_row(&mut self, items: Vec<usize>, s: &ComputedStyle, definite_h: Option<f32>) {
+        let content = self.dims.content;
+        let avail = content.w;
+        let (gap, row_gap) = (s.gap, s.row_gap);
+        // Outer (margin-box) main sizes: the basis, and the smallest the
+        // item can be without its content overflowing.
+        let mut base = Vec::with_capacity(items.len());
+        let mut min = Vec::with_capacity(items.len());
+        for &i in &items {
+            let c = &self.children[i];
+            let (lo, hi) = c.intrinsic_widths(avail);
+            // The automatic minimum: the content's minimum, but no more
+            // than a width that's set.
+            let lo = lo.min(c.intrinsic_widths_of(avail, false).0);
+            let outer_extra = c.outer_extra_w(avail);
+            base.push(match c.flex().basis.resolve(avail) {
+                Some(b) => b + outer_extra,
+                None => hi,
+            });
+            min.push(lo);
+        }
+        let hyp: Vec<f32> = base.iter().zip(&min).map(|(b, m)| b.max(*m)).collect();
+        // Break into lines.
+        let mut lines: Vec<Vec<usize>> = Vec::new();
+        let mut used = 0.0;
+        for (k, &h) in hyp.iter().enumerate() {
+            match lines.last_mut() {
+                Some(line) if !s.flex_wrap || used + gap + h <= avail => {
+                    line.push(k);
+                    used += gap + h;
+                }
+                _ => {
+                    lines.push(vec![k]);
+                    used = h;
+                }
+            }
+        }
+        // Resolve flexible sizes and lay each item out at its size.
+        let mut size = hyp.clone();
+        for line in &lines {
+            let gaps = gap * (line.len() - 1) as f32;
+            let free = avail - gaps - line.iter().map(|&k| hyp[k]).sum::<f32>();
+            if free > 0.0 {
+                let grow: f32 = line.iter().map(|&k| self.children[items[k]].flex().grow).sum();
+                if grow > 0.0 {
+                    for &k in line {
+                        size[k] += free * self.children[items[k]].flex().grow / grow;
+                    }
+                }
+            } else if free < 0.0 {
+                // Shrink in proportion to shrink × basis; items that reach
+                // their minimum stop, and the rest shrink a little more.
+                for _ in 0..4 {
+                    let over = line.iter().map(|&k| size[k]).sum::<f32>() + gaps - avail;
+                    let open: Vec<usize> = line
+                        .iter()
+                        .copied()
+                        .filter(|&k| size[k] > min[k] + 0.01)
+                        .collect();
+                    let weight = |k: usize| self.children[items[k]].flex().shrink * base[k].max(0.0);
+                    let total: f32 = open.iter().map(|&k| weight(k)).sum();
+                    if over <= 0.01 || total <= 0.0 {
+                        break;
+                    }
+                    for &k in &open {
+                        size[k] = (size[k] - over * weight(k) / total).max(min[k]);
+                    }
+                }
+            }
+            for &k in line {
+                let c = &mut self.children[items[k]];
+                c.layout_outer(content.x, content.y, size[k], avail);
+            }
+        }
+        // Line heights, then `align-content` if the container's height is set.
+        let mut cross: Vec<f32> = lines
+            .iter()
+            .map(|line| {
+                line.iter()
+                    .map(|&k| self.children[items[k]].dims.margin_box().h)
+                    .fold(0.0, f32::max)
+            })
+            .collect();
+        let gaps = row_gap * lines.len().saturating_sub(1) as f32;
+        let mut line_y = content.y;
+        let mut line_gap = row_gap;
+        if let Some(h) = definite_h {
+            if !s.flex_wrap && cross.len() == 1 {
+                cross[0] = h;
+            } else if !cross.is_empty() {
+                let free = h - cross.iter().sum::<f32>() - gaps;
+                let (start, extra) = spread(s.align_content, free, cross.len());
+                if s.align_content == Justify::Stretch && free > 0.0 {
+                    cross.iter_mut().for_each(|c| *c += free / lines.len() as f32);
+                } else {
+                    line_y += start;
+                    line_gap += extra;
+                }
+            }
+        }
+        for (line, &line_h) in lines.iter().zip(&cross) {
+            let gaps = gap * (line.len() - 1) as f32;
+            let free = avail - gaps - line.iter().map(|&k| size[k]).sum::<f32>();
+            let (start, extra) = spread(s.justify, free, line.len());
+            let mut x = content.x + start;
+            for &k in line {
+                let item = items[k];
+                let align = self.children[item].flex().align.unwrap_or(s.align_items);
+                let c = &mut self.children[item];
+                let mb = c.dims.margin_box();
+                let dy = match align {
+                    Align::Stretch => {
+                        if c.flex().auto_height {
+                            c.dims.content.h += (line_h - mb.h).max(0.0);
+                        }
+                        0.0
+                    }
+                    Align::Start => 0.0,
+                    Align::End => line_h - mb.h,
+                    Align::Center => (line_h - mb.h) / 2.0,
+                };
+                // `row-reverse` mirrors each line.
+                let target_x = if s.flex_reverse {
+                    content.x + content.w - (x - content.x) - size[k]
+                } else {
+                    x
+                };
+                c.translate(target_x - mb.x, line_y + dy - mb.y);
+                x += size[k] + gap + extra;
+            }
+            line_y += line_h + line_gap;
+        }
+        self.dims.content.h = if lines.is_empty() {
+            0.0
+        } else {
+            line_y - line_gap - content.y
+        };
+    }
+
+    fn layout_flex_column(&mut self, items: Vec<usize>, s: &ComputedStyle, definite_h: Option<f32>) {
+        let content = self.dims.content;
+        let gap = s.row_gap;
+        // Width across: stretched, or shrink-to-fit when aligned.
+        let mut size = Vec::with_capacity(items.len());
+        for &i in &items {
+            let align = self.children[i].flex().align.unwrap_or(s.align_items);
+            let c = &mut self.children[i];
+            let w = if align == Align::Stretch && c.flex().auto_width {
+                content.w
+            } else {
+                let (lo, hi) = c.intrinsic_widths(content.w);
+                hi.min(content.w).max(lo)
+            };
+            c.layout_outer(content.x, content.y, w, content.w);
+            let h = c.dims.margin_box().h;
+            let basis = c
+                .flex()
+                .basis
+                .resolve(definite_h.unwrap_or(0.0))
+                .filter(|_| definite_h.is_some());
+            size.push(match basis {
+                Some(b) => b + (h - c.dims.content.h),
+                None => h,
+            });
+        }
+        let gaps = gap * items.len().saturating_sub(1) as f32;
+        let mut free = 0.0;
+        if let Some(main) = definite_h {
+            free = main - gaps - size.iter().sum::<f32>();
+            let grow: f32 = items.iter().map(|&i| self.children[i].flex().grow).sum();
+            if free > 0.0 && grow > 0.0 {
+                for (k, &i) in items.iter().enumerate() {
+                    size[k] += free * self.children[i].flex().grow / grow;
+                }
+                free = 0.0;
+            }
+        }
+        let (start, extra) = if definite_h.is_some() {
+            spread(s.justify, free, items.len())
+        } else {
+            (0.0, 0.0)
+        };
+        let mut y = content.y + start;
+        for (k, &i) in items.iter().enumerate() {
+            let align = self.children[i].flex().align.unwrap_or(s.align_items);
+            let c = &mut self.children[i];
+            let mb = c.dims.margin_box();
+            c.dims.content.h += (size[k] - mb.h).max(0.0);
+            let dx = match align {
+                Align::Stretch | Align::Start => 0.0,
+                Align::End => content.w - mb.w,
+                Align::Center => (content.w - mb.w) / 2.0,
+            };
+            c.translate(content.x + dx - mb.x, y - mb.y);
+            y += size[k] + gap + extra;
+        }
+        self.dims.content.h = if items.is_empty() {
+            0.0
+        } else {
+            y - gap - extra - content.y
+        };
+    }
+
+    /// Does this child of a flex container take part in the flex layout?
+    /// Elements do (unless absolutely positioned), and so do runs of text
+    /// that aren't just whitespace.
+    fn is_flex_item(&self) -> bool {
+        match &self.kind {
+            BoxKind::Block(_) => !self.out_of_flow(),
+            BoxKind::Anonymous { items, .. } => items.iter().any(|i| match i {
+                InlineItem::Text { text, style, .. } => style.pre || !is_collapsible_ws(text),
+                InlineItem::Atomic(_) | InlineItem::Float(_) => true,
+                InlineItem::Break(_) | InlineItem::OutOfFlow(_) => false,
+            }),
+        }
+    }
+
+    /// This item's flex properties. Anonymous items (runs of text) have the
+    /// initial values.
+    fn flex(&self) -> FlexItem {
+        match self.kind {
+            BoxKind::Block(n) => {
+                let s = &n.style;
+                FlexItem {
+                    grow: s.flex_grow,
+                    shrink: s.flex_shrink,
+                    basis: s.flex_basis,
+                    align: s.align_self,
+                    order: s.order,
+                    auto_width: s.width == Len::Auto,
+                    auto_height: s.height == Len::Auto,
+                }
+            }
+            BoxKind::Anonymous { .. } => FlexItem {
+                grow: 0.0,
+                shrink: 1.0,
+                basis: Len::Auto,
+                align: None,
+                order: 0,
+                auto_width: true,
+                auto_height: true,
+            },
+        }
+    }
+
+    /// Horizontal margins, padding and borders: what's around the content box.
+    fn outer_extra_w(&self, cb_w: f32) -> f32 {
+        match self.kind {
+            BoxKind::Block(n) => {
+                let s = &n.style;
+                let e = |l: &[Len; 4]| l[1].or_zero(cb_w) + l[3].or_zero(cb_w);
+                e(&s.margin) + e(&s.padding) + s.border_width[1] + s.border_width[3]
+            }
+            BoxKind::Anonymous { .. } => 0.0,
+        }
+    }
+
+    /// Lay out with margin box `outer_w` wide, its left edge at `x`, in a
+    /// container `cb_w` wide (for percentages).
+    fn layout_outer(&mut self, x: f32, y: f32, outer_w: f32, cb_w: f32) {
+        match self.kind {
+            BoxKind::Block(_) => {
+                let m = margins_h(self, cb_w);
+                self.layout_block(x, cb_w, y, Some((outer_w - m).max(0.0)));
+            }
+            BoxKind::Anonymous { .. } => self.layout_at(x, y, outer_w),
+        }
     }
 
     /// Lay out at a forced border-box width `w`, as a flex item or table cell.
@@ -955,6 +1236,12 @@ impl<'a> LayoutBox<'a> {
     /// the narrowest this box can be without overflowing, and the width it
     /// takes when nothing wraps.
     fn intrinsic_widths(&self, cb_w: f32) -> (f32, f32) {
+        self.intrinsic_widths_of(cb_w, true)
+    }
+
+    /// `intrinsic_widths`, but with `sized: false` this box's own `width` is
+    /// ignored (its descendants' still count): the size of its content.
+    fn intrinsic_widths_of(&self, cb_w: f32, sized: bool) -> (f32, f32) {
         let s = self.style();
         let edges = |l: &[Len; 4]| l[1].or_zero(cb_w) + l[3].or_zero(cb_w);
         let (pb, m) = match self.kind {
@@ -984,7 +1271,7 @@ impl<'a> LayoutBox<'a> {
             }
             // A cell with a fixed width still grows to fit its content.
             // Percentages are left to the table.
-            if s.display != Display::TableCell {
+            if s.display != Display::TableCell && sized {
                 if let Some(w) = s.width.resolve(cb_w) {
                     return (w + hz, w + hz);
                 }
@@ -1071,19 +1358,31 @@ impl<'a> LayoutBox<'a> {
                 (min, best.max(line))
             }
             BoxKind::Block(_) => {
-                let row = s.display == Display::Flex && s.flex_row;
-                let ws = self.children.iter().map(|c| c.intrinsic_widths(cb_w));
+                let row = is_flex(s.display) && s.flex_row;
+                let ws: Vec<(f32, f32)> = self
+                    .children
+                    .iter()
+                    .filter(|c| !is_flex(s.display) || c.is_flex_item())
+                    .map(|c| c.intrinsic_widths(cb_w))
+                    .collect();
                 if row {
-                    let gaps = s.gap * self.children.len().saturating_sub(1) as f32;
-                    let (a, b) = ws.fold((0.0, 0.0), |(a, b), (x, y)| (a + x, b + y));
-                    (a + gaps, b + gaps)
+                    let gaps = s.gap * ws.len().saturating_sub(1) as f32;
+                    let max = ws.iter().map(|w| w.1).sum::<f32>() + gaps;
+                    // Wrapping lines can be as narrow as their widest item.
+                    let min = if s.flex_wrap {
+                        ws.iter().map(|w| w.0).fold(0.0, f32::max)
+                    } else {
+                        ws.iter().map(|w| w.0).sum::<f32>() + gaps
+                    };
+                    (min, max)
                 } else {
+                    let ws = ws.into_iter();
                     ws.fold((0.0, 0.0), |(a, b), (x, y)| (f32::max(a, x), f32::max(b, y)))
                 }
             }
         };
         let (mut min, mut max) = (min + hz, max + hz);
-        if let (BoxKind::Block(_), Some(w)) = (&self.kind, s.width.resolve(cb_w)) {
+        if let (BoxKind::Block(_), Some(w), true) = (&self.kind, s.width.resolve(cb_w), sized) {
             // A fixed-width cell (percentages were skipped above).
             if matches!(s.width, Len::Px(_)) {
                 min = min.max(w + hz);
@@ -2053,6 +2352,33 @@ fn break_between(a: char, b: char) -> bool {
     found
 }
 
+struct FlexItem {
+    grow: f32,
+    shrink: f32,
+    basis: Len,
+    align: Option<Align>,
+    order: i32,
+    auto_width: bool,
+    auto_height: bool,
+}
+
+/// Where `n` things start, and the extra space between each, when `free`
+/// space is shared out by `j`. With no space to share, everything starts at
+/// the start (or overflows evenly when centred, or at the end).
+fn spread(j: Justify, free: f32, n: usize) -> (f32, f32) {
+    let n = n.max(1) as f32;
+    match j {
+        Justify::Start | Justify::Stretch => (0.0, 0.0),
+        Justify::End => (free, 0.0),
+        Justify::Center => (free / 2.0, 0.0),
+        _ if free <= 0.0 => (0.0, 0.0),
+        Justify::SpaceBetween if n > 1.0 => (0.0, free / (n - 1.0)),
+        Justify::SpaceBetween => (0.0, 0.0),
+        Justify::SpaceAround => (free / n / 2.0, free / n),
+        Justify::SpaceEvenly => (free / (n + 1.0), free / (n + 1.0)),
+    }
+}
+
 fn margins_h(b: &LayoutBox, cb_w: f32) -> f32 {
     let s = b.style();
     s.margin[1].or_zero(cb_w) + s.margin[3].or_zero(cb_w)
@@ -2662,5 +2988,133 @@ mod position_tests {
             n.children.iter().find_map(find)
         }
         assert_eq!(find(&styled), Some(-3));
+    }
+}
+
+#[cfg(test)]
+mod flex_tests {
+    use super::table_tests::{boxes, close};
+
+    /// The `<i>` items of a flex `<div>` styled `style`, 300px wide.
+    fn items(style: &str, items: &[&str]) -> Vec<crate::layout::Rect> {
+        let html: String = items
+            .iter()
+            .map(|s| format!("<i style='display:block;{s}'>x</i>"))
+            .collect();
+        boxes(
+            &format!("<div style='display:flex;width:300px;{style}'>{html}</div>"),
+            800.0,
+            "i",
+        )
+    }
+
+    #[test]
+    fn grow_fills_the_line() {
+        let i = items("", &["width:50px", "flex:1", "flex-grow:2"]);
+        assert!(close(i[0].w, 50.0), "{i:?}");
+        // 250px left for the other two, shared 1:2 (each starts at 0px with `flex: 1`... and its content).
+        assert!(close(i[0].w + i[1].w + i[2].w, 300.0), "{i:?}");
+        assert!(i[2].w > i[1].w, "{i:?}");
+        let i = items("", &["flex:1", "flex:1", "flex:1"]);
+        assert!(close(i[0].w, 100.0) && close(i[2].x, 200.0), "{i:?}");
+    }
+
+    #[test]
+    fn justify_content() {
+        let w = "width:50px";
+        let i = items("justify-content:space-between", &[w, w, w]);
+        assert!(
+            close(i[0].x, 0.0) && close(i[1].x, 125.0) && close(i[2].x, 250.0),
+            "{i:?}"
+        );
+        let i = items("justify-content:center", &[w, w]);
+        assert!(close(i[0].x, 100.0) && close(i[1].x, 150.0), "{i:?}");
+        let i = items("justify-content:flex-end", &[w]);
+        assert!(close(i[0].x, 250.0), "{i:?}");
+        let i = items("justify-content:space-evenly", &[w, w]);
+        assert!(close(i[0].x, 200.0 / 3.0), "{i:?}");
+    }
+
+    #[test]
+    fn align_items_and_self() {
+        let tall = "height:100px";
+        let i = items("", &[tall, ""]);
+        assert!(close(i[1].h, 100.0), "stretch by default: {i:?}");
+        let i = items("align-items:center", &[tall, ""]);
+        assert!(close(i[1].y + i[1].h / 2.0, 50.0), "{i:?}");
+        let i = items("", &[tall, "align-self:flex-end"]);
+        assert!(close(i[1].y + i[1].h, 100.0), "{i:?}");
+        let i = items("height:200px;align-items:flex-start", &[""]);
+        assert!(close(i[0].y, 0.0) && i[0].h < 50.0, "{i:?}");
+    }
+
+    #[test]
+    fn wrapping() {
+        let w = "width:100px;height:20px";
+        let i = items("flex-wrap:wrap", &[w, w, w, w, w]);
+        assert!(
+            close(i[2].y, 0.0) && close(i[3].x, 0.0) && close(i[3].y, 20.0),
+            "{i:?}"
+        );
+        let i = items("flex-wrap:wrap;gap:10px 5px", &[w, w, w]);
+        assert!(
+            close(i[1].x, 105.0) && close(i[2].x, 0.0) && close(i[2].y, 30.0),
+            "{i:?}"
+        );
+        let d = boxes("<div style='display:flex;flex-wrap:wrap;width:300px'><i style='display:block;width:200px'>x</i><i style='display:block;width:200px'>y</i></div>", 800.0, "div");
+        assert!(d[0].h > 30.0, "two lines tall: {d:?}");
+    }
+
+    #[test]
+    fn shrinking_stops_at_the_content() {
+        let long = "<i style='display:block'>unbreakablewordthatislong</i>";
+        let i = boxes(
+            &format!("<div style='display:flex;width:100px'>{long}<i style='display:block;width:200px'>b</i></div>"),
+            800.0,
+            "i",
+        );
+        assert!(i[0].w > 100.0, "the long word doesn't get squashed: {i:?}");
+        let i = items("", &["width:200px;flex:none", "width:200px"]);
+        assert!(close(i[0].w, 200.0) && close(i[1].w, 100.0), "{i:?}");
+    }
+
+    #[test]
+    fn columns() {
+        let i = items(
+            "flex-direction:column;align-items:center",
+            &["width:50px", "width:100px"],
+        );
+        assert!(
+            close(i[0].x, 125.0) && close(i[1].x, 100.0) && i[1].y >= i[0].y + i[0].h - 0.5,
+            "{i:?}"
+        );
+        let i = items("flex-direction:column;height:300px", &["flex:1", "height:50px"]);
+        assert!(close(i[0].h, 250.0), "grows to fill the height: {i:?}");
+        let i = items(
+            "flex-direction:column;height:300px;justify-content:flex-end",
+            &["height:50px"],
+        );
+        assert!(close(i[0].y, 250.0), "{i:?}");
+        let i = items("flex-direction:column", &[""]);
+        assert!(close(i[0].w, 300.0), "stretched across: {i:?}");
+    }
+
+    #[test]
+    fn order_and_reverse() {
+        let w = "width:50px";
+        let i = items("flex-direction:row-reverse", &[w, w]);
+        assert!(close(i[0].x, 250.0) && close(i[1].x, 200.0), "{i:?}");
+        let i = items("", &["width:50px;order:2", w]);
+        assert!(close(i[0].x, 50.0) && close(i[1].x, 0.0), "{i:?}");
+    }
+
+    #[test]
+    fn inline_flex_sits_in_the_line() {
+        let d = boxes(
+            "before <span style='display:inline-flex;gap:4px'><b>a</b><b>b</b></span> after",
+            800.0,
+            "span",
+        );
+        assert!(d[0].x > 30.0 && d[0].w < 100.0, "{d:?}");
     }
 }

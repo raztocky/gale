@@ -17,6 +17,7 @@ pub enum Display {
     InlineBlock,
     ListItem,
     Flex,
+    InlineFlex,
     Table,
     InlineTable,
     /// `thead`, `tbody`, `tfoot` and their `display` equivalents.
@@ -25,6 +26,29 @@ pub enum Display {
     TableCell,
     TableCaption,
     None,
+}
+
+/// Where flex items go along a line (`justify-content`) or where lines go
+/// in their container (`align-content`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Justify {
+    Start,
+    End,
+    Center,
+    SpaceBetween,
+    SpaceAround,
+    SpaceEvenly,
+    /// `align-content` only: lines share the extra space.
+    Stretch,
+}
+
+/// Where a flex item goes across its line (`align-items`, `align-self`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Align {
+    Stretch,
+    Start,
+    End,
+    Center,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -131,7 +155,22 @@ pub struct ComputedStyle {
     pub max_width: Len,
     pub visible: bool,
     pub flex_row: bool,
+    /// `row-reverse` or `column-reverse`.
+    pub flex_reverse: bool,
+    pub flex_wrap: bool,
+    pub justify: Justify,
+    pub align_items: Align,
+    /// `None` is `auto`: the container's `align-items`.
+    pub align_self: Option<Align>,
+    pub align_content: Justify,
+    pub flex_grow: f32,
+    pub flex_shrink: f32,
+    /// `Auto` takes the item's width (or height), else its content's size.
+    pub flex_basis: Len,
+    pub order: i32,
+    /// `column-gap`: between items in a row, or between columns.
     pub gap: f32,
+    pub row_gap: f32,
     /// Horizontal and vertical `border-spacing` between table cells.
     pub border_spacing: [f32; 2],
     pub border_collapse: bool,
@@ -182,7 +221,18 @@ impl ComputedStyle {
             max_width: Len::Auto,
             visible: true,
             flex_row: true,
+            flex_reverse: false,
+            flex_wrap: false,
+            justify: Justify::Start,
+            align_items: Align::Stretch,
+            align_self: None,
+            align_content: Justify::Stretch,
+            flex_grow: 0.0,
+            flex_shrink: 1.0,
+            flex_basis: Len::Auto,
+            order: 0,
             gap: 0.0,
+            row_gap: 0.0,
             border_spacing: [0.0; 2],
             border_collapse: false,
             vertical_align: VAlign::Middle,
@@ -636,7 +686,8 @@ fn compute(
                         Display::Block
                     }
                     "inline" => Display::Inline,
-                    "inline-block" | "inline-flex" | "inline-grid" => Display::InlineBlock,
+                    "inline-block" | "inline-grid" => Display::InlineBlock,
+                    "inline-flex" => Display::InlineFlex,
                     "list-item" => Display::ListItem,
                     "flex" => Display::Flex,
                     "table" => Display::Table,
@@ -762,10 +813,44 @@ fn compute(
                 }
             }
             "visibility" => s.visible = kw != "hidden" && kw != "collapse",
-            "flex-direction" => s.flex_row = !kw.starts_with("column"),
-            "gap" | "column-gap" => {
+            "flex-direction" => {
+                s.flex_row = !kw.starts_with("column");
+                s.flex_reverse = kw.ends_with("-reverse");
+            }
+            "flex-wrap" => s.flex_wrap = kw == "wrap" || kw == "wrap-reverse",
+            "justify-content" => s.justify = justify(kw).unwrap_or(s.justify),
+            "align-content" => s.align_content = justify(kw).unwrap_or(s.align_content),
+            "align-items" => s.align_items = align(kw).unwrap_or(s.align_items),
+            "align-self" => s.align_self = align(kw),
+            "flex-grow" | "flex-shrink" => {
+                if let Some(Value::Number(n)) = first {
+                    let n = n.clamp(0.0, 1e6);
+                    if name == "flex-grow" {
+                        s.flex_grow = n;
+                    } else {
+                        s.flex_shrink = n;
+                    }
+                }
+            }
+            "flex-basis" => {
+                s.flex_basis = match kw {
+                    "auto" | "content" => Len::Auto,
+                    _ => ctxv.len(first, fs),
+                }
+            }
+            "order" => {
+                if let Some(Value::Number(n)) = first {
+                    s.order = n.clamp(-1e6, 1e6) as i32;
+                }
+            }
+            "column-gap" => {
                 if let Some(v) = first {
                     s.gap = ctxv.length(v, fs).unwrap_or(0.0)
+                }
+            }
+            "row-gap" => {
+                if let Some(v) = first {
+                    s.row_gap = ctxv.length(v, fs).unwrap_or(0.0)
                 }
             }
             "border-spacing" => {
@@ -880,11 +965,35 @@ fn compute(
     if s.float != Float::None || matches!(s.position, Position::Absolute | Position::Fixed) {
         s.display = match s.display {
             Display::InlineTable => Display::Table,
+            Display::InlineFlex => Display::Flex,
             Display::Table | Display::Flex | Display::ListItem | Display::None => s.display,
             _ => Display::Block,
         };
     }
     s
+}
+
+fn justify(kw: &str) -> Option<Justify> {
+    Some(match kw {
+        "normal" | "start" | "flex-start" | "left" | "baseline" => Justify::Start,
+        "end" | "flex-end" | "right" => Justify::End,
+        "center" => Justify::Center,
+        "space-between" => Justify::SpaceBetween,
+        "space-around" => Justify::SpaceAround,
+        "space-evenly" => Justify::SpaceEvenly,
+        "stretch" => Justify::Stretch,
+        _ => return None,
+    })
+}
+
+fn align(kw: &str) -> Option<Align> {
+    Some(match kw {
+        "normal" | "stretch" => Align::Stretch,
+        "start" | "flex-start" | "self-start" | "baseline" | "first" | "left" => Align::Start,
+        "end" | "flex-end" | "self-end" | "last" | "right" => Align::End,
+        "center" => Align::Center,
+        _ => return None,
+    })
 }
 
 struct Ctx<'p> {
@@ -1044,9 +1153,56 @@ fn expand(d: &Declaration, props: &mut HashMap<String, Vec<Value>>) {
             }
         }
         "flex-flow" => {
-            if let Some(v) = d.values.first() {
-                set("flex-direction".into(), vec![v.clone()]);
+            for v in &d.values {
+                if let Value::Keyword(k) = v {
+                    let prop = if k.contains("wrap") {
+                        "flex-wrap"
+                    } else {
+                        "flex-direction"
+                    };
+                    set(prop.into(), vec![v.clone()]);
+                }
             }
+        }
+        // `gap: <row> [<column>]`.
+        "gap" => {
+            let v: Vec<Value> = d.values.iter().filter(|v| **v != Value::Comma).cloned().collect();
+            if let Some(row) = v.first() {
+                set("row-gap".into(), vec![row.clone()]);
+                set("column-gap".into(), vec![v.get(1).unwrap_or(row).clone()]);
+            }
+        }
+        // `flex: none | auto | <grow> [<shrink>] [<basis>] | <basis>`.
+        "flex" => {
+            let kw = |v: &Value, k: &str| matches!(v, Value::Keyword(x) if x == k);
+            let num = |n: f32| vec![Value::Number(n)];
+            let (grow, shrink, basis) = match d.values.as_slice() {
+                [v] if kw(v, "none") => (num(0.0), num(0.0), vec![Value::Keyword("auto".into())]),
+                [v] if kw(v, "auto") => (num(1.0), num(1.0), vec![Value::Keyword("auto".into())]),
+                [v] if kw(v, "initial") => (num(0.0), num(1.0), vec![Value::Keyword("auto".into())]),
+                vals => {
+                    let nums: Vec<f32> = vals
+                        .iter()
+                        .filter_map(|v| match v {
+                            Value::Number(n) => Some(*n),
+                            _ => None,
+                        })
+                        .collect();
+                    let basis = vals
+                        .iter()
+                        .find(|v| !matches!(v, Value::Number(_)))
+                        .cloned()
+                        .unwrap_or(Value::Length(0.0, Unit::Px));
+                    (
+                        num(nums.first().copied().unwrap_or(1.0)),
+                        num(nums.get(1).copied().unwrap_or(1.0)),
+                        vec![basis],
+                    )
+                }
+            };
+            set("flex-grow".into(), grow);
+            set("flex-shrink".into(), shrink);
+            set("flex-basis".into(), basis);
         }
         _ => set(d.name.clone(), d.values.clone()),
     }

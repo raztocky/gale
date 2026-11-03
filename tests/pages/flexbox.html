@@ -1,0 +1,52 @@
+<!doctype html>
+<html>
+<head>
+<title>Flexbox</title>
+<style>
+  body { font-family: sans-serif; max-width: 760px; }
+  .row { display: flex; gap: 8px; background-color: #f2f2f2; border: 1px solid #ccc; padding: 6px; margin-bottom: 10px; }
+  .row > div { background-color: #cde; border: 1px solid #89a; padding: 4px 8px; }
+  .nav { display: flex; align-items: center; justify-content: space-between; background-color: #222; color: white; padding: 8px 12px; }
+  .nav a { color: white; margin-left: 14px; }
+  .cards { display: flex; flex-wrap: wrap; gap: 10px; }
+  .card { flex: 1 1 200px; background-color: #fff; border: 1px solid #bbb; padding: 10px; }
+  .col { display: flex; flex-direction: column; height: 160px; width: 200px; background-color: #eef; padding: 6px; gap: 6px; }
+  .col > div { background-color: #fff; border: 1px solid #99c; padding: 4px; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; background-color: #e7f0ff; border: 1px solid #9bd; padding: 2px 8px; }
+  .dot { width: 8px; height: 8px; background-color: #36c; }
+</style>
+</head>
+<body>
+<h1>Flexbox</h1>
+
+<div class="nav"><b>Brickle</b><span><a href="#">Home</a><a href="#">Docs</a><a href="#">About</a></span></div>
+
+<h2>justify-content</h2>
+<div class="row"><div>start</div><div>two</div><div>three</div></div>
+<div class="row" style="justify-content: center"><div>center</div><div>two</div></div>
+<div class="row" style="justify-content: flex-end"><div>end</div><div>two</div></div>
+<div class="row" style="justify-content: space-between"><div>space-between</div><div>two</div><div>three</div></div>
+<div class="row" style="justify-content: space-evenly"><div>evenly</div><div>two</div><div>three</div></div>
+
+<h2>Grow, and alignment across the line</h2>
+<div class="row"><div style="flex: 1">flex: 1</div><div style="flex: 2">flex: 2</div><div>auto</div></div>
+<div class="row" style="height: 70px"><div>stretched (default)</div><div style="align-self: flex-start">start</div><div style="align-self: center">center</div><div style="align-self: flex-end">end</div></div>
+
+<h2>Wrapping cards</h2>
+<div class="cards">
+  <div class="card"><b>One</b><br>Cards are at least 200px and share the rest of the row.</div>
+  <div class="card"><b>Two</b><br>They wrap onto a new line when there isn't room.</div>
+  <div class="card"><b>Three</b><br>Each line grows to fill the width.</div>
+  <div class="card"><b>Four</b><br>And all cards on a line are as tall as the tallest one.</div>
+  <div class="card"><b>Five</b></div>
+</div>
+
+<h2>Column, reverse and inline-flex</h2>
+<div class="row" style="gap: 16px">
+  <div class="col"><div>top</div><div style="flex: 1">flex: 1 fills the height</div><div style="align-self: flex-end">end</div></div>
+  <div class="col" style="justify-content: center; align-items: center"><div>centred</div><div>both ways</div></div>
+</div>
+<div class="row" style="flex-direction: row-reverse"><div>first in the HTML</div><div>second</div><div>third</div></div>
+<p>Text with an <span class="pill"><span class="dot"></span>inline-flex pill</span> in the middle of it.</p>
+</body>
+</html>
