@@ -24,11 +24,14 @@ pub enum DrawOp {
         size: f32,
         color: Color,
         italic: bool,
+        /// Glyphs whose centre is outside this aren't drawn (`overflow`).
+        clip: Option<Rect>,
     },
-    /// An image (as decoded) drawn into `rect`.
+    /// An image (as decoded) drawn into `rect`, cropped to `clip`.
     Image {
         rect: Rect,
         image: Arc<Bitmap>,
+        clip: Option<Rect>,
     },
 }
 
@@ -81,6 +84,13 @@ pub const MAX_ATLAS_BYTES: usize = 24 * 1024 * 1024;
 type AtlasKey = (usize, char, u32, bool);
 
 /// Turn text runs into glyph placements plus a bitmap atlas.
+fn contains(outer: Rect, inner: Rect) -> bool {
+    inner.x >= outer.x
+        && inner.y >= outer.y
+        && inner.x + inner.w <= outer.x + outer.w
+        && inner.y + inner.h <= outer.y + outer.h
+}
+
 pub fn rasterize(ops: Vec<DrawOp>) -> (DisplayList, Vec<GlyphBitmap>) {
     let mut atlas: Vec<GlyphBitmap> = Vec::new();
     let mut atlas_bytes = 0usize;
@@ -93,8 +103,8 @@ pub fn rasterize(ops: Vec<DrawOp>) -> (DisplayList, Vec<GlyphBitmap>) {
     for op in ops {
         match op {
             DrawOp::Rect { rect, color } => list.push(DisplayCommand::Rect { rect, color }),
-            DrawOp::Image { rect, image } => {
-                if !(rect.w >= 1.0 && rect.h >= 1.0) {
+            DrawOp::Image { rect, image, clip } => {
+                if !(rect.w >= 1.0 && rect.h >= 1.0) || clip.is_some_and(|c| rect.intersect(c).is_empty()) {
                     continue;
                 }
                 // Only ever shrunk here: enlarging is left to the browser's
@@ -125,7 +135,32 @@ pub fn rasterize(ops: Vec<DrawOp>) -> (DisplayList, Vec<GlyphBitmap>) {
                         b
                     }
                 };
-                list.push(DisplayCommand::Image { rect, image: bmp });
+                match clip {
+                    Some(c) if !contains(c, rect) => {
+                        // Crop to the pixels inside the clip, and draw just those.
+                        let v = rect.intersect(c);
+                        let (sx, sy) = (bmp.w as f32 / rect.w, bmp.h as f32 / rect.h);
+                        let x0 = ((v.x - rect.x) * sx).floor().max(0.0) as u32;
+                        let y0 = ((v.y - rect.y) * sy).floor().max(0.0) as u32;
+                        let x1 = ((v.x + v.w - rect.x) * sx).ceil() as u32;
+                        let y1 = ((v.y + v.h - rect.y) * sy).ceil() as u32;
+                        let part = image::crop(&bmp, x0, y0, x1, y1);
+                        if part.w == 0 || part.h == 0 {
+                            continue;
+                        }
+                        let dest = Rect {
+                            x: rect.x + x0 as f32 / sx,
+                            y: rect.y + y0 as f32 / sy,
+                            w: part.w as f32 / sx,
+                            h: part.h as f32 / sy,
+                        };
+                        list.push(DisplayCommand::Image {
+                            rect: dest,
+                            image: Arc::new(part),
+                        });
+                    }
+                    _ => list.push(DisplayCommand::Image { rect, image: bmp }),
+                }
             }
             DrawOp::Text {
                 x,
@@ -135,6 +170,7 @@ pub fn rasterize(ops: Vec<DrawOp>) -> (DisplayList, Vec<GlyphBitmap>) {
                 size,
                 color,
                 italic,
+                clip,
             } => {
                 if !(MIN_TEXT_SIZE..=crate::style::MAX_FONT_SIZE).contains(&size) || font >= font::COUNT {
                     continue;
@@ -171,7 +207,10 @@ pub fn rasterize(ops: Vec<DrawOp>) -> (DisplayList, Vec<GlyphBitmap>) {
                     if id != u32::MAX {
                         let gx = (pen + m.xmin as f32).round();
                         let gy = (baseline - (m.height as i32 + m.ymin) as f32).round();
-                        glyphs.push(PlacedGlyph { x: gx, y: gy, id });
+                        let (cx, cy) = (gx + m.width as f32 / 2.0, gy + m.height as f32 / 2.0);
+                        if clip.is_none_or(|c| c.contains(cx, cy)) {
+                            glyphs.push(PlacedGlyph { x: gx, y: gy, id });
+                        }
                     }
                     pen += m.advance_width;
                 }
@@ -203,11 +242,32 @@ fn skew(m: &fontdue::Metrics, bitmap: &[u8]) -> GlyphBitmap {
 }
 
 pub fn build_display_list(root: &LayoutBox) -> Vec<DrawOp> {
+    let clips = crate::layout::clip_map(root);
     let mut list = Vec::new();
     for b in crate::layout::paint_order(root) {
+        let start = list.len();
         render_box(&mut list, b);
+        if let Some(&c) = clips.get(&crate::layout::box_addr(b)) {
+            clip_ops(&mut list, start, c);
+        }
     }
     list
+}
+
+/// Clip the ops from `start` on to `c`: rectangles exactly, text and images
+/// when they're rasterized.
+fn clip_ops(list: &mut Vec<DrawOp>, start: usize, c: Rect) {
+    for op in &mut list[start..] {
+        match op {
+            DrawOp::Rect { rect, .. } => *rect = rect.intersect(c),
+            DrawOp::Text { clip, .. } | DrawOp::Image { clip, .. } => *clip = Some(c),
+        }
+    }
+    let mut i = start;
+    list.retain(|op| {
+        i += 1;
+        i <= start || !matches!(op, DrawOp::Rect { rect, .. } if rect.is_empty())
+    });
 }
 
 /// Paint one box (not its children).
@@ -270,6 +330,7 @@ fn render_box(list: &mut Vec<DrawOp>, b: &LayoutBox) {
                 size: s.font_size,
                 color: s.color,
                 italic: false,
+                clip: None,
             });
         }
     }
@@ -277,6 +338,7 @@ fn render_box(list: &mut Vec<DrawOp>, b: &LayoutBox) {
         list.push(DrawOp::Image {
             rect: b.dims.content,
             image: img.bitmap.clone(),
+            clip: None,
         });
     }
     if let BoxKind::Anonymous { frags, .. } = &b.kind {
@@ -307,6 +369,7 @@ fn render_box(list: &mut Vec<DrawOp>, b: &LayoutBox) {
                     size,
                     color: t.style.color,
                     italic: t.style.italic,
+                    clip: None,
                 });
             }
             let thick = (size / 14.0).max(1.0);
@@ -729,6 +792,7 @@ mod tests {
                 size,
                 color: Color::BLACK,
                 italic: true,
+                clip: None,
             })
             .collect();
         let (list, atlas) = rasterize(ops);
@@ -765,6 +829,7 @@ mod tests {
                 size: 14.0 + (i % 5) as f32 * 7.0,
                 color: Color::BLACK,
                 italic: i % 2 == 0,
+                clip: None,
             });
         }
         let (list, atlas) = rasterize(ops);
@@ -793,6 +858,7 @@ mod tests {
             size: 14.0,
             color: Color::BLACK,
             italic: false,
+            clip: None,
         };
         let (list, atlas) = rasterize(vec![op("banana"), op("nab")]);
         assert_eq!(atlas.len(), 3, "b, a, n once each");

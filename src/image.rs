@@ -241,6 +241,19 @@ fn decode_webp(bytes: &[u8]) -> Result<Bitmap, String> {
 
 /// Scale a bitmap to `w`×`h`: averaging when shrinking, linear when
 /// enlarging. Done with premultiplied alpha so transparent edges don't go dark.
+/// The pixels of `src` in columns `x0..x1` and rows `y0..y1` (clamped).
+pub fn crop(src: &Bitmap, x0: u32, y0: u32, x1: u32, y1: u32) -> Bitmap {
+    let (x1, y1) = (x1.min(src.w), y1.min(src.h));
+    let (x0, y0) = (x0.min(x1), y0.min(y1));
+    let (w, h) = (x1 - x0, y1 - y0);
+    let mut rgba = Vec::with_capacity(w as usize * h as usize * 4);
+    for y in y0..y1 {
+        let row = (y as usize * src.w as usize + x0 as usize) * 4;
+        rgba.extend_from_slice(&src.rgba[row..row + w as usize * 4]);
+    }
+    Bitmap { w, h, rgba }
+}
+
 pub fn resize(src: &Bitmap, w: u32, h: u32) -> Bitmap {
     let (w, h) = (w.max(1), h.max(1));
     if (w, h) == (src.w, src.h) {

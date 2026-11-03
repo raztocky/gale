@@ -574,13 +574,16 @@ impl Page {
         let (list, atlas) = paint::rasterize(paint::build_display_list(&root));
         let mut links = Vec::new();
         let order = layout::paint_order(&root);
+        // What's clipped away can't be clicked either.
+        let clips = layout::clip_map(&root);
+        let clip_of = |b: &LayoutBox| clips.get(&layout::box_addr(b)).copied();
         for b in &order {
-            collect_links(b, &mut links);
+            collect_links(b, clip_of(b), &mut links);
         }
         links.truncate(MAX_LINKS);
         let mut hits = Vec::new();
         for b in &order {
-            collect_hits(b, &mut hits);
+            collect_hits(b, clip_of(b), &mut hits);
         }
         *self.hits.borrow_mut() = hits;
         let mut texts = Vec::new();
@@ -594,9 +597,8 @@ impl Page {
         };
         collect_text(
             &root,
-            &Seen::new(&order, page),
+            &Seen::new(&order, page, clips),
             background,
-            None,
             &mut texts,
             &mut 0,
         );
@@ -652,6 +654,8 @@ struct Seen {
     covers: Vec<(Rect, usize)>,
     /// `covers` indices by 256px band of the page.
     bands: HashMap<i64, Vec<usize>>,
+    /// What `overflow` clips each box to (`layout::clip_map`).
+    clips: HashMap<usize, Rect>,
 }
 
 /// Most covering boxes, and band entries, considered per page.
@@ -660,7 +664,7 @@ const MAX_BAND_ENTRIES: usize = 64 * 1024;
 const BAND: f32 = 256.0;
 
 impl Seen {
-    fn new(order: &[&LayoutBox], page: Rect) -> Seen {
+    fn new(order: &[&LayoutBox], page: Rect, clips: HashMap<usize, Rect>) -> Seen {
         let mut covers = Vec::new();
         for (i, b) in order.iter().enumerate() {
             let s = b.style();
@@ -690,6 +694,7 @@ impl Seen {
             order: order.iter().enumerate().map(|(i, b)| (addr(b), i)).collect(),
             covers,
             bands,
+            clips,
         }
     }
 
@@ -731,43 +736,20 @@ fn contains(outer: Rect, inner: Rect) -> bool {
         && inner.y + inner.h <= outer.y + outer.h
 }
 
-fn intersect(a: Rect, b: Rect) -> Rect {
-    let (x, y) = (a.x.max(b.x), a.y.max(b.y));
-    Rect {
-        x,
-        y,
-        w: ((a.x + a.w).min(b.x + b.w) - x).max(0.0),
-        h: ((a.y + a.h).min(b.y + b.h) - y).max(0.0),
-    }
-}
-
 /// The visible text under `b`, in tree (reading) order, with where each
 /// character ends. `under` is the background behind it, `clip` what an
 /// `overflow` ancestor would clip it to, and `chars` counts what's been
 /// collected so far.
-fn collect_text(
-    b: &LayoutBox,
-    seen: &Seen,
-    mut under: Color,
-    mut clip: Option<Rect>,
-    out: &mut Vec<TextRun>,
-    chars: &mut usize,
-) {
+fn collect_text(b: &LayoutBox, seen: &Seen, mut under: Color, out: &mut Vec<TextRun>, chars: &mut usize) {
     if let BoxKind::Block(_) = b.kind {
         let s = b.style();
         if s.background.a == 255 {
             under = s.background;
         }
-        if s.position == Position::Fixed {
-            clip = None;
-        }
-        if s.overflow_clip {
-            let p = b.dims.padding_box();
-            clip = Some(clip.map_or(p, |c| intersect(c, p)));
-        }
     }
     if let BoxKind::Anonymous { frags, .. } = &b.kind {
         let painted = seen.order.get(&addr(b)).copied().unwrap_or(0);
+        let clip = seen.clips.get(&addr(b)).copied();
         for f in frags.iter().filter(|f| f.style.visible && !f.text.is_empty()) {
             let fi = font::index(&f.style);
             let (a, d) = font::vmetrics(fi, f.style.font_size);
@@ -802,7 +784,7 @@ fn collect_text(
         }
     }
     for c in &b.children {
-        collect_text(c, seen, under, clip, out, chars);
+        collect_text(c, seen, under, out, chars);
     }
 }
 
@@ -918,14 +900,20 @@ impl ScriptLoader {
 }
 
 /// One box's hit areas (called in paint order, so later boxes are on top).
-fn collect_hits(b: &LayoutBox, out: &mut Vec<(Rect, u32)>) {
+fn collect_hits(b: &LayoutBox, clip: Option<Rect>, out: &mut Vec<(Rect, u32)>) {
+    let mut push = |r: Rect, uid: u32| {
+        let r = clip.map_or(r, |c| r.intersect(c));
+        if !r.is_empty() {
+            out.push((r, uid));
+        }
+    };
     if b.uid != 0 {
-        out.push((b.dims.border_box(), b.uid));
+        push(b.dims.border_box(), b.uid);
     }
     if let BoxKind::Anonymous { frags, .. } = &b.kind {
         for f in frags {
             let (a, d) = font::vmetrics(font::index(&f.style), f.style.font_size);
-            out.push((
+            push(
                 Rect {
                     x: f.x,
                     y: f.baseline - a,
@@ -933,28 +921,34 @@ fn collect_hits(b: &LayoutBox, out: &mut Vec<(Rect, u32)>) {
                     h: a + d,
                 },
                 f.uid,
-            ));
+            );
         }
     }
 }
 
-fn collect_links(b: &LayoutBox, out: &mut Vec<(Rect, String)>) {
+fn collect_links(b: &LayoutBox, clip: Option<Rect>, out: &mut Vec<(Rect, String)>) {
+    let mut push = |r: Rect, l: &String| {
+        let r = clip.map_or(r, |c| r.intersect(c));
+        if !r.is_empty() {
+            out.push((r, l.clone()));
+        }
+    };
     if let (Some(l), BoxKind::Block(_)) = (&b.link, &b.kind) {
-        out.push((b.dims.border_box(), l.clone()));
+        push(b.dims.border_box(), l);
     }
     if let BoxKind::Anonymous { frags, .. } = &b.kind {
         for f in frags {
             if let Some(l) = &f.link {
                 let (a, d) = font::vmetrics(font::index(&f.style), f.style.font_size);
-                out.push((
+                push(
                     Rect {
                         x: f.x,
                         y: f.baseline - a,
                         w: f.w,
                         h: a + d,
                     },
-                    l.clone(),
-                ));
+                    l,
+                );
             }
         }
     }
@@ -1143,6 +1137,27 @@ mod image_tests {
     }
 
     #[test]
+    fn images_are_cropped_by_overflow() {
+        let (page, _) = load("<body style='margin:0'><div style='width:50px;height:30px;overflow:hidden'><img src=/100x100.png></div>");
+        let r = page.render(800.0, 600.0);
+        let (rect, img) = r
+            .list
+            .iter()
+            .find_map(|c| match c {
+                DisplayCommand::Image { rect, image } => Some((*rect, image.clone())),
+                _ => None,
+            })
+            .expect("image drawn");
+        assert!(rect.w <= 50.5 && rect.h <= 30.5, "{rect:?}");
+        assert!(
+            img.w <= 51 && img.h <= 31,
+            "only the visible pixels are sent: {}x{}",
+            img.w,
+            img.h
+        );
+    }
+
+    #[test]
     fn images_are_drawn_at_the_size_shown() {
         let (page, _) = load("<img src=/400x200.png width=100>");
         let r = page.render(800.0, 600.0);
@@ -1290,5 +1305,79 @@ mod text_tests {
             chars <= MAX_TEXT_CHARS && chars > MAX_TEXT_CHARS - 2000,
             "{chars}"
         );
+    }
+}
+
+#[cfg(test)]
+mod clip_tests {
+    use super::*;
+    use crate::paint::DisplayCommand;
+
+    fn render(html: &str) -> Rendered {
+        let page = Page::parse("https://example.com/", html, "", &mut |_, _| Err("none".into()));
+        page.render(800.0, 600.0)
+    }
+
+    fn red_rects(r: &Rendered) -> Vec<Rect> {
+        r.list
+            .iter()
+            .filter_map(|c| match c {
+                DisplayCommand::Rect { rect, color } if color.r == 255 && color.g == 0 => Some(*rect),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const BODY: &str = "<body style='margin:0'>";
+
+    #[test]
+    fn text_and_backgrounds_are_clipped() {
+        let r = render(&format!(
+            "{BODY}<div style='height:20px;overflow:hidden'>one<br>two<br>three<br>four</div>"
+        ));
+        let lowest = r
+            .list
+            .iter()
+            .filter_map(|c| match c {
+                DisplayCommand::Glyphs { glyphs, .. } => glyphs.iter().map(|g| g.y).reduce(f32::max),
+                _ => None,
+            })
+            .fold(0.0, f32::max);
+        assert!(lowest < 20.0, "no glyph starts below the box: {lowest}");
+        let r = render(&format!(
+            "{BODY}<div style='height:10px;overflow:hidden'><div style='height:100px;background-color:red'></div></div>"
+        ));
+        assert_eq!(red_rects(&r).iter().map(|r| r.h).collect::<Vec<_>>(), [10.0]);
+    }
+
+    #[test]
+    fn clipped_links_cant_be_clicked() {
+        let r = render(&format!(
+            "{BODY}<div style='height:0;overflow:hidden'><a href=/hidden>hidden</a></div><a href=/shown>shown</a>"
+        ));
+        let links: Vec<&str> = r.links.iter().map(|(_, l)| l.as_str()).collect();
+        assert_eq!(links, ["/shown"]);
+    }
+
+    #[test]
+    fn positioned_boxes_escape_as_in_css() {
+        let red = "width:10px;height:10px;background-color:red";
+        // Fixed always escapes.
+        let r = render(&format!(
+            "{BODY}<div style='height:10px;overflow:hidden'><div style='position:fixed;top:50px;{red}'></div></div>"
+        ));
+        assert_eq!(red_rects(&r).len(), 1);
+        // Absolute escapes a clipping box that isn't its containing block...
+        let r = render(&format!(
+            "{BODY}<div style='position:relative'><div style='height:10px;overflow:hidden'>\
+             <div style='position:absolute;top:30px;{red}'></div></div></div>"
+        ));
+        assert_eq!(red_rects(&r).len(), 1);
+        // ...but not one that is.
+        let r = render(&format!(
+            "{BODY}<div style='position:relative;height:10px;overflow:hidden'>\
+             <div style='position:absolute;top:30px;{red}'></div></div>"
+        ));
+        assert!(red_rects(&r).is_empty());
     }
 }

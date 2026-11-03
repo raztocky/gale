@@ -37,6 +37,19 @@ impl Rect {
     pub fn contains(&self, x: f32, y: f32) -> bool {
         x >= self.x && x < self.x + self.w && y >= self.y && y < self.y + self.h
     }
+    /// The overlap of two rectangles (zero-sized if they don't meet).
+    pub fn intersect(self, o: Rect) -> Rect {
+        let (x, y) = (self.x.max(o.x), self.y.max(o.y));
+        Rect {
+            x,
+            y,
+            w: ((self.x + self.w).min(o.x + o.w) - x).max(0.0),
+            h: ((self.y + self.h).min(o.y + o.h) - y).max(0.0),
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.w <= 0.0 || self.h <= 0.0
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1818,6 +1831,47 @@ impl<'a> LayoutBox<'a> {
         child.translate(fx - mb.x, fy - mb.y);
         floats.add(child.dims.margin_box(), side);
     }
+}
+
+/// A box's identity, for maps keyed by box.
+pub fn box_addr(b: &LayoutBox) -> usize {
+    b as *const LayoutBox as usize
+}
+
+/// What each box is clipped to by `overflow` on its ancestors, by
+/// [`box_addr`] (boxes that aren't clipped aren't listed). A box's own
+/// `overflow` clips what's inside it, not itself. Fixed boxes escape all
+/// clipping, and absolutely positioned ones escape the clipping of boxes
+/// outside their containing block, as in CSS.
+pub fn clip_map(root: &LayoutBox) -> HashMap<usize, Rect> {
+    fn walk(b: &LayoutBox, clip: Option<Rect>, abs_clip: Option<Rect>, out: &mut HashMap<usize, Rect>) {
+        let block = matches!(b.kind, BoxKind::Block(_));
+        let inner = if block && b.style().overflow_clip {
+            let p = b.dims.padding_box();
+            Some(clip.map_or(p, |c| c.intersect(p)))
+        } else {
+            clip
+        };
+        let inner_abs = if block && b.position() != Position::Static {
+            inner
+        } else {
+            abs_clip
+        };
+        for c in &b.children {
+            let (cc, cabs) = match c.position() {
+                Position::Fixed => (None, None),
+                Position::Absolute => (inner_abs, inner_abs),
+                _ => (inner, inner_abs),
+            };
+            if let Some(r) = cc {
+                out.insert(box_addr(c), r);
+            }
+            walk(c, cc, cabs, out);
+        }
+    }
+    let mut out = HashMap::new();
+    walk(root, None, None, &mut out);
+    out
 }
 
 /// Every box in the order it's painted, back to front (CSS 2.1 Appendix E,

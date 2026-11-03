@@ -1,0 +1,16 @@
+<!doctype html>
+<html><head><title>Overflow</title>
+<style>
+  body { font-family: sans-serif; }
+  .box { width: 220px; height: 70px; overflow: hidden; border: 2px solid #36c; background-color: #eef; padding: 6px; margin-bottom: 12px; }
+  .tall { background-color: #fcc; height: 200px; }
+  .wrap { position: relative; }
+</style></head>
+<body>
+<h1>Overflow</h1>
+<div class="box">This box is 70px tall with <code>overflow: hidden</code>. Its text goes on for several lines, but only what fits in the box is drawn, and the rest can't be clicked or copied.</div>
+<div class="box"><div class="tall">A child 200px tall, with a pink background clipped to the box.</div></div>
+<div class="box" style="height: 40px; white-space: nowrap">A single line that is much too long for the box, so it's cut off at the right edge.</div>
+<div class="wrap"><div class="box" style="height: 30px">Clipped box<div style="position: absolute; top: 40px; left: 240px; background-color: #ffd; border: 1px solid #aa6; padding: 4px">absolute, escapes (its containing block is outside the box)</div></div></div>
+<p style="margin-top: 50px">After.</p>
+</body></html>
