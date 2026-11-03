@@ -142,6 +142,10 @@ pub struct ComputedStyle {
     /// `overflow` other than `visible`, or `display: flow-root`: the box
     /// contains its floats and doesn't wrap around outside ones.
     pub contain_floats: bool,
+    /// `overflow` other than `visible`: a real browser clips the content to
+    /// the padding box. (Brickle doesn't clip painting yet, but text outside
+    /// isn't offered for copying.)
+    pub overflow_clip: bool,
     pub position: Position,
     /// `top`, `right`, `bottom`, `left`.
     pub inset: [Len; 4],
@@ -185,6 +189,7 @@ impl ComputedStyle {
             float: Float::None,
             clear: Clear::None,
             contain_floats: false,
+            overflow_clip: false,
             position: Position::Static,
             inset: [Len::Auto; 4],
             z_index: None,
@@ -807,6 +812,7 @@ fn compute(
             "overflow" | "overflow-x" | "overflow-y" => {
                 if matches!(kw, "hidden" | "auto" | "scroll" | "clip") {
                     s.contain_floats = true;
+                    s.overflow_clip = true;
                 }
             }
             "vertical-align" => {

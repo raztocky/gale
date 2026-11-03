@@ -84,8 +84,23 @@ fn spans(runs: &[TextRun], a: Pos, b: Pos) -> impl Iterator<Item = (&TextRun, us
         })
 }
 
+/// Can `c` go on the clipboard? Characters that are invisible but change
+/// what text means or how it shows are dropped, so pasted text is what you
+/// saw: control characters, direction overrides (which can make `exe.txt`
+/// show as `txt.exe`), zero-width spaces and joiners-that-aren't, soft
+/// hyphens, and Unicode tag characters (used to hide text in plain sight).
+/// Zero-width (non-)joiners stay: emoji and some scripts need them.
+fn copyable(c: char) -> bool {
+    !matches!(c,
+        '\u{0}'..='\u{8}' | '\u{b}'..='\u{1f}' | '\u{7f}'..='\u{9f}'
+        | '\u{ad}' | '\u{61c}' | '\u{180e}'
+        | '\u{200b}' | '\u{200e}' | '\u{200f}'
+        | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{2069}'
+        | '\u{feff}' | '\u{fff9}'..='\u{fffb}' | '\u{e0000}'..='\u{e007f}')
+}
+
 /// The selected text, with a newline wherever the selection moves to a new
-/// line, and no spaces at the ends of lines.
+/// line, no spaces at the ends of lines, and no invisible characters.
 pub fn text(runs: &[TextRun], a: Pos, b: Pos) -> String {
     let mut out = String::new();
     let mut prev: Option<&Rect> = None;
@@ -95,7 +110,7 @@ pub fn text(runs: &[TextRun], a: Pos, b: Pos) -> String {
             out.push('\n');
         }
         prev = Some(&r.rect);
-        out.extend(r.text.chars().skip(from).take(to - from));
+        out.extend(r.text.chars().skip(from).take(to - from).filter(|c| copyable(*c)));
     }
     out.trim_end().to_string()
 }
@@ -226,6 +241,16 @@ mod tests {
         assert_eq!(word(&r, (1, 1)), Some(((0, 0), (1, 3))));
         assert_eq!(word(&r, (3, 0)), Some(((3, 0), (3, 3))));
         assert_eq!(all(&r), Some(((0, 0), (3, 3))));
+    }
+
+    #[test]
+    fn invisible_characters_are_not_copied() {
+        // A direction override, a zero-width space, a soft hyphen, an escape
+        // and tag characters spelling "hi"; a zero-width joiner stays.
+        let t = "a\u{202e}b\u{200b}c\u{ad}d\u{1b}e\u{e0068}\u{e0069}f\u{200d}g\tz";
+        let r = runs(&[(t, 0.0, 0)]);
+        let n = t.chars().count();
+        assert_eq!(text(&r, (0, 0), (0, n)), "abcdef\u{200d}g\tz");
     }
 
     #[test]

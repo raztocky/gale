@@ -3,10 +3,10 @@
 use crate::css::{self, Color, Stylesheet};
 use crate::dom::Node;
 use crate::image::{self, Decoded};
-use crate::layout::{self, BoxKind, LayoutBox, Rect};
+use crate::layout::{self, BoxKind, LayoutBox, Rect, TextFrag};
 use crate::paint::{self, DisplayList};
 use crate::select::TextRun;
-use crate::style::{self, StyleContext};
+use crate::style::{self, Float, Position, StyleContext};
 use crate::{font, html, net};
 
 use crate::forms::{self, Activation, Submission};
@@ -583,7 +583,22 @@ impl Page {
         }
         *self.hits.borrow_mut() = hits;
         let mut texts = Vec::new();
-        collect_text(&root, &mut texts, &mut 0);
+        // Text pushed off the left, top or right is hidden; the page scrolls
+        // down, so nothing below it is.
+        let page = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: width,
+            h: f32::MAX / 4.0,
+        };
+        collect_text(
+            &root,
+            &Seen::new(&order, page),
+            background,
+            None,
+            &mut texts,
+            &mut 0,
+        );
         let mb = root.dims.margin_box();
         Rendered {
             list,
@@ -600,18 +615,154 @@ impl Page {
 /// can't be selected.
 pub const MAX_TEXT_CHARS: usize = 2_000_000;
 
+/// What decides whether a piece of text can be seen. Text a page hides
+/// from you (transparent, the colour of what's behind it, tiny, off the
+/// page, clipped away, or covered by something opaque) isn't offered for
+/// selecting and copying, so what you copy is what you saw.
+struct Seen {
+    /// The page: text entirely outside it is hidden.
+    page: Rect,
+    /// Each box's position in paint order, by address.
+    order: HashMap<usize, usize>,
+    /// Opaque floats and positioned boxes, with their paint-order position,
+    /// which hide text painted before them.
+    covers: Vec<(Rect, usize)>,
+    /// `covers` indices by 256px band of the page.
+    bands: HashMap<i64, Vec<usize>>,
+}
+
+/// Most covering boxes, and band entries, considered per page.
+const MAX_COVERS: usize = 512;
+const MAX_BAND_ENTRIES: usize = 64 * 1024;
+const BAND: f32 = 256.0;
+
+impl Seen {
+    fn new(order: &[&LayoutBox], page: Rect) -> Seen {
+        let mut covers = Vec::new();
+        for (i, b) in order.iter().enumerate() {
+            let s = b.style();
+            let on_top = s.position != Position::Static || s.float != Float::None;
+            if matches!(b.kind, BoxKind::Block(_))
+                && on_top
+                && s.background.a == 255
+                && covers.len() < MAX_COVERS
+            {
+                covers.push((b.dims.border_box(), i));
+            }
+        }
+        let mut bands: HashMap<i64, Vec<usize>> = HashMap::new();
+        let mut entries = 0;
+        for (k, (r, _)) in covers.iter().enumerate() {
+            let (top, bottom) = ((r.y / BAND).floor() as i64, ((r.y + r.h) / BAND).floor() as i64);
+            for band in top..=bottom {
+                if entries >= MAX_BAND_ENTRIES {
+                    break;
+                }
+                bands.entry(band).or_default().push(k);
+                entries += 1;
+            }
+        }
+        Seen {
+            page,
+            order: order.iter().enumerate().map(|(i, b)| (addr(b), i)).collect(),
+            covers,
+            bands,
+        }
+    }
+
+    /// Is `f`, at `rect` in a box painted `painted`-th, hidden from view?
+    fn hidden(&self, f: &TextFrag, rect: Rect, under: Color, clip: Option<Rect>, painted: usize) -> bool {
+        let s = &f.style;
+        let faint = s.color.a < 26;
+        let camouflaged = [(s.color.r, under.r), (s.color.g, under.g), (s.color.b, under.b)]
+            .iter()
+            .all(|(a, b)| a.abs_diff(*b) <= 8);
+        let (cx, cy) = (rect.x + rect.w / 2.0, rect.y + rect.h / 2.0);
+        let off_page = !overlaps(rect, self.page);
+        let clipped = clip.is_some_and(|c| !c.contains(cx, cy));
+        let covered = || {
+            let band = (rect.y / BAND).floor() as i64;
+            self.bands.get(&band).is_some_and(|ks| {
+                ks.iter().any(|&k| {
+                    let (r, i) = self.covers[k];
+                    i > painted && contains(r, rect)
+                })
+            })
+        };
+        s.font_size < 4.0 || rect.w <= 0.0 || faint || camouflaged || off_page || clipped || covered()
+    }
+}
+
+fn addr(b: &LayoutBox) -> usize {
+    b as *const LayoutBox as usize
+}
+
+fn overlaps(a: Rect, b: Rect) -> bool {
+    a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
+}
+
+fn contains(outer: Rect, inner: Rect) -> bool {
+    inner.x >= outer.x
+        && inner.y >= outer.y
+        && inner.x + inner.w <= outer.x + outer.w
+        && inner.y + inner.h <= outer.y + outer.h
+}
+
+fn intersect(a: Rect, b: Rect) -> Rect {
+    let (x, y) = (a.x.max(b.x), a.y.max(b.y));
+    Rect {
+        x,
+        y,
+        w: ((a.x + a.w).min(b.x + b.w) - x).max(0.0),
+        h: ((a.y + a.h).min(b.y + b.h) - y).max(0.0),
+    }
+}
+
 /// The visible text under `b`, in tree (reading) order, with where each
-/// character ends. `chars` counts what's been collected so far.
-fn collect_text(b: &LayoutBox, out: &mut Vec<TextRun>, chars: &mut usize) {
+/// character ends. `under` is the background behind it, `clip` what an
+/// `overflow` ancestor would clip it to, and `chars` counts what's been
+/// collected so far.
+fn collect_text(
+    b: &LayoutBox,
+    seen: &Seen,
+    mut under: Color,
+    mut clip: Option<Rect>,
+    out: &mut Vec<TextRun>,
+    chars: &mut usize,
+) {
+    if let BoxKind::Block(_) = b.kind {
+        let s = b.style();
+        if s.background.a == 255 {
+            under = s.background;
+        }
+        if s.position == Position::Fixed {
+            clip = None;
+        }
+        if s.overflow_clip {
+            let p = b.dims.padding_box();
+            clip = Some(clip.map_or(p, |c| intersect(c, p)));
+        }
+    }
     if let BoxKind::Anonymous { frags, .. } = &b.kind {
+        let painted = seen.order.get(&addr(b)).copied().unwrap_or(0);
         for f in frags.iter().filter(|f| f.style.visible && !f.text.is_empty()) {
+            let fi = font::index(&f.style);
+            let (a, d) = font::vmetrics(fi, f.style.font_size);
+            let rect = Rect {
+                x: f.x,
+                y: f.baseline - a,
+                w: f.w,
+                h: a + d,
+            };
+            let behind = if f.bg.a > 0 { f.bg } else { under };
+            if seen.hidden(f, rect, behind, clip, painted) {
+                continue;
+            }
             let n = f.text.chars().count();
             if *chars + n > MAX_TEXT_CHARS {
                 return;
             }
             *chars += n;
-            let fi = font::index(&f.style);
-            let (a, d) = font::vmetrics(fi, f.style.font_size);
             let mut x = 0.0;
             let mut offsets = Vec::with_capacity(n + 1);
             offsets.push(0.0);
@@ -621,19 +772,14 @@ fn collect_text(b: &LayoutBox, out: &mut Vec<TextRun>, chars: &mut usize) {
                 offsets.push(x);
             }
             out.push(TextRun {
-                rect: Rect {
-                    x: f.x,
-                    y: f.baseline - a,
-                    w: f.w,
-                    h: a + d,
-                },
+                rect,
                 text: f.text.clone(),
                 offsets,
             });
         }
     }
     for c in &b.children {
-        collect_text(c, out, chars);
+        collect_text(c, seen, under, clip, out, chars);
     }
 }
 
@@ -1045,6 +1191,57 @@ mod text_tests {
         for t in &r.texts {
             assert_eq!(t.offsets.len(), t.text.chars().count() + 1);
             assert!((t.offsets.last().unwrap() - t.rect.w).abs() < 0.01, "{t:?}");
+        }
+    }
+
+    /// Everything select-all would copy.
+    fn copied(html: &str) -> String {
+        let r = render(html);
+        let (a, b) = select::all(&r.texts).unwrap();
+        select::text(&r.texts, a, b)
+    }
+
+    #[test]
+    fn hidden_text_is_not_copied() {
+        let tricks = [
+            "<span style='color:transparent'>EVIL</span>",
+            "<span style='color:white'>EVIL</span>",
+            "<span style='color:#fdfdfd'>EVIL</span>",
+            "<div style='background-color:#123456;color:#123457'>EVIL</div>",
+            "<span style='background-color:black;color:black'>EVIL</span>",
+            "<span style='font-size:0'>EVIL</span>",
+            "<span style='font-size:2px'>EVIL</span>",
+            "<div style='position:absolute;left:-9999px'>EVIL</div>",
+            "<div style='position:absolute;top:-500px'>EVIL</div>",
+            "<div style='height:0;overflow:hidden'><p>EVIL</p></div>",
+            "<div style='width:10px;overflow:hidden;white-space:nowrap'>ok EVIL EVIL EVIL</div>",
+            "<div style='position:relative'><p style='margin:0'>EVIL</p>\
+             <div style='position:absolute;top:0;left:0;width:300px;height:24px;background-color:white'></div></div>",
+        ];
+        for t in tricks {
+            let text = copied(&format!("<p>SAFE start</p>{t}<p>SAFE end</p>"));
+            assert!(!text.contains("EVIL"), "{t}: copied {text:?}");
+            assert!(
+                text.contains("SAFE start") && text.contains("SAFE end"),
+                "{t}: copied {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn visible_text_is_still_copied() {
+        for t in [
+            "<span style='color:#999'>SHOWN</span>",
+            "<span style='background-color:black;color:white'>SHOWN</span>",
+            "<div style='position:absolute;top:200px;left:20px'>SHOWN</div>",
+            "<div style='height:20px;overflow:hidden'>SHOWN</div>",
+            // A box drawn under the text (earlier in paint order) hides nothing.
+            "<div style='position:relative'><div style='position:absolute;top:0;width:300px;height:50px;background-color:#eee'></div>\
+             <p style='position:relative'>SHOWN</p></div>",
+        ] {
+            let r = render(t);
+            assert!(!r.texts.is_empty(), "{t}: no text at all");
+            assert!(copied(t).contains("SHOWN"), "{t}: copied {:?}", copied(t));
         }
     }
 

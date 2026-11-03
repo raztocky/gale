@@ -183,6 +183,16 @@ the clipboard only when you press `Ctrl+C` (to copy the address). Only the brows
 reach the clipboard; sandboxed pages can't, and scripts have no clipboard API
 (`navigator.clipboard` is missing and `document.execCommand` does nothing).
 
+What you copy from a page is what you saw. Text a page hides from you isn't selectable: text
+that's transparent or the colour of what's behind it, smaller than 4px, pushed off the page, clipped
+away by an `overflow` box, or covered by something opaque painted over it. Copied text also loses
+invisible characters that change what it means or how it shows: control characters, direction
+overrides, zero-width spaces, soft hyphens and Unicode tag characters. So a command you copy
+can't carry a hidden `; curl … | sh`.
+
+*Enforced by:* `hidden_text_is_not_copied` in `src/page.rs` and `invisible_characters_are_not_copied`
+in `src/select.rs`.
+
 ## What Brickle does store
 
 - `~/.config/brickle/rules.txt`: the block and allow rules you make in the request panel.
