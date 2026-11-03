@@ -86,9 +86,24 @@ pub struct Color {
 }
 
 impl Color {
-    pub const BLACK: Color = Color { r: 0, g: 0, b: 0, a: 255 };
-    pub const WHITE: Color = Color { r: 255, g: 255, b: 255, a: 255 };
-    pub const TRANSPARENT: Color = Color { r: 0, g: 0, b: 0, a: 0 };
+    pub const BLACK: Color = Color {
+        r: 0,
+        g: 0,
+        b: 0,
+        a: 255,
+    };
+    pub const WHITE: Color = Color {
+        r: 255,
+        g: 255,
+        b: 255,
+        a: 255,
+    };
+    pub const TRANSPARENT: Color = Color {
+        r: 0,
+        g: 0,
+        b: 0,
+        a: 0,
+    };
     pub const fn rgb(r: u8, g: u8, b: u8) -> Color {
         Color { r, g, b, a: 255 }
     }
@@ -103,14 +118,20 @@ pub const MAX_RULES: usize = 5_000;
 
 pub fn parse(source: &str) -> Stylesheet {
     let src = strip_comments(source);
-    let mut p = Parser { chars: src.chars().collect(), pos: 0 };
+    let mut p = Parser {
+        chars: src.chars().collect(),
+        pos: 0,
+    };
     Stylesheet { rules: p.rules(0) }
 }
 
 /// Parse the contents of a `style="..."` attribute.
 pub fn parse_inline(source: &str) -> Vec<Declaration> {
     let src = strip_comments(source);
-    let mut p = Parser { chars: src.chars().collect(), pos: 0 };
+    let mut p = Parser {
+        chars: src.chars().collect(),
+        pos: 0,
+    };
     p.declarations()
 }
 
@@ -165,6 +186,8 @@ impl Parser {
             }
             self.pos += 1;
         }
+        // An escape at the very end can step past the input (found by fuzzing).
+        self.pos = self.pos.min(self.chars.len());
         self.chars[start..self.pos].iter().collect()
     }
     /// Skip a `{ ... }` block including nested blocks.
@@ -225,10 +248,12 @@ impl Parser {
                     if self.peek() == Some('}') {
                         self.pos += 1;
                     }
-                    let selectors: Vec<Selector> =
-                        prelude.split(',').filter_map(parse_selector).collect();
+                    let selectors: Vec<Selector> = prelude.split(',').filter_map(parse_selector).collect();
                     if !selectors.is_empty() && !declarations.is_empty() && rules.len() < MAX_RULES {
-                        rules.push(Rule { selectors, declarations });
+                        rules.push(Rule {
+                            selectors,
+                            declarations,
+                        });
                     }
                 }
             }
@@ -258,7 +283,11 @@ impl Parser {
                     value = value[..i].trim();
                 }
                 if !name.is_empty() && !name.starts_with("--") {
-                    decls.push(Declaration { name, values: parse_values(value), important });
+                    decls.push(Declaration {
+                        name,
+                        values: parse_values(value),
+                        important,
+                    });
                 }
             }
         }
@@ -340,12 +369,10 @@ pub fn parse_selector(text: &str) -> Option<Selector> {
                     match name.as_str() {
                         "root" => s.root = true,
                         "link" | "any-link" => s.attrs.push("href".into()),
-                        "visited" | "hover" | "active" | "focus" | "focus-visible"
-                        | "focus-within" | "checked" | "disabled" | "target" | "first-child"
-                        | "last-child" | "nth-child" | "not" | "is" | "where" | "has"
-                        | "first-of-type" | "last-of-type" | "nth-of-type" | "empty" => {
-                            return None
-                        }
+                        "visited" | "hover" | "active" | "focus" | "focus-visible" | "focus-within"
+                        | "checked" | "disabled" | "target" | "first-child" | "last-child" | "nth-child"
+                        | "not" | "is" | "where" | "has" | "first-of-type" | "last-of-type"
+                        | "nth-of-type" | "empty" => return None,
                         _ => return None,
                     }
                 }
@@ -441,7 +468,10 @@ fn parse_value_token(tok: &str) -> Option<Value> {
             })
             .collect();
         if nums.len() >= 3 {
-            let a = nums.get(3).map(|a| if *a <= 1.0 { a * 255.0 } else { *a }).unwrap_or(255.0);
+            let a = nums
+                .get(3)
+                .map(|a| if *a <= 1.0 { a * 255.0 } else { *a })
+                .unwrap_or(255.0);
             return Some(Value::Color(Color {
                 r: nums[0].clamp(0.0, 255.0) as u8,
                 g: nums[1].clamp(0.0, 255.0) as u8,
@@ -484,6 +514,10 @@ fn parse_value_token(tok: &str) -> Option<Value> {
 }
 
 fn parse_hex(hex: &str) -> Option<Color> {
+    // Byte-slicing below assumes ASCII (found by fuzzing).
+    if !hex.is_ascii() {
+        return None;
+    }
     let d = |s: &str| u8::from_str_radix(s, 16).ok();
     let dup = |c: char| d(&format!("{c}{c}"));
     let cs: Vec<char> = hex.chars().collect();
@@ -575,7 +609,10 @@ mod tests {
         assert_eq!(r.selectors.len(), 2);
         assert_eq!(r.selectors[1].specificity(), (1, 1, 1));
         assert_eq!(r.selectors[1].parts[0].1, Combinator::Child);
-        assert_eq!(r.declarations[0].values, vec![Value::Color(Color::rgb(255, 0, 0))]);
+        assert_eq!(
+            r.declarations[0].values,
+            vec![Value::Color(Color::rgb(255, 0, 0))]
+        );
         assert!(r.declarations[1].important);
     }
 
@@ -587,10 +624,29 @@ mod tests {
     }
 
     #[test]
+    fn non_ascii_hex_color() {
+        // Found by fuzzing: used to slice through a multi-byte character.
+        assert_eq!(parse_values("#ab\u{cd}d\u{e2}"), vec![]);
+        parse("p { color: #f\u{fffd}0 }");
+    }
+
+    #[test]
+    fn escape_at_end_of_input() {
+        // Found by fuzzing: a trailing backslash inside a string overran.
+        parse("a { content: \"x\\");
+        parse_inline("x: 'a\\");
+    }
+
+    #[test]
     fn rgb_functions() {
         assert_eq!(
             parse_values("rgba(10, 20, 30, 0.5)"),
-            vec![Value::Color(Color { r: 10, g: 20, b: 30, a: 127 })]
+            vec![Value::Color(Color {
+                r: 10,
+                g: 20,
+                b: 30,
+                a: 127
+            })]
         );
     }
 }

@@ -20,7 +20,12 @@ pub struct Rect {
 
 impl Rect {
     pub fn expand(self, e: Edges) -> Rect {
-        Rect { x: self.x - e.l, y: self.y - e.t, w: self.w + e.l + e.r, h: self.h + e.t + e.b }
+        Rect {
+            x: self.x - e.l,
+            y: self.y - e.t,
+            w: self.w + e.l + e.r,
+            h: self.h + e.t + e.b,
+        }
     }
     pub fn contains(&self, x: f32, y: f32) -> bool {
         x >= self.x && x < self.x + self.w && y >= self.y && y < self.y + self.h
@@ -68,7 +73,12 @@ pub struct TextFrag {
 
 #[derive(Debug, Clone)]
 pub enum InlineItem {
-    Text { text: String, style: Rc<ComputedStyle>, bg: Color, link: Option<String> },
+    Text {
+        text: String,
+        style: Rc<ComputedStyle>,
+        bg: Color,
+        link: Option<String>,
+    },
     Break(Rc<ComputedStyle>),
     /// Index into the anonymous box's `children` (an inline-block).
     Atomic(usize),
@@ -77,7 +87,11 @@ pub enum InlineItem {
 pub enum BoxKind<'a> {
     Block(&'a StyledNode<'a>),
     /// An anonymous block holding an inline formatting context.
-    Anonymous { items: Vec<InlineItem>, frags: Vec<TextFrag>, style: Rc<ComputedStyle> },
+    Anonymous {
+        items: Vec<InlineItem>,
+        frags: Vec<TextFrag>,
+        style: Rc<ComputedStyle>,
+    },
 }
 
 pub struct LayoutBox<'a> {
@@ -90,7 +104,13 @@ pub struct LayoutBox<'a> {
 
 impl<'a> LayoutBox<'a> {
     fn new(kind: BoxKind<'a>) -> Self {
-        LayoutBox { dims: Dimensions::default(), kind, children: Vec::new(), marker: None, link: None }
+        LayoutBox {
+            dims: Dimensions::default(),
+            kind,
+            children: Vec::new(),
+            marker: None,
+            link: None,
+        }
     }
 
     pub fn style(&self) -> &ComputedStyle {
@@ -202,12 +222,7 @@ fn is_collapsible_ws(s: &str) -> bool {
     s.chars().all(|c| c.is_ascii_whitespace())
 }
 
-fn flatten_inline<'a>(
-    node: &'a StyledNode<'a>,
-    anon: &mut LayoutBox<'a>,
-    bg: Color,
-    link: Option<String>,
-) {
+fn flatten_inline<'a>(node: &'a StyledNode<'a>, anon: &mut LayoutBox<'a>, bg: Color, link: Option<String>) {
     let push = |anon: &mut LayoutBox<'a>, item: InlineItem| {
         if let BoxKind::Anonymous { items, .. } = &mut anon.kind {
             items.push(item);
@@ -215,7 +230,15 @@ fn flatten_inline<'a>(
     };
     match &node.node.node_type {
         NodeType::Text(t) => {
-            push(anon, InlineItem::Text { text: t.clone(), style: node.style.clone(), bg, link });
+            push(
+                anon,
+                InlineItem::Text {
+                    text: t.clone(),
+                    style: node.style.clone(),
+                    bg,
+                    link,
+                },
+            );
         }
         NodeType::Element(e) => {
             if node.display() == Display::None {
@@ -250,7 +273,11 @@ fn flatten_inline<'a>(
                 push(anon, InlineItem::Atomic(idx));
                 return;
             }
-            let bg = if node.style.background.a > 0 { node.style.background } else { bg };
+            let bg = if node.style.background.a > 0 {
+                node.style.background
+            } else {
+                bg
+            };
             for c in &node.children {
                 let l = child_link(c, &link);
                 match c.display() {
@@ -285,7 +312,12 @@ impl<'a> LayoutBox<'a> {
         match self.kind {
             BoxKind::Block(_) => self.layout_block(cb_x, cb_w, y, None),
             BoxKind::Anonymous { .. } => {
-                self.dims.content = Rect { x: cb_x, y, w: cb_w, h: 0.0 };
+                self.dims.content = Rect {
+                    x: cb_x,
+                    y,
+                    w: cb_w,
+                    h: 0.0,
+                };
                 self.layout_inline();
             }
         }
@@ -294,8 +326,18 @@ impl<'a> LayoutBox<'a> {
     fn edges(&mut self, cb_w: f32) {
         let s = self.style().clone();
         let r = |l: Len| l.or_zero(cb_w);
-        self.dims.padding = Edges { t: r(s.padding[0]), r: r(s.padding[1]), b: r(s.padding[2]), l: r(s.padding[3]) };
-        self.dims.border = Edges { t: s.border_width[0], r: s.border_width[1], b: s.border_width[2], l: s.border_width[3] };
+        self.dims.padding = Edges {
+            t: r(s.padding[0]),
+            r: r(s.padding[1]),
+            b: r(s.padding[2]),
+            l: r(s.padding[3]),
+        };
+        self.dims.border = Edges {
+            t: s.border_width[0],
+            r: s.border_width[1],
+            b: s.border_width[2],
+            l: s.border_width[3],
+        };
         self.dims.margin.t = r(s.margin[0]);
         self.dims.margin.b = r(s.margin[2]);
     }
@@ -376,7 +418,11 @@ impl<'a> LayoutBox<'a> {
             let collapse = prev_mb.min(mt).max(0.0);
             child.layout(content.x, content.w, cursor - collapse);
             cursor = child.dims.margin_box().y + child.dims.margin_box().h;
-            prev_mb = if matches!(child.kind, BoxKind::Block(_)) { child.dims.margin.b } else { 0.0 };
+            prev_mb = if matches!(child.kind, BoxKind::Block(_)) {
+                child.dims.margin.b
+            } else {
+                0.0
+            };
         }
         self.dims.content.h = cursor - content.y;
     }
@@ -389,9 +435,17 @@ impl<'a> LayoutBox<'a> {
             return;
         }
         let avail = content.w - gap * (n.saturating_sub(1)) as f32;
-        let prefs: Vec<f32> = self.children.iter().map(|c| c.max_content_width(content.w)).collect();
+        let prefs: Vec<f32> = self
+            .children
+            .iter()
+            .map(|c| c.max_content_width(content.w))
+            .collect();
         let total: f32 = prefs.iter().sum();
-        let scale = if total > avail && total > 0.0 { avail / total } else { 1.0 };
+        let scale = if total > avail && total > 0.0 {
+            avail / total
+        } else {
+            1.0
+        };
         let mut x = content.x;
         let mut h = 0.0f32;
         for (child, pref) in self.children.iter_mut().zip(prefs) {
@@ -399,7 +453,12 @@ impl<'a> LayoutBox<'a> {
             match child.kind {
                 BoxKind::Block(_) => child.layout_block(x, w, content.y, Some(w)),
                 _ => {
-                    child.dims.content = Rect { x, y: content.y, w, h: 0.0 };
+                    child.dims.content = Rect {
+                        x,
+                        y: content.y,
+                        w,
+                        h: 0.0,
+                    };
                     child.layout_inline();
                 }
             }
@@ -415,9 +474,7 @@ impl<'a> LayoutBox<'a> {
         let s = self.style();
         let edges = |l: &[Len; 4]| l[1].or_zero(cb_w) + l[3].or_zero(cb_w);
         let hz = match self.kind {
-            BoxKind::Block(_) => {
-                edges(&s.padding) + edges(&s.margin) + s.border_width[1] + s.border_width[3]
-            }
+            BoxKind::Block(_) => edges(&s.padding) + edges(&s.margin) + s.border_width[1] + s.border_width[3],
             _ => 0.0,
         };
         if let (BoxKind::Block(_), Some(w)) = (&self.kind, s.width.resolve(cb_w)) {
@@ -435,7 +492,11 @@ impl<'a> LayoutBox<'a> {
                             } else {
                                 text.split_ascii_whitespace().collect::<Vec<_>>().join(" ")
                             };
-                            let txt = if style.uppercase { collapsed.to_uppercase() } else { collapsed };
+                            let txt = if style.uppercase {
+                                collapsed.to_uppercase()
+                            } else {
+                                collapsed
+                            };
                             let f = font::index(style);
                             for (i, part) in txt.split('\n').enumerate() {
                                 if i > 0 {
@@ -497,8 +558,19 @@ impl<'a> LayoutBox<'a> {
         }
 
         enum Piece {
-            Word { text: String, style: Rc<ComputedStyle>, bg: Color, link: Option<String>, w: f32 },
-            Space { style: Rc<ComputedStyle>, bg: Color, link: Option<String>, w: f32 },
+            Word {
+                text: String,
+                style: Rc<ComputedStyle>,
+                bg: Color,
+                link: Option<String>,
+                w: f32,
+            },
+            Space {
+                style: Rc<ComputedStyle>,
+                bg: Color,
+                link: Option<String>,
+                w: f32,
+            },
             Break(Rc<ComputedStyle>),
             Atomic(usize, f32),
         }
@@ -506,9 +578,18 @@ impl<'a> LayoutBox<'a> {
         let mut last_space = true;
         for item in &items {
             match item {
-                InlineItem::Text { text, style, bg, link } => {
+                InlineItem::Text {
+                    text,
+                    style,
+                    bg,
+                    link,
+                } => {
                     let f = font::index(style);
-                    let text = if style.uppercase { text.to_uppercase() } else { text.clone() };
+                    let text = if style.uppercase {
+                        text.to_uppercase()
+                    } else {
+                        text.clone()
+                    };
                     let mk_word = |t: &str| Piece::Word {
                         text: t.to_string(),
                         style: style.clone(),
@@ -585,33 +666,56 @@ impl<'a> LayoutBox<'a> {
         let mut lines: Vec<(Vec<Placed>, f32, Option<Rc<ComputedStyle>>)> = Vec::new();
         let mut cur: Vec<Placed> = Vec::new();
         let mut x = 0.0f32;
-        let finish = |cur: &mut Vec<Placed>, x: &mut f32, lines: &mut Vec<_>, br: Option<Rc<ComputedStyle>>| {
-            // Drop trailing spaces.
-            while let Some(Placed::Text(t)) = cur.last() {
-                if t.text == " " {
-                    *x -= t.w;
-                    cur.pop();
-                } else {
-                    break;
+        let finish =
+            |cur: &mut Vec<Placed>, x: &mut f32, lines: &mut Vec<_>, br: Option<Rc<ComputedStyle>>| {
+                // Drop trailing spaces.
+                while let Some(Placed::Text(t)) = cur.last() {
+                    if t.text == " " {
+                        *x -= t.w;
+                        cur.pop();
+                    } else {
+                        break;
+                    }
                 }
-            }
-            lines.push((std::mem::take(cur), *x, br));
-            *x = 0.0;
-        };
+                lines.push((std::mem::take(cur), *x, br));
+                *x = 0.0;
+            };
         for p in pieces {
             match p {
-                Piece::Word { text, style, bg, link, w } => {
+                Piece::Word {
+                    text,
+                    style,
+                    bg,
+                    link,
+                    w,
+                } => {
                     if x + w > avail && !cur.is_empty() && !(style.pre && style.nowrap) {
                         finish(&mut cur, &mut x, &mut lines, None);
                     }
-                    cur.push(Placed::Text(TextFrag { x, baseline: 0.0, w, text, style, bg, link }));
+                    cur.push(Placed::Text(TextFrag {
+                        x,
+                        baseline: 0.0,
+                        w,
+                        text,
+                        style,
+                        bg,
+                        link,
+                    }));
                     x += w;
                 }
                 Piece::Space { style, bg, link, w } => {
                     if cur.is_empty() {
                         continue;
                     }
-                    cur.push(Placed::Text(TextFrag { x, baseline: 0.0, w, text: " ".into(), style, bg, link }));
+                    cur.push(Placed::Text(TextFrag {
+                        x,
+                        baseline: 0.0,
+                        w,
+                        text: " ".into(),
+                        style,
+                        bg,
+                        link,
+                    }));
                     x += w;
                 }
                 Piece::Break(s) => finish(&mut cur, &mut x, &mut lines, Some(s)),

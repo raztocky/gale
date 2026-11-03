@@ -7,15 +7,38 @@
 use crate::dom::{self, AttrMap, Node};
 
 const VOID: &[&str] = &[
-    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
-    "track", "wbr",
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track",
+    "wbr",
 ];
 const RAW_TEXT: &[&str] = &["script", "style", "textarea", "title"];
 /// Opening one of these closes an open <p>.
 const CLOSES_P: &[&str] = &[
-    "address", "article", "aside", "blockquote", "div", "dl", "fieldset", "figure", "footer",
-    "form", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr", "main", "nav", "ol", "p", "pre",
-    "section", "table", "ul",
+    "address",
+    "article",
+    "aside",
+    "blockquote",
+    "div",
+    "dl",
+    "fieldset",
+    "figure",
+    "footer",
+    "form",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "header",
+    "hr",
+    "main",
+    "nav",
+    "ol",
+    "p",
+    "pre",
+    "section",
+    "table",
+    "ul",
 ];
 
 /// Deepest element nesting we build. Deeper start tags are ignored (their
@@ -26,8 +49,15 @@ pub const MAX_DEPTH: usize = 256;
 pub const MAX_NODES: usize = 100_000;
 
 pub fn parse(source: &str) -> Node {
-    let tokens = Tokenizer { chars: source.chars().collect(), pos: 0 }.run();
-    let mut b = TreeBuilder { stack: vec![dom::elem("#document".into(), AttrMap::new(), vec![])], nodes: 0 };
+    let tokens = Tokenizer {
+        chars: source.chars().collect(),
+        pos: 0,
+    }
+    .run();
+    let mut b = TreeBuilder {
+        stack: vec![dom::elem("#document".into(), AttrMap::new(), vec![])],
+        nodes: 0,
+    };
     for t in tokens {
         b.feed(t);
     }
@@ -36,7 +66,11 @@ pub fn parse(source: &str) -> Node {
 
 #[derive(Debug)]
 enum Token {
-    Start { name: String, attrs: AttrMap, self_closing: bool },
+    Start {
+        name: String,
+        attrs: AttrMap,
+        self_closing: bool,
+    },
     End(String),
     Text(String),
 }
@@ -51,12 +85,14 @@ impl Tokenizer {
         self.chars.get(self.pos).copied()
     }
     fn starts_with(&self, s: &str) -> bool {
-        s.chars().enumerate().all(|(i, c)| self.chars.get(self.pos + i) == Some(&c))
+        s.chars()
+            .enumerate()
+            .all(|(i, c)| self.chars.get(self.pos + i) == Some(&c))
     }
     fn starts_with_ci(&self, s: &str) -> bool {
-        s.chars().enumerate().all(|(i, c)| {
-            self.chars.get(self.pos + i).map(|x| x.to_ascii_lowercase()) == Some(c)
-        })
+        s.chars()
+            .enumerate()
+            .all(|(i, c)| self.chars.get(self.pos + i).map(|x| x.to_ascii_lowercase()) == Some(c))
     }
     fn eat_while(&mut self, f: impl Fn(char) -> bool) -> String {
         let start = self.pos;
@@ -94,7 +130,12 @@ impl Tokenizer {
                         out.push(Token::Text(decode_entities(&std::mem::take(&mut text))));
                     }
                     let tok = self.tag();
-                    if let Token::Start { name, self_closing: false, .. } = &tok {
+                    if let Token::Start {
+                        name,
+                        self_closing: false,
+                        ..
+                    } = &tok
+                    {
                         if RAW_TEXT.contains(&name.as_str()) {
                             let name = name.clone();
                             out.push(tok);
@@ -170,7 +211,10 @@ impl Tokenizer {
                             Some(q @ ('"' | '\'')) => {
                                 self.pos += 1;
                                 let v = self.eat_while(|c| c != q);
-                                self.pos += 1;
+                                // The closing quote may be missing at end of input.
+                                if self.peek() == Some(q) {
+                                    self.pos += 1;
+                                }
                                 v
                             }
                             _ => self.eat_while(|c| !c.is_whitespace() && c != '>'),
@@ -183,7 +227,11 @@ impl Tokenizer {
         if closing {
             Token::End(name)
         } else {
-            Token::Start { name, attrs, self_closing }
+            Token::Start {
+                name,
+                attrs,
+                self_closing,
+            }
         }
     }
 }
@@ -231,8 +279,10 @@ impl TreeBuilder {
                         t = rest.to_string();
                     }
                 }
-                if let Some(Node { node_type: dom::NodeType::Text(prev), .. }) =
-                    parent.children.last_mut()
+                if let Some(Node {
+                    node_type: dom::NodeType::Text(prev),
+                    ..
+                }) = parent.children.last_mut()
                 {
                     prev.push_str(&t);
                 } else if self.nodes < MAX_NODES {
@@ -240,7 +290,11 @@ impl TreeBuilder {
                     parent.children.push(dom::text(t));
                 }
             }
-            Token::Start { name, attrs, self_closing } => {
+            Token::Start {
+                name,
+                attrs,
+                self_closing,
+            } => {
                 if self.nodes >= MAX_NODES {
                     return;
                 }
@@ -273,7 +327,10 @@ impl TreeBuilder {
                 }
                 if self.current_tag() == name {
                     self.pop();
-                } else if let Some(i) = self.stack.iter().rposition(|n| n.tag() == Some(&name)) {
+                } else if let Some(i) = self.stack.iter().skip(1).rposition(|n| n.tag() == Some(&name)) {
+                    // skip(1): never match the internal #document root (found
+                    // by fuzzing: `</#document>` looped forever).
+                    let i = i + 1;
                     while self.stack.len() > i {
                         self.pop();
                     }
@@ -316,9 +373,7 @@ fn normalize(doc: Node) -> Node {
             Some(t) if head_tags.contains(&t) && body.is_none() && loose_body.is_empty() => {
                 loose_head.push(c)
             }
-            None if body.is_none()
-                && loose_body.is_empty()
-                && c.text_content().trim().is_empty() => {}
+            None if body.is_none() && loose_body.is_empty() && c.text_content().trim().is_empty() => {}
             _ => loose_body.push(c),
         }
     }
@@ -447,8 +502,26 @@ mod tests {
     }
 
     #[test]
+    fn closing_the_document_root_terminates() {
+        // Found by fuzzing: this used to loop forever.
+        let doc = parse("<p>a</#document>b");
+        assert_eq!(doc.children[1].text_content(), "ab");
+    }
+
+    #[test]
+    fn unterminated_attribute_at_eof() {
+        // Found by fuzzing: used to index past the end of the input.
+        parse("<h oref=\".1>text");
+        parse("<a href='x");
+        parse("<p class=\"");
+    }
+
+    #[test]
     fn raw_text_script() {
         let doc = parse("<script>if (a < b) { x = '</p>'; }</script><p>hi");
-        assert_eq!(doc.children[0].children[0].text_content(), "if (a < b) { x = '</p>'; }");
+        assert_eq!(
+            doc.children[0].children[0].text_content(),
+            "if (a < b) { x = '</p>'; }"
+        );
     }
 }

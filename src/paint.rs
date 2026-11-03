@@ -5,10 +5,21 @@ use crate::font;
 use crate::layout::{BoxKind, LayoutBox, Rect};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DisplayCommand {
-    Rect { rect: Rect, color: Color },
-    Text { x: f32, baseline: f32, text: String, font: usize, size: f32, color: Color, italic: bool },
+    Rect {
+        rect: Rect,
+        color: Color,
+    },
+    Text {
+        x: f32,
+        baseline: f32,
+        text: String,
+        font: usize,
+        size: f32,
+        color: Color,
+        italic: bool,
+    },
 }
 
 pub type DisplayList = Vec<DisplayCommand>;
@@ -24,19 +35,45 @@ fn render_box(list: &mut DisplayList, b: &LayoutBox) {
     if let BoxKind::Block(_) = b.kind {
         let bb = b.dims.border_box();
         if s.background.a > 0 {
-            list.push(DisplayCommand::Rect { rect: bb, color: s.background });
+            list.push(DisplayCommand::Rect {
+                rect: bb,
+                color: s.background,
+            });
         }
         let bw = s.border_width;
         let bc = s.border_color;
         let sides = [
-            Rect { x: bb.x, y: bb.y, w: bb.w, h: bw[0] },
-            Rect { x: bb.x + bb.w - bw[1], y: bb.y, w: bw[1], h: bb.h },
-            Rect { x: bb.x, y: bb.y + bb.h - bw[2], w: bb.w, h: bw[2] },
-            Rect { x: bb.x, y: bb.y, w: bw[3], h: bb.h },
+            Rect {
+                x: bb.x,
+                y: bb.y,
+                w: bb.w,
+                h: bw[0],
+            },
+            Rect {
+                x: bb.x + bb.w - bw[1],
+                y: bb.y,
+                w: bw[1],
+                h: bb.h,
+            },
+            Rect {
+                x: bb.x,
+                y: bb.y + bb.h - bw[2],
+                w: bb.w,
+                h: bw[2],
+            },
+            Rect {
+                x: bb.x,
+                y: bb.y,
+                w: bw[3],
+                h: bb.h,
+            },
         ];
         for (i, r) in sides.into_iter().enumerate() {
             if bw[i] > 0.0 && bc[i].a > 0 {
-                list.push(DisplayCommand::Rect { rect: r, color: bc[i] });
+                list.push(DisplayCommand::Rect {
+                    rect: r,
+                    color: bc[i],
+                });
             }
         }
         if let Some(m) = &b.marker {
@@ -65,7 +102,12 @@ fn render_box(list: &mut DisplayList, b: &LayoutBox) {
             let (a, d) = font::vmetrics(f, size);
             if t.bg.a > 0 {
                 list.push(DisplayCommand::Rect {
-                    rect: Rect { x: t.x, y: t.baseline - a, w: t.w, h: a + d },
+                    rect: Rect {
+                        x: t.x,
+                        y: t.baseline - a,
+                        w: t.w,
+                        h: a + d,
+                    },
                     color: t.bg,
                 });
             }
@@ -83,13 +125,23 @@ fn render_box(list: &mut DisplayList, b: &LayoutBox) {
             let thick = (size / 14.0).max(1.0);
             if t.style.underline {
                 list.push(DisplayCommand::Rect {
-                    rect: Rect { x: t.x, y: t.baseline + size * 0.1, w: t.w, h: thick },
+                    rect: Rect {
+                        x: t.x,
+                        y: t.baseline + size * 0.1,
+                        w: t.w,
+                        h: thick,
+                    },
                     color: t.style.color,
                 });
             }
             if t.style.strike {
                 list.push(DisplayCommand::Rect {
-                    rect: Rect { x: t.x, y: t.baseline - a * 0.35, w: t.w, h: thick },
+                    rect: Rect {
+                        x: t.x,
+                        y: t.baseline - a * 0.35,
+                        w: t.w,
+                        h: thick,
+                    },
                     color: t.style.color,
                 });
             }
@@ -120,17 +172,34 @@ const GLYPH_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 impl Canvas {
     pub fn new(width: usize, height: usize, bg: Color) -> Canvas {
-        Canvas { pixels: vec![pack(bg); width * height], width, height }
+        Canvas {
+            pixels: vec![pack(bg); width * height],
+            width,
+            height,
+        }
     }
 
     pub fn paint(&mut self, list: &DisplayList, scroll_y: f32, offset_y: f32, cache: &mut GlyphCache) {
         let dy = offset_y - scroll_y;
         for cmd in list {
             match cmd {
-                DisplayCommand::Rect { rect, color } => {
-                    self.fill(Rect { y: rect.y + dy, ..*rect }, *color, offset_y)
-                }
-                DisplayCommand::Text { x, baseline, text, font, size, color, italic } => {
+                DisplayCommand::Rect { rect, color } => self.fill(
+                    Rect {
+                        y: rect.y + dy,
+                        ..*rect
+                    },
+                    *color,
+                    offset_y,
+                ),
+                DisplayCommand::Text {
+                    x,
+                    baseline,
+                    text,
+                    font,
+                    size,
+                    color,
+                    italic,
+                } => {
                     let by = baseline + dy;
                     if by + size < offset_y || by - size * 1.5 > self.height as f32 {
                         continue;
@@ -184,7 +253,11 @@ impl Canvas {
             let gx = (pen + m.xmin as f32).round() as i64;
             let gy = (baseline - (m.height as i32 + m.ymin) as f32).round() as i64;
             for row in 0..m.height {
-                let skew = if italic { ((m.height - row) as f32 * 0.2) as i64 } else { 0 };
+                let skew = if italic {
+                    ((m.height - row) as f32 * 0.2) as i64
+                } else {
+                    0
+                };
                 let y = gy + row as i64;
                 if y < clip_top as i64 || y < 0 || y >= self.height as i64 {
                     continue;
@@ -213,9 +286,7 @@ impl Canvas {
             return;
         }
         let d = self.pixels[i];
-        let mix = |src: u8, dst: u32| -> u32 {
-            (src as u32 * a as u32 + dst * (255 - a as u32)) / 255
-        };
+        let mix = |src: u8, dst: u32| -> u32 { (src as u32 * a as u32 + dst * (255 - a as u32)) / 255 };
         let r = mix(c.r, (d >> 16) & 0xff);
         let g = mix(c.g, (d >> 8) & 0xff);
         let b = mix(c.b, d & 0xff);
@@ -224,7 +295,11 @@ impl Canvas {
 
     pub fn write_png(&self, path: &str) -> std::io::Result<()> {
         let file = std::fs::File::create(path)?;
-        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), self.width as u32, self.height as u32);
+        let mut enc = png::Encoder::new(
+            std::io::BufWriter::new(file),
+            self.width as u32,
+            self.height as u32,
+        );
         enc.set_color(png::ColorType::Rgb);
         enc.set_depth(png::BitDepth::Eight);
         let mut w = enc.write_header().map_err(std::io::Error::other)?;

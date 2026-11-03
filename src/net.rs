@@ -39,7 +39,10 @@ pub fn fetch(url: &str) -> Result<Fetched, String> {
         "file" => {
             let path = url.trim_start_matches("file://");
             let path = path.split(['?', '#']).next().unwrap_or(path);
-            read_file(path).map(|body| Fetched { url: url.to_string(), body })
+            read_file(path).map(|body| Fetched {
+                url: url.to_string(),
+                body,
+            })
         }
         "https" => fetch_http(url),
         "http" => {
@@ -48,7 +51,10 @@ pub fn fetch(url: &str) -> Result<Fetched, String> {
             let upgraded = format!("https://{}", &url["http://".len()..]);
             fetch_http(&upgraded).or_else(|_| fetch_http(url))
         }
-        "" => read_file(url).map(|body| Fetched { url: url.to_string(), body }),
+        "" => read_file(url).map(|body| Fetched {
+            url: url.to_string(),
+            body,
+        }),
         s => Err(format!("{url}: the \"{s}\" scheme is not supported")),
     }
 }
@@ -59,14 +65,20 @@ fn read_file(path: &str) -> Result<String, String> {
         return Err(format!("{path}: not a regular file"));
     }
     if meta.len() > MAX_BYTES {
-        return Err(format!("{path}: file is larger than {} MB", MAX_BYTES / 1024 / 1024));
+        return Err(format!(
+            "{path}: file is larger than {} MB",
+            MAX_BYTES / 1024 / 1024
+        ));
     }
     let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn fetch_http(url: &str) -> Result<Fetched, String> {
-    let host = url::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
+    let host = url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_default();
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
         .timeout(Duration::from_secs(20))
@@ -95,15 +107,23 @@ fn fetch_http(url: &str) -> Result<Fetched, String> {
         .read_to_end(&mut bytes)
         .map_err(|e| format!("{url}: {e}"))?;
     if bytes.len() as u64 > MAX_BYTES {
-        return Err(format!("{url}: response is larger than {} MB", MAX_BYTES / 1024 / 1024));
+        return Err(format!(
+            "{url}: response is larger than {} MB",
+            MAX_BYTES / 1024 / 1024
+        ));
     }
-    Ok(Fetched { url: final_url, body: String::from_utf8_lossy(&bytes).into_owned() })
+    Ok(Fetched {
+        url: final_url,
+        body: String::from_utf8_lossy(&bytes).into_owned(),
+    })
 }
 
 /// Honour NO_PROXY (ureq 2 doesn't): comma-separated hosts, `.suffix` or
 /// `*.suffix` domains, and `*` for everything.
 fn bypass_proxy(host: &str) -> bool {
-    let list = std::env::var("NO_PROXY").or_else(|_| std::env::var("no_proxy")).unwrap_or_default();
+    let list = std::env::var("NO_PROXY")
+        .or_else(|_| std::env::var("no_proxy"))
+        .unwrap_or_default();
     no_proxy_matches(&list, host)
 }
 
@@ -169,7 +189,11 @@ pub fn normalize(input: &str) -> String {
 /// Resolve `href` relative to `base`.
 pub fn resolve(base: &str, href: &str) -> String {
     let href = href.trim();
-    if href.contains("://") || href.starts_with("about:") || href.starts_with("mailto:") || href.starts_with("data:") {
+    if href.contains("://")
+        || href.starts_with("about:")
+        || href.starts_with("mailto:")
+        || href.starts_with("data:")
+    {
         return href.to_string();
     }
     let base = base.split('#').next().unwrap_or(base);
@@ -224,7 +248,10 @@ mod tests {
 
     #[test]
     fn resolves() {
-        assert_eq!(resolve("https://a.com/x/y.html", "z.html"), "https://a.com/x/z.html");
+        assert_eq!(
+            resolve("https://a.com/x/y.html", "z.html"),
+            "https://a.com/x/z.html"
+        );
         assert_eq!(resolve("https://a.com/x/y.html", "../z"), "https://a.com/z");
         assert_eq!(resolve("https://a.com/x/", "/q?a=1"), "https://a.com/q?a=1");
         assert_eq!(resolve("https://a.com", "b"), "https://a.com/b");
@@ -255,9 +282,15 @@ mod tests {
 
     #[test]
     fn address_bar_shows_real_host() {
-        assert_eq!(display_parts("https://google.com@evil.com/x").0, "https://evil.com");
+        assert_eq!(
+            display_parts("https://google.com@evil.com/x").0,
+            "https://evil.com"
+        );
         // Cyrillic "а" in a lookalike domain is shown as punycode.
-        assert_eq!(display_parts("https://\u{430}pple.com/").0, "https://xn--pple-43d.com");
+        assert_eq!(
+            display_parts("https://\u{430}pple.com/").0,
+            "https://xn--pple-43d.com"
+        );
         assert_eq!(display_parts("http://a.com:8080/p?q=1").1, "/p?q=1");
     }
 }

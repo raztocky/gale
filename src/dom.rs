@@ -41,11 +41,17 @@ impl ElementData {
 }
 
 pub fn text(data: String) -> Node {
-    Node { children: Vec::new(), node_type: NodeType::Text(data) }
+    Node {
+        children: Vec::new(),
+        node_type: NodeType::Text(data),
+    }
 }
 
 pub fn elem(tag: String, attrs: AttrMap, children: Vec<Node>) -> Node {
-    Node { children, node_type: NodeType::Element(ElementData { tag, attrs }) }
+    Node {
+        children,
+        node_type: NodeType::Element(ElementData { tag, attrs }),
+    }
 }
 
 impl Node {

@@ -205,7 +205,11 @@ fn style_node<'a>(
         }
         ancestors.pop();
     }
-    StyledNode { node, style, children }
+    StyledNode {
+        node,
+        style,
+        children,
+    }
 }
 
 fn matches_simple(e: &ElementData, s: &SimpleSelector, is_root: bool) -> bool {
@@ -232,9 +236,7 @@ fn matches(e: &ElementData, ancestors: &[&ElementData], sel: &css::Selector) -> 
             return true;
         }
         match comb {
-            Combinator::Child => anc
-                .split_last()
-                .is_some_and(|(p, rest)| go(&parts[1..], p, rest)),
+            Combinator::Child => anc.split_last().is_some_and(|(p, rest)| go(&parts[1..], p, rest)),
             // With only descendant combinators left, matching the nearest
             // qualifying ancestor is always optimal, so no backtracking is
             // needed. This keeps crafted selectors like `a a a a a b` on deep
@@ -269,42 +271,88 @@ fn compute(
             if let Some(spec) = best {
                 for d in &rule.declarations {
                     order += 1;
-                    matched.push(MatchedRule { key: (d.important, *origin, spec, order), decl: d });
+                    matched.push(MatchedRule {
+                        key: (d.important, *origin, spec, order),
+                        decl: d,
+                    });
                 }
             }
         }
     }
-    let inline = e.attrs.get("style").map(|s| css::parse_inline(s)).unwrap_or_default();
+    let inline = e
+        .attrs
+        .get("style")
+        .map(|s| css::parse_inline(s))
+        .unwrap_or_default();
     for d in &inline {
         order += 1;
-        matched.push(MatchedRule { key: (d.important, 2, (1, 0, 0), order), decl: d });
+        matched.push(MatchedRule {
+            key: (d.important, 2, (1, 0, 0), order),
+            decl: d,
+        });
     }
     // Presentational attributes (<font color>, bgcolor, width...) at low priority.
     let mut presentational = Vec::new();
-    for (attr, prop) in [("bgcolor", "background-color"), ("color", "color"), ("width", "width"), ("height", "height")] {
+    for (attr, prop) in [
+        ("bgcolor", "background-color"),
+        ("color", "color"),
+        ("width", "width"),
+        ("height", "height"),
+    ] {
         if let Some(v) = e.attrs.get(attr) {
             if attr == "color" && e.tag != "font" {
                 continue;
             }
-            if (attr == "width" || attr == "height") && !matches!(e.tag.as_str(), "img" | "table" | "td" | "th" | "hr") {
+            if (attr == "width" || attr == "height")
+                && !matches!(e.tag.as_str(), "img" | "table" | "td" | "th" | "hr")
+            {
                 continue;
             }
-            let v = if v.chars().all(|c| c.is_ascii_digit()) { format!("{v}px") } else { v.clone() };
-            presentational.push(Declaration { name: prop.into(), values: css::parse_values(&v), important: false });
+            let v = if v.chars().all(|c| c.is_ascii_digit()) {
+                format!("{v}px")
+            } else {
+                v.clone()
+            };
+            presentational.push(Declaration {
+                name: prop.into(),
+                values: css::parse_values(&v),
+                important: false,
+            });
         }
     }
     let bordered = |t: &ElementData| t.attrs.get("border").is_some_and(|b| b != "0");
     if e.tag == "table" && bordered(e) {
-        presentational.push(Declaration { name: "border".into(), values: css::parse_values("1px outset gray"), important: false });
+        presentational.push(Declaration {
+            name: "border".into(),
+            values: css::parse_values("1px outset gray"),
+            important: false,
+        });
     }
-    if matches!(e.tag.as_str(), "td" | "th") && ancestors.iter().rev().find(|a| a.tag == "table").is_some_and(|t| bordered(t)) {
-        presentational.push(Declaration { name: "border".into(), values: css::parse_values("1px inset gray"), important: false });
+    if matches!(e.tag.as_str(), "td" | "th")
+        && ancestors
+            .iter()
+            .rev()
+            .find(|a| a.tag == "table")
+            .is_some_and(|t| bordered(t))
+    {
+        presentational.push(Declaration {
+            name: "border".into(),
+            values: css::parse_values("1px inset gray"),
+            important: false,
+        });
     }
     if e.attrs.contains_key("hidden") {
-        presentational.push(Declaration { name: "display".into(), values: vec![Value::Keyword("none".into())], important: false });
+        presentational.push(Declaration {
+            name: "display".into(),
+            values: vec![Value::Keyword("none".into())],
+            important: false,
+        });
     }
     for d in &presentational {
-        matched.push(MatchedRule { key: (false, 1, (0, 0, 0), 0), decl: d });
+        matched.push(MatchedRule {
+            key: (false, 1, (0, 0, 0), 0),
+            decl: d,
+        });
     }
     matched.sort_by_key(|m| m.key);
 
@@ -315,7 +363,10 @@ fn compute(
 
     let mut s = parent.inherit();
     s.display = Display::Inline;
-    let ctxv = Ctx { parent, viewport: ctx.viewport };
+    let ctxv = Ctx {
+        parent,
+        viewport: ctx.viewport,
+    };
 
     // font-size first: em units in other properties depend on it.
     if let Some(v) = props.get("font-size").and_then(|v| v.first()) {
@@ -359,7 +410,9 @@ fn compute(
                     "block" | "table" | "table-row" | "table-row-group" | "table-header-group"
                     | "table-footer-group" | "grid" | "flow-root" | "table-caption" => Display::Block,
                     "inline" => Display::Inline,
-                    "inline-block" | "table-cell" | "inline-table" | "inline-flex" | "inline-grid" => Display::InlineBlock,
+                    "inline-block" | "table-cell" | "inline-table" | "inline-flex" | "inline-grid" => {
+                        Display::InlineBlock
+                    }
                     "list-item" => Display::ListItem,
                     "flex" => Display::Flex,
                     "none" => Display::None,
@@ -394,13 +447,27 @@ fn compute(
                         Value::Str(st) => st.to_ascii_lowercase(),
                         _ => continue,
                     };
-                    let fam = if name.contains("mono") || name.contains("courier") || name.contains("consol") || name == "menlo" {
+                    let fam = if name.contains("mono")
+                        || name.contains("courier")
+                        || name.contains("consol")
+                        || name == "menlo"
+                    {
                         Some(Family::Mono)
-                    } else if name == "serif" || name.contains("times") || name.contains("georgia") || name.contains("garamond") {
+                    } else if name == "serif"
+                        || name.contains("times")
+                        || name.contains("georgia")
+                        || name.contains("garamond")
+                    {
                         Some(Family::Serif)
-                    } else if name.contains("sans") || name.contains("arial") || name.contains("helvetica")
-                        || name.contains("system-ui") || name.contains("inter") || name.contains("verdana")
-                        || name.contains("roboto") || name.contains("segoe") || name.contains("apple")
+                    } else if name.contains("sans")
+                        || name.contains("arial")
+                        || name.contains("helvetica")
+                        || name.contains("system-ui")
+                        || name.contains("inter")
+                        || name.contains("verdana")
+                        || name.contains("roboto")
+                        || name.contains("segoe")
+                        || name.contains("apple")
                     {
                         Some(Family::Sans)
                     } else {
@@ -452,8 +519,14 @@ fn compute(
                     "none" => ListStyle::None,
                     "circle" => ListStyle::Circle,
                     "square" => ListStyle::Square,
-                    "decimal" | "decimal-leading-zero" | "lower-alpha" | "upper-alpha"
-                    | "lower-roman" | "upper-roman" | "lower-latin" | "upper-latin" => ListStyle::Decimal,
+                    "decimal"
+                    | "decimal-leading-zero"
+                    | "lower-alpha"
+                    | "upper-alpha"
+                    | "lower-roman"
+                    | "upper-roman"
+                    | "lower-latin"
+                    | "upper-latin" => ListStyle::Decimal,
                     _ => ListStyle::Disc,
                 }
             }
@@ -500,9 +573,9 @@ fn compute(
     // Borders only show with a visible style; `currentColor` is the default.
     for (i, side) in ["top", "right", "bottom", "left"].iter().enumerate() {
         let style = props.get(&format!("border-{side}-style"));
-        let visible = style.and_then(|v| v.first()).is_some_and(
-            |v| matches!(v, Value::Keyword(k) if k != "none" && k != "hidden"),
-        );
+        let visible = style
+            .and_then(|v| v.first())
+            .is_some_and(|v| matches!(v, Value::Keyword(k) if k != "none" && k != "hidden"));
         if !visible {
             s.border_width[i] = 0.0;
         }
@@ -554,7 +627,12 @@ fn expand(d: &Declaration, props: &mut HashMap<String, Vec<Value>>) {
     let four = |vals: &[Value]| -> [Value; 4] {
         let v: Vec<Value> = vals.iter().filter(|v| **v != Value::Comma).cloned().collect();
         match v.len() {
-            0 => [Value::Number(0.0), Value::Number(0.0), Value::Number(0.0), Value::Number(0.0)],
+            0 => [
+                Value::Number(0.0),
+                Value::Number(0.0),
+                Value::Number(0.0),
+                Value::Number(0.0),
+            ],
             1 => [v[0].clone(), v[0].clone(), v[0].clone(), v[0].clone()],
             2 => [v[0].clone(), v[1].clone(), v[0].clone(), v[1].clone()],
             3 => [v[0].clone(), v[1].clone(), v[2].clone(), v[1].clone()],
@@ -579,8 +657,11 @@ fn expand(d: &Declaration, props: &mut HashMap<String, Vec<Value>>) {
             }
         }
         "border" | "border-top" | "border-right" | "border-bottom" | "border-left" => {
-            let targets: Vec<&str> =
-                if name == "border" { sides.to_vec() } else { vec![&name[7..]] };
+            let targets: Vec<&str> = if name == "border" {
+                sides.to_vec()
+            } else {
+                vec![&name[7..]]
+            };
             let mut width = Value::Keyword("medium".into());
             let mut style = Value::Keyword("none".into());
             let mut color: Option<Value> = None;
@@ -607,8 +688,16 @@ fn expand(d: &Declaration, props: &mut HashMap<String, Vec<Value>>) {
             }
         }
         "background" => {
-            let color = d.values.iter().rev().find(|v| matches!(v, Value::Color(_))).cloned();
-            set("background-color".into(), vec![color.unwrap_or(Value::Color(Color::TRANSPARENT))]);
+            let color = d
+                .values
+                .iter()
+                .rev()
+                .find(|v| matches!(v, Value::Color(_)))
+                .cloned();
+            set(
+                "background-color".into(),
+                vec![color.unwrap_or(Value::Color(Color::TRANSPARENT))],
+            );
         }
         "font" => {
             // font: [style] [weight] size[/line-height] family
