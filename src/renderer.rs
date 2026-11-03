@@ -4,8 +4,11 @@
 //! which applies the security policy.
 
 use crate::ipc::{read_frame, write_frame, FromRenderer, ToRenderer};
-use crate::page::Page;
+use crate::js::{self, ClickResult, Runtime};
+use crate::net::Dest;
+use crate::page::{Page, ScriptOutput};
 use std::io::{self, Read, Write};
+use std::time::Instant;
 
 pub fn run() -> Result<(), String> {
     let mut input = io::stdin().lock();
@@ -26,18 +29,23 @@ fn recv(input: &mut impl Read) -> Result<Option<ToRenderer>, String> {
 
 pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), String> {
     let mut page: Option<Page> = None;
+    // The page's scripts, if it has any (only for sites you allowed).
+    let mut rt: Option<Runtime> = None;
     while let Some(msg) = recv(input)? {
         match msg {
             ToRenderer::Load {
                 url,
                 html,
                 blocker_css,
+                scripts,
+                viewport,
             } => {
-                let mut fetch = |target: &str| -> Result<String, String> {
+                let mut fetch = |target: &str, dest: Dest| -> Result<String, String> {
                     send(
                         output,
                         FromRenderer::Fetch {
                             url: target.to_string(),
+                            dest,
                         },
                     )?;
                     match recv(input)? {
@@ -45,21 +53,55 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                         _ => Err("protocol error: expected a fetch reply".into()),
                     }
                 };
-                let p = Page::parse(&url, &html, &blocker_css, &mut fetch);
+                let (p, new_rt, out) = if scripts {
+                    Page::load_with_scripts(&url, &html, &blocker_css, viewport, &mut fetch)
+                } else {
+                    (
+                        Page::parse(&url, &html, &blocker_css, &mut fetch),
+                        None,
+                        ScriptOutput::default(),
+                    )
+                };
                 send(
                     output,
                     FromRenderer::Loaded {
                         title: p.title.clone(),
+                        navigate: out.navigate,
+                        console: out.console,
                     },
                 )?;
                 page = Some(p);
+                rt = new_rt;
             }
             ToRenderer::Render { width, height } => {
                 let p = page.as_ref().ok_or("render before load")?;
                 let width = width.clamp(1.0, 16_000.0);
+                let rendered = p.render(width, height.clamp(1.0, 16_000.0));
+                if let Some(rt) = rt.as_mut() {
+                    rt.set_boxes(p.boxes());
+                }
+                send(output, FromRenderer::Rendered(rendered))?;
+            }
+            ToRenderer::Click { x, y } => {
+                let p = page.as_mut().ok_or("click before load")?;
+                let mut result = ClickResult::default();
+                let (mut navigate, mut console) = (None, vec![]);
+                if let (Some(rt), Some(uid)) = (rt.as_mut(), p.hit(x, y)) {
+                    result = rt.click(uid, Instant::now() + js::EVENT_BUDGET);
+                    if result.changed {
+                        p.refresh(rt);
+                    }
+                    navigate = rt.take_navigate();
+                    console = rt.take_console();
+                }
                 send(
                     output,
-                    FromRenderer::Rendered(p.render(width, height.clamp(1.0, 16_000.0))),
+                    FromRenderer::Clicked {
+                        prevented: result.prevented,
+                        changed: result.changed,
+                        navigate,
+                        console,
+                    },
                 )?;
             }
             ToRenderer::Dom => {

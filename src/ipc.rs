@@ -8,6 +8,7 @@
 
 use crate::css::Color;
 use crate::layout::Rect;
+use crate::net::Dest;
 use crate::page::Rendered;
 use crate::paint::{DisplayCommand, GlyphBitmap, PlacedGlyph, MAX_ATLAS_BYTES, MAX_GLYPH_SIDE};
 use std::io::{self, Read, Write};
@@ -20,6 +21,8 @@ const MAX_COORD: f32 = 10_000_000.0;
 /// so a hostile renderer can't bog down the browser's painter.
 const MAX_COMMANDS: usize = 500_000;
 const MAX_GLYPHS: usize = 4_000_000;
+/// Console lines a renderer may report per message.
+const MAX_CONSOLE: usize = 200;
 
 /// Browser -> renderer.
 #[derive(Debug, Clone, PartialEq)]
@@ -28,8 +31,17 @@ pub enum ToRenderer {
         url: String,
         html: String,
         blocker_css: String,
+        /// Run the page's JavaScript (you allowed it for this site).
+        scripts: bool,
+        /// Window size, for scripts.
+        viewport: (f32, f32),
     },
     FetchReply(Result<String, String>),
+    /// You clicked the page at this page-space point.
+    Click {
+        x: f32,
+        y: f32,
+    },
     Render {
         width: f32,
         height: f32,
@@ -40,10 +52,26 @@ pub enum ToRenderer {
 /// Renderer -> browser.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FromRenderer {
-    Fetch { url: String },
-    Loaded { title: String },
+    Fetch {
+        url: String,
+        dest: Dest,
+    },
+    Loaded {
+        title: String,
+        /// A navigation a script asked for (the browser applies its checks).
+        navigate: Option<String>,
+        console: Vec<String>,
+    },
     Rendered(Rendered),
     Dom(String),
+    Clicked {
+        /// A script called `preventDefault()`: don't follow the link.
+        prevented: bool,
+        /// The page changed; render again.
+        changed: bool,
+        navigate: Option<String>,
+        console: Vec<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -103,6 +131,21 @@ impl Enc {
     fn color(&mut self, c: Color) {
         self.0.extend_from_slice(&[c.r, c.g, c.b, c.a]);
     }
+    fn opt_str(&mut self, s: &Option<String>) {
+        match s {
+            Some(s) => {
+                self.u8(1);
+                self.str(s);
+            }
+            None => self.u8(0),
+        }
+    }
+    fn strs(&mut self, v: &[String]) {
+        self.u32(v.len() as u32);
+        for s in v {
+            self.str(s);
+        }
+    }
     fn rect(&mut self, r: Rect) {
         for v in [r.x, r.y, r.w, r.h] {
             self.f32(v);
@@ -142,6 +185,23 @@ impl<'a> Dec<'a> {
         let n = self.u32()? as usize;
         let bytes = self.take(n)?;
         String::from_utf8(bytes.to_vec()).map_err(|_| "invalid UTF-8".to_string())
+    }
+    fn bool(&mut self) -> DecResult<bool> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            v => Err(format!("invalid boolean {v}")),
+        }
+    }
+    fn opt_str(&mut self) -> DecResult<Option<String>> {
+        Ok(if self.bool()? { Some(self.str()?) } else { None })
+    }
+    fn strs(&mut self, max: usize) -> DecResult<Vec<String>> {
+        let n = self.count(4)?;
+        if n > max {
+            return Err("list too long".into());
+        }
+        (0..n).map(|_| self.str()).collect()
     }
     fn color(&mut self) -> DecResult<Color> {
         let b = self.take(4)?;
@@ -241,11 +301,21 @@ impl ToRenderer {
                 url,
                 html,
                 blocker_css,
+                scripts,
+                viewport,
             } => {
                 e.u8(1);
                 e.str(url);
                 e.str(html);
                 e.str(blocker_css);
+                e.u8(*scripts as u8);
+                e.f32(viewport.0);
+                e.f32(viewport.1);
+            }
+            ToRenderer::Click { x, y } => {
+                e.u8(5);
+                e.f32(*x);
+                e.f32(*y);
             }
             ToRenderer::FetchReply(r) => {
                 e.u8(2);
@@ -277,6 +347,12 @@ impl ToRenderer {
                 url: d.str()?,
                 html: d.str()?,
                 blocker_css: d.str()?,
+                scripts: d.bool()?,
+                viewport: (d.f32()?, d.f32()?),
+            },
+            5 => ToRenderer::Click {
+                x: d.f32()?,
+                y: d.f32()?,
             },
             2 => match d.u8()? {
                 1 => ToRenderer::FetchReply(Ok(d.str()?)),
@@ -298,13 +374,35 @@ impl FromRenderer {
     pub fn encode(&self) -> Vec<u8> {
         let mut e = Enc::default();
         match self {
-            FromRenderer::Fetch { url } => {
+            FromRenderer::Fetch { url, dest } => {
                 e.u8(1);
                 e.str(url);
+                e.u8(match dest {
+                    Dest::Script => 2,
+                    _ => 1,
+                });
             }
-            FromRenderer::Loaded { title } => {
+            FromRenderer::Loaded {
+                title,
+                navigate,
+                console,
+            } => {
                 e.u8(2);
                 e.str(title);
+                e.opt_str(navigate);
+                e.strs(console);
+            }
+            FromRenderer::Clicked {
+                prevented,
+                changed,
+                navigate,
+                console,
+            } => {
+                e.u8(5);
+                e.u8(*prevented as u8);
+                e.u8(*changed as u8);
+                e.opt_str(navigate);
+                e.strs(console);
             }
             FromRenderer::Rendered(r) => {
                 e.u8(3);
@@ -354,8 +452,27 @@ impl FromRenderer {
     pub fn decode(buf: &[u8]) -> DecResult<FromRenderer> {
         let mut d = Dec { buf, pos: 0 };
         let msg = match d.u8()? {
-            1 => FromRenderer::Fetch { url: d.str()? },
-            2 => FromRenderer::Loaded { title: d.str()? },
+            1 => FromRenderer::Fetch {
+                url: d.str()?,
+                // Only the kinds a page may ask for; everything else is a
+                // protocol violation.
+                dest: match d.u8()? {
+                    1 => Dest::Stylesheet,
+                    2 => Dest::Script,
+                    t => return Err(format!("invalid request type {t}")),
+                },
+            },
+            2 => FromRenderer::Loaded {
+                title: d.str()?,
+                navigate: d.opt_str()?,
+                console: d.strs(MAX_CONSOLE)?,
+            },
+            5 => FromRenderer::Clicked {
+                prevented: d.bool()?,
+                changed: d.bool()?,
+                navigate: d.opt_str()?,
+                console: d.strs(MAX_CONSOLE)?,
+            },
             3 => {
                 let height = d.f32()?.max(0.0);
                 let background = d.color()?;
@@ -504,8 +621,23 @@ mod tests {
         let msgs = vec![
             FromRenderer::Fetch {
                 url: "https://a/b.css".into(),
+                dest: Dest::Stylesheet,
             },
-            FromRenderer::Loaded { title: "T".into() },
+            FromRenderer::Fetch {
+                url: "https://a/b.js".into(),
+                dest: Dest::Script,
+            },
+            FromRenderer::Loaded {
+                title: "T".into(),
+                navigate: Some("https://b/".into()),
+                console: vec!["[log] hi".into()],
+            },
+            FromRenderer::Clicked {
+                prevented: true,
+                changed: false,
+                navigate: None,
+                console: vec![],
+            },
             FromRenderer::Rendered(sample()),
             FromRenderer::Dom("<html>".into()),
         ];
@@ -517,7 +649,10 @@ mod tests {
                 url: "u".into(),
                 html: "<p>".into(),
                 blocker_css: ".ad { display: none !important }".into(),
+                scripts: true,
+                viewport: (1000.0, 700.0),
             },
+            ToRenderer::Click { x: 10.0, y: 20.0 },
             ToRenderer::FetchReply(Ok("css".into())),
             ToRenderer::FetchReply(Err("nope".into())),
             ToRenderer::Render {

@@ -50,3 +50,9 @@ path = "fuzz_targets/filter.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "js"
+path = "fuzz_targets/js.rs"
+test = false
+doc = false

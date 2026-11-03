@@ -516,3 +516,82 @@ fn cookies_follow_redirect_hops_and_values_stay_out_of_logs() {
         "values are never logged: {stdout}"
     );
 }
+
+/// JavaScript is off unless you allow a site; when on, scripts are fetched
+/// through the same policy as everything else, and scripts themselves get
+/// no network access.
+#[test]
+fn javascript_is_off_by_default_and_has_no_network() {
+    let home = temp_dir("js");
+    std::fs::create_dir_all(home.join("data/brickle/filters")).unwrap();
+    std::fs::write(home.join("data/brickle/filters/test.txt"), "/tracker.js$script\n").unwrap();
+    let page = "<p id=out>static</p>\
+                <script>document.getElementById('out').textContent = 'inline ran';\
+                fetch('/beacon?from=fetch'); var x = new XMLHttpRequest(); x.open('GET', '/beacon?from=xhr'); x.send();\
+                navigator.sendBeacon('/beacon?from=beacon'); new Image().src = '/beacon?from=img';</script>\
+                <script src=/app.js></script><script src=/tracker.js></script>"
+        .to_string();
+    let (port, seen) = serve(vec![
+        ("/", "text/html", page),
+        (
+            "/app.js",
+            "application/javascript",
+            "document.title = 'app ran';".into(),
+        ),
+        ("/tracker.js", "application/javascript", "".into()),
+    ]);
+    let url = format!("http://127.0.0.1:{port}/");
+    let paths = |seen: &Arc<Mutex<Vec<Vec<String>>>>| -> Vec<String> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .map(|r| r[0].split(' ').nth(1).unwrap().to_string())
+            .collect()
+    };
+
+    // Off by default: no script is fetched or run.
+    let out = brickle(&home).args(["dom", &url]).output().unwrap();
+    let dom = String::from_utf8_lossy(&out.stdout);
+    assert!(dom.contains("\"static\""), "{dom}");
+    assert_eq!(paths(&seen), vec!["/"]);
+
+    // Allowed for the site: scripts run, fetched as scripts, filters apply.
+    let allow = brickle(&home)
+        .args(["js", "allow", "127.0.0.1"])
+        .output()
+        .unwrap();
+    assert!(allow.status.success());
+    let out = brickle(&home).args(["requests", &url]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("BLOCKED  js    ") && stdout.contains("tracker.js"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("blocked fetch()") && stdout.contains("blocked XMLHttpRequest"),
+        "{stdout}"
+    );
+    assert_eq!(
+        paths(&seen),
+        vec!["/", "/", "/app.js"],
+        "scripts made no requests: {stdout}"
+    );
+    let js_req = seen.lock().unwrap()[2].clone();
+    assert!(
+        js_req.contains(&"Sec-Fetch-Dest: script".to_string()),
+        "{js_req:?}"
+    );
+    let out = brickle(&home).args(["dom", &url]).output().unwrap();
+    let dom = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        dom.contains("\"inline ran\"") && dom.contains("\"app ran\""),
+        "{dom}"
+    );
+
+    // --no-sandbox never runs scripts.
+    let out = brickle(&home)
+        .args(["--no-sandbox", "dom", &url])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).contains("\"static\""));
+}

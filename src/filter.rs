@@ -21,12 +21,15 @@ use std::collections::{HashMap, HashSet};
 pub enum Dest {
     Document,
     Stylesheet,
+    Script,
 }
 
 const T_DOCUMENT: u8 = 1;
 const T_STYLESHEET: u8 = 2;
-/// Types Brickle never requests (script, image, xhr, font, ...).
+/// Types Brickle never requests (image, xhr, font, ...).
 const T_OTHER: u8 = 4;
+const T_SCRIPT: u8 = 8;
+const T_ALL: u8 = T_DOCUMENT | T_STYLESHEET | T_OTHER | T_SCRIPT;
 
 #[derive(Debug, Clone)]
 struct NetRule {
@@ -234,6 +237,7 @@ impl NetRule {
         let t = match req.dest {
             Dest::Document => T_DOCUMENT,
             Dest::Stylesheet => T_STYLESHEET,
+            Dest::Script => T_SCRIPT,
         };
         let type_ok = if self.types == 0 {
             // Untyped rules apply to subresources; top-level documents are
@@ -722,10 +726,12 @@ fn parse_network(line: &str) -> Option<Parsed> {
             let type_bit = match key {
                 "document" | "doc" => Some(T_DOCUMENT),
                 "stylesheet" | "css" => Some(T_STYLESHEET),
-                "script" | "image" | "xmlhttprequest" | "xhr" | "font" | "media" | "object"
-                | "subdocument" | "frame" | "ping" | "websocket" | "other" | "beacon" | "webrtc"
-                | "object-subrequest" => Some(T_OTHER),
-                "all" => Some(T_DOCUMENT | T_STYLESHEET | T_OTHER),
+                "script" => Some(T_SCRIPT),
+                "image" | "xmlhttprequest" | "xhr" | "font" | "media" | "object" | "subdocument"
+                | "frame" | "ping" | "websocket" | "other" | "beacon" | "webrtc" | "object-subrequest" => {
+                    Some(T_OTHER)
+                }
+                "all" => Some(T_ALL),
                 _ => None,
             };
             if let Some(bit) = type_bit {
@@ -775,9 +781,9 @@ fn parse_network(line: &str) -> Option<Parsed> {
         }
     }
     if neg_types != 0 {
-        types = (T_DOCUMENT | T_STYLESHEET | T_OTHER) & !neg_types & !T_DOCUMENT | (types & T_DOCUMENT);
+        types = T_ALL & !neg_types & !T_DOCUMENT | (types & T_DOCUMENT);
     }
-    if types != 0 && types & (T_DOCUMENT | T_STYLESHEET) == 0 && !generichide && !elemhide {
+    if types != 0 && types & (T_DOCUMENT | T_STYLESHEET | T_SCRIPT) == 0 && !generichide && !elemhide {
         return Some(Parsed::Irrelevant);
     }
 
@@ -838,7 +844,7 @@ fn parse_network(line: &str) -> Option<Parsed> {
         // removeparam applies to navigations as well as subresources.
         let mut rule = rule;
         if rule.types == 0 {
-            rule.types = T_DOCUMENT | T_STYLESHEET;
+            rule.types = T_DOCUMENT | T_STYLESHEET | T_SCRIPT;
         }
         let pattern = if rest.is_empty() && start == Anchor::None {
             None

@@ -291,7 +291,7 @@ fn matches_simple(e: &ElementData, s: &SimpleSelector, is_root: bool) -> bool {
 }
 
 /// Match a right-to-left selector against an element and its ancestor chain.
-fn matches(e: &ElementData, ancestors: &[&ElementData], sel: &css::Selector) -> bool {
+pub fn matches(e: &ElementData, ancestors: &[&ElementData], sel: &css::Selector) -> bool {
     fn go(parts: &[(SimpleSelector, Combinator)], e: &ElementData, anc: &[&ElementData]) -> bool {
         let (simple, comb) = &parts[0];
         if !matches_simple(e, simple, anc.is_empty() && e.tag == "html") {

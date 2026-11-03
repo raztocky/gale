@@ -148,6 +148,12 @@ pub struct Network {
     local_allowed: HashSet<String>,
     log: Vec<LogEntry>,
     page_stylesheets: usize,
+    page_scripts: usize,
+    /// Sites where you allowed JavaScript (`~/.config/brickle/js-sites.txt`).
+    js_sites: HashSet<String>,
+    js_path: Option<PathBuf>,
+    /// `--js`: allow JavaScript everywhere for this run.
+    pub js_everywhere: bool,
     /// When the current page's loading must be finished, document,
     /// redirects and subresources together.
     deadline: std::time::Instant,
@@ -186,6 +192,10 @@ impl Network {
             local_allowed: HashSet::new(),
             log: Vec::new(),
             page_stylesheets: 0,
+            page_scripts: 0,
+            js_sites: HashSet::new(),
+            js_path: None,
+            js_everywhere: false,
             deadline: std::time::Instant::now() + PAGE_TIME_BUDGET,
             cancel: Cancel::new(),
             page_bytes: 0,
@@ -230,7 +240,58 @@ impl Network {
         }
         n.rebuild_user();
         n.cookies = Jar::from_disk(config_dir().as_deref(), data_dir().as_deref());
+        if let Some(path) = config_dir().map(|d| d.join("js-sites.txt")) {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                n.js_sites = text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                    .map(cookies::site)
+                    .collect();
+            }
+            n.js_path = Some(path);
+        }
         n
+    }
+
+    /// May pages on this URL run JavaScript? Off unless you allowed the
+    /// site (or ran with `--js`). Only web pages ever run scripts.
+    pub fn scripts_allowed(&self, url: &str) -> bool {
+        matches!(net::scheme(url).as_str(), "http" | "https")
+            && (self.js_everywhere || self.js_sites.contains(&cookies::site(url)))
+    }
+
+    pub fn js_sites(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.js_sites.iter().cloned().collect();
+        v.sort();
+        v
+    }
+
+    /// Allow or stop allowing JavaScript on a site, and save the list.
+    pub fn set_scripts_allowed(&mut self, site_or_url: &str, allow: bool) -> Result<String, String> {
+        let site = cookies::site(site_or_url);
+        if site.is_empty() {
+            return Err("not a website".into());
+        }
+        if allow {
+            self.js_sites.insert(site.clone());
+        } else {
+            self.js_sites.remove(&site);
+        }
+        if let Some(path) = &self.js_path {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            }
+            let mut text = String::from(
+                "# Sites where Brickle runs JavaScript (one per line). Everywhere else it's off.\n",
+            );
+            for s in self.js_sites() {
+                text.push_str(&s);
+                text.push('\n');
+            }
+            std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+        }
+        Ok(site)
     }
 
     pub fn set_user_rules(&mut self, rules: Vec<String>) {
@@ -244,6 +305,15 @@ impl Network {
             f.add_rule(r);
         }
         self.user = f;
+    }
+
+    /// A fresh time and request budget for the current page (when it is
+    /// loaded again without JavaScript).
+    pub fn restart_page_budget(&mut self) {
+        self.deadline = std::time::Instant::now() + PAGE_TIME_BUDGET;
+        self.page_stylesheets = 0;
+        self.page_scripts = 0;
+        self.page_bytes = 0;
     }
 
     /// When the current page must have finished loading.
@@ -273,6 +343,7 @@ impl Network {
     /// Load a top-level page. `from` is the page that linked here, if any.
     pub fn navigate(&mut self, url: &str, from: Option<&str>) -> Nav {
         self.page_stylesheets = 0;
+        self.page_scripts = 0;
         self.deadline = std::time::Instant::now() + PAGE_TIME_BUDGET;
         self.page_bytes = 0;
         let fetched = self.fetch(url, from, Dest::Document);
@@ -357,10 +428,29 @@ impl Network {
 
     /// Fetch a stylesheet for the page at `page_url`. The page URL comes from
     /// the browser's own state, never from the renderer.
-    pub fn subresource(&mut self, page_url: &str, url: &str) -> Result<String, String> {
-        self.page_stylesheets += 1;
-        let why = if self.page_stylesheets > MAX_STYLESHEETS {
-            Some("too many stylesheets")
+    pub fn subresource(&mut self, page_url: &str, url: &str, dest: Dest) -> Result<String, String> {
+        let why = match dest {
+            Dest::Stylesheet => {
+                self.page_stylesheets += 1;
+                (self.page_stylesheets > MAX_STYLESHEETS).then_some("too many stylesheets")
+            }
+            Dest::Script if !self.scripts_allowed(page_url) => {
+                // Decided here, from the browser's own record of the page,
+                // whatever the renderer claims.
+                self.record(url, dest, Outcome::NotAllowed, vec![]);
+                return Err(format!("JavaScript is off for this site, skipped {url}"));
+            }
+            Dest::Script => {
+                self.page_scripts += 1;
+                (self.page_scripts > crate::js::MAX_SCRIPTS).then_some("too many scripts")
+            }
+            _ => {
+                self.record(url, dest, Outcome::NotAllowed, vec![]);
+                return Err(format!("not a subresource type, skipped {url}"));
+            }
+        };
+        let why = if why.is_some() {
+            why
         } else if std::time::Instant::now() >= self.deadline || self.cancel.is_cancelled() {
             Some("page took too long to load")
         } else if self.page_bytes > PAGE_BYTE_BUDGET {
@@ -369,10 +459,10 @@ impl Network {
             None
         };
         if let Some(why) = why {
-            self.record(url, Dest::Stylesheet, Outcome::OverLimit, vec![]);
+            self.record(url, dest, Outcome::OverLimit, vec![]);
             return Err(format!("{why}, skipped {url}"));
         }
-        match self.fetch(url, Some(page_url), Dest::Stylesheet) {
+        match self.fetch(url, Some(page_url), dest) {
             Fetch::Done { body, .. } => {
                 self.page_bytes += body.len();
                 Ok(body)
@@ -419,10 +509,7 @@ impl Network {
     }
 
     fn fetch(&mut self, url: &str, initiator: Option<&str>, dest: Dest) -> Fetch {
-        let fdest = match dest {
-            Dest::Document => filter::Dest::Document,
-            _ => filter::Dest::Stylesheet,
-        };
+        let fdest = filter_dest(dest);
         let page = if dest == Dest::Document { None } else { initiator };
         let mut url = url.to_string();
         let mut from = initiator.map(str::to_string);
@@ -431,7 +518,7 @@ impl Network {
             //    its serialization. Credentials are dropped.
             let Some((parsed, had_credentials)) = net::canonical(&url) else {
                 self.record(&url, dest, Outcome::NotAllowed, vec![]);
-                return Fetch::Stopped(format!("Not a valid address: {}", esc(&url)));
+                return Fetch::Stopped(format!("Not a valid address: {url}"));
             };
             url = parsed.into();
 
@@ -468,8 +555,8 @@ impl Network {
                 Decision::Denied(rule) => {
                     self.record(&url, dest, Outcome::Denied { rule: rule.clone() }, stripped);
                     return Fetch::Stopped(format!(
-                        "You blocked {host} (rule <code>{}</code>). Open the request panel (F12) to unblock it.",
-                        esc(&rule)
+                        "You blocked {host} (rule {}). Open the request panel (F12) to unblock it.",
+                        rule
                     ));
                 }
                 Decision::Blocked(rule) => {
@@ -616,12 +703,7 @@ impl Network {
 
     /// Apply your rules, then the filter lists, to one request.
     pub fn decide(&self, url: &str, page: Option<&str>, dest: Dest) -> Decision {
-        let fdest = if dest == Dest::Document {
-            filter::Dest::Document
-        } else {
-            filter::Dest::Stylesheet
-        };
-        let req = Req::new(url, page, fdest);
+        let req = Req::new(url, page, filter_dest(dest));
         if let Some(rule) = self.user.blocks(&req) {
             return Decision::Denied(rule);
         }
@@ -687,6 +769,14 @@ impl Network {
     }
 }
 
+fn filter_dest(dest: Dest) -> filter::Dest {
+    match dest {
+        Dest::Document => filter::Dest::Document,
+        Dest::Script => filter::Dest::Script,
+        _ => filter::Dest::Stylesheet,
+    }
+}
+
 /// A page served from the internet (not a local file or local device).
 fn is_public_page(url: &str) -> bool {
     matches!(net::scheme(url).as_str(), "http" | "https") && !net::is_local_host(&filter::host_of(url))
@@ -731,6 +821,7 @@ mod tests {
         let r = n.subresource(
             "https://news.example/",
             "https://tracker.example/t.css?utm_source=x",
+            Dest::Stylesheet,
         );
         assert!(r.is_err());
         assert_eq!(net::requests_sent(), before);
@@ -757,7 +848,11 @@ mod tests {
         n.set_user_rules(vec!["@@||cdn.example^".into(), "||cdn.example^".into()]);
         assert_eq!(css(&n), Decision::Denied("||cdn.example^".into()));
         assert!(n
-            .subresource("https://a.example/", "https://cdn.example/x.css")
+            .subresource(
+                "https://a.example/",
+                "https://cdn.example/x.css",
+                Dest::Stylesheet
+            )
             .is_err());
         assert!(matches!(n.take_log()[0].outcome, Outcome::Denied { .. }));
     }
@@ -778,7 +873,7 @@ mod tests {
     fn web_pages_cannot_load_local_files() {
         let mut n = Network::empty();
         assert!(n
-            .subresource("https://evil.example/", "file:///etc/passwd")
+            .subresource("https://evil.example/", "file:///etc/passwd", Dest::Stylesheet)
             .is_err());
         assert_eq!(n.take_log()[0].outcome, Outcome::NotAllowed);
         match n.navigate("file:///etc/passwd", Some("https://evil.example/")) {
@@ -796,7 +891,9 @@ mod tests {
             "http://localhost:8080/x.css",
             "http://[::1]/x.css",
         ] {
-            assert!(n.subresource("https://evil.example/", target).is_err());
+            assert!(n
+                .subresource("https://evil.example/", target, Dest::Stylesheet)
+                .is_err());
             assert_eq!(
                 n.take_log().last().unwrap().outcome,
                 Outcome::LocalNetwork,
@@ -819,7 +916,11 @@ mod tests {
         n.deadline = std::time::Instant::now() - std::time::Duration::from_secs(1);
         let before = net::requests_sent();
         assert!(n
-            .subresource("https://a.example/", "https://a.example/late.css")
+            .subresource(
+                "https://a.example/",
+                "https://a.example/late.css",
+                Dest::Stylesheet
+            )
             .unwrap_err()
             .contains("too long"));
         assert_eq!(n.take_log()[0].outcome, Outcome::OverLimit);
@@ -844,7 +945,11 @@ mod tests {
         assert_eq!(n.toggle_preview(&e), ("||cdn.example^".into(), "block"));
         n.toggle(&e).unwrap();
         assert!(n
-            .subresource("https://a.example/", "https://cdn.example/x.css")
+            .subresource(
+                "https://a.example/",
+                "https://cdn.example/x.css",
+                Dest::Stylesheet
+            )
             .is_err());
         let denied = n.take_log().remove(0);
         assert_eq!(n.toggle_preview(&denied).1, "unblock");

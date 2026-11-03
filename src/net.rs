@@ -242,6 +242,8 @@ impl ureq::Resolver for PublicOnly {
 pub enum Dest {
     Document,
     Stylesheet,
+    /// A page's script (only for sites where you allowed JavaScript).
+    Script,
     /// `brickle filters update`.
     Download,
 }
@@ -485,6 +487,17 @@ fn http_get_timeout(
                 .set("Sec-Fetch-Site", site)
                 .set("Priority", "u=2")
         }
+        Dest::Script => {
+            req = req
+                .set("Accept", "*/*")
+                .set("Accept-Language", "en-US,en;q=0.5")
+                .set("Accept-Encoding", "gzip, deflate, br, zstd")
+                .set("Connection", "keep-alive");
+            req = with_cookie(req, cookie);
+            req.set("Sec-Fetch-Dest", "script")
+                .set("Sec-Fetch-Mode", "no-cors")
+                .set("Sec-Fetch-Site", site)
+        }
         Dest::Download => req
             .set("Accept", "*/*")
             .set("Accept-Language", "en-US,en;q=0.5")
@@ -512,6 +525,9 @@ fn http_get_timeout(
         || ctype.contains("html")
         || ctype.contains("xml")
         || ctype.contains("css")
+        || ctype.contains("javascript")
+        || ctype.contains("ecmascript")
+        || ctype.contains("json")
         || ctype.is_empty();
     if !texty {
         return Err(NetError::Other(format!("can't display content of type {ctype}")));

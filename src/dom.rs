@@ -8,6 +8,9 @@ pub type AttrMap = HashMap<String, String>;
 pub struct Node {
     pub children: Vec<Node>,
     pub node_type: NodeType,
+    /// Identifies the node to scripts (0 = not scripted). Lets the renderer
+    /// map a click on the page back to the element under it.
+    pub uid: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +47,7 @@ pub fn text(data: String) -> Node {
     Node {
         children: Vec::new(),
         node_type: NodeType::Text(data),
+        uid: 0,
     }
 }
 
@@ -51,6 +55,7 @@ pub fn elem(tag: String, attrs: AttrMap, children: Vec<Node>) -> Node {
     Node {
         children,
         node_type: NodeType::Element(ElementData { tag, attrs }),
+        uid: 0,
     }
 }
 
