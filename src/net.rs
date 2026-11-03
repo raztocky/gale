@@ -827,6 +827,47 @@ pub fn display_parts(input: &str) -> (String, String) {
     }
 }
 
+/// Where searches from the address bar go: DuckDuckGo's HTML version,
+/// which works without JavaScript.
+pub const SEARCH_URL: &str = "https://html.duckduckgo.com/html/";
+
+/// What the address bar does with what you typed: go to it if it looks like
+/// an address or a file, else search for it.
+pub fn address_or_search(input: &str) -> String {
+    if looks_like_search(input) {
+        url::Url::parse_with_params(SEARCH_URL, [("q", input.trim())])
+            .map(String::from)
+            .unwrap_or_else(|_| SEARCH_URL.to_string())
+    } else {
+        normalize(input)
+    }
+}
+
+/// Text with spaces, or a single word with no dot, that isn't a URL,
+/// `localhost`, an IP address or an existing file.
+fn looks_like_search(input: &str) -> bool {
+    let t = input.trim();
+    if t.is_empty() || t.contains("://") || t.starts_with("about:") || t.starts_with("file:") {
+        return false;
+    }
+    if t.chars().any(char::is_whitespace) {
+        return true;
+    }
+    if t.starts_with(['/', '.', '~']) || std::path::Path::new(t).exists() {
+        return false;
+    }
+    let host = t.split(['/', '?', '#']).next().unwrap_or("");
+    if host.starts_with('[') {
+        return false; // an IPv6 address
+    }
+    let host = match host.rsplit_once(':') {
+        Some((h, port)) if port.chars().all(|c| c.is_ascii_digit()) => h,
+        _ => host,
+    };
+    let dotted = host.contains('.') && !host.starts_with('.') && !host.ends_with('.');
+    !(dotted || host.eq_ignore_ascii_case("localhost"))
+}
+
 /// Turn a user-typed address or a path into an absolute URL.
 pub fn normalize(input: &str) -> String {
     let input = input.trim();
@@ -861,6 +902,30 @@ pub fn resolve(base: &str, href: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn address_bar_searches_what_isnt_an_address() {
+        let search = |q: &str| format!("{SEARCH_URL}?q={q}");
+        assert_eq!(address_or_search("cats"), search("cats"));
+        assert_eq!(
+            address_or_search("  rust borrow checker "),
+            search("rust+borrow+checker")
+        );
+        assert_eq!(address_or_search("what is 2+2?"), search("what+is+2%2B2%3F"));
+        assert_eq!(address_or_search("c++ & more"), search("c%2B%2B+%26+more"));
+        for url in [
+            "example.com",
+            "en.wikipedia.org/wiki/Rust",
+            "localhost:8080",
+            "192.168.1.1",
+            "[::1]:80",
+            "https://cats",
+            "about:blank",
+        ] {
+            assert!(!address_or_search(url).starts_with(SEARCH_URL), "{url}");
+        }
+        assert_eq!(address_or_search("example.com"), "https://example.com/");
+    }
 
     #[test]
     fn resolves() {

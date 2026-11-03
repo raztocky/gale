@@ -16,6 +16,11 @@ link, reloading, going back or forward) and for that page's own resources, or wh
 `brickle filters update`. It doesn't prefetch or preconnect, it doesn't update anything in the
 background, and it makes no requests at startup.
 
+What you type in the address bar goes nowhere until you press Enter: there are no suggestions.
+If it isn't an address (it has spaces, or is a single word with no dot), Enter searches for it on
+[DuckDuckGo's HTML version](https://html.duckduckgo.com/html/), which works without JavaScript.
+That search is an ordinary page load, with all the rules here applied.
+
 What you type into a page's form is only sent when you submit the form (pressing Enter in a field,
 or clicking its submit button), as a request you see in the request panel like any other. Brickle
 doesn't save form data or passwords anywhere.

@@ -683,7 +683,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             if ui.editing {
                 match key {
                     Key::Enter => {
-                        navigate = Some((net::normalize(&ui.address), None));
+                        navigate = Some((net::address_or_search(&ui.address), None));
                         ui.editing = false;
                     }
                     Key::Escape => {

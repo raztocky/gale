@@ -40,7 +40,7 @@ libraries, run `sudo apt install build-essential libxkbcommon-dev`.
 
 | Action | Keys |
 |---|---|
-| Type a URL | `Ctrl+L` or click the address bar |
+| Type a URL, or search DuckDuckGo | `Ctrl+L` or click the address bar, then `Enter` |
 | Request panel | `F12`, `Ctrl+Shift+E`, or click "N blocked · M requests" |
 | Scroll | mouse wheel, arrow keys, `Space`, `PgUp`/`PgDn` |
 | Back / forward | `Backspace` or `Alt+←` / `Alt+→` |
