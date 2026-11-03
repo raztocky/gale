@@ -23,6 +23,10 @@ flate2 = "1.1.10"
 ruzstd = "0.9.1"
 unicode-linebreak = "0.1.5"
 read-fonts = "0.46.0"
+# Image decoders (pure Rust). Images are only ever decoded in the sandboxed renderer.
+zune-jpeg = "0.5.15"
+gif = { version = "0.14.2", default-features = false, features = ["std"] }
+image-webp = "0.2.4"
 
 # The renderer sandbox (Landlock + seccomp + rlimits) is Linux-only.
 [target.'cfg(target_os = "linux")'.dependencies]

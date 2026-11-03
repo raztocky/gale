@@ -2,8 +2,10 @@
 
 use crate::css::Color;
 use crate::font;
+use crate::image::{self, Bitmap};
 use crate::layout::{BoxKind, LayoutBox, Rect};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// What layout produces: rectangles and text runs. Text is turned into glyph
 /// bitmaps by [`rasterize`] inside the (sandboxed) renderer, so the browser
@@ -23,9 +25,14 @@ pub enum DrawOp {
         color: Color,
         italic: bool,
     },
+    /// An image (as decoded) drawn into `rect`.
+    Image {
+        rect: Rect,
+        image: Arc<Bitmap>,
+    },
 }
 
-/// What the browser paints: rectangles and pre-rasterized glyphs.
+/// What the browser paints: rectangles, pre-rasterized glyphs and images.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DisplayCommand {
     Rect {
@@ -37,7 +44,16 @@ pub enum DisplayCommand {
         color: Color,
         glyphs: Vec<PlacedGlyph>,
     },
+    /// RGBA pixels stretched over `rect` (normally already its size).
+    Image {
+        rect: Rect,
+        image: Arc<Bitmap>,
+    },
 }
+
+/// Image pixels sent with one frame, in bytes. Past this, images are sent
+/// small and the browser enlarges them.
+pub const MAX_FRAME_IMAGE_BYTES: usize = 40 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PlacedGlyph {
@@ -70,9 +86,47 @@ pub fn rasterize(ops: Vec<DrawOp>) -> (DisplayList, Vec<GlyphBitmap>) {
     let mut atlas_bytes = 0usize;
     let mut ids: HashMap<AtlasKey, Option<(u32, fontdue::Metrics)>> = HashMap::new();
     let mut list = Vec::with_capacity(ops.len());
+    // Images scaled to the size they're drawn at, so the browser gets no
+    // more pixels than it shows. The same image at the same size is sent once.
+    let mut scaled: HashMap<(usize, u32, u32), Arc<Bitmap>> = HashMap::new();
+    let mut image_bytes = 0usize;
     for op in ops {
         match op {
             DrawOp::Rect { rect, color } => list.push(DisplayCommand::Rect { rect, color }),
+            DrawOp::Image { rect, image } => {
+                if !(rect.w >= 1.0 && rect.h >= 1.0) {
+                    continue;
+                }
+                // Only ever shrunk here: enlarging is left to the browser's
+                // painter, so no bitmap is bigger than the decoded image.
+                let (w, h) = (
+                    (rect.w.round() as u32).clamp(1, image.w),
+                    (rect.h.round() as u32).clamp(1, image.h),
+                );
+                let key = (Arc::as_ptr(&image) as usize, w, h);
+                let bmp = match scaled.get(&key) {
+                    Some(b) => b.clone(),
+                    None => {
+                        let (w, h) = if image_bytes + w as usize * h as usize * 4 > MAX_FRAME_IMAGE_BYTES {
+                            image::fit(w, h, 64)
+                        } else {
+                            (w, h)
+                        };
+                        if image_bytes + w as usize * h as usize * 4 > MAX_FRAME_IMAGE_BYTES {
+                            continue;
+                        }
+                        let b = if (w, h) == (image.w, image.h) {
+                            image.clone()
+                        } else {
+                            Arc::new(image::resize(&image, w, h))
+                        };
+                        image_bytes += b.rgba.len();
+                        scaled.insert(key, b.clone());
+                        b
+                    }
+                };
+                list.push(DisplayCommand::Image { rect, image: bmp });
+            }
             DrawOp::Text {
                 x,
                 baseline,
@@ -216,6 +270,12 @@ fn render_box(list: &mut Vec<DrawOp>, b: &LayoutBox) {
             });
         }
     }
+    if let Some(img) = &b.image {
+        list.push(DrawOp::Image {
+            rect: b.dims.content,
+            image: img.bitmap.clone(),
+        });
+    }
     if let BoxKind::Anonymous { frags, .. } = &b.kind {
         for t in frags {
             if !t.style.visible {
@@ -331,6 +391,45 @@ impl Canvas {
                         continue;
                     };
                     self.blit(g.x, g.y + dy, bmp, *color, clip_top);
+                }
+            }
+            DisplayCommand::Image { rect, image } => self.draw_image(
+                Rect {
+                    y: rect.y + dy,
+                    ..*rect
+                },
+                image,
+                clip_top,
+            ),
+        }
+    }
+
+    /// Draw RGBA pixels stretched over `r` (nearest pixel), alpha-blended
+    /// and clipped to the canvas.
+    pub fn draw_image(&mut self, r: Rect, img: &Bitmap, clip_top: f32) {
+        let (iw, ih) = (img.w as usize, img.h as usize);
+        if iw == 0 || ih == 0 || img.rgba.len() < iw * ih * 4 || !(r.w > 0.0 && r.h > 0.0) {
+            return;
+        }
+        let (x0, y0) = (r.x.round(), r.y.round());
+        let (w, h) = (r.w.round().max(1.0), r.h.round().max(1.0));
+        let ys = (y0.max(clip_top).max(0.0) as usize).min(self.height);
+        let ye = ((y0 + h).max(0.0) as usize).min(self.height);
+        let xs = (x0.max(0.0) as usize).min(self.width);
+        let xe = ((x0 + w).max(0.0) as usize).min(self.width);
+        for y in ys..ye {
+            let sy = (((y as f32 - y0) * ih as f32 / h) as usize).min(ih - 1);
+            for x in xs..xe {
+                let sx = (((x as f32 - x0) * iw as f32 / w) as usize).min(iw - 1);
+                let p = &img.rgba[(sy * iw + sx) * 4..][..4];
+                if p[3] != 0 {
+                    let c = Color {
+                        r: p[0],
+                        g: p[1],
+                        b: p[2],
+                        a: 255,
+                    };
+                    self.blend(x, y, c, p[3]);
                 }
             }
         }
@@ -505,7 +604,9 @@ impl TileCache {
         let extents = list
             .iter()
             .map(|cmd| match cmd {
-                DisplayCommand::Rect { rect, .. } => (rect.y, rect.y + rect.h),
+                DisplayCommand::Rect { rect, .. } | DisplayCommand::Image { rect, .. } => {
+                    (rect.y, rect.y + rect.h)
+                }
                 DisplayCommand::Glyphs { glyphs, .. } => {
                     glyphs.iter().fold((f32::MAX, f32::MIN), |(lo, hi), g| {
                         let h = atlas.get(g.id as usize).map(|b| b.h as f32).unwrap_or(0.0);

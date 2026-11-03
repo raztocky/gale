@@ -25,7 +25,7 @@ const LOAD_EXTRA: Duration = Duration::from_secs(10);
 /// Most subresource requests a renderer may make for one page. The network
 /// service refuses anything past its own budget; a renderer that keeps
 /// asking anyway is misbehaving.
-const MAX_FETCHES: usize = MAX_STYLESHEETS + crate::js::MAX_SCRIPTS + 8;
+const MAX_FETCHES: usize = MAX_STYLESHEETS + crate::js::MAX_SCRIPTS + crate::network::MAX_IMAGES + 8;
 /// Longest a page with JavaScript may take to load before Brickle gives up
 /// on its scripts and shows it without them.
 const SCRIPT_LOAD_LIMIT: Duration = Duration::from_secs(15);
@@ -45,6 +45,9 @@ struct NetHost<'a> {
 impl Host for NetHost<'_> {
     fn fetch(&mut self, url: &str, dest: Dest) -> Result<String, String> {
         self.net.subresource(&self.page, url, dest)
+    }
+    fn image(&mut self, url: &str) -> Result<Vec<u8>, String> {
+        self.net.image(&self.page, url)
     }
     fn request(&mut self, url: &str, req: ScriptRequest) -> Result<ScriptResponse, String> {
         self.net.script_request(&self.page, url, req)
@@ -206,7 +209,8 @@ impl Tab {
         if !sandbox {
             let page_url = url.to_string();
             let mut fetch = |target: &str, dest: Dest| net.subresource(&page_url, target, dest);
-            let page = Page::parse(url, html, &blocker_css, &mut fetch);
+            let mut page = Page::parse(url, html, &blocker_css, &mut fetch);
+            page.load_images(&mut |u| net.image(&page_url, u));
             tab.title = page.title.clone();
             tab.backend = Backend::InProcess(Box::new(page));
             tab.log = net.take_log();
@@ -511,6 +515,13 @@ impl Renderer {
                 return Err(self.kill("renderer sent too many messages and was killed"));
             }
             match self.recv(deadline, &mut budget)? {
+                FromRenderer::Fetch {
+                    url,
+                    dest: Dest::Image,
+                } if fetches < MAX_FETCHES => {
+                    fetches += 1;
+                    self.send(ToRenderer::ImageReply(host.image(&url)))?
+                }
                 FromRenderer::Fetch { url, dest } if fetches < MAX_FETCHES => {
                     fetches += 1;
                     self.send(ToRenderer::FetchReply(host.fetch(&url, dest)))?

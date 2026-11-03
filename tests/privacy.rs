@@ -85,12 +85,20 @@ fn serve_dynamic(
                 }
                 _ => ("200", ctype),
             };
+            // A body may be binary, written as "hex:89504e47...".
+            let body: Vec<u8> = match body.strip_prefix("hex:") {
+                Some(h) => (0..h.len() / 2)
+                    .map(|i| u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).unwrap())
+                    .collect(),
+                None => body.into_bytes(),
+            };
             let mut s = stream;
             let _ = write!(
                 s,
-                "HTTP/1.1 {status} X\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {status} X\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             );
+            let _ = s.write_all(&body);
         }
     });
     (port, seen)
@@ -729,4 +737,108 @@ fn forms_submit_through_the_browser() {
     let sub = tab.interact(&mut net, Input::Key(Key::Enter)).submit.unwrap();
     assert_eq!(sub.url, format!("http://127.0.0.1:{port}/search?q=cats"));
     assert!(!sub.post);
+}
+
+/// Images go through the same rules as everything else: your rules and
+/// `$image` filters, first-party-only cookies, Firefox's headers. Only real
+/// images are accepted (no SVG, no HTML posing as an image), and they are
+/// decoded in the sandboxed renderer.
+#[test]
+fn images_follow_the_rules() {
+    let home = temp_dir("images");
+    std::fs::create_dir_all(home.join("data/brickle/filters")).unwrap();
+    std::fs::write(home.join("data/brickle/filters/test.txt"), "/track/*$image\n").unwrap();
+    let png = {
+        let mut out = Vec::new();
+        let mut e = png::Encoder::new(&mut out, 4, 2);
+        e.set_color(png::ColorType::Rgb);
+        e.write_header().unwrap().write_image_data(&[90; 24]).unwrap();
+        out
+    };
+    let hex: String = png.iter().map(|b| format!("{b:02x}")).collect();
+    let hex: &'static str = format!("hex:{hex}").leak();
+    let (port, seen) = serve_dynamic(|port| {
+        vec![
+            (
+                "/",
+                "text/html\r\nSet-Cookie: sid=1",
+                format!(
+                    "<img src=/a.png alt=A><img src=/track/pixel.gif?utm_source=mail>\
+                     <link rel=stylesheet href=/track/style.css>\
+                     <img src=/vector.svg><img src=/page.html>\
+                     <img src=http://localhost:{port}/third.png><img src=/a.png>"
+                ),
+            ),
+            ("/a.png", "image/png", hex.into()),
+            ("/third.png", "image/png\r\nSet-Cookie: t=1", hex.into()),
+            ("/track/style.css", "text/css", String::new()),
+            ("/vector.svg", "image/svg+xml", "<svg onload=alert(1)/>".into()),
+            ("/page.html", "text/html", "<p>not an image".into()),
+        ]
+    });
+    let url = format!("http://127.0.0.1:{port}/");
+    let out = brickle(&home).args(["requests", &url]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let seen = seen.lock().unwrap();
+    let paths: Vec<&str> = seen.iter().map(|r| r[0].as_str()).collect();
+    assert_eq!(
+        paths,
+        [
+            "GET / HTTP/1.1",
+            "GET /track/style.css HTTP/1.1",
+            "GET /a.png HTTP/1.1",
+            "GET /vector.svg HTTP/1.1",
+            "GET /page.html HTTP/1.1",
+            "GET /third.png HTTP/1.1",
+        ],
+        "the $image rule blocks only the image; each image is fetched once\n{stdout}"
+    );
+    let header = |i: usize, name: &str| {
+        seen[i]
+            .iter()
+            .find_map(|l| l.strip_prefix(&format!("{name}: ")))
+            .map(str::to_string)
+    };
+    assert_eq!(header(2, "Sec-Fetch-Dest").as_deref(), Some("image"));
+    assert_eq!(header(2, "Sec-Fetch-Mode").as_deref(), Some("no-cors"));
+    assert_eq!(
+        header(2, "Accept").as_deref(),
+        Some("image/avif,image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5")
+    );
+    assert_eq!(header(2, "Cookie").as_deref(), Some("sid=1"), "first-party image");
+    assert_eq!(header(5, "Cookie"), None, "third-party image gets no cookies");
+    assert!(stdout.contains("refused cookies t (third-party)"), "{stdout}");
+    assert!(
+        stdout.contains("pixel.gif"),
+        "the blocked image is listed: {stdout}"
+    );
+    assert!(
+        !stdout.contains("?utm_source") && stdout.contains("stripped utm_source"),
+        "tracking parameters are stripped from images too: {stdout}"
+    );
+
+    drop(seen); // the server records into it
+
+    // The page renders with the picture in it, decoded by the renderer.
+    let png_out = home.join("page.png");
+    let out = brickle(&home)
+        .args(["render", &url, "-o", png_out.to_str().unwrap(), "-w", "200"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let d = png::Decoder::new(std::fs::File::open(&png_out).unwrap());
+    let mut r = d.read_info().unwrap();
+    let mut buf = vec![0; r.output_buffer_size()];
+    let info = r.next_frame(&mut buf).unwrap();
+    let px = info.color_type.samples();
+    let grey = buf
+        .chunks(px)
+        .filter(|p| p[0] == 90 && p[1] == 90 && p[2] == 90)
+        .count();
+    assert!(grey >= 8, "the 4×2 image is painted ({grey} pixels)");
 }

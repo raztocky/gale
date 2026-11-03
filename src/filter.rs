@@ -4,7 +4,7 @@
 //! - Network rules: `||host^`, `|https://…`, plain substrings, `*`, `^`,
 //!   `|` end anchors, and `@@` exceptions.
 //! - Options: `third-party`/`3p`, `first-party`/`1p`, `domain=`/`from=`,
-//!   `document`, `stylesheet`/`css`, `all`, `important`, `match-case`,
+//!   `document`, `stylesheet`/`css`, `script`, `xhr`, `image`, `all`, `important`, `match-case`,
 //!   `removeparam=`, `generichide`/`elemhide` (exceptions), `badfilter`.
 //! - Cosmetic rules: `##selector`, `example.com##selector`, `#@#` exceptions.
 //! - Preprocessor: `!#if` / `!#else` / `!#endif` (evaluated as Firefox).
@@ -12,7 +12,7 @@
 //! Rules the engine can't apply faithfully (regex rules, `$redirect`,
 //! `$csp`, scriptlets, procedural cosmetics...) are skipped rather than
 //! approximated, so they never over-block. Rules that only target request
-//! types Brickle never makes (`$script`, `$image`, `$xhr`...) are dropped too.
+//! types Brickle never makes (`$font`, `$media`, `$websocket`...) are dropped too.
 
 use std::collections::{HashMap, HashSet};
 
@@ -24,17 +24,19 @@ pub enum Dest {
     Script,
     /// `fetch`/`XMLHttpRequest` from a page's script.
     Xhr,
+    Image,
 }
 
 const T_DOCUMENT: u8 = 1;
 const T_STYLESHEET: u8 = 2;
-/// Types Brickle never requests (image, xhr, font, ...).
+/// Types Brickle never requests (font, media, ...).
 const T_OTHER: u8 = 4;
 const T_SCRIPT: u8 = 8;
 const T_XHR: u8 = 16;
-const T_ALL: u8 = T_DOCUMENT | T_STYLESHEET | T_OTHER | T_SCRIPT | T_XHR;
+const T_IMAGE: u8 = 32;
+const T_ALL: u8 = T_DOCUMENT | T_STYLESHEET | T_OTHER | T_SCRIPT | T_XHR | T_IMAGE;
 /// Types Brickle requests, so rules for them matter.
-const T_USED: u8 = T_DOCUMENT | T_STYLESHEET | T_SCRIPT | T_XHR;
+const T_USED: u8 = T_DOCUMENT | T_STYLESHEET | T_SCRIPT | T_XHR | T_IMAGE;
 
 #[derive(Debug, Clone)]
 struct NetRule {
@@ -244,6 +246,7 @@ impl NetRule {
             Dest::Stylesheet => T_STYLESHEET,
             Dest::Script => T_SCRIPT,
             Dest::Xhr => T_XHR,
+            Dest::Image => T_IMAGE,
         };
         let type_ok = if self.types == 0 {
             // Untyped rules apply to subresources; top-level documents are
@@ -734,8 +737,9 @@ fn parse_network(line: &str) -> Option<Parsed> {
                 "stylesheet" | "css" => Some(T_STYLESHEET),
                 "script" => Some(T_SCRIPT),
                 "xmlhttprequest" | "xhr" => Some(T_XHR),
-                "image" | "font" | "media" | "object" | "subdocument" | "frame" | "ping" | "websocket"
-                | "other" | "beacon" | "webrtc" | "object-subrequest" => Some(T_OTHER),
+                "image" => Some(T_IMAGE),
+                "font" | "media" | "object" | "subdocument" | "frame" | "ping" | "websocket" | "other"
+                | "beacon" | "webrtc" | "object-subrequest" => Some(T_OTHER),
                 "all" => Some(T_ALL),
                 _ => None,
             };
@@ -977,9 +981,33 @@ mod tests {
     }
 
     #[test]
+    fn image_rules_apply_to_images_only() {
+        let f =
+            Filters::parse("||pixel.example^$image\n||cdn.example/ads/\n@@||cdn.example/ads/ok.png$image\n");
+        let page = Some("https://site.example/");
+        let check = |u: &str, d: Dest| f.check(&Req::new(u, page, d));
+        assert!(matches!(
+            check("https://pixel.example/t.gif", Dest::Image),
+            Verdict::Block(_)
+        ));
+        assert_eq!(
+            check("https://pixel.example/t.css", Dest::Stylesheet),
+            Verdict::None
+        );
+        assert!(matches!(
+            check("https://cdn.example/ads/a.png", Dest::Image),
+            Verdict::Block(_)
+        ));
+        assert!(matches!(
+            check("https://cdn.example/ads/ok.png", Dest::Image),
+            Verdict::Allow(_)
+        ));
+    }
+
+    #[test]
     fn skips_unsupported_and_irrelevant() {
         let f = Filters::parse(
-            "/^https?:\\/\\/[a-z]+\\.example\\//\n||x.example^$redirect=noop.js\n||img.example^$image\nexample.com##+js(nobab)\n##.ok\n",
+            "/^https?:\\/\\/[a-z]+\\.example\\//\n||x.example^$redirect=noop.js\n||img.example^$font\nexample.com##+js(nobab)\n##.ok\n",
         );
         assert_eq!(f.stats.network, 0);
         assert_eq!(f.stats.cosmetic, 1);

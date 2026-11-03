@@ -139,8 +139,9 @@ in `src/cookies.rs`.
   sees the answer if that site allows it (`Access-Control-Allow-Origin`). Otherwise the response
   is withheld and the panel says so. Requests that would need a CORS "preflight" aren't sent at
   all yet.
-- **No beacons.** `navigator.sendBeacon` sends nothing, and setting an image's `src` loads
-  nothing.
+- **No beacons.** `navigator.sendBeacon` sends nothing, and an image a script makes but doesn't
+  put on the page (`new Image().src = ...`, the usual tracking pixel) loads nothing. Images a
+  script adds to the page load like any other image (rule 10).
 - **Cookies for scripts** follow the cookie rules (rule 8): no third-party cookies, ever.
   `document.cookie` shows only the page's own non-HttpOnly cookies; scripts can't see, create or
   replace HttpOnly ones (those are how sites keep you logged in). `localStorage` and
@@ -153,6 +154,21 @@ in `src/cookies.rs`.
 
 *Enforced by:* `javascript_is_off_by_default_and_its_requests_follow_the_rules` in
 `tests/privacy.rs`, and the tests in `src/js.rs` and `src/cookies.rs`.
+
+## 10. Images
+
+Images on a page (`<img>`) are requests like any other: listed in the request panel (as "img"),
+with your rules, the blocker (including `$image` rules, which most tracking pixels match),
+tracking-parameter stripping, HTTPS-only, the local-network block and the cookie rules (no
+third-party cookies) applied to each. Brickle sends Firefox's headers for images. Each image is
+fetched once per page, and a page gets at most 300 images and 64 MB of them.
+
+Only PNG, JPEG, GIF and WebP are shown (GIFs and WebPs only their first frame). SVG images are
+refused for now: an SVG is a document that can carry scripts. `data:` images are decoded
+without any request.
+
+*Enforced by:* `images_follow_the_rules` in `tests/privacy.rs`, and the tests in
+`src/network.rs` and `src/filter.rs`.
 
 ## What Brickle does store
 

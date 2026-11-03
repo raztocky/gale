@@ -67,7 +67,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [html, css, render, ipc, filter, js]
+        target: [html, css, render, ipc, filter, js, image]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -85,6 +85,9 @@ jobs:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
           restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: Seed the image corpus
+        if: matrix.target == 'image'
+        run: mkdir -p fuzz/corpus/image && cp tests/data/tiny* fuzz/corpus/image/
       - run: cargo install cargo-fuzz --locked
       - name: Fuzz for 3 minutes
         env:

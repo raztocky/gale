@@ -66,6 +66,19 @@ impl<R: Read, W: Write> Host for IpcHost<'_, R, W> {
         }
     }
 
+    fn image(&mut self, url: &str) -> Result<Vec<u8>, String> {
+        match self.ask(FromRenderer::Fetch {
+            url: url.to_string(),
+            dest: Dest::Image,
+        })? {
+            ToRenderer::ImageReply(r) => r,
+            _ => {
+                self.broken = Some("protocol error: expected an image".into());
+                Err("protocol error".into())
+            }
+        }
+    }
+
     fn request(&mut self, url: &str, req: ScriptRequest) -> Result<ScriptResponse, String> {
         match self.ask(FromRenderer::Request {
             url: url.to_string(),
@@ -117,12 +130,13 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                     cookies: cookies.clone(),
                     broken: None,
                 };
-                let (p, new_rt, out) = if scripts {
+                let (mut p, new_rt, out) = if scripts {
                     Page::load_with_scripts(&url, &html, &blocker_css, viewport, &mut host)
                 } else {
                     let p = Page::parse(&url, &html, &blocker_css, &mut |u, d| host.fetch(u, d));
                     (p, None, ScriptOutput::default())
                 };
+                p.load_images(&mut |u| host.image(u));
                 if let Some(e) = host.broken {
                     return Err(e);
                 }
@@ -167,14 +181,16 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                         broken: None,
                     };
                     pump(rt, &mut host, until);
+                    if Some(rt.version()) != before {
+                        p.refresh(rt);
+                        done.changed = true;
+                        // Scripts may have added images.
+                        p.load_images(&mut |u| host.image(u));
+                    }
                     if let Some(e) = host.broken {
                         return Err(e);
                     }
                     cookies = host.cookies;
-                    if Some(rt.version()) != before {
-                        p.refresh(rt);
-                        done.changed = true;
-                    }
                     navigate = rt.take_navigate();
                     console = rt.take_console();
                 }
@@ -197,9 +213,10 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                 }
                 send(output, FromRenderer::Dom(s))?;
             }
-            ToRenderer::FetchReply(_) | ToRenderer::Response { .. } | ToRenderer::Cookies(_) => {
-                return Err("protocol error: unexpected reply".into())
-            }
+            ToRenderer::FetchReply(_)
+            | ToRenderer::ImageReply(_)
+            | ToRenderer::Response { .. }
+            | ToRenderer::Cookies(_) => return Err("protocol error: unexpected reply".into()),
         }
     }
     Ok(())

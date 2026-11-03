@@ -2,6 +2,7 @@
 
 use crate::css::{self, Color, Stylesheet};
 use crate::dom::Node;
+use crate::image::{self, Decoded};
 use crate::layout::{self, BoxKind, LayoutBox, Rect};
 use crate::paint::{self, DisplayList};
 use crate::style::{self, StyleContext};
@@ -36,7 +37,14 @@ pub struct Page {
     arena: Option<Dom>,
     /// The form field that has the keyboard.
     pub focus: Option<u32>,
+    /// Images by URL: decoded, or `None` if they couldn't be loaded.
+    images: HashMap<String, Option<Decoded>>,
+    /// Bytes of decoded pixels kept in `images`.
+    image_bytes: usize,
 }
+
+/// Decoded image pixels a page may keep (the renderer has 4 GB in all).
+const MAX_IMAGE_MEMORY: usize = 512 * 1024 * 1024;
 
 /// What a click or keystroke on the page did.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -90,6 +98,10 @@ pub trait Host {
     fn fetch(&mut self, url: &str, dest: Dest) -> Result<String, String>;
     /// A script's `fetch`/`XMLHttpRequest`.
     fn request(&mut self, url: &str, req: ScriptRequest) -> Result<ScriptResponse, String>;
+    /// An image's bytes.
+    fn image(&mut self, url: &str) -> Result<Vec<u8>, String> {
+        Err(format!("images are off, skipped {url}"))
+    }
     /// A script set `document.cookie`.
     fn set_cookie(&mut self, value: &str);
     /// `document.cookie` as it stands.
@@ -234,7 +246,56 @@ impl Page {
             hits: RefCell::new(Vec::new()),
             arena: None,
             focus: None,
+            images: HashMap::new(),
+            image_bytes: 0,
         }
+    }
+
+    /// Fetch and decode the document's images not tried yet. Decoding
+    /// happens here, in the (sandboxed) renderer; `fetch` asks the browser.
+    pub fn load_images(&mut self, fetch: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>) {
+        let mut imgs = Vec::new();
+        self.dom.walk(&mut imgs, &|n| n.tag() == Some("img"));
+        let urls: Vec<String> = imgs
+            .iter()
+            .filter_map(|n| n.element().and_then(|e| image_source(&self.url, e)))
+            .collect();
+        for url in urls {
+            if self.images.contains_key(&url) || self.images.len() >= crate::network::MAX_IMAGES {
+                continue;
+            }
+            let bytes = match data_url(&url) {
+                Some(b) => b,
+                None if url.starts_with("data:") => Err("unsupported data: address".into()),
+                None => fetch(&url),
+            };
+            let decoded = bytes.ok().and_then(|b| {
+                // A decoder bug must not take the page down with it.
+                std::panic::catch_unwind(|| image::decode(&b)).ok()?.ok()
+            });
+            let decoded = decoded.filter(|d| {
+                let n = d.bitmap.rgba.len();
+                if self.image_bytes + n > MAX_IMAGE_MEMORY {
+                    return false;
+                }
+                self.image_bytes += n;
+                true
+            });
+            self.images.insert(url, decoded);
+        }
+    }
+
+    /// Decoded images for the `<img>` elements in `tree`, by node.
+    fn images_by_node(&self, tree: &Node) -> HashMap<u32, Decoded> {
+        let mut imgs = Vec::new();
+        tree.walk(&mut imgs, &|n| n.tag() == Some("img"));
+        imgs.iter()
+            .filter_map(|n| {
+                let url = image_source(&self.url, n.element()?)?;
+                let d = self.images.get(&url)?.clone()?;
+                Some((n.uid, d))
+            })
+            .collect()
     }
 
     /// Use `dom` as the page's document: collect its stylesheets (fetching
@@ -492,8 +553,9 @@ impl Page {
         // Form controls get their value, label or placeholder to draw.
         let mut tree = self.dom.clone();
         forms::decorate(&mut tree, self.focus);
+        let images = self.images_by_node(&tree);
         let styled = style::style_tree(&tree, &ctx);
-        let root = layout::layout_tree(&styled, width);
+        let root = layout::layout_tree_with_images(&styled, width, &images);
 
         // The root's (or body's) background paints the whole canvas.
         let mut background = styled.style.background;
@@ -521,6 +583,67 @@ impl Page {
             links,
         }
     }
+}
+
+/// The address an `<img>` shows: `src`, or else the first `srcset` entry.
+fn image_source(base: &str, e: &crate::dom::ElementData) -> Option<String> {
+    let src = e
+        .attrs
+        .get("src")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            e.attrs
+                .get("srcset")
+                .and_then(|s| s.split(',').next())
+                .and_then(|c| c.split_whitespace().next())
+        })?;
+    if src.len() > 4 && src[..5].eq_ignore_ascii_case("data:") {
+        return Some(src.to_string());
+    }
+    Some(net::resolve(base, src))
+}
+
+/// The bytes of a `data:image/...;base64,` address (decoded here, no request).
+fn data_url(url: &str) -> Option<Result<Vec<u8>, String>> {
+    let rest = url
+        .get(..5)
+        .filter(|p| p.eq_ignore_ascii_case("data:"))
+        .map(|_| &url[5..])?;
+    let (meta, payload) = rest.split_once(',')?;
+    let meta = meta.to_ascii_lowercase();
+    if !meta.starts_with("image/") || meta.contains("svg") {
+        return Some(Err("not an image".into()));
+    }
+    if !meta.ends_with(";base64") {
+        return Some(Err("only base64 image data is supported".into()));
+    }
+    Some(base64(payload).ok_or_else(|| "bad base64".to_string()))
+}
+
+fn base64(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' => break,
+            b' ' | b'\n' | b'\r' | b'\t' => continue,
+            _ => return None,
+        } as u32;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
 }
 
 /// Style and link elements, in document order; inside `<noscript>` only
@@ -686,5 +809,167 @@ mod form_script_tests {
             r.submit.map(|s| s.url).as_deref(),
             Some("https://example.com/s?q=x")
         );
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+    use crate::paint::DisplayCommand;
+
+    /// A `w`×`h` opaque PNG.
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut e = ::png::Encoder::new(&mut out, w, h);
+            e.set_color(::png::ColorType::Rgb);
+            let mut wr = e.write_header().unwrap();
+            wr.write_image_data(&vec![200; (w * h * 3) as usize]).unwrap();
+        }
+        out
+    }
+
+    /// Load `html`; image URLs ending in `/WxH.png` are served as PNGs of
+    /// that size, anything else fails. Returns the page and what was fetched.
+    fn load(html: &str) -> (Page, Vec<String>) {
+        let mut page = Page::parse("https://example.com/", html, "", &mut |_, _| Err("none".into()));
+        let mut asked = Vec::new();
+        page.load_images(&mut |u| {
+            asked.push(u.to_string());
+            let name = u.rsplit('/').next().unwrap_or("");
+            let size = name.strip_suffix(".png").and_then(|s| s.split_once('x'));
+            match size.and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?))) {
+                Some((w, h)) => Ok(png(w, h)),
+                None => Err("404".into()),
+            }
+        });
+        let _ = page.render(800.0, 600.0);
+        (page, asked)
+    }
+
+    /// The border box of the element with this id.
+    fn size_of(page: &Page, id: &str) -> (f32, f32) {
+        let mut found = Vec::new();
+        page.dom.walk(&mut found, &|n| {
+            n.element().and_then(|e| e.attrs.get("id")).map(String::as_str) == Some(id)
+        });
+        let uid = found.first().expect("element").uid;
+        let r = page
+            .boxes()
+            .into_iter()
+            .find(|(u, _)| *u == uid)
+            .map(|(_, r)| r)
+            .expect("box");
+        (r.w.round(), r.h.round())
+    }
+
+    #[test]
+    fn images_are_sized_like_browsers_do() {
+        let (page, _) = load(
+            "<img id=a src=/100x50.png>\
+             <img id=b src=/100x50.png width=40>\
+             <img id=c src=/100x50.png style='height:10px'>\
+             <img id=d src=/100x50.png width=30 height=30>\
+             <div style='width:60px'><img id=e src=/100x50.png style='max-width:100%'></div>\
+             <div style='width:200px'><img id=f src=/100x50.png style='width:50%'></div>\
+             <img id=g src=/100x50.png width=40 height=90 style='height:auto'>",
+        );
+        assert_eq!(size_of(&page, "a"), (100.0, 50.0), "natural size");
+        assert_eq!(size_of(&page, "b"), (40.0, 20.0), "width keeps the aspect ratio");
+        assert_eq!(size_of(&page, "c"), (20.0, 10.0), "height keeps the aspect ratio");
+        assert_eq!(size_of(&page, "d"), (30.0, 30.0), "both given");
+        assert_eq!(size_of(&page, "e"), (60.0, 30.0), "max-width scales it down");
+        assert_eq!(size_of(&page, "f"), (100.0, 50.0), "percent of the container");
+        assert_eq!(
+            size_of(&page, "g"),
+            (40.0, 20.0),
+            "height:auto overrides the attribute"
+        );
+    }
+
+    #[test]
+    fn failed_images_show_alt_text_and_each_url_is_fetched_once() {
+        let (page, asked) = load(
+            "<p><img src=/missing.gif alt='no picture'> <img src=/8x8.png> <img src=8x8.png>\
+             <img srcset='/16x16.png 1x, /32x32.png 2x'> <img src=''></p>",
+        );
+        assert_eq!(
+            asked,
+            [
+                "https://example.com/missing.gif",
+                "https://example.com/8x8.png",
+                "https://example.com/16x16.png"
+            ]
+        );
+        let r = page.render(800.0, 600.0);
+        let images: Vec<_> = r
+            .list
+            .iter()
+            .filter_map(|c| match c {
+                DisplayCommand::Image { rect, image } => Some((rect.w, rect.h, image.w, image.h)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(images, [(8.0, 8.0, 8, 8), (8.0, 8.0, 8, 8), (16.0, 16.0, 16, 16)]);
+        // The same image at the same size is shared, not copied.
+        let shared: Vec<_> = r
+            .list
+            .iter()
+            .filter_map(|c| match c {
+                DisplayCommand::Image { image, .. } => Some(std::sync::Arc::as_ptr(image)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shared[0], shared[1]);
+        // The only text on the page is the missing image's alt text.
+        assert!(r.list.iter().any(|c| matches!(c, DisplayCommand::Glyphs { .. })));
+        let (_, without_alt) = load("<p><img src=/missing.gif> <img src=/8x8.png></p>");
+        assert!(without_alt.len() == 2);
+    }
+
+    #[test]
+    fn images_are_drawn_at_the_size_shown() {
+        let (page, _) = load("<img src=/400x200.png width=100>");
+        let r = page.render(800.0, 600.0);
+        let img = r
+            .list
+            .iter()
+            .find_map(|c| match c {
+                DisplayCommand::Image { image, .. } => Some(image.clone()),
+                _ => None,
+            })
+            .expect("image drawn");
+        assert_eq!((img.w, img.h), (100, 50));
+    }
+
+    #[test]
+    fn data_urls_are_decoded_without_a_request() {
+        let b64 = {
+            const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let bytes = png(3, 2);
+            let mut s = String::new();
+            for c in bytes.chunks(3) {
+                let n = c
+                    .iter()
+                    .enumerate()
+                    .fold(0u32, |a, (i, &b)| a | (b as u32) << (16 - 8 * i));
+                for i in 0..4 {
+                    if i <= c.len() {
+                        s.push(T[(n >> (18 - 6 * i) & 63) as usize] as char);
+                    } else {
+                        s.push('=');
+                    }
+                }
+            }
+            s
+        };
+        let (page, asked) = load(&format!(
+            "<img id=a src='data:image/png;base64,{b64}'><img src='data:image/svg+xml,<svg/>'>\
+             <img src='data:text/html;base64,PGI+'>"
+        ));
+        assert!(asked.is_empty(), "{asked:?}");
+        assert_eq!(size_of(&page, "a"), (3.0, 2.0));
+        assert_eq!(base64("aGk="), Some(b"hi".to_vec()));
+        assert_eq!(base64("a!"), None);
     }
 }

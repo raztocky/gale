@@ -157,6 +157,11 @@ pub fn may_load(from: Option<&str>, to: &str) -> bool {
 }
 
 pub fn read_file(path: &str) -> Result<String, String> {
+    read_file_bytes(path).map(|b| String::from_utf8_lossy(&b).into_owned())
+}
+
+/// A local file's bytes, with the same checks as [`read_file`].
+pub fn read_file_bytes(path: &str) -> Result<Vec<u8>, String> {
     let path = url::Url::parse(path)
         .ok()
         .filter(|u| u.scheme() == "file")
@@ -173,8 +178,7 @@ pub fn read_file(path: &str) -> Result<String, String> {
             MAX_BYTES / 1024 / 1024
         ));
     }
-    let bytes = std::fs::read(&path).map_err(|e| format!("{shown}: {e}"))?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    std::fs::read(&path).map_err(|e| format!("{shown}: {e}"))
 }
 
 /// Loopback, private, link-local and similar non-public addresses.
@@ -246,6 +250,8 @@ pub enum Dest {
     Script,
     /// A request a page's script made (`fetch`, `XMLHttpRequest`).
     Xhr,
+    /// An `<img>`.
+    Image,
     /// `brickle filters update`.
     Download,
 }
@@ -315,6 +321,8 @@ pub struct Response {
     /// Every response header (lower-case names), for script requests.
     pub headers: Vec<(String, String)>,
     pub body: String,
+    /// The raw body of an image (`body` is empty then).
+    pub bytes: Vec<u8>,
 }
 
 /// One HTTP GET. Redirects are returned, not followed, so the caller can
@@ -624,6 +632,21 @@ fn http_get_timeout(
                 .set("Sec-Fetch-Site", site)
                 .set("Priority", "u=4")
         }
+        Dest::Image => {
+            req = req
+                .set(
+                    "Accept",
+                    "image/avif,image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5",
+                )
+                .set("Accept-Language", "en-US,en;q=0.5")
+                .set("Accept-Encoding", "gzip, deflate, br, zstd")
+                .set("Connection", "keep-alive");
+            req = with_cookie(req, cookie);
+            req.set("Sec-Fetch-Dest", "image")
+                .set("Sec-Fetch-Mode", "no-cors")
+                .set("Sec-Fetch-Site", site)
+                .set("Priority", "u=5, i")
+        }
         Dest::Download => req
             .set("Accept", "*/*")
             .set("Accept-Language", "en-US,en;q=0.5")
@@ -655,6 +678,7 @@ fn http_get_timeout(
             set_cookies,
             headers,
             body: String::new(),
+            bytes: vec![],
         });
     }
     let ctype = resp.content_type().to_ascii_lowercase();
@@ -666,7 +690,16 @@ fn http_get_timeout(
         || ctype.contains("ecmascript")
         || ctype.contains("json")
         || ctype.is_empty();
-    if !texty {
+    // Images: any image type but SVG (which is a document, with scripts).
+    // What it really is gets decided from its bytes, in the renderer.
+    let image = dest == Dest::Image
+        && (ctype.is_empty()
+            || (ctype.starts_with("image/") && !ctype.contains("svg"))
+            || ctype == "application/octet-stream");
+    if dest == Dest::Image && !image {
+        return Err(NetError::Other(format!("not an image ({ctype})")));
+    }
+    if !texty && !image {
         return Err(NetError::Other(format!("can't display content of type {ctype}")));
     }
     // ureq decodes gzip and brotli itself; deflate and zstd are done here.
@@ -716,7 +749,12 @@ fn http_get_timeout(
         location: None,
         set_cookies,
         headers,
-        body: String::from_utf8_lossy(&bytes).into_owned(),
+        body: if image {
+            String::new()
+        } else {
+            String::from_utf8_lossy(&bytes).into_owned()
+        },
+        bytes: if image { bytes } else { vec![] },
     })
 }
 
