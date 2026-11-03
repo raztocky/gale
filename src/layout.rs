@@ -2,14 +2,17 @@
 //!
 //! Supports normal flow (block + inline formatting contexts), the CSS box
 //! model, auto margins, max-width, sibling margin collapsing, text wrapping
-//! and alignment, list markers, inline-blocks, a simple flexbox, floats and
-//! tables (the CSS 2.1 automatic table layout, in the separated-borders model).
+//! and alignment, list markers, inline-blocks, a simple flexbox, floats,
+//! positioning and tables (the CSS 2.1 automatic table layout, in the
+//! separated-borders model).
 
 use crate::css::Color;
 use crate::dom::NodeType;
 use crate::font;
 use crate::image::Decoded;
-use crate::style::{Clear, ComputedStyle, Display, Float, Len, ListStyle, StyledNode, TextAlign, VAlign};
+use crate::style::{
+    Clear, ComputedStyle, Display, Float, Len, ListStyle, Position, StyledNode, TextAlign, VAlign,
+};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -91,6 +94,9 @@ pub enum InlineItem {
     /// Index into the anonymous box's `children` (a float). Floats sit in
     /// the inline content they appear in, so lines can flow around them.
     Float(usize),
+    /// Index into the anonymous box's `children` (an absolutely positioned
+    /// box). It takes no space; where it appears is its static position.
+    OutOfFlow(usize),
 }
 
 pub enum BoxKind<'a> {
@@ -153,6 +159,22 @@ impl<'a> LayoutBox<'a> {
         }
     }
 
+    fn position(&self) -> Position {
+        match self.kind {
+            BoxKind::Block(n) => n.style.position,
+            BoxKind::Anonymous { .. } => Position::Static,
+        }
+    }
+
+    /// Absolutely positioned (`absolute` or `fixed`).
+    fn out_of_flow(&self) -> bool {
+        matches!(self.position(), Position::Absolute | Position::Fixed)
+    }
+
+    fn is_float(&self) -> bool {
+        matches!(self.kind, BoxKind::Block(n) if n.style.float != Float::None)
+    }
+
     /// Move what's inside this box, but not the box itself.
     fn translate_contents(&mut self, dy: f32) {
         if let BoxKind::Anonymous { frags, .. } = &mut self.kind {
@@ -186,7 +208,9 @@ fn build_block<'a>(node: &'a StyledNode<'a>, link: Option<String>) -> LayoutBox<
         let link = child_link(child, &link);
         match child.display() {
             Display::None => {}
-            _ if child.style.float != Float::None && node.style.display != Display::Flex => {
+            _ if out_of_flow(child)
+                || (child.style.float != Float::None && node.style.display != Display::Flex) =>
+            {
                 let anon = run.get_or_insert_with(|| {
                     LayoutBox::new(BoxKind::Anonymous {
                         items: Vec::new(),
@@ -248,6 +272,10 @@ fn build_block<'a>(node: &'a StyledNode<'a>, link: Option<String>) -> LayoutBox<
     b
 }
 
+fn out_of_flow(n: &StyledNode) -> bool {
+    n.node.element().is_some() && matches!(n.style.position, Position::Absolute | Position::Fixed)
+}
+
 fn child_link(child: &StyledNode, inherited: &Option<String>) -> Option<String> {
     match child.node.element() {
         Some(e) if e.tag == "a" => e.attrs.get("href").cloned().or_else(|| inherited.clone()),
@@ -302,7 +330,9 @@ fn flatten_inline<'a>(node: &'a StyledNode<'a>, anon: &mut LayoutBox<'a>, bg: Co
                 return;
             }
             let float = node.style.float != Float::None;
+            let oof = out_of_flow(node);
             if float
+                || oof
                 || matches!(
                     node.display(),
                     Display::InlineBlock | Display::InlineTable | Display::TableCell
@@ -333,7 +363,9 @@ fn flatten_inline<'a>(node: &'a StyledNode<'a>, anon: &mut LayoutBox<'a>, bg: Co
                 anon.children.push(ib);
                 push(
                     anon,
-                    if float {
+                    if oof {
+                        InlineItem::OutOfFlow(idx)
+                    } else if float {
                         InlineItem::Float(idx)
                     } else {
                         InlineItem::Atomic(idx)
@@ -349,7 +381,7 @@ fn flatten_inline<'a>(node: &'a StyledNode<'a>, anon: &mut LayoutBox<'a>, bg: Co
             for c in &node.children {
                 let l = child_link(c, &link);
                 match c.display() {
-                    _ if c.style.float != Float::None => flatten_inline(c, anon, bg, l),
+                    _ if c.style.float != Float::None || out_of_flow(c) => flatten_inline(c, anon, bg, l),
                     Display::Block
                     | Display::ListItem
                     | Display::Flex
@@ -470,22 +502,63 @@ fn build_cell<'a>(
 // Layout
 // ---------------------------------------------------------------------------
 
+/// Lay out for a viewport `viewport_w` wide. Absolutely positioned boxes
+/// with no positioned ancestor use the page's own height as the viewport's.
 pub fn layout_tree<'a>(root: &'a StyledNode<'a>, viewport_w: f32) -> LayoutBox<'a> {
-    layout_tree_with_images(root, viewport_w, &HashMap::new())
+    layout_tree_with_images(root, (viewport_w, 0.0), &HashMap::new())
 }
 
 /// Lay out with decoded images for `<img>` elements, by node.
 pub fn layout_tree_with_images<'a>(
     root: &'a StyledNode<'a>,
-    viewport_w: f32,
+    viewport: (f32, f32),
     images: &HashMap<u32, Decoded>,
 ) -> LayoutBox<'a> {
+    let viewport_w = viewport.0;
     let mut b = build_layout_tree(root);
     if !images.is_empty() {
         attach_images(&mut b, images);
     }
     b.layout_block(0.0, viewport_w, 0.0, None);
+    // The initial containing block: absolutely positioned boxes with no
+    // positioned ancestor, and fixed ones, are placed in it. Pages are
+    // painted whole, so fixed boxes don't stay put when scrolling.
+    let h = if viewport.1 > 0.0 {
+        viewport.1
+    } else {
+        b.dims.margin_box().h
+    };
+    let icb = Rect {
+        x: 0.0,
+        y: 0.0,
+        w: viewport_w,
+        h,
+    };
+    b.lay_out_contained(icb, Some(icb));
+    apply_relative(&mut b, icb);
     b
+}
+
+/// Shift `position: relative` boxes by their offsets, once everything else
+/// is in place (they don't affect the layout around them).
+fn apply_relative(b: &mut LayoutBox, cb: Rect) {
+    for c in &mut b.children {
+        if c.position() == Position::Relative {
+            let s = c.style();
+            let [t, r, bo, l] = s.inset;
+            let dx = l.resolve(cb.w).or(r.resolve(cb.w).map(|r| -r)).unwrap_or(0.0);
+            let dy = t.resolve(cb.h).or(bo.resolve(cb.h).map(|b| -b)).unwrap_or(0.0);
+            if dx != 0.0 || dy != 0.0 {
+                c.translate(dx, dy);
+            }
+        }
+        // Anonymous boxes pass their parent's containing block through.
+        let inner = match c.kind {
+            BoxKind::Block(_) => c.dims.content,
+            BoxKind::Anonymous { .. } => cb,
+        };
+        apply_relative(c, inner);
+    }
 }
 
 fn attach_images(b: &mut LayoutBox, images: &HashMap<u32, Decoded>) {
@@ -531,6 +604,7 @@ impl<'a> LayoutBox<'a> {
                 let s = &n.style;
                 s.contain_floats
                     || s.float != Float::None
+                    || matches!(s.position, Position::Absolute | Position::Fixed)
                     || matches!(
                         s.display,
                         Display::Flex
@@ -684,6 +758,110 @@ impl<'a> LayoutBox<'a> {
         if let Len::Px(h) = s.min_height {
             d.content.h = d.content.h.max(h);
         }
+        // A positioned box is the containing block of the absolutely
+        // positioned boxes inside it. (Those do this themselves once their
+        // height is known, in `layout_absolute`.)
+        if !matches!(
+            s.position,
+            Position::Static | Position::Absolute | Position::Fixed
+        ) {
+            self.lay_out_contained(self.dims.padding_box(), None);
+        }
+    }
+
+    /// Lay out the absolutely positioned boxes whose containing block is
+    /// `cb`. For the root, `icb` is the initial containing block: fixed
+    /// boxes go there, from anywhere in the tree.
+    fn lay_out_contained(&mut self, cb: Rect, icb: Option<Rect>) {
+        // A positioned root has already placed its own absolute boxes.
+        let own = icb.is_none() || self.position() == Position::Static;
+        walk_contained(self, cb, icb, own);
+        fn walk_contained(b: &mut LayoutBox, cb: Rect, icb: Option<Rect>, own: bool) {
+            for c in &mut b.children {
+                match (c.position(), icb) {
+                    (Position::Absolute, _) if own => {
+                        c.layout_absolute(cb);
+                        if icb.is_some() {
+                            walk_contained(c, cb, icb, false);
+                        }
+                    }
+                    (Position::Fixed, Some(v)) => {
+                        c.layout_absolute(v);
+                        walk_contained(c, cb, icb, false);
+                    }
+                    (Position::Static, _) => walk_contained(c, cb, icb, own),
+                    // Another containing block: only the root looks inside,
+                    // for fixed boxes.
+                    (_, Some(_)) => walk_contained(c, cb, icb, false),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Size and place an absolutely positioned box in containing block `cb`
+    /// (a padding box). Its `dims.content` origin holds its static position.
+    fn layout_absolute(&mut self, cb: Rect) {
+        let (sx, sy) = (self.dims.content.x, self.dims.content.y);
+        let s = self.style().clone();
+        let [t, r, b, l] = [
+            s.inset[0].resolve(cb.h),
+            s.inset[1].resolve(cb.w),
+            s.inset[2].resolve(cb.h),
+            s.inset[3].resolve(cb.w),
+        ];
+        let px = |l: Len, base: f32| l.or_zero(base);
+        let pb = px(s.padding[1], cb.w) + px(s.padding[3], cb.w) + s.border_width[1] + s.border_width[3];
+        let (ml, mr) = (s.margin[3].resolve(cb.w), s.margin[1].resolve(cb.w));
+        let mh = ml.unwrap_or(0.0) + mr.unwrap_or(0.0);
+        let width = s.width.resolve(cb.w);
+        // Border-box width: as given, stretched between `left` and `right`,
+        // or shrink-to-fit.
+        let bw = match (width, l, r) {
+            (Some(w), ..) => w + pb,
+            (None, Some(l), Some(r)) => (cb.w - l - r - mh).max(0.0),
+            _ => {
+                let (min, max) = self.intrinsic_widths(cb.w);
+                let avail = cb.w - l.unwrap_or(0.0) - r.unwrap_or(0.0);
+                max.min(avail).max(min) - mh
+            }
+        };
+        let bw = match s.max_width.resolve(cb.w) {
+            Some(m) if width.is_some() => bw.min(m + pb),
+            _ => bw,
+        };
+        // Auto margins center a box pinned on both sides.
+        let (ml, mr) = match (l, r, width, ml, mr) {
+            (Some(l), Some(r), Some(_), None, None) => {
+                let free = ((cb.w - l - r - bw) / 2.0).max(0.0);
+                (free, free)
+            }
+            _ => (ml.unwrap_or(0.0), mr.unwrap_or(0.0)),
+        };
+        self.layout_block(0.0, bw + ml + mr, 0.0, Some(bw));
+        self.dims.margin.l = ml;
+        self.dims.margin.r = mr;
+
+        let (mt, mb) = (s.margin[0].or_zero(cb.w), s.margin[2].or_zero(cb.w));
+        let pbv = self.dims.border_box().h - self.dims.content.h;
+        if let (Len::Auto, Some(t), Some(b)) = (s.height, t, b) {
+            self.dims.content.h = (cb.h - t - b - mt - mb - pbv).max(0.0);
+        }
+        let bh = self.dims.border_box().h;
+        let x = match (l, r) {
+            (Some(l), _) => cb.x + l + ml,
+            (None, Some(r)) => cb.x + cb.w - r - mr - bw,
+            _ => sx + ml,
+        };
+        let y = match (t, b) {
+            (Some(t), _) => cb.y + t + mt,
+            (None, Some(b)) => cb.y + cb.h - b - mb - bh,
+            _ => sy + mt,
+        };
+        // Its own absolute boxes, now that its size is final.
+        self.lay_out_contained(self.dims.padding_box(), None);
+        let bb = self.dims.border_box();
+        self.translate(x - bb.x, y - bb.y);
     }
 
     fn layout_block_children(&mut self, floats: &mut Floats) {
@@ -881,6 +1059,7 @@ impl<'a> LayoutBox<'a> {
                             line = 0.0;
                             run = 0.0;
                         }
+                        InlineItem::OutOfFlow(_) => {}
                         InlineItem::Atomic(i) | InlineItem::Float(i) => {
                             let (cmin, cmax) = self.children[*i].intrinsic_widths(cb_w);
                             line += cmax;
@@ -971,6 +1150,7 @@ impl<'a> LayoutBox<'a> {
             Break(Rc<ComputedStyle>),
             Atomic(usize, f32),
             Float(usize),
+            OutOfFlow(usize),
         }
         let mut pieces = Vec::new();
         let mut last_space = true;
@@ -1083,6 +1263,7 @@ impl<'a> LayoutBox<'a> {
                     prev_tail = None;
                 }
                 InlineItem::Float(i) => pieces.push(Piece::Float(*i)),
+                InlineItem::OutOfFlow(i) => pieces.push(Piece::OutOfFlow(*i)),
             }
         }
 
@@ -1219,6 +1400,19 @@ impl<'a> LayoutBox<'a> {
                     cur.push(Placed::Atomic(i, x));
                     x += w;
                 }
+                Piece::OutOfFlow(i) => {
+                    // Remember the static position; the containing block
+                    // lays it out later.
+                    self.children[i].dims = Dimensions {
+                        content: Rect {
+                            x: left + x,
+                            y: line_y,
+                            w: 0.0,
+                            h: 0.0,
+                        },
+                        ..Dimensions::default()
+                    };
+                }
                 Piece::Float(i) => {
                     let fw = self.children[i].dims.margin_box().w;
                     if cur.is_empty() || x + fw <= avail {
@@ -1325,6 +1519,53 @@ impl<'a> LayoutBox<'a> {
         child.translate(fx - mb.x, fy - mb.y);
         floats.add(child.dims.margin_box(), side);
     }
+}
+
+/// Every box in the order it's painted, back to front (CSS 2.1 Appendix E,
+/// simplified): within each stacking context, positioned boxes with a
+/// negative `z-index`, then the normal flow in tree order, then floats, then
+/// the other positioned boxes by `z-index`. Each float and positioned box is
+/// painted as a unit, with everything inside it.
+pub fn paint_order<'b, 'a>(root: &'b LayoutBox<'a>) -> Vec<&'b LayoutBox<'a>> {
+    type Boxes<'b, 'a> = Vec<&'b LayoutBox<'a>>;
+    fn walk<'b, 'a>(
+        b: &'b LayoutBox<'a>,
+        flow: &mut Boxes<'b, 'a>,
+        floats: &mut Boxes<'b, 'a>,
+        layers: &mut Vec<(i32, &'b LayoutBox<'a>)>,
+    ) {
+        for c in &b.children {
+            if c.position() != Position::Static {
+                layers.push((c.style().z_index.unwrap_or(0), c));
+            } else if c.is_float() {
+                floats.push(c);
+            } else {
+                flow.push(c);
+                walk(c, flow, floats, layers);
+            }
+        }
+    }
+    fn stack<'b, 'a>(b: &'b LayoutBox<'a>, out: &mut Boxes<'b, 'a>) {
+        out.push(b);
+        let (mut flow, mut floats, mut layers) = (Vec::new(), Vec::new(), Vec::new());
+        walk(b, &mut flow, &mut floats, &mut layers);
+        // Stable, so equal `z-index` keeps tree order.
+        layers.sort_by_key(|(z, _)| *z);
+        let split = layers.partition_point(|(z, _)| *z < 0);
+        for (_, c) in &layers[..split] {
+            stack(c, out);
+        }
+        out.extend(flow);
+        for f in floats {
+            stack(f, out);
+        }
+        for (_, c) in &layers[split..] {
+            stack(c, out);
+        }
+    }
+    let mut out = Vec::new();
+    stack(root, &mut out);
+    out
 }
 
 /// A piece of a line, positioned relative to the line's start.
@@ -1795,7 +2036,11 @@ impl LayoutBox<'_> {
                 return Some(f.baseline);
             }
         }
-        self.children.iter().rev().find_map(|c| c.last_baseline())
+        self.children
+            .iter()
+            .rev()
+            .filter(|c| !c.out_of_flow() && !c.is_float())
+            .find_map(|c| c.last_baseline())
     }
 }
 
@@ -2275,5 +2520,147 @@ mod float_tests {
         let f = "<div style='float:left;width:3px;height:3px'></div>".repeat(3000);
         let d = boxes(&format!("{f}{TEXT}"), 300.0, "div");
         assert_eq!(d.len(), 3000);
+    }
+}
+
+#[cfg(test)]
+mod position_tests {
+    use super::table_tests::{boxes, close};
+    use crate::css;
+    use crate::html;
+    use crate::layout::{layout_tree, paint_order, BoxKind};
+    use crate::style::{self, StyleContext};
+
+    #[test]
+    fn relative_shifts_without_moving_neighbours() {
+        let page = "<div>a</div><div style='position:relative;left:10px;top:5px'>b</div><div>c</div>";
+        let d = boxes(page, 300.0, "div");
+        let plain = boxes("<div>a</div><div>b</div><div>c</div>", 300.0, "div");
+        assert!(
+            close(d[1].x, plain[1].x + 10.0) && close(d[1].y, plain[1].y + 5.0),
+            "{d:?}"
+        );
+        assert!(close(d[2].y, plain[2].y), "the next block doesn't move: {d:?}");
+        let r = boxes(
+            "<div style='position:relative;right:10px;bottom:5px'>b</div>",
+            300.0,
+            "div",
+        );
+        assert!(close(r[0].x, -10.0) && close(r[0].y, -5.0), "{r:?}");
+    }
+
+    #[test]
+    fn absolute_is_out_of_flow_and_placed_in_its_containing_block() {
+        let page = "<div style='position:relative;margin-left:50px;width:200px;height:100px'>\
+             <p style='position:absolute;top:10px;left:20px;margin:0'>x</p></div><div>after</div>";
+        let d = boxes(page, 400.0, "div");
+        let p = boxes(page, 400.0, "p");
+        assert!(close(p[0].x, 70.0) && close(p[0].y, 10.0), "{p:?}");
+        assert!(close(d[1].y, 100.0), "takes no space: {d:?}");
+        assert!(p[0].w < 50.0, "shrinks to fit: {p:?}");
+    }
+
+    #[test]
+    fn right_bottom_and_stretching() {
+        let cb = "position:relative;width:300px;height:200px";
+        let p = boxes(
+            &format!("<div style='{cb}'><p style='position:absolute;right:10px;bottom:20px;width:50px;height:30px;margin:0'></p></div>"),
+            800.0,
+            "p",
+        );
+        assert!(close(p[0].x, 240.0) && close(p[0].y, 150.0), "{p:?}");
+        let p = boxes(
+            &format!("<div style='{cb}'><p style='position:absolute;inset:10px;margin:0'></p></div>"),
+            800.0,
+            "p",
+        );
+        assert!(close(p[0].w, 280.0) && close(p[0].h, 180.0), "{p:?}");
+        let p = boxes(
+            &format!("<div style='{cb}'><p style='position:absolute;left:0;right:0;width:100px;margin:0 auto'></p></div>"),
+            800.0,
+            "p",
+        );
+        assert!(close(p[0].x, 100.0), "auto margins center it: {p:?}");
+    }
+
+    #[test]
+    fn static_position_when_insets_are_auto() {
+        let p = boxes(
+            "<div style='position:relative'>before<p style='position:absolute;margin:0'>x</p></div>",
+            400.0,
+            "p",
+        );
+        assert!(
+            p[0].x > 30.0 && close(p[0].y, 0.0),
+            "where it would have been: {p:?}"
+        );
+    }
+
+    #[test]
+    fn no_positioned_ancestor_uses_the_page() {
+        let p = boxes(
+            "<div style='margin:30px'><p style='position:absolute;top:0;left:0;margin:0'>x</p></div>",
+            400.0,
+            "p",
+        );
+        assert!(close(p[0].x, 0.0) && close(p[0].y, 0.0), "{p:?}");
+        // Fixed ignores positioned ancestors.
+        let p = boxes(
+            "<div style='position:relative;margin:30px'><p style='position:fixed;top:0;left:0;margin:0'>x</p></div>",
+            400.0,
+            "p",
+        );
+        assert!(close(p[0].x, 0.0) && close(p[0].y, 0.0), "{p:?}");
+    }
+
+    #[test]
+    fn nested_containing_blocks() {
+        let page = "<div style='position:relative;left:100px;top:100px;width:200px;height:200px'>\
+             <section style='position:absolute;top:10px;left:10px;width:100px;height:100px'>\
+             <p style='position:absolute;bottom:0;right:0;width:10px;height:10px;margin:0'></p></section></div>";
+        let p = boxes(page, 800.0, "p");
+        // 100 (relative) + 10 (section) + 100 - 10.
+        assert!(close(p[0].x, 200.0) && close(p[0].y, 200.0), "{p:?}");
+    }
+
+    #[test]
+    fn paint_order_follows_z_index() {
+        let page = "<div id=a style='position:relative;z-index:2'>a</div>\
+             <div id=b style='position:relative;z-index:-1'>b</div>\
+             <div id=c>c</div><div id=d style='float:left'>d</div><div id=e style='position:absolute'>e</div>";
+        let dom = html::parse(page);
+        let ua = css::parse(style::UA_CSS);
+        let ctx = StyleContext {
+            sheets: vec![(0, &ua)],
+            viewport: (400.0, 600.0),
+        };
+        let styled = style::style_tree(&dom, &ctx);
+        let root = layout_tree(&styled, 400.0);
+        let ids: Vec<String> = paint_order(&root)
+            .iter()
+            .filter_map(|b| match b.kind {
+                BoxKind::Block(n) => n.node.element()?.attrs.get("id").cloned(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, ["b", "c", "d", "e", "a"]);
+    }
+
+    #[test]
+    fn negative_z_index_parses() {
+        let dom = html::parse("<div style='z-index:-3;position:relative'>x</div>");
+        let ua = css::parse(style::UA_CSS);
+        let ctx = StyleContext {
+            sheets: vec![(0, &ua)],
+            viewport: (400.0, 600.0),
+        };
+        let styled = style::style_tree(&dom, &ctx);
+        fn find(n: &style::StyledNode) -> Option<i32> {
+            if n.node.element().is_some_and(|e| e.tag == "div") {
+                return n.style.z_index;
+            }
+            n.children.iter().find_map(find)
+        }
+        assert_eq!(find(&styled), Some(-3));
     }
 }

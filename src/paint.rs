@@ -204,10 +204,13 @@ fn skew(m: &fontdue::Metrics, bitmap: &[u8]) -> GlyphBitmap {
 
 pub fn build_display_list(root: &LayoutBox) -> Vec<DrawOp> {
     let mut list = Vec::new();
-    render_box(&mut list, root);
+    for b in crate::layout::paint_order(root) {
+        render_box(&mut list, b);
+    }
     list
 }
 
+/// Paint one box (not its children).
 fn render_box(list: &mut Vec<DrawOp>, b: &LayoutBox) {
     let s = b.style();
     if let BoxKind::Block(_) = b.kind {
@@ -330,9 +333,6 @@ fn render_box(list: &mut Vec<DrawOp>, b: &LayoutBox) {
                 });
             }
         }
-    }
-    for c in &b.children {
-        render_box(list, c);
     }
 }
 

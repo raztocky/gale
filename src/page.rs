@@ -555,7 +555,7 @@ impl Page {
         forms::decorate(&mut tree, self.focus);
         let images = self.images_by_node(&tree);
         let styled = style::style_tree(&tree, &ctx);
-        let root = layout::layout_tree_with_images(&styled, width, &images);
+        let root = layout::layout_tree_with_images(&styled, (width, viewport_h), &images);
 
         // The root's (or body's) background paints the whole canvas.
         let mut background = styled.style.background;
@@ -570,9 +570,14 @@ impl Page {
 
         let (list, atlas) = paint::rasterize(paint::build_display_list(&root));
         let mut links = Vec::new();
-        collect_links(&root, &mut links);
+        let order = layout::paint_order(&root);
+        for b in &order {
+            collect_links(b, &mut links);
+        }
         let mut hits = Vec::new();
-        collect_hits(&root, &mut hits);
+        for b in &order {
+            collect_hits(b, &mut hits);
+        }
         *self.hits.borrow_mut() = hits;
         let mb = root.dims.margin_box();
         Rendered {
@@ -696,7 +701,7 @@ impl ScriptLoader {
     }
 }
 
-/// Every box with a DOM node, in paint order (later boxes are on top).
+/// One box's hit areas (called in paint order, so later boxes are on top).
 fn collect_hits(b: &LayoutBox, out: &mut Vec<(Rect, u32)>) {
     if b.uid != 0 {
         out.push((b.dims.border_box(), b.uid));
@@ -714,9 +719,6 @@ fn collect_hits(b: &LayoutBox, out: &mut Vec<(Rect, u32)>) {
                 f.uid,
             ));
         }
-    }
-    for c in &b.children {
-        collect_hits(c, out);
     }
 }
 
@@ -739,9 +741,6 @@ fn collect_links(b: &LayoutBox, out: &mut Vec<(Rect, String)>) {
                 ));
             }
         }
-    }
-    for c in &b.children {
-        collect_links(c, out);
     }
 }
 

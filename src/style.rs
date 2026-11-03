@@ -35,6 +35,17 @@ pub enum Float {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Position {
+    Static,
+    Relative,
+    Absolute,
+    Fixed,
+    /// Laid out like `static` (pages aren't scrolled within), but still a
+    /// containing block for absolutely positioned descendants.
+    Sticky,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Clear {
     None,
     Left,
@@ -131,6 +142,11 @@ pub struct ComputedStyle {
     /// `overflow` other than `visible`, or `display: flow-root`: the box
     /// contains its floats and doesn't wrap around outside ones.
     pub contain_floats: bool,
+    pub position: Position,
+    /// `top`, `right`, `bottom`, `left`.
+    pub inset: [Len; 4],
+    /// `None` is `auto`.
+    pub z_index: Option<i32>,
 }
 
 impl ComputedStyle {
@@ -169,6 +185,9 @@ impl ComputedStyle {
             float: Float::None,
             clear: Clear::None,
             contain_floats: false,
+            position: Position::Static,
+            inset: [Len::Auto; 4],
+            z_index: None,
         }
     }
 
@@ -766,6 +785,25 @@ fn compute(
                     _ => Clear::None,
                 }
             }
+            "position" => {
+                s.position = match kw {
+                    "relative" => Position::Relative,
+                    "absolute" => Position::Absolute,
+                    "fixed" => Position::Fixed,
+                    "sticky" | "-webkit-sticky" => Position::Sticky,
+                    _ => Position::Static,
+                }
+            }
+            "top" => s.inset[0] = ctxv.len(first, fs),
+            "right" => s.inset[1] = ctxv.len(first, fs),
+            "bottom" => s.inset[2] = ctxv.len(first, fs),
+            "left" => s.inset[3] = ctxv.len(first, fs),
+            "z-index" => {
+                s.z_index = match first {
+                    Some(Value::Number(n)) => Some(n.clamp(-1e9, 1e9) as i32),
+                    _ => None,
+                }
+            }
             "overflow" | "overflow-x" | "overflow-y" => {
                 if matches!(kw, "hidden" | "auto" | "scroll" | "clip") {
                     s.contain_floats = true;
@@ -829,8 +867,11 @@ fn compute(
     if is_root && s.display == Display::Inline {
         s.display = Display::Block;
     }
-    // Floats are always block-level.
-    if s.float != Float::None {
+    // Absolutely positioned boxes don't float, and both are block-level.
+    if matches!(s.position, Position::Absolute | Position::Fixed) {
+        s.float = Float::None;
+    }
+    if s.float != Float::None || matches!(s.position, Position::Absolute | Position::Fixed) {
         s.display = match s.display {
             Display::InlineTable => Display::Table,
             Display::Table | Display::Flex | Display::ListItem | Display::None => s.display,
@@ -898,6 +939,11 @@ fn expand(d: &Declaration, props: &mut HashMap<String, Vec<Value>>) {
         "margin" | "padding" => {
             for (i, v) in four(&d.values).into_iter().enumerate() {
                 set(format!("{name}-{}", sides[i]), vec![v]);
+            }
+        }
+        "inset" => {
+            for (i, v) in four(&d.values).into_iter().enumerate() {
+                set(sides[i].to_string(), vec![v]);
             }
         }
         "border-width" | "border-color" | "border-style" => {

@@ -1,0 +1,50 @@
+<!doctype html>
+<html>
+<head>
+<title>Positioning</title>
+<style>
+  body { font-family: sans-serif; max-width: 760px; }
+  .frame { position: relative; height: 140px; background-color: #f2f2f2; border: 1px solid #ccc; margin-bottom: 8px; }
+  .pin { position: absolute; background-color: #36c; color: white; padding: 2px 6px; }
+  .card { position: relative; width: 220px; padding: 12px; background-color: #fff; border: 1px solid #bbb; }
+  .badge { position: absolute; top: -8px; right: -8px; background-color: #d33; color: white; padding: 0 6px; }
+  .menu { position: relative; display: inline-block; background-color: #333; color: white; padding: 4px 10px; }
+  .dropdown { position: absolute; top: 100%; left: 0; width: 160px; background-color: white; color: black; border: 1px solid #999; padding: 4px 8px; }
+  .modal { position: absolute; left: 0; right: 0; width: 300px; margin: 0 auto; top: 20px; background-color: #ffd; border: 2px solid #aa6; padding: 10px; }
+  .layer { position: absolute; width: 120px; height: 70px; padding: 4px; border: 1px solid #333; }
+</style>
+</head>
+<body>
+<h1>Positioning</h1>
+
+<h2>Absolute, pinned to each corner</h2>
+<div class="frame">
+  <span class="pin" style="top: 6px; left: 6px">top left</span>
+  <span class="pin" style="top: 6px; right: 6px">top right</span>
+  <span class="pin" style="bottom: 6px; left: 6px">bottom left</span>
+  <span class="pin" style="bottom: 6px; right: 6px">bottom right</span>
+  <div class="modal">Centred with <code>left: 0; right: 0; margin: auto</code></div>
+</div>
+
+<h2>Badge and dropdown</h2>
+<div class="card">Notifications <span class="badge">3</span></div>
+<p><span class="menu">Menu ▾<span class="dropdown">First item<br>Second item<br>Third item</span></span>
+The dropdown hangs below the menu and covers this text, because positioned boxes paint above the normal flow.</p>
+<p>&nbsp;</p>
+
+<h2>Relative offsets don't move the neighbours</h2>
+<p>One <span style="position: relative; top: -6px; background-color: #cfc">raised</span> word. (Inline boxes aren't offset yet, so it stays in line.)</p>
+<div style="background-color: #eef; padding: 4px">A block</div>
+<div style="position: relative; left: 30px; top: 6px; background-color: #fee; padding: 4px">Shifted 30px right and 6px down with <code>position: relative</code></div>
+<div style="background-color: #eef; padding: 4px">The next block is where it would have been anyway</div>
+
+<h2>z-index</h2>
+<div class="frame" style="height: 120px">
+  <div class="layer" style="left: 10px; top: 10px; background-color: #fcc; z-index: 3">z-index: 3</div>
+  <div class="layer" style="left: 60px; top: 30px; background-color: #cfc; z-index: 1">z-index: 1</div>
+  <div class="layer" style="left: 110px; top: 40px; background-color: #ccf; z-index: 2">z-index: 2</div>
+  <div class="layer" style="left: 300px; top: 20px; background-color: #ffc">auto, later in the page</div>
+  <div class="layer" style="left: 340px; top: 40px; background-color: #fcf">auto, last</div>
+</div>
+</body>
+</html>
