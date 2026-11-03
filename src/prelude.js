@@ -515,7 +515,13 @@
     get form() { return this.closest('form'); }
     get options() { return this.querySelectorAll('option'); }
     get elements() { return this.querySelectorAll('input, select, textarea, button'); }
-    submit() { dom.log('warn', '[brickle] form submission is not supported yet'); }
+    submit() { if (this.localName === 'form') dom.submit(idOf(this), null); }
+    requestSubmit(submitter) {
+      if (this.localName !== 'form') return;
+      const ev = new Event('submit', { bubbles: true, cancelable: true });
+      ev.submitter = submitter || null;
+      if (dispatchOn(this, ev)) dom.submit(idOf(this), submitter ? idOf(submitter) : null);
+    }
     reset() {}
     select() {}
     get content() { // <template>
@@ -1218,6 +1224,12 @@
       const ev = new MouseEvent(type, { bubbles: true, cancelable: true, button: 0 });
       ev.isTrusted = true;
       dispatchOn(target, ev);
+      return ev.defaultPrevented;
+    },
+    fireEvent(id, type, bubbles, cancelable) {
+      const ev = new Event(type, { bubbles, cancelable });
+      ev.isTrusted = true;
+      dispatchOn(wrap(id), ev);
       return ev.defaultPrevented;
     },
     fireLoad() {

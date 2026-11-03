@@ -3,12 +3,13 @@
 use crate::describe;
 use brickle::css::Color;
 use brickle::font;
+use brickle::forms::Submission;
 use brickle::layout::{Edges, Rect};
 use brickle::net;
 use brickle::network::{Action, LogEntry, Network, Outcome};
-use brickle::page::Rendered;
+use brickle::page::{Key as PageKey, Rendered};
 use brickle::paint::{Canvas, GlyphCache, TileCache};
-use brickle::tab::Tab;
+use brickle::tab::{Input, Tab};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -61,8 +62,6 @@ struct Info {
     title: String,
     log: Vec<LogEntry>,
     interstitial: Option<Action>,
-    /// The page runs JavaScript, so clicks go to its scripts first.
-    scripts: bool,
 }
 
 impl Info {
@@ -73,7 +72,6 @@ impl Info {
             title: tab.title.clone(),
             log: tab.log.clone(),
             interstitial: tab.interstitial.clone(),
-            scripts: tab.scripts,
         }
     }
 }
@@ -87,17 +85,19 @@ enum Job {
         w: f32,
         h: f32,
         cancel: net::Cancel,
+        /// A form submission to send instead of a plain request.
+        post: Option<Submission>,
     },
     Render {
         tab: Box<Tab>,
         w: f32,
         h: f32,
     },
-    /// A click on a page with scripts; `link` is the link under it, if any.
-    Click {
+    /// A click, typing or a key on the page; `link` is the link under a
+    /// click, if any.
+    Input {
         tab: Box<Tab>,
-        x: f32,
-        y: f32,
+        input: Input,
         link: Option<String>,
         w: f32,
         h: f32,
@@ -106,7 +106,8 @@ enum Job {
 
 struct Done {
     tab: Tab,
-    rendered: Rendered,
+    /// None if the page didn't change.
+    rendered: Option<Rendered>,
     new_page: bool,
     /// For a click: what scripts did, and the link that was clicked.
     click: Option<(brickle::tab::Click, Option<String>)>,
@@ -127,13 +128,17 @@ fn spawn_loader(net: Arc<Mutex<Network>>, sandboxed: bool) -> (Sender<Job>, Rece
                         w,
                         h,
                         cancel,
+                        post,
                     } => {
                         let mut tab = {
                             let mut n = net.lock().unwrap_or_else(|e| e.into_inner());
                             n.cancel = cancel;
-                            Tab::open_sized(&mut n, &url, from.as_deref(), sandboxed, (w, h))
+                            match &post {
+                                Some(sub) => Tab::submit(&mut n, sub, from.as_deref(), sandboxed, (w, h)),
+                                None => Tab::open_sized(&mut n, &url, from.as_deref(), sandboxed, (w, h)),
+                            }
                         };
-                        let rendered = tab.render(w, h);
+                        let rendered = Some(tab.render(w, h));
                         Done {
                             tab,
                             rendered,
@@ -142,7 +147,7 @@ fn spawn_loader(net: Arc<Mutex<Network>>, sandboxed: bool) -> (Sender<Job>, Rece
                         }
                     }
                     Job::Render { mut tab, w, h } => {
-                        let rendered = tab.render(w, h);
+                        let rendered = Some(tab.render(w, h));
                         Done {
                             tab: *tab,
                             rendered,
@@ -150,19 +155,18 @@ fn spawn_loader(net: Arc<Mutex<Network>>, sandboxed: bool) -> (Sender<Job>, Rece
                             click: None,
                         }
                     }
-                    Job::Click {
+                    Job::Input {
                         mut tab,
-                        x,
-                        y,
+                        input,
                         link,
                         w,
                         h,
                     } => {
                         let click = {
                             let mut n = net.lock().unwrap_or_else(|e| e.into_inner());
-                            tab.click(&mut n, x, y)
+                            tab.interact(&mut n, input)
                         };
-                        let rendered = tab.render(w, h);
+                        let rendered = click.changed.then(|| tab.render(w, h));
                         Done {
                             tab: *tab,
                             rendered,
@@ -208,7 +212,6 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         title: String::new(),
         log: vec![],
         interstitial: None,
-        scripts: false,
     };
     // Painted tiles of the current page; rebuilt when the page changes.
     let mut tiles: Option<TileCache> = None;
@@ -231,6 +234,12 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
     let mut script_nav: Option<String> = None;
     let mut script_hops = 0u32;
     let mut clicked_link: Option<String> = None;
+    // A form field on the page has the keyboard; what you typed, waiting to
+    // be sent; a form submission waiting to be opened.
+    let mut page_focus = false;
+    let mut pending_input: Vec<Input> = Vec::new();
+    let mut submitted: Option<Submission> = None;
+    let mut queued_post: Option<Submission> = None;
     let mut laid_out_at = (0.0f32, 0.0f32);
     let mut scroll = 0.0f32;
     let mut ui = Ui {
@@ -255,6 +264,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         w: w as f32,
         h: h as f32 - BAR_H,
         cancel: stop.clone(),
+        post: None,
     });
     busy = Some(Some(start.to_string()));
 
@@ -282,8 +292,12 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             }
             discard = false;
             if let Some((click, link)) = &done.click {
-                // Scripts had their say; now the link (or their navigation).
-                if let Some(to) = &click.navigate {
+                // Scripts and form controls had their say; now a form
+                // submission, a script's navigation, or the link.
+                page_focus = click.focus;
+                if let Some(sub) = &click.submit {
+                    submitted = Some(sub.clone());
+                } else if let Some(to) = &click.navigate {
                     script_nav = Some(to.clone());
                 } else if let (false, Some(l)) = (click.prevented, link) {
                     clicked_link = Some(l.clone());
@@ -295,9 +309,15 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 }
             }
             info = Info::of(&done.tab);
-            rendered = done.rendered;
-            tiles = None; // new content: repaint tiles on demand
-            laid_out_at = (page_w, view_h);
+            if let Some(r) = done.rendered {
+                rendered = r;
+                tiles = None; // new content: repaint tiles on demand
+                laid_out_at = (page_w, view_h);
+            }
+            if done.new_page {
+                page_focus = false;
+                pending_input.clear();
+            }
             tab = Some(done.tab);
             if done.new_page {
                 ui.address = info.url.clone();
@@ -322,9 +342,23 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     w: page_w,
                     h: view_h,
                     cancel: stop.clone(),
+                    post: queued_post.take(),
                 });
                 busy = Some(Some(url));
                 scroll = 0.0;
+            } else if let (Some(input), true) = (pending_input.first().cloned(), tab.is_some()) {
+                // Typing goes to the page in order, a batch at a time.
+                pending_input.remove(0);
+                if let Some(t) = tab.take() {
+                    let _ = jobs.send(Job::Input {
+                        tab: Box::new(t),
+                        input,
+                        link: None,
+                        w: page_w,
+                        h: view_h,
+                    });
+                    busy = Some(None);
+                }
             } else if need_layout || laid_out_at != (page_w, view_h) {
                 need_layout = false;
                 if let Some(t) = tab.take() {
@@ -367,6 +401,26 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 dirty = true;
                 continue;
             }
+            if page_focus {
+                // A form field has the keyboard.
+                let k = match key {
+                    Key::Backspace => Some(PageKey::Backspace),
+                    Key::Enter | Key::NumPadEnter => Some(PageKey::Enter),
+                    Key::Tab => Some(PageKey::Tab),
+                    Key::Escape => Some(PageKey::Escape),
+                    _ => None,
+                };
+                if let Some(k) = k {
+                    pending_input.push(Input::Key(k));
+                    if k == PageKey::Escape {
+                        page_focus = false;
+                    }
+                    continue;
+                }
+                if key == Key::Space {
+                    continue; // typed as a character, not a scroll
+                }
+            }
             let before = scroll;
             match key {
                 Key::Down => scroll += 40.0,
@@ -407,6 +461,15 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             for c in chars.into_iter().filter(|c| !c.is_control()) {
                 ui.address.push(c);
                 dirty = true;
+            }
+        } else if page_focus {
+            let text: String = chars.into_iter().filter(|c| !c.is_control()).collect();
+            if !text.is_empty() {
+                // Consecutive characters travel together.
+                match pending_input.last_mut() {
+                    Some(Input::Type(t)) if t.len() < 4096 => t.push_str(&text),
+                    _ => pending_input.push(Input::Type(text)),
+                }
             }
         }
 
@@ -516,14 +579,14 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                         Err(_) => "Wait for the page to finish loading".into(),
                     });
                 } else if over_panel {
-                } else if info.scripts && my > BAR_H && busy.is_none() && tab.is_some() {
-                    // Let the page's scripts see the click first.
+                } else if my > BAR_H && busy.is_none() && tab.is_some() && info.interstitial.is_none() {
+                    // The page sees the click first (form controls, scripts);
+                    // the link is followed after, unless a script prevents it.
                     let link = rendered.link_at(mx, my - BAR_H + scroll).map(|l| l.to_string());
                     if let Some(t) = tab.take() {
-                        let _ = jobs.send(Job::Click {
+                        let _ = jobs.send(Job::Input {
                             tab: Box::new(t),
-                            x: mx,
-                            y: my - BAR_H + scroll,
+                            input: Input::Click(mx, my - BAR_H + scroll),
                             link,
                             w: page_w,
                             h: view_h,
@@ -557,6 +620,14 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         }
         was_down = down;
 
+        if let Some(sub) = submitted.take() {
+            // Opened like a link from this page; POSTs carry their body.
+            let from = Some(info.url.clone());
+            if sub.post {
+                queued_post = Some(sub.clone());
+            }
+            navigate = Some((sub.url, from));
+        }
         if let Some(l) = clicked_link.take() {
             let url = net::resolve(&info.url, &l);
             if !url.starts_with("brickle:") {

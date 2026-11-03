@@ -6,6 +6,7 @@ pub mod css;
 pub mod dom;
 pub mod filter;
 pub mod font;
+pub mod forms;
 pub mod html;
 pub mod ipc;
 pub mod js;

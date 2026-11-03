@@ -152,5 +152,5 @@ On non-Linux systems the sandbox isn't implemented yet, so you have to run with 
 
 ## Not yet
 
-JavaScript modules, CORS preflight, forms, images, real table layout, floats, positioning (`absolute`/`fixed`), flex wrapping and
+JavaScript modules, CORS preflight, file uploads, images, real table layout, floats, positioning (`absolute`/`fixed`), flex wrapping and
 alignment, `calc()`/`var()`, web fonts, forms, and text selection.

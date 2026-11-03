@@ -55,6 +55,18 @@ fn serve_dynamic(
                 }
                 lines.push(l.trim_end().to_string());
             }
+            // Keep a request body as a "BODY: ..." line.
+            let len = lines
+                .iter()
+                .find_map(|l| l.strip_prefix("Content-Length: "))
+                .and_then(|n| n.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if len > 0 {
+                let mut body = vec![0u8; len.min(1 << 20)];
+                if std::io::Read::read_exact(&mut reader, &mut body).is_ok() {
+                    lines.push(format!("BODY: {}", String::from_utf8_lossy(&body)));
+                }
+            }
             let path = lines
                 .first()
                 .and_then(|l| l.split(' ').nth(1))
@@ -651,4 +663,70 @@ fn javascript_is_off_by_default_and_its_requests_follow_the_rules() {
         .output()
         .unwrap();
     assert!(String::from_utf8_lossy(&out.stdout).contains("\"static\""));
+}
+
+/// Forms: what you type is submitted only when you submit, through the
+/// browser's checks, with Firefox's headers and the page's own cookies.
+#[test]
+fn forms_submit_through_the_browser() {
+    use brickle::page::Key;
+    use brickle::tab::{Input, Tab};
+    let (port, seen) = serve(vec![
+        (
+            "/",
+            "text/html\r\nSet-Cookie: sid=1",
+            "<form method=post action=/login><input name=user><input type=password name=pw>\
+             <input type=submit value=Go></form>\
+             <form action=/search><input name=q></form>"
+                .into(),
+        ),
+        ("/login", "text/html", "<p>welcome".into()),
+        ("/search", "text/html", "<p>results".into()),
+    ]);
+    let url = format!("http://127.0.0.1:{port}/");
+    let mut net = brickle::network::Network::empty();
+    // In-process here (the test binary can't be a sandboxed renderer); the
+    // form code is the same.
+    let mut tab = Tab::open(&mut net, &url, None, false);
+    let _ = tab.render(800.0, 600.0);
+    for input in [
+        Input::Key(Key::Tab),
+        Input::Type("raz".into()),
+        Input::Key(Key::Tab),
+        Input::Type("p&ss w=rd".into()),
+    ] {
+        let r = tab.interact(&mut net, input);
+        assert!(r.submit.is_none() && r.focus);
+    }
+    assert_eq!(seen.lock().unwrap().len(), 1, "typing sends nothing");
+    let r = tab.interact(&mut net, Input::Key(Key::Enter));
+    let sub = r.submit.expect("Enter submits");
+    let _ = Tab::submit(&mut net, &sub, Some(&url), false, (800.0, 600.0));
+    let seen = seen.lock().unwrap();
+    let post = &seen[1];
+    assert_eq!(post[0], "POST /login HTTP/1.1");
+    let header = |name: &str| post.iter().find(|l| l.starts_with(&format!("{name}: "))).cloned();
+    assert_eq!(
+        header("Content-Type").as_deref(),
+        Some("Content-Type: application/x-www-form-urlencoded")
+    );
+    assert_eq!(header("Origin"), Some(format!("Origin: http://127.0.0.1:{port}")));
+    assert_eq!(header("Cookie").as_deref(), Some("Cookie: sid=1"));
+    assert_eq!(
+        header("Sec-Fetch-Mode").as_deref(),
+        Some("Sec-Fetch-Mode: navigate")
+    );
+    assert_eq!(header("BODY").as_deref(), Some("BODY: user=raz&pw=p%26ss+w%3Drd"));
+    drop(seen);
+
+    // A GET form goes to its URL with the data as the query.
+    let mut tab = Tab::open(&mut net, &url, None, false);
+    let _ = tab.render(800.0, 600.0);
+    for k in [Key::Tab, Key::Tab, Key::Tab] {
+        tab.interact(&mut net, Input::Key(k));
+    }
+    tab.interact(&mut net, Input::Type("cats".into()));
+    let sub = tab.interact(&mut net, Input::Key(Key::Enter)).submit.unwrap();
+    assert_eq!(sub.url, format!("http://127.0.0.1:{port}/search?q=cats"));
+    assert!(!sub.post);
 }

@@ -7,7 +7,8 @@ use crate::paint::{self, DisplayList};
 use crate::style::{self, StyleContext};
 use crate::{font, html, net};
 
-use crate::js::{self, Runtime};
+use crate::forms::{self, Activation, Submission};
+use crate::js::{self, Dom, Runtime};
 use crate::net::{Dest, ScriptRequest};
 use crate::network::ScriptResponse;
 use std::cell::RefCell;
@@ -30,6 +31,33 @@ pub struct Page {
     /// Boxes from the last layout and the node each is for, in paint
     /// order, for finding what a click hit.
     hits: RefCell<Vec<(Rect, u32)>>,
+    /// The page's editable DOM when it has no scripts (with scripts, the
+    /// script runtime holds it). Typing and form controls change it.
+    arena: Option<Dom>,
+    /// The form field that has the keyboard.
+    pub focus: Option<u32>,
+}
+
+/// What a click or keystroke on the page did.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Interaction {
+    /// A script called `preventDefault()` on a click: don't follow a link.
+    pub prevented: bool,
+    /// The page changed and needs a new layout.
+    pub changed: bool,
+    /// A form was submitted: the browser should go here.
+    pub submit: Option<Submission>,
+    /// A field that takes typing has the focus.
+    pub focus: bool,
+}
+
+/// A key that does something in a form field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    Backspace,
+    Enter,
+    Tab,
+    Escape,
 }
 
 /// What scripts left behind while a page loaded.
@@ -122,7 +150,7 @@ pub fn pump(rt: &mut Runtime, host: &mut dyn Host, until: Instant) {
 
 fn ua_sheet() -> &'static Stylesheet {
     static UA: OnceLock<Stylesheet> = OnceLock::new();
-    UA.get_or_init(|| css::parse(style::UA_CSS))
+    UA.get_or_init(|| css::parse(&format!("{}\n{}", style::UA_CSS, forms::UA_CSS)))
 }
 
 impl Page {
@@ -130,7 +158,9 @@ impl Page {
     /// requested through `fetch`.
     pub fn parse(url: &str, src: &str, blocker_css: &str, fetch: &mut Fetcher) -> Page {
         let mut page = Page::empty(url, blocker_css, false);
-        page.set_tree(html::parse(src), fetch);
+        let arena = Dom::from_tree(&html::parse(src));
+        page.set_tree(arena.to_tree(), fetch);
+        page.arena = Some(arena);
         page
     }
 
@@ -202,6 +232,8 @@ impl Page {
             scripting,
             sheet_cache: HashMap::new(),
             hits: RefCell::new(Vec::new()),
+            arena: None,
+            focus: None,
         }
     }
 
@@ -261,6 +293,174 @@ impl Page {
         self.set_tree(rt.tree(), &mut |_, _| Err("page already loaded".into()));
     }
 
+    /// Run `f` on the page's editable DOM: the script runtime's, or the
+    /// page's own.
+    fn with_dom<R>(&mut self, rt: Option<&mut Runtime>, f: impl FnOnce(&mut Dom) -> R) -> Option<R> {
+        match rt {
+            Some(rt) => Some(rt.with_dom(f)),
+            None => self.arena.as_mut().map(f),
+        }
+    }
+
+    fn dom_version(&mut self, rt: Option<&mut Runtime>) -> u64 {
+        self.with_dom(rt, |d| d.version).unwrap_or(0)
+    }
+
+    /// After the editable DOM changed: take the new tree.
+    fn sync(&mut self, rt: Option<&mut Runtime>) {
+        let tree = match rt {
+            Some(rt) => rt.tree(),
+            None => match &self.arena {
+                Some(a) => a.to_tree(),
+                None => return,
+            },
+        };
+        self.set_tree(tree, &mut |_, _| Err("page already loaded".into()));
+    }
+
+    /// Submit `form` (as if by `submitter`): scripts first get a `submit`
+    /// event they can cancel.
+    fn submit(
+        &mut self,
+        mut rt: Option<&mut Runtime>,
+        form: u32,
+        submitter: Option<u32>,
+    ) -> Option<Submission> {
+        if let Some(rt) = rt.as_deref_mut() {
+            if rt.fire(form, "submit", true, true) {
+                return None;
+            }
+        }
+        let url = self.url.clone();
+        self.with_dom(rt, |d| forms::submission(d, form, submitter, &url))
+            .flatten()
+    }
+
+    /// You clicked the page at page-space (x, y).
+    pub fn click_at(&mut self, mut rt: Option<&mut Runtime>, x: f32, y: f32, until: Instant) -> Interaction {
+        let mut out = Interaction::default();
+        let before = self.dom_version(rt.as_deref_mut());
+        let Some(uid) = self.hit(x, y) else {
+            self.focus = None;
+            return out;
+        };
+        if let Some(rt) = rt.as_deref_mut() {
+            out.prevented = rt.click(uid, until).prevented;
+        }
+        let control = self
+            .with_dom(rt.as_deref_mut(), |d| forms::control_at(d, uid))
+            .flatten();
+        let was_focus = self.focus;
+        self.focus = None;
+        if let (Some(c), false) = (control, out.prevented) {
+            match self.with_dom(rt.as_deref_mut(), |d| forms::activate(d, c)) {
+                Some(Activation::Focus(f)) => {
+                    self.focus = Some(f);
+                    if was_focus != Some(f) {
+                        if let Some(rt) = rt.as_deref_mut() {
+                            rt.fire(f, "focus", false, false);
+                        }
+                    }
+                }
+                Some(Activation::Changed(c)) => {
+                    if let Some(rt) = rt.as_deref_mut() {
+                        rt.fire(c, "input", true, false);
+                        rt.fire(c, "change", true, false);
+                    }
+                }
+                Some(Activation::Submit { form, submitter }) => {
+                    out.submit = self.submit(rt.as_deref_mut(), form, Some(submitter));
+                }
+                _ => {}
+            }
+        }
+        self.finish(rt, before, was_focus, &mut out);
+        out
+    }
+
+    /// You typed text into the focused field.
+    pub fn type_text(&mut self, mut rt: Option<&mut Runtime>, text: &str) -> Interaction {
+        let mut out = Interaction::default();
+        let Some(f) = self.focus else { return out };
+        let before = self.dom_version(rt.as_deref_mut());
+        let typed = self.with_dom(rt.as_deref_mut(), |d| forms::type_text(d, f, text)) == Some(true);
+        if typed {
+            if let Some(rt) = rt.as_deref_mut() {
+                rt.fire(f, "input", true, false);
+            }
+        }
+        self.finish(rt, before, Some(f), &mut out);
+        out
+    }
+
+    /// You pressed a key with a field focused.
+    pub fn key(&mut self, mut rt: Option<&mut Runtime>, key: Key) -> Interaction {
+        let mut out = Interaction::default();
+        let before = self.dom_version(rt.as_deref_mut());
+        let was = self.focus;
+        match (key, self.focus) {
+            (Key::Backspace, Some(f)) => {
+                if self.with_dom(rt.as_deref_mut(), |d| forms::backspace(d, f)) == Some(true) {
+                    if let Some(rt) = rt.as_deref_mut() {
+                        rt.fire(f, "input", true, false);
+                    }
+                }
+            }
+            (Key::Enter, Some(f)) => {
+                let textarea = self
+                    .with_dom(rt.as_deref_mut(), |d| {
+                        d.element(f).is_some_and(|e| e.tag == "textarea")
+                    })
+                    .unwrap_or(false);
+                if textarea {
+                    self.with_dom(rt.as_deref_mut(), |d| forms::type_text(d, f, "\n"));
+                } else if let Some((form, submitter)) = self
+                    .with_dom(rt.as_deref_mut(), |d| forms::implicit_submit(d, f))
+                    .flatten()
+                {
+                    if let Some(rt) = rt.as_deref_mut() {
+                        rt.fire(f, "change", true, false);
+                    }
+                    out.submit = self.submit(rt.as_deref_mut(), form, submitter);
+                }
+            }
+            (Key::Tab, _) => {
+                self.focus = self
+                    .with_dom(rt.as_deref_mut(), |d| forms::next_field(d, was))
+                    .flatten();
+            }
+            (Key::Escape, _) => self.focus = None,
+            _ => {}
+        }
+        self.finish(rt, before, was, &mut out);
+        out
+    }
+
+    /// Common end of an interaction: `form.submit()` from scripts, new
+    /// layout if anything changed.
+    fn finish(
+        &mut self,
+        mut rt: Option<&mut Runtime>,
+        before: u64,
+        was_focus: Option<u32>,
+        out: &mut Interaction,
+    ) {
+        if out.submit.is_none() {
+            if let Some((form, submitter)) = rt.as_deref_mut().and_then(|r| r.take_submit()) {
+                let url = self.url.clone();
+                out.submit = self
+                    .with_dom(rt.as_deref_mut(), |d| forms::submission(d, form, submitter, &url))
+                    .flatten();
+            }
+        }
+        let changed = self.dom_version(rt.as_deref_mut()) != before;
+        if changed {
+            self.sync(rt);
+        }
+        out.changed = changed || self.focus != was_focus;
+        out.focus = self.focus.is_some();
+    }
+
     /// The node under a page-space point, from the last layout.
     pub fn hit(&self, x: f32, y: f32) -> Option<u32> {
         self.hits
@@ -289,7 +489,10 @@ impl Page {
             sheets: all,
             viewport: (width, viewport_h),
         };
-        let styled = style::style_tree(&self.dom, &ctx);
+        // Form controls get their value, label or placeholder to draw.
+        let mut tree = self.dom.clone();
+        forms::decorate(&mut tree, self.focus);
+        let styled = style::style_tree(&tree, &ctx);
         let root = layout::layout_tree(&styled, width);
 
         // The root's (or body's) background paints the whole canvas.
@@ -438,4 +641,50 @@ pub fn error_page(url: &str, err: &str) -> String {
         esc(url),
         esc(err)
     )
+}
+
+#[cfg(test)]
+mod form_script_tests {
+    use super::*;
+
+    fn load(html: &str) -> (Page, Runtime) {
+        let mut host = FetchOnly(|_: &str, _: Dest| Err("none".to_string()));
+        let (page, rt, _) =
+            Page::load_with_scripts("https://example.com/", html, "", (800.0, 600.0), &mut host);
+        let _ = page.render(800.0, 600.0);
+        (page, rt.expect("scripts run"))
+    }
+
+    #[test]
+    fn scripts_see_typing_and_can_cancel_submission() {
+        let (mut page, mut rt) = load(
+            "<form id=f action=/s><input name=q id=q></form><p id=log></p>\
+             <script>const q = document.getElementById('q'), log = document.getElementById('log');\
+             q.addEventListener('input', () => log.textContent = 'typed ' + q.value);\
+             document.getElementById('f').addEventListener('submit', (e) => { e.preventDefault(); log.textContent += ' blocked'; });\
+             </script>",
+        );
+        page.key(Some(&mut rt), Key::Tab);
+        let r = page.type_text(Some(&mut rt), "hi");
+        assert!(r.changed);
+        assert!(page.dom.text_content().contains("typed hi"));
+        let r = page.key(Some(&mut rt), Key::Enter);
+        assert_eq!(r.submit, None, "the script cancelled it");
+        assert!(page.dom.text_content().contains("typed hi blocked"));
+    }
+
+    #[test]
+    fn form_submit_from_a_script() {
+        let (mut page, mut rt) = load(
+            "<form id=f action=/s><input name=q value=x id=q><button type=button id=b>go</button></form>\
+             <script>document.getElementById('b').onclick = () => document.getElementById('f').submit();</script>",
+        );
+        // Focus the field, then "click" the button via Tab + a script click.
+        rt.run_script("document.getElementById('b').click()", 0, "test");
+        let r = page.key(Some(&mut rt), Key::Escape);
+        assert_eq!(
+            r.submit.map(|s| s.url).as_deref(),
+            Some("https://example.com/s?q=x")
+        );
+    }
 }

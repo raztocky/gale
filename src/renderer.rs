@@ -4,7 +4,7 @@
 //! which applies the security policy.
 
 use crate::ipc::{read_frame, write_frame, FromRenderer, ToRenderer};
-use crate::js::{self, ClickResult, Runtime};
+use crate::js::{self, Runtime};
 use crate::net::{Dest, ScriptRequest};
 use crate::network::ScriptResponse;
 use crate::page::{pump, Host, Page, ScriptOutput};
@@ -147,14 +147,19 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                 }
                 send(output, FromRenderer::Rendered(rendered))?;
             }
-            ToRenderer::Click { x, y } => {
-                let p = page.as_mut().ok_or("click before load")?;
-                let mut result = ClickResult::default();
+            msg @ (ToRenderer::Click { .. } | ToRenderer::Type(_) | ToRenderer::Key(_)) => {
+                let p = page.as_mut().ok_or("input before load")?;
+                let until = Instant::now() + js::EVENT_BUDGET;
+                let before = rt.as_ref().map(|r| r.version());
+                let mut done = match msg {
+                    ToRenderer::Click { x, y } => p.click_at(rt.as_mut(), x, y, until),
+                    ToRenderer::Type(t) => p.type_text(rt.as_mut(), &t),
+                    ToRenderer::Key(k) => p.key(rt.as_mut(), k),
+                    _ => unreachable!(),
+                };
                 let (mut navigate, mut console) = (None, vec![]);
-                if let (Some(rt), Some(uid)) = (rt.as_mut(), p.hit(x, y)) {
-                    let until = Instant::now() + js::EVENT_BUDGET;
-                    let before = rt.version();
-                    result = rt.click(uid, until);
+                if let Some(rt) = rt.as_mut() {
+                    // Handlers may have made requests or set timers.
                     let mut host = IpcHost {
                         input: &mut *input,
                         output: &mut *output,
@@ -166,9 +171,9 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                         return Err(e);
                     }
                     cookies = host.cookies;
-                    result.changed = rt.version() != before;
-                    if result.changed {
+                    if Some(rt.version()) != before {
                         p.refresh(rt);
+                        done.changed = true;
                     }
                     navigate = rt.take_navigate();
                     console = rt.take_console();
@@ -176,10 +181,12 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                 send(
                     output,
                     FromRenderer::Clicked {
-                        prevented: result.prevented,
-                        changed: result.changed,
+                        prevented: done.prevented,
+                        changed: done.changed,
                         navigate,
                         console,
+                        submit: done.submit,
+                        focus: done.focus,
                     },
                 )?;
             }

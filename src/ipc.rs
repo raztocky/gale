@@ -7,9 +7,11 @@
 //! channel.
 
 use crate::css::Color;
+use crate::forms::Submission;
 use crate::layout::Rect;
 use crate::net::{Credentials, Dest, ScriptRequest};
 use crate::network::ScriptResponse;
+use crate::page::Key;
 use crate::page::Rendered;
 use crate::paint::{DisplayCommand, GlyphBitmap, PlacedGlyph, MAX_ATLAS_BYTES, MAX_GLYPH_SIDE};
 use std::io::{self, Read, Write};
@@ -54,6 +56,10 @@ pub enum ToRenderer {
         x: f32,
         y: f32,
     },
+    /// You typed this into the focused field.
+    Type(String),
+    /// You pressed a key with a field focused.
+    Key(Key),
     Render {
         width: f32,
         height: f32,
@@ -90,6 +96,10 @@ pub enum FromRenderer {
         changed: bool,
         navigate: Option<String>,
         console: Vec<String>,
+        /// A form was submitted (the browser checks it like any navigation).
+        submit: Option<Submission>,
+        /// A field that takes typing has the focus.
+        focus: bool,
     },
 }
 
@@ -374,6 +384,19 @@ impl ToRenderer {
                 e.f32(*x);
                 e.f32(*y);
             }
+            ToRenderer::Type(t) => {
+                e.u8(8);
+                e.str(t);
+            }
+            ToRenderer::Key(k) => {
+                e.u8(9);
+                e.u8(match k {
+                    Key::Backspace => 1,
+                    Key::Enter => 2,
+                    Key::Tab => 3,
+                    Key::Escape => 4,
+                });
+            }
             ToRenderer::FetchReply(r) => {
                 e.u8(2);
                 match r {
@@ -423,6 +446,14 @@ impl ToRenderer {
                 cookies: d.str()?,
             },
             7 => ToRenderer::Cookies(d.str()?),
+            8 => ToRenderer::Type(d.str()?),
+            9 => ToRenderer::Key(match d.u8()? {
+                1 => Key::Backspace,
+                2 => Key::Enter,
+                3 => Key::Tab,
+                4 => Key::Escape,
+                k => return Err(format!("unknown key {k}")),
+            }),
             5 => ToRenderer::Click {
                 x: d.f32()?,
                 y: d.f32()?,
@@ -486,12 +517,25 @@ impl FromRenderer {
                 changed,
                 navigate,
                 console,
+                submit,
+                focus,
             } => {
                 e.u8(5);
                 e.u8(*prevented as u8);
                 e.u8(*changed as u8);
                 e.opt_str(navigate);
                 e.strs(console);
+                match submit {
+                    Some(s) => {
+                        e.u8(1);
+                        e.str(&s.url);
+                        e.u8(s.post as u8);
+                        e.opt_str(&s.body);
+                        e.opt_str(&s.content_type);
+                    }
+                    None => e.u8(0),
+                }
+                e.u8(*focus as u8);
             }
             FromRenderer::Rendered(r) => {
                 e.u8(3);
@@ -576,6 +620,17 @@ impl FromRenderer {
                 changed: d.bool()?,
                 navigate: d.opt_str()?,
                 console: d.strs(MAX_CONSOLE)?,
+                submit: if d.bool()? {
+                    Some(Submission {
+                        url: d.str()?,
+                        post: d.bool()?,
+                        body: d.opt_str()?,
+                        content_type: d.opt_str()?,
+                    })
+                } else {
+                    None
+                },
+                focus: d.bool()?,
             },
             3 => {
                 let height = d.f32()?.max(0.0);
@@ -751,6 +806,21 @@ mod tests {
                 changed: false,
                 navigate: None,
                 console: vec![],
+                submit: None,
+                focus: true,
+            },
+            FromRenderer::Clicked {
+                prevented: false,
+                changed: true,
+                navigate: None,
+                console: vec!["[log] x".into()],
+                submit: Some(Submission {
+                    url: "https://a/s".into(),
+                    post: true,
+                    body: Some("q=1".into()),
+                    content_type: Some("application/x-www-form-urlencoded".into()),
+                }),
+                focus: false,
             },
             FromRenderer::Rendered(sample()),
             FromRenderer::Dom("<html>".into()),
@@ -783,6 +853,8 @@ mod tests {
             },
             ToRenderer::Cookies("c=3".into()),
             ToRenderer::Click { x: 10.0, y: 20.0 },
+            ToRenderer::Type("héllo".into()),
+            ToRenderer::Key(Key::Enter),
             ToRenderer::FetchReply(Ok("css".into())),
             ToRenderer::FetchReply(Err("nope".into())),
             ToRenderer::Render {

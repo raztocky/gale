@@ -6,13 +6,14 @@
 //! a validated display list. If the renderer crashes, hangs or sends garbage,
 //! it is killed and an error page is shown; the browser keeps running.
 
+use crate::forms::Submission;
 use crate::ipc::{read_frame, write_frame, FromRenderer, ToRenderer, MAX_FRAME};
 use crate::net::{self, Cancel};
 use crate::net::{Dest, ScriptRequest};
 use crate::network::ScriptResponse;
 use crate::network::{Action, LogEntry, Nav, Network, MAX_STYLESHEETS};
-use crate::page::Host;
 use crate::page::{error_page, Page, Rendered};
+use crate::page::{Host, Key};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::time::{Duration, Instant};
@@ -93,6 +94,20 @@ pub struct Click {
     pub changed: bool,
     /// A script asked to go somewhere.
     pub navigate: Option<String>,
+    /// A form was submitted: go here (the browser checks it like any
+    /// navigation).
+    pub submit: Option<Submission>,
+    /// A field that takes typing has the focus.
+    pub focus: bool,
+}
+
+/// Something you did to a page.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Input {
+    /// A click at a page-space point.
+    Click(f32, f32),
+    Type(String),
+    Key(Key),
 }
 
 /// What the renderer reported when a page loaded.
@@ -122,7 +137,25 @@ impl Tab {
         sandbox: bool,
         viewport: (f32, f32),
     ) -> Tab {
-        match net.navigate(url, from) {
+        let nav = net.navigate(url, from);
+        Tab::from_nav(net, nav, from, sandbox, viewport)
+    }
+
+    /// Submit a form from the page at `from` (the browser's own record of
+    /// it) and open what comes back.
+    pub fn submit(
+        net: &mut Network,
+        sub: &Submission,
+        from: Option<&str>,
+        sandbox: bool,
+        viewport: (f32, f32),
+    ) -> Tab {
+        let nav = net.submit_form(sub, from);
+        Tab::from_nav(net, nav, from, sandbox, viewport)
+    }
+
+    fn from_nav(net: &mut Network, nav: Nav, from: Option<&str>, sandbox: bool, viewport: (f32, f32)) -> Tab {
+        match nav {
             Nav::Page { url, html } => Tab::with_html_sized(net, &url, from, &html, sandbox, viewport),
             Nav::Interstitial { url, html, action } => {
                 // Our own trusted HTML: no renderer or subresources needed.
@@ -205,39 +238,69 @@ impl Tab {
     }
 
     /// Tell the page you clicked at page-space point (x, y), so its scripts
-    /// can react. Returns what happened; the caller follows the link (if
-    /// any) unless a script prevented it.
+    /// and form controls can react. The caller follows the link under the
+    /// click (if any) unless a script prevented it.
     pub fn click(&mut self, net: &mut Network, x: f32, y: f32) -> Click {
-        let Backend::Sandboxed(r) = &mut self.backend else {
-            return Click::default();
+        self.interact(net, Input::Click(x, y))
+    }
+
+    /// A click, typing or a key press on the page.
+    pub fn interact(&mut self, net: &mut Network, input: Input) -> Click {
+        let r = match &mut self.backend {
+            Backend::Failed(_) => return Click::default(),
+            Backend::InProcess(page) => {
+                let until = Instant::now() + crate::js::EVENT_BUDGET;
+                let done = match input {
+                    Input::Click(x, y) => page.click_at(None, x, y, until),
+                    Input::Type(t) => page.type_text(None, &t),
+                    Input::Key(k) => page.key(None, k),
+                };
+                return Click {
+                    prevented: done.prevented,
+                    changed: done.changed,
+                    navigate: None,
+                    submit: done.submit,
+                    focus: done.focus,
+                };
+            }
+            Backend::Sandboxed(r) => r,
         };
-        if !self.scripts {
-            return Click::default();
-        }
         let mut host = NetHost {
             net,
             page: self.url.clone(),
         };
-        let result = r.send(ToRenderer::Click { x, y }).and_then(|_| {
+        let msg = match input {
+            Input::Click(x, y) => ToRenderer::Click { x, y },
+            Input::Type(t) => ToRenderer::Type(t),
+            Input::Key(k) => ToRenderer::Key(k),
+        };
+        let result = r.send(msg).and_then(|_| {
             match r.serve(Instant::now() + RENDERER_TIMEOUT, SCRIPT_BYTES, &mut host)? {
                 FromRenderer::Clicked {
                     prevented,
                     changed,
                     navigate,
                     console,
-                } => Ok((prevented, changed, navigate, console)),
+                    submit,
+                    focus,
+                } => Ok((
+                    Click {
+                        prevented,
+                        changed,
+                        navigate,
+                        submit,
+                        focus,
+                    },
+                    console,
+                )),
                 _ => Err(r.kill("renderer sent an unexpected message and was killed")),
             }
         });
         match result {
-            Ok((prevented, changed, navigate, console)) => {
+            Ok((click, console)) => {
                 let room = MAX_CONSOLE.saturating_sub(self.console.len());
                 self.console.extend(console.into_iter().take(room));
-                Click {
-                    prevented,
-                    changed,
-                    navigate,
-                }
+                click
             }
             Err(e) => {
                 self.backend = Backend::Failed(e);

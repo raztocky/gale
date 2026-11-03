@@ -48,3 +48,14 @@ clicks, no network for scripts. Rules that still apply to what's next:
   shared with CSS.
 - [ ] `MutationObserver` callbacks; `getComputedStyle` beyond inline styles.
 - [ ] Faster startup for the JS fuzzer (snapshot the prelude).
+
+## Forms
+
+Done: text fields, passwords, textareas, checkboxes, radio buttons, selects, buttons, labels,
+Tab between fields, Enter to submit, GET/POST (url-encoded, multipart, text/plain), and the
+`input`/`change`/`submit` events for scripts.
+- [ ] A real drop-down for `<select>` (clicks cycle through the options for now).
+- [ ] Moving the caret, selecting text, copy and paste.
+- [ ] File uploads (`<input type=file>`).
+- [ ] Form validation (`required`, `pattern`), `<input type=number>` steppers, date pickers.
+- [ ] Ask before re-sending a POST on reload or back (reload currently does a GET).
