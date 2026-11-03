@@ -2223,6 +2223,23 @@ impl<'a> LayoutBox<'a> {
         }
 
         let n = busy.len();
+        // Collapsed borders: neighbouring cells, and the cells at the edges
+        // with the table, overlap by the widest border, so shared borders
+        // are drawn as one.
+        let spacing = if s.border_collapse {
+            let widest = |sides: [usize; 2]| {
+                cells
+                    .iter()
+                    .map(|c| {
+                        let w = self.row(rows[c.row]).children[c.idx].style().border_width;
+                        w[sides[0]].max(w[sides[1]])
+                    })
+                    .fold(0.0, f32::max)
+            };
+            [-widest([1, 3]), -widest([0, 2])]
+        } else {
+            spacing
+        };
         let mut t = TableCols {
             rows,
             cells,
@@ -2682,6 +2699,28 @@ mod table_tests {
             "td",
         );
         assert!(close(td[1].x, td[0].x + td[0].w), "{td:?}");
+    }
+
+    #[test]
+    fn collapsed_borders_are_shared() {
+        let page = "<table style='border-collapse:collapse;border:1px solid'><tr>\
+             <td style='border:1px solid'>a<td style='border:1px solid'>b<tr>\
+             <td style='border:1px solid'>c<td style='border:1px solid'>d</table>";
+        let td = boxes(page, 800.0, "td");
+        let t = boxes(page, 800.0, "table")[0];
+        assert!(
+            close(td[1].x, td[0].x + td[0].w - 1.0),
+            "one shared line between columns: {td:?}"
+        );
+        assert!(
+            close(td[2].y, td[0].y + td[0].h - 1.0),
+            "and between rows: {td:?}"
+        );
+        assert!(
+            close(td[0].x, t.x) && close(td[0].y, t.y),
+            "edge cells sit on the table's border: {td:?} {t:?}"
+        );
+        assert!(close(td[1].x + td[1].w, t.x + t.w), "{td:?} {t:?}");
     }
 
     #[test]
