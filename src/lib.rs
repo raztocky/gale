@@ -19,6 +19,7 @@ pub mod page;
 pub mod paint;
 pub mod renderer;
 pub mod sandbox;
+pub mod select;
 pub mod style;
 pub mod tab;
 pub mod urlclean;

@@ -5,6 +5,7 @@ use crate::dom::Node;
 use crate::image::{self, Decoded};
 use crate::layout::{self, BoxKind, LayoutBox, Rect};
 use crate::paint::{self, DisplayList};
+use crate::select::TextRun;
 use crate::style::{self, StyleContext};
 use crate::{font, html, net};
 
@@ -84,6 +85,8 @@ pub struct Rendered {
     pub height: f32,
     pub background: Color,
     pub links: Vec<(Rect, String)>,
+    /// The page's text in reading order, for selecting and copying it.
+    pub texts: Vec<TextRun>,
 }
 
 /// Fetches a subresource (absolute URL) for the page. In the sandboxed
@@ -579,6 +582,8 @@ impl Page {
             collect_hits(b, &mut hits);
         }
         *self.hits.borrow_mut() = hits;
+        let mut texts = Vec::new();
+        collect_text(&root, &mut texts, &mut 0);
         let mb = root.dims.margin_box();
         Rendered {
             list,
@@ -586,7 +591,49 @@ impl Page {
             height: mb.y + mb.h,
             background,
             links,
+            texts,
         }
+    }
+}
+
+/// Most characters of a page's text sent for selection; past this, the rest
+/// can't be selected.
+pub const MAX_TEXT_CHARS: usize = 2_000_000;
+
+/// The visible text under `b`, in tree (reading) order, with where each
+/// character ends. `chars` counts what's been collected so far.
+fn collect_text(b: &LayoutBox, out: &mut Vec<TextRun>, chars: &mut usize) {
+    if let BoxKind::Anonymous { frags, .. } = &b.kind {
+        for f in frags.iter().filter(|f| f.style.visible && !f.text.is_empty()) {
+            let n = f.text.chars().count();
+            if *chars + n > MAX_TEXT_CHARS {
+                return;
+            }
+            *chars += n;
+            let fi = font::index(&f.style);
+            let (a, d) = font::vmetrics(fi, f.style.font_size);
+            let mut x = 0.0;
+            let mut offsets = Vec::with_capacity(n + 1);
+            offsets.push(0.0);
+            let mut buf = [0u8; 4];
+            for c in f.text.chars() {
+                x += font::measure(fi, f.style.font_size, c.encode_utf8(&mut buf));
+                offsets.push(x);
+            }
+            out.push(TextRun {
+                rect: Rect {
+                    x: f.x,
+                    y: f.baseline - a,
+                    w: f.w,
+                    h: a + d,
+                },
+                text: f.text.clone(),
+                offsets,
+            });
+        }
+    }
+    for c in &b.children {
+        collect_text(c, out, chars);
     }
 }
 
@@ -970,5 +1017,48 @@ mod image_tests {
         assert_eq!(size_of(&page, "a"), (3.0, 2.0));
         assert_eq!(base64("aGk="), Some(b"hi".to_vec()));
         assert_eq!(base64("a!"), None);
+    }
+}
+
+#[cfg(test)]
+mod text_tests {
+    use super::*;
+    use crate::select;
+
+    fn render(html: &str) -> Rendered {
+        let page = Page::parse("https://example.com/", html, "", &mut |_, _| Err("none".into()));
+        page.render(800.0, 600.0)
+    }
+
+    #[test]
+    fn page_text_in_reading_order() {
+        let r = render(
+            "<p>Hello <b>bold</b> world</p><p style='visibility:hidden'>secret</p>\
+             <div style='position:absolute;top:0;right:0'>corner</div><p>Second line</p>",
+        );
+        let (a, b) = select::all(&r.texts).unwrap();
+        // Tree order, so the positioned box comes where it is in the page.
+        assert_eq!(
+            select::text(&r.texts, a, b),
+            "Hello bold world\ncorner\nSecond line"
+        );
+        for t in &r.texts {
+            assert_eq!(t.offsets.len(), t.text.chars().count() + 1);
+            assert!((t.offsets.last().unwrap() - t.rect.w).abs() < 0.01, "{t:?}");
+        }
+    }
+
+    #[test]
+    fn page_text_is_capped() {
+        let big = "x".repeat(1000);
+        let r = render(&format!(
+            "<pre>{}</pre>",
+            format!("{big}\n").repeat(MAX_TEXT_CHARS / 1000 + 5)
+        ));
+        let chars: usize = r.texts.iter().map(|t| t.text.chars().count()).sum();
+        assert!(
+            chars <= MAX_TEXT_CHARS && chars > MAX_TEXT_CHARS - 2000,
+            "{chars}"
+        );
     }
 }

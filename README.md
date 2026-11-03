@@ -49,7 +49,8 @@ libraries, run `sudo apt install build-essential libxkbcommon-dev`.
 | Switch tabs | `Ctrl+Tab`, `Ctrl+Shift+Tab`, `Ctrl+PgDn`/`PgUp`, `Ctrl+1`…`Ctrl+9` |
 | Open a link in a new tab | middle-click, or `Ctrl`+click |
 | Forms | click a field to type; `Tab` next field, `Enter` submit, `Esc` leave the field |
-| Paste / copy the address | `Ctrl+V` or `Shift+Insert` in the address bar or a form field / `Ctrl+C` |
+| Select text | drag, double-click a word, `Ctrl+A` for the page, `Esc` to clear |
+| Copy / paste | `Ctrl+C` copies the selection (or the address); `Ctrl+V` or `Shift+Insert` pastes into the address bar or a form field |
 
 ## Architecture
 
@@ -161,4 +162,4 @@ On non-Linux systems the sandbox isn't implemented yet, so you have to run with 
 ## Not yet
 
 JavaScript modules, CORS preflight, file uploads, CSS background images, SVG, animated images, collapsed table borders (`border-collapse` only removes the spacing), `position: fixed` staying put while scrolling, `position: sticky` (laid out as static), relative offsets on inline elements, flex wrapping and
-alignment, `calc()`/`var()`, web fonts, forms, and text selection.
+alignment, `calc()`/`var()`, web fonts, and selecting text inside form fields.

@@ -9,10 +9,12 @@ use brickle::net;
 use brickle::network::{Action, LogEntry, Network, Outcome};
 use brickle::page::{Key as PageKey, Rendered};
 use brickle::paint::{Canvas, GlyphCache, TileCache};
+use brickle::select::{self, Pos};
 use brickle::tab::{Input, Tab};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// The tab strip, then the address bar.
 const TABS_H: f32 = 30.0;
@@ -37,6 +39,13 @@ const CHROME: Color = Color::rgb(0xec, 0xee, 0xf1);
 const RED: Color = Color::rgb(0xc0, 0x1c, 0x1c);
 const GREEN: Color = Color::rgb(0x15, 0x80, 0x3d);
 const AMBER: Color = Color::rgb(0xb4, 0x53, 0x09);
+/// Drawn over selected text.
+const SELECTION: Color = Color {
+    r: 0x33,
+    g: 0x90,
+    b: 0xff,
+    a: 0x60,
+};
 
 struct Chars(Arc<Mutex<Vec<char>>>);
 impl minifb::InputCallback for Chars {
@@ -283,6 +292,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         height: 0.0,
         background: Color::WHITE,
         links: vec![],
+        texts: vec![],
     };
     // In flight: the URL being loaded (None for a re-layout).
     let mut busy: Option<Option<String>>;
@@ -314,6 +324,14 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
     };
     let mut cache = GlyphCache::default();
     let mut was_down = false;
+    // Selected text on the page (where it started, where it ends now), and a
+    // press on the page that becomes a click when you let go, unless you
+    // dragged to select. A second press soon after selects a word.
+    let mut sel: Option<(Pos, Pos)> = None;
+    let mut press: Option<(f32, f32)> = None;
+    let mut dragged = false;
+    let mut word_press = false;
+    let mut last_press: Option<(Instant, f32, f32)> = None;
     let mut dirty = true;
     let mut frame = 0u32;
     let mut canvas = Canvas::new(w, h, Color::WHITE);
@@ -379,6 +397,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             tab = p.tab;
             info = p.info;
             rendered = p.rendered;
+            sel = None;
             history = p.history;
             forward = p.forward;
             scroll = p.scroll;
@@ -500,6 +519,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             info = Info::of(&done.tab);
             if let Some(r) = done.rendered {
                 rendered = r;
+                sel = None;
                 tiles = None; // new content: repaint tiles on demand
                 laid_out_at = (page_w, view_h);
             }
@@ -635,14 +655,28 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 dirty = true;
                 continue;
             }
-            // Copy the address: what you're typing, or the page's.
+            // Copy the selected text, or else the address: what you're
+            // typing, or the page's.
             if ctrl && key == Key::C && !page_focus {
-                let url = if ui.editing { &ui.address } else { &info.url };
-                ui.flash = Some(if clip.copy(url) {
-                    "Copied the address".into()
+                let selected = sel
+                    .filter(|_| !ui.editing)
+                    .map(|(a, b)| select::text(&rendered.texts, a, b))
+                    .filter(|t| !t.is_empty());
+                let (what, done) = match &selected {
+                    Some(t) => (t.as_str(), "Copied"),
+                    None if ui.editing => (ui.address.as_str(), "Copied the address"),
+                    None => (info.url.as_str(), "Copied the address"),
+                };
+                ui.flash = Some(if clip.copy(what) {
+                    done.into()
                 } else {
                     "Couldn't reach the clipboard".into()
                 });
+                dirty = true;
+                continue;
+            }
+            if ctrl && key == Key::A && !ui.editing && !page_focus {
+                sel = select::all(&rendered.texts);
                 dirty = true;
                 continue;
             }
@@ -709,6 +743,10 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     queued = None;
                     ui.address = info.url.clone();
                     ui.flash = Some("Stopped".into());
+                    dirty = true;
+                }
+                Key::Escape if sel.is_some() => {
+                    sel = None;
                     dirty = true;
                 }
                 Key::Left if alt => hist = -1,
@@ -878,44 +916,98 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                         Err(_) => "Wait for the page to finish loading".into(),
                     });
                 } else if over_panel {
-                } else if my > BAR_H && busy.is_none() && tab.is_some() && info.interstitial.is_none() {
-                    // The page sees the click first (form controls, scripts);
-                    // the link is followed after, unless a script prevents it.
-                    let link = rendered.link_at(mx, my - BAR_H + scroll).map(|l| l.to_string());
-                    if let Some(t) = tab.take() {
-                        let _ = jobs.send((
-                            cur_id,
-                            Job::Input {
-                                tab: Box::new(t),
-                                input: Input::Click(mx, my - BAR_H + scroll),
-                                link,
-                                w: page_w,
-                                h: view_h,
-                            },
-                        ));
-                        busy = Some(None);
-                    }
-                } else if let Some(l) = rendered.link_at(mx, my - BAR_H + scroll) {
-                    let url = net::resolve(&info.url, l);
-                    if let Some(rest) = url.strip_prefix("brickle:") {
-                        // Internal actions only work on our own warning pages.
-                        if let Some(action) = info.interstitial.clone() {
-                            match rest {
-                                "proceed" => {
-                                    if let Ok(mut n) = net.try_lock() {
-                                        navigate = Some((n.allow_action(&action), info.opener.clone()));
-                                    }
-                                }
-                                "back" => hist = -1,
-                                _ => {}
-                            }
-                        }
+                } else if my > BAR_H {
+                    // The page gets the click when you let go (below), so
+                    // that dragging can select text instead.
+                    press = Some((mx, my));
+                    dragged = false;
+                    let double = last_press.is_some_and(|(t, x, y)| {
+                        t.elapsed().as_millis() < 400 && (mx - x).abs() + (my - y).abs() < 4.0
+                    });
+                    last_press = if double {
+                        None
                     } else {
-                        navigate = Some((url, Some(info.url.clone())));
+                        Some((Instant::now(), mx, my))
+                    };
+                    word_press = double;
+                    sel = match select::hit(&rendered.texts, mx, my - BAR_H + scroll) {
+                        Some(p) if double => select::word(&rendered.texts, p),
+                        Some(p) => Some((p, p)),
+                        None => None,
+                    };
+                    if ui.editing {
+                        ui.editing = false;
+                        ui.address = info.url.clone();
                     }
                 } else if ui.editing {
                     ui.editing = false;
                     ui.address = info.url.clone();
+                }
+                dirty = true;
+            }
+        }
+        // A press on the page: dragging selects text, letting go without
+        // dragging clicks where it was pressed.
+        if let Some((px, py)) = press {
+            if down {
+                if let Some((mx, my)) = mouse {
+                    if (mx - px).abs() + (my - py).abs() > 4.0 {
+                        dragged = true;
+                    }
+                    if dragged && !word_press {
+                        let to = select::hit(&rendered.texts, mx, my - BAR_H + scroll);
+                        if let (Some((from, _)), Some(to)) = (sel, to) {
+                            if sel != Some((from, to)) {
+                                sel = Some((from, to));
+                                dirty = true;
+                            }
+                        }
+                    }
+                } else {
+                    // Left the window: letting go out there isn't a click.
+                    dragged = true;
+                }
+            } else {
+                press = None;
+                if !dragged && !word_press {
+                    sel = None;
+                    let (mx, my) = (px, py);
+                    if busy.is_none() && tab.is_some() && info.interstitial.is_none() {
+                        // The page sees the click first (form controls, scripts);
+                        // the link is followed after, unless a script prevents it.
+                        let link = rendered.link_at(mx, my - BAR_H + scroll).map(|l| l.to_string());
+                        if let Some(t) = tab.take() {
+                            let _ = jobs.send((
+                                cur_id,
+                                Job::Input {
+                                    tab: Box::new(t),
+                                    input: Input::Click(mx, my - BAR_H + scroll),
+                                    link,
+                                    w: page_w,
+                                    h: view_h,
+                                },
+                            ));
+                            busy = Some(None);
+                        }
+                    } else if let Some(l) = rendered.link_at(mx, my - BAR_H + scroll) {
+                        let url = net::resolve(&info.url, l);
+                        if let Some(rest) = url.strip_prefix("brickle:") {
+                            // Internal actions only work on our own warning pages.
+                            if let Some(action) = info.interstitial.clone() {
+                                match rest {
+                                    "proceed" => {
+                                        if let Ok(mut n) = net.try_lock() {
+                                            navigate = Some((n.allow_action(&action), info.opener.clone()));
+                                        }
+                                    }
+                                    "back" => hist = -1,
+                                    _ => {}
+                                }
+                            }
+                        } else {
+                            navigate = Some((url, Some(info.url.clone())));
+                        }
+                    }
                 }
                 dirty = true;
             }
@@ -1051,6 +1143,16 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 scroll,
                 BAR_H as usize,
             );
+            if let Some((a, b)) = sel {
+                for r in select::highlights(&rendered.texts, a, b, scroll, scroll + view_h) {
+                    let r = Rect {
+                        y: r.y - scroll + BAR_H,
+                        w: r.w.min(page_w - r.x),
+                        ..r
+                    };
+                    canvas.fill(r, SELECTION, BAR_H);
+                }
+            }
             draw_chrome(
                 &mut canvas,
                 &ui,
@@ -1235,6 +1337,7 @@ fn blank_rendered() -> Rendered {
         height: 0.0,
         background: Color::WHITE,
         links: vec![],
+        texts: vec![],
     }
 }
 

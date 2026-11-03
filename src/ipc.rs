@@ -13,10 +13,11 @@ use crate::layout::Rect;
 use crate::net::{Credentials, Dest, ScriptRequest};
 use crate::network::ScriptResponse;
 use crate::page::Key;
-use crate::page::Rendered;
+use crate::page::{Rendered, MAX_TEXT_CHARS};
 use crate::paint::{
     DisplayCommand, GlyphBitmap, PlacedGlyph, MAX_ATLAS_BYTES, MAX_FRAME_IMAGE_BYTES, MAX_GLYPH_SIDE,
 };
+use crate::select::TextRun;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 
@@ -618,6 +619,15 @@ impl FromRenderer {
                     e.rect(*rect);
                     e.str(href);
                 }
+                e.u32(r.texts.len() as u32);
+                for t in &r.texts {
+                    e.rect(t.rect);
+                    e.str(&t.text);
+                    e.u32(t.offsets.len() as u32);
+                    for o in &t.offsets {
+                        e.f32(*o);
+                    }
+                }
                 e.u32(r.atlas.len() as u32);
                 for g in &r.atlas {
                     e.0.extend_from_slice(&g.w.to_le_bytes());
@@ -750,6 +760,32 @@ impl FromRenderer {
                 for _ in 0..n {
                     links.push((d.rect()?, d.str()?));
                 }
+                // Text for selection: each run's offsets must fit its text,
+                // start at 0 and never go backwards.
+                let n = d.count(28)?;
+                let mut texts = Vec::with_capacity(n);
+                let mut chars = 0usize;
+                for _ in 0..n {
+                    let rect = d.rect()?;
+                    let text = d.str()?;
+                    let len = text.chars().count();
+                    chars += len;
+                    if chars > MAX_TEXT_CHARS {
+                        return Err("too much text".into());
+                    }
+                    let m = d.count(4)?;
+                    if m != len + 1 {
+                        return Err("text offsets don't match the text".into());
+                    }
+                    let mut offsets = Vec::with_capacity(m);
+                    for _ in 0..m {
+                        offsets.push(d.f32()?);
+                    }
+                    if offsets[0] != 0.0 || offsets.windows(2).any(|w| w[1] < w[0]) {
+                        return Err("text offsets out of order".into());
+                    }
+                    texts.push(TextRun { rect, text, offsets });
+                }
                 let n = d.count(4)?;
                 let mut atlas = Vec::with_capacity(n);
                 let mut atlas_bytes = 0usize;
@@ -785,6 +821,7 @@ impl FromRenderer {
                     height,
                     background,
                     links,
+                    texts,
                 })
             }
             4 => FromRenderer::Dom(d.str()?),
@@ -850,6 +887,16 @@ mod tests {
                 },
                 "/a".into(),
             )],
+            texts: vec![TextRun {
+                rect: Rect {
+                    x: 1.0,
+                    y: 2.0,
+                    w: 15.0,
+                    h: 10.0,
+                },
+                text: "héy".into(),
+                offsets: vec![0.0, 5.0, 10.0, 15.0],
+            }],
         }
     }
 
@@ -950,6 +997,24 @@ mod tests {
         for m in msgs {
             assert_eq!(ToRenderer::decode(&m.encode()).unwrap(), m);
         }
+    }
+
+    #[test]
+    fn text_runs_are_checked() {
+        let bad = |f: &dyn Fn(&mut TextRun)| {
+            let mut r = sample();
+            f(&mut r.texts[0]);
+            FromRenderer::decode(&FromRenderer::Rendered(r).encode()).is_err()
+        };
+        assert!(!bad(&|_| {}));
+        assert!(
+            bad(&|t| t.offsets.pop().map(drop).unwrap_or(())),
+            "too few offsets"
+        );
+        assert!(bad(&|t| t.offsets.push(20.0)), "too many offsets");
+        assert!(bad(&|t| t.offsets[2] = 1.0), "going backwards");
+        assert!(bad(&|t| t.offsets[0] = 3.0), "not starting at 0");
+        assert!(bad(&|t| t.offsets[3] = f32::NAN), "not finite");
     }
 
     fn with_image(w: u32, h: u32) -> Rendered {
