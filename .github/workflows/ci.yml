@@ -11,6 +11,11 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same branch or PR cancels the older run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -24,10 +29,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: stable
-          components: rustfmt, clippy
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal -c rustfmt,clippy && rustup default stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: System libraries for the window
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev
@@ -36,6 +39,18 @@ jobs:
       - run: cargo test --locked
       - name: Renderer sandbox blocks files, network and exec
         run: cargo run --release --locked -- sandbox-test
+
+  zizmor:
+    name: zizmor (workflow security)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # findings go to the repo's Security tab
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: zizmorcore/zizmor-action@45d7276c9ca790aabd705e31ca99c6185c3e76dd # v0.8.1
 
   deny:
     name: cargo-deny (advisories, licenses, sources, bans)
@@ -57,9 +72,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: nightly
+      - name: Rust toolchain
+        run: rustup toolchain install nightly --profile minimal && rustup default nightly
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: fuzz
@@ -73,11 +87,14 @@ jobs:
           restore-keys: fuzz-corpus-${{ matrix.target }}-
       - run: cargo install cargo-fuzz --locked
       - name: Fuzz for 3 minutes
-        run: cargo fuzz run -O ${{ matrix.target }} -- -max_total_time=180 -max_len=8192 -timeout=10 -rss_limit_mb=4096
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo fuzz run -O "$TARGET" -- -max_total_time=180 -max_len=8192 -timeout=10 -rss_limit_mb=4096
       - name: Shrink the corpus
         if: success()
-        run: |
-          cargo fuzz cmin -O ${{ matrix.target }} 2>/dev/null || true
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo fuzz cmin -O "$TARGET" 2>/dev/null || true
       - name: Upload crashing inputs
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

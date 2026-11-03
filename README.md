@@ -124,8 +124,13 @@ described in [PRIVACY.md](PRIVACY.md). Security measures:
   `render`, `ipc`, `filter`).
 - **Dependency auditing.** [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) checks
   RustSec advisories, licenses and sources, and bans AI crates, in CI on every push and weekly
-  (config in `deny.toml`). CI actions are pinned to commit hashes, and Dependabot proposes
-  updates. To report a vulnerability, see [SECURITY.md](SECURITY.md).
+  (config in `deny.toml`). CI actions are pinned to commit hashes. Dependabot proposes updates,
+  each waiting 7 days after release so hijacked releases have time to be caught.
+- **Static analysis.** CodeQL scans the Rust code and the workflows, zizmor audits the CI
+  workflows, and OpenSSF Scorecard rates the project's practices. Results are under the repo's
+  Security tab.
+
+To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 On non-Linux systems the sandbox isn't implemented yet, so you have to run with `--no-sandbox`.
 
