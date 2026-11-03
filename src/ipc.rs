@@ -180,6 +180,59 @@ impl<'a> Dec<'a> {
     }
 }
 
+/// Height of a paint-budget band, in px.
+const BAND: f32 = 256.0;
+/// Each band may be painted over this many times its area...
+const MAX_OVERDRAW: f32 = 32.0;
+/// ...measured against a page this wide (generous: normal pages are narrower).
+const BUDGET_WIDTH: f32 = 4096.0;
+
+/// The caps above limit how much a renderer sends, not how expensive it is
+/// to paint: 500k rectangles stacked on the first screen would freeze the
+/// window on every repaint. So the page is cut into horizontal bands and the
+/// painted area overlapping each band is capped. A window shows only a few
+/// bands, so this bounds the cost of any single frame.
+fn check_paint_budget(list: &[DisplayCommand], atlas: &[GlyphBitmap], height: f32) -> DecResult<()> {
+    let bottom = height + 4096.0; // content may hang a little below the page
+    let bands = (bottom / BAND).ceil() as usize + 1;
+    let limit = MAX_OVERDRAW * BUDGET_WIDTH * BAND;
+    let mut used = vec![0f32; bands];
+    let mut add = |x: f32, y: f32, w: f32, h: f32| -> DecResult<()> {
+        // Only the part that can ever be on screen costs anything.
+        let x0 = x.max(0.0);
+        let x1 = (x + w).min(16_384.0);
+        let y0 = y.max(0.0);
+        let y1 = (y + h).min(bottom);
+        if x1 <= x0 || y1 <= y0 {
+            return Ok(());
+        }
+        let width = x1 - x0;
+        let first = (y0 / BAND) as usize;
+        let last = ((y1 / BAND) as usize).min(bands - 1);
+        for (b, slot) in used.iter_mut().enumerate().take(last + 1).skip(first) {
+            let top = (b as f32 * BAND).max(y0);
+            let bot = ((b + 1) as f32 * BAND).min(y1);
+            *slot += width * (bot - top).max(0.0);
+            if *slot > limit {
+                return Err(format!("too much painting around y={}", b as f32 * BAND));
+            }
+        }
+        Ok(())
+    };
+    for cmd in list {
+        match cmd {
+            DisplayCommand::Rect { rect, .. } => add(rect.x, rect.y, rect.w, rect.h)?,
+            DisplayCommand::Glyphs { glyphs, .. } => {
+                for g in glyphs {
+                    let bmp = &atlas[g.id as usize];
+                    add(g.x, g.y, bmp.w as f32, bmp.h as f32)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl ToRenderer {
     pub fn encode(&self) -> Vec<u8> {
         let mut e = Enc::default();
@@ -371,6 +424,7 @@ impl FromRenderer {
                         }
                     }
                 }
+                check_paint_budget(&list, &atlas, height)?;
                 FromRenderer::Rendered(Rendered {
                     atlas,
                     list,
@@ -515,6 +569,38 @@ mod tests {
         assert!(FromRenderer::decode(&FromRenderer::Rendered(r).encode())
             .unwrap_err()
             .contains("too large"));
+        // Valid but ruinous: thousands of window-sized rectangles stacked on
+        // the first screen.
+        let mut r = sample();
+        r.list = (0..5000)
+            .map(|_| DisplayCommand::Rect {
+                rect: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 1200.0,
+                    h: 900.0,
+                },
+                color: Color::BLACK,
+            })
+            .collect();
+        assert!(FromRenderer::decode(&FromRenderer::Rendered(r).encode())
+            .unwrap_err()
+            .contains("too much painting"));
+        // The same rectangles spread down a long page are fine.
+        let mut r = sample();
+        r.height = 5000.0 * 900.0;
+        r.list = (0..5000)
+            .map(|i| DisplayCommand::Rect {
+                rect: Rect {
+                    x: 0.0,
+                    y: i as f32 * 900.0,
+                    w: 1200.0,
+                    h: 900.0,
+                },
+                color: Color::BLACK,
+            })
+            .collect();
+        assert!(FromRenderer::decode(&FromRenderer::Rendered(r).encode()).is_ok());
         // A forged glyph count larger than the message.
         let mut e = Enc::default();
         e.u8(3);

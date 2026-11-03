@@ -98,7 +98,8 @@ described in [PRIVACY.md](PRIVACY.md). Security measures:
   - **rlimits:** 4 GB of memory and 120 s of CPU time.
 
   The browser only ever receives rectangles and finished glyph bitmaps from a renderer, and checks
-  them (sizes, counts, references) before painting. It never runs the font rasterizer on anything
+  them (sizes, counts, references, and a per-region paint budget so it can't make every repaint
+  crawl) before painting. It never runs the font rasterizer on anything
   a page controls. It kills a renderer that hangs for 20 s or sends a malformed message, then
   shows an error page. Run `brickle sandbox-test` to see it block file reads, network and exec on your
   machine.

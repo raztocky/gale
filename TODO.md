@@ -19,6 +19,11 @@ Planned work, roughly in priority order. Items marked *discuss* need a decision 
 - [ ] Unicode line breaking (UAX #14) with `unicode-linebreak`
 - [ ] Draw the browser's own UI text in a sandboxed helper too
 
+## Performance / robustness
+- [ ] Paint pages into tiles once and scroll by copying pixels (faster scrolling, and display
+      lists no longer re-run every frame)
+- [ ] Paint off the window thread, like loading, so even a slow paint can't freeze the window
+
 ## Project
 - [ ] Choose a license
 - [ ] App icon and home-page art of Brickle the cat; `.desktop` file for the Linux menu
