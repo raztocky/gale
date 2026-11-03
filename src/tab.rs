@@ -541,6 +541,10 @@ impl Renderer {
     }
 
     fn send(&mut self, msg: ToRenderer) -> Result<(), String> {
+        // Already killed: say so, whatever the reader thread saw since.
+        if self.to_child.is_none() {
+            return Err("renderer was stopped".into());
+        }
         match self.rx.try_recv() {
             Ok(Ok(_)) => return Err(self.kill("renderer sent a message nobody asked for and was killed")),
             Ok(Err(e)) => return Err(self.kill(&e)),
@@ -848,6 +852,9 @@ except BrokenPipeError:
             .map(|l| l.title)
             .unwrap_err();
         assert!(err.contains("stopped responding"), "{err}");
+        // Give the reader thread time to notice the renderer is gone: the
+        // answer must be the same however late it is.
+        std::thread::sleep(Duration::from_millis(300));
         let err = r.send(ToRenderer::Dom).unwrap_err();
         assert!(err.contains("stopped"), "{err}");
         assert!(start.elapsed() < Duration::from_secs(3));
