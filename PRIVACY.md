@@ -170,6 +170,14 @@ without any request.
 *Enforced by:* `images_follow_the_rules` in `tests/privacy.rs`, and the tests in
 `src/network.rs` and `src/filter.rs`.
 
+## 11. The clipboard is yours
+
+Brickle reads the clipboard only when you press `Ctrl+V` or `Shift+Insert`, and only to type what's
+on it into the address bar or the form field you're in, as if you'd typed it yourself. It writes
+the clipboard only when you press `Ctrl+C` (to copy the address). Only the browser process can
+reach the clipboard; sandboxed pages can't, and scripts have no clipboard API
+(`navigator.clipboard` is missing and `document.execCommand` does nothing).
+
 ## What Brickle does store
 
 - `~/.config/brickle/rules.txt`: the block and allow rules you make in the request panel.

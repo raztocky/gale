@@ -7,7 +7,7 @@ publish = false
 
 [features]
 default = ["gui"]
-gui = ["dep:minifb"]
+gui = ["dep:minifb", "dep:arboard"]
 
 [dependencies]
 fontdue = "0.9"
@@ -27,6 +27,7 @@ read-fonts = "0.46.0"
 zune-jpeg = "0.5.15"
 gif = { version = "0.14.2", default-features = false, features = ["std"] }
 image-webp = "0.2.4"
+arboard = { version = "3.7.0", default-features = false, optional = true }
 
 # The renderer sandbox (Landlock + seccomp + rlimits) is Linux-only.
 [target.'cfg(target_os = "linux")'.dependencies]

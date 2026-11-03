@@ -49,6 +49,7 @@ libraries, run `sudo apt install build-essential libxkbcommon-dev`.
 | Switch tabs | `Ctrl+Tab`, `Ctrl+Shift+Tab`, `Ctrl+PgDn`/`PgUp`, `Ctrl+1`…`Ctrl+9` |
 | Open a link in a new tab | middle-click, or `Ctrl`+click |
 | Forms | click a field to type; `Tab` next field, `Enter` submit, `Esc` leave the field |
+| Paste / copy the address | `Ctrl+V` or `Shift+Insert` in the address bar or a form field / `Ctrl+C` |
 
 ## Architecture
 

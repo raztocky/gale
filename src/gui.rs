@@ -24,6 +24,9 @@ const STATUS_H: f32 = 22.0;
 const PANEL_W: f32 = 400.0;
 const PANEL_HEAD: f32 = 116.0;
 const ROW_H: f32 = 38.0;
+/// Longest address, and longest paste, we take from the clipboard.
+const MAX_ADDRESS: usize = 8 * 1024;
+const MAX_PASTE: usize = 64 * 1024;
 
 const SANS: usize = 0;
 const BOLD: usize = 1;
@@ -42,6 +45,44 @@ impl minifb::InputCallback for Chars {
             self.0.lock().unwrap().push(c);
         }
     }
+}
+
+/// The system clipboard, opened when first used (it may be unavailable,
+/// e.g. without a display server). Only the browser process touches it, and
+/// only when you press a copy or paste key: pages can never read it.
+/// On X11 what we copy is served by this object, so it lives as long as the
+/// window.
+struct Clip(Option<arboard::Clipboard>);
+
+impl Clip {
+    fn get(&mut self) -> Option<&mut arboard::Clipboard> {
+        if self.0.is_none() {
+            self.0 = arboard::Clipboard::new().ok();
+        }
+        self.0.as_mut()
+    }
+
+    fn paste(&mut self) -> Option<String> {
+        Some(clean_paste(&self.get()?.get_text().ok()?))
+    }
+
+    fn copy(&mut self, text: &str) -> bool {
+        self.get().is_some_and(|c| c.set_text(text).is_ok())
+    }
+}
+
+/// Clipboard text as typed input: line endings as `\n`, control characters
+/// other than newlines and tabs dropped, and at most `MAX_PASTE` bytes.
+fn clean_paste(t: &str) -> String {
+    let t = t.replace("\r\n", "\n").replace('\r', "\n");
+    let mut out = String::new();
+    for c in t.chars().filter(|c| !c.is_control() || *c == '\n' || *c == '\t') {
+        if out.len() + c.len_utf8() > MAX_PASTE {
+            break;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// History entries remember who opened them, so back/forward re-apply the
@@ -219,6 +260,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
     window.set_target_fps(60);
     let typed = Arc::new(Mutex::new(Vec::new()));
     window.set_input_callback(Box::new(Chars(typed.clone())));
+    let mut clip = Clip(None);
 
     let net = Arc::new(Mutex::new(net));
     let (jobs, done_rx) = spawn_loader(net.clone(), sandboxed);
@@ -569,6 +611,40 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     tab_action = action;
                     continue;
                 }
+            }
+            // Paste into the address bar or the focused form field.
+            if (ctrl && key == Key::V) || (shift && key == Key::Insert) {
+                if !ui.editing && !page_focus {
+                    continue;
+                }
+                match clip.paste() {
+                    Some(t) if ui.editing => {
+                        // One line: newlines and tabs are dropped.
+                        for c in t.trim().chars().filter(|c| !c.is_control()) {
+                            if ui.address.len() + c.len_utf8() > MAX_ADDRESS {
+                                break;
+                            }
+                            ui.address.push(c);
+                        }
+                    }
+                    // Single-line fields drop newlines themselves.
+                    Some(t) if !t.is_empty() => pending_input.push(Input::Type(t)),
+                    Some(_) => {}
+                    None => ui.flash = Some("Couldn't read the clipboard".into()),
+                }
+                dirty = true;
+                continue;
+            }
+            // Copy the address: what you're typing, or the page's.
+            if ctrl && key == Key::C && !page_focus {
+                let url = if ui.editing { &ui.address } else { &info.url };
+                ui.flash = Some(if clip.copy(url) {
+                    "Copied the address".into()
+                } else {
+                    "Couldn't reach the clipboard".into()
+                });
+                dirty = true;
+                continue;
             }
             if ui.editing {
                 match key {
@@ -1681,4 +1757,27 @@ fn fit(text: &str, max_w: f32, font_idx: usize, size: f32) -> String {
     }
     out.push('…');
     out
+}
+
+#[cfg(test)]
+mod clipboard_tests {
+    use super::{clean_paste, Clip, MAX_PASTE};
+
+    #[test]
+    fn pasted_text_is_cleaned() {
+        assert_eq!(clean_paste("a\r\nb\rc\n\td"), "a\nb\nc\n\td");
+        assert_eq!(clean_paste("x\u{1b}[31my\u{7}"), "x[31my", "no escape sequences");
+        let big = "é".repeat(MAX_PASTE);
+        let p = clean_paste(&big);
+        assert!(p.len() <= MAX_PASTE && p.chars().all(|c| c == 'é'));
+    }
+
+    /// Needs a display: `cargo test -- --ignored clipboard_round_trip`.
+    #[test]
+    #[ignore]
+    fn clipboard_round_trip() {
+        let mut clip = Clip(None);
+        assert!(clip.copy("https://example.com/brickle"));
+        assert_eq!(clip.paste().as_deref(), Some("https://example.com/brickle"));
+    }
 }
