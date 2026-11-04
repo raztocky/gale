@@ -952,19 +952,88 @@ pub const TILE_H: usize = 512;
 /// Memory the tile cache may use before evicting tiles far from view.
 const TILE_CACHE_BYTES: usize = 96 * 1024 * 1024;
 
-/// A page painted into horizontal tiles of finished pixels. Each tile is
-/// painted once, the first time it scrolls into view; after that, scrolling
-/// only copies pixels, so a page's display list (however heavy) isn't
-/// replayed on every frame.
-pub struct TileCache {
-    width: usize,
-    bg: Color,
+/// What painting any tile of a page needs, shared read-only with the tile
+/// painters.
+struct Scene {
+    list: DisplayList,
+    atlas: Vec<GlyphBitmap>,
     /// Vertical extent (top, bottom) of each display command, so a tile only
     /// paints the commands that overlap it.
     extents: Vec<(f32, f32)>,
+    width: usize,
+    bg: Color,
+}
+
+impl Scene {
+    fn paint_tile(&self, i: usize) -> Vec<u32> {
+        let top = (i * TILE_H) as f32;
+        let bottom = top + TILE_H as f32;
+        let mut c = Canvas::new(self.width, TILE_H, self.bg);
+        for (cmd, &(lo, hi)) in self.list.iter().zip(&self.extents) {
+            if hi >= top && lo <= bottom {
+                c.paint_cmd(cmd, &self.atlas, -top, 0.0);
+            }
+        }
+        c.pixels
+    }
+}
+
+type TileJob = (Arc<Scene>, u64, usize);
+type TileDone = (u64, usize, Vec<u32>);
+
+/// Threads that paint page tiles, so a page that's slow to paint never
+/// holds up the window: it keeps scrolling and answering while tiles
+/// arrive.
+pub struct TilePainter {
+    jobs: std::sync::mpsc::Sender<TileJob>,
+    done: std::sync::mpsc::Receiver<TileDone>,
+    /// The page being shown; jobs for older ones are skipped.
+    current: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl TilePainter {
+    pub fn new(threads: usize) -> TilePainter {
+        use std::sync::atomic::Ordering;
+        let (jobs, job_rx) = std::sync::mpsc::channel::<TileJob>();
+        let (done_tx, done) = std::sync::mpsc::channel::<TileDone>();
+        let job_rx = Arc::new(std::sync::Mutex::new(job_rx));
+        let current = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        for n in 0..threads.max(1) {
+            let (job_rx, done_tx, current) = (job_rx.clone(), done_tx.clone(), current.clone());
+            let _ = std::thread::Builder::new()
+                .name(format!("brickle-paint-{n}"))
+                .spawn(move || loop {
+                    let job = job_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                    let Ok((scene, generation, i)) = job else {
+                        break; // the window closed
+                    };
+                    if generation != current.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    // A painting bug costs a blank tile, not the painter.
+                    let px = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scene.paint_tile(i)))
+                        .unwrap_or_else(|_| vec![pack(scene.bg); scene.width * TILE_H]);
+                    if done_tx.send((generation, i, px)).is_err() {
+                        break;
+                    }
+                });
+        }
+        TilePainter { jobs, done, current }
+    }
+}
+
+/// A page painted into horizontal tiles, each `TILE_H` rows tall. A tile is
+/// painted once, the first time it (nearly) scrolls into view; after that,
+/// scrolling only copies pixels, so a page's display list (however heavy)
+/// isn't replayed on every frame.
+pub struct TileCache {
+    scene: Arc<Scene>,
     tiles: HashMap<usize, Vec<u32>>,
+    /// Tiles asked of a painter and not back yet.
+    pending: std::collections::HashSet<usize>,
     count: usize,
     max_tiles: usize,
+    generation: u64,
 }
 
 impl TileCache {
@@ -975,6 +1044,7 @@ impl TileCache {
         page_height: f32,
         bg: Color,
     ) -> TileCache {
+        static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let extents = list
             .iter()
             .map(|cmd| match cmd {
@@ -993,61 +1063,91 @@ impl TileCache {
         let count = ((page_height.max(0.0) + 4096.0) / TILE_H as f32).ceil() as usize;
         let tile_bytes = (width * TILE_H * 4).max(1);
         TileCache {
-            width,
-            bg,
-            extents,
+            scene: Arc::new(Scene {
+                list: list.clone(),
+                atlas: atlas.to_vec(),
+                extents,
+                width,
+                bg,
+            }),
             tiles: HashMap::new(),
+            pending: Default::default(),
             count,
             max_tiles: (TILE_CACHE_BYTES / tile_bytes).max(4),
+            generation: GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
     }
 
     pub fn width(&self) -> usize {
-        self.width
+        self.scene.width
     }
 
-    fn paint_tile(&self, i: usize, list: &DisplayList, atlas: &[GlyphBitmap]) -> Vec<u32> {
-        let top = (i * TILE_H) as f32;
-        let bottom = top + TILE_H as f32;
-        let mut c = Canvas::new(self.width, TILE_H, self.bg);
-        for (cmd, &(lo, hi)) in list.iter().zip(&self.extents) {
-            if hi >= top && lo <= bottom {
-                c.paint_cmd(cmd, atlas, -top, 0.0);
+    fn insert(&mut self, i: usize, tile: Vec<u32>, near: usize) {
+        if self.tiles.len() >= self.max_tiles {
+            // Evict the tile farthest from what's on screen.
+            if let Some(&far) = self.tiles.keys().max_by_key(|&&k| k.abs_diff(near)) {
+                self.tiles.remove(&far);
             }
         }
-        c.pixels
+        self.tiles.insert(i, tile);
+    }
+
+    /// Take tiles the painter has finished. True if any arrived (the window
+    /// should be drawn again).
+    pub fn collect(&mut self, painter: &TilePainter) -> bool {
+        let mut got = false;
+        while let Ok((generation, i, px)) = painter.done.try_recv() {
+            if generation == self.generation && self.pending.remove(&i) {
+                let near = self.pending.iter().copied().min().unwrap_or(i);
+                self.insert(i, px, near);
+                got = true;
+            }
+        }
+        got
     }
 
     /// Composite the page, scrolled by `scroll`, into `canvas` from row
-    /// `top` down. Missing tiles are painted on demand.
+    /// `top` down. Missing tiles are painted right here without a
+    /// `painter`; with one, they're asked for (with one more above and
+    /// below) and left as background until they arrive. True if everything
+    /// on screen was there.
     pub fn draw(
         &mut self,
         canvas: &mut Canvas,
-        list: &DisplayList,
-        atlas: &[GlyphBitmap],
         scroll: f32,
         top: usize,
-    ) {
+        painter: Option<&TilePainter>,
+    ) -> bool {
         let scroll = scroll.max(0.0).round() as usize;
         let view_h = canvas.height.saturating_sub(top);
         let first = scroll / TILE_H;
         let last = ((scroll + view_h) / TILE_H).min(self.count.saturating_sub(1));
         if first >= self.count {
-            return;
+            return true;
+        }
+        let mut complete = true;
+        if let Some(p) = painter {
+            p.current
+                .store(self.generation, std::sync::atomic::Ordering::Relaxed);
+            let wanted = first.saturating_sub(1)..=(last + 1).min(self.count - 1);
+            for i in wanted {
+                if !self.tiles.contains_key(&i) && self.pending.insert(i) {
+                    let _ = p.jobs.send((self.scene.clone(), self.generation, i));
+                }
+            }
         }
         for i in first..=last {
             if !self.tiles.contains_key(&i) {
-                if self.tiles.len() >= self.max_tiles {
-                    // Evict the tile farthest from what's on screen.
-                    if let Some(&far) = self.tiles.keys().max_by_key(|&&k| k.abs_diff(first)) {
-                        self.tiles.remove(&far);
-                    }
+                if painter.is_some() {
+                    complete = false;
+                    continue;
                 }
-                let t = self.paint_tile(i, list, atlas);
-                self.tiles.insert(i, t);
+                let t = self.scene.paint_tile(i);
+                self.insert(i, t, first);
             }
             let tile = &self.tiles[&i];
-            let w = self.width.min(canvas.width);
+            let tw = self.scene.width;
+            let w = tw.min(canvas.width);
             for row in 0..TILE_H {
                 let page_y = i * TILE_H + row;
                 if page_y < scroll {
@@ -1058,9 +1158,10 @@ impl TileCache {
                     break;
                 }
                 let dst = y * canvas.width;
-                canvas.pixels[dst..dst + w].copy_from_slice(&tile[row * self.width..row * self.width + w]);
+                canvas.pixels[dst..dst + w].copy_from_slice(&tile[row * tw..row * tw + w]);
             }
         }
+        complete
     }
 }
 
@@ -1152,12 +1253,71 @@ mod tests {
             let mut direct = Canvas::new(w, h, bg);
             direct.paint(&list, &atlas, scroll as f32, top as f32);
             let mut tiled = Canvas::new(w, h, bg);
-            tiles.draw(&mut tiled, &list, &atlas, scroll as f32, top);
+            tiles.draw(&mut tiled, scroll as f32, top, None);
             assert!(
                 direct.pixels[top * w..] == tiled.pixels[top * w..],
                 "scroll {scroll}"
             );
         }
+    }
+
+    #[test]
+    fn painter_threads_paint_the_same_tiles() {
+        let ops: Vec<DrawOp> = (0..60)
+            .map(|i| DrawOp::Text {
+                x: 10.0,
+                baseline: 30.0 + i as f32 * 37.0,
+                text: format!("line {i}"),
+                font: 0,
+                size: 18.0,
+                color: Color::BLACK,
+                italic: false,
+                clip: None,
+            })
+            .collect();
+        let (list, atlas) = rasterize(ops);
+        let (w, h, top) = (300usize, 600usize, 30usize);
+        let bg = Color::WHITE;
+        let painter = TilePainter::new(2);
+        let mut tiles = TileCache::new(&list, &atlas, w, 2300.0, bg);
+        for scroll in [0usize, 700, 1300] {
+            let mut tiled = Canvas::new(w, h, bg);
+            // Asked for, not painted here: the first draw is incomplete.
+            let start = std::time::Instant::now();
+            while !tiles.draw(&mut tiled, scroll as f32, top, Some(&painter)) {
+                tiles.collect(&painter);
+                assert!(start.elapsed().as_secs() < 10, "tiles never came");
+                std::thread::yield_now();
+            }
+            let mut direct = Canvas::new(w, h, bg);
+            direct.paint(&list, &atlas, scroll as f32, top as f32);
+            assert!(
+                direct.pixels[top * w..] == tiled.pixels[top * w..],
+                "scroll {scroll}"
+            );
+        }
+        // A new page: it gets its own tiles, and none of the old page's
+        // (still arriving from the look-ahead) end up in it.
+        let (list2, atlas2) = rasterize(vec![DrawOp::Rect {
+            rect: Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 300.0,
+                h: 3000.0,
+            },
+            color: Color::rgb(200, 0, 0),
+        }]);
+        let mut other = TileCache::new(&list2, &atlas2, w, 2300.0, bg);
+        let mut c = Canvas::new(w, h, bg);
+        let start = std::time::Instant::now();
+        while !other.draw(&mut c, 1300.0, top, Some(&painter)) {
+            other.collect(&painter);
+            assert!(start.elapsed().as_secs() < 10, "tiles never came");
+            std::thread::yield_now();
+        }
+        assert!(c.pixels[top * w..]
+            .iter()
+            .all(|&p| p == pack(Color::rgb(200, 0, 0))));
     }
 
     #[test]

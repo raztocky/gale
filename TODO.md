@@ -28,7 +28,7 @@ Planned work, roughly in priority order. Items marked *discuss* need a decision 
 
 ## Performance / robustness
 - [x] Paint pages into tiles once and scroll by copying pixels
-- [ ] Paint off the window thread, like loading, so even a slow paint can't freeze the window
+- [x] Paint off the window thread, like loading, so even a slow paint can't freeze the window (fixed and sticky layers are still painted on it)
 
 ## Project
 - [ ] Choose a license

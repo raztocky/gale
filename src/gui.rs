@@ -9,7 +9,7 @@ use brickle::lineedit::LineEdit;
 use brickle::net;
 use brickle::network::{Action, LogEntry, Network, Outcome};
 use brickle::page::{Key as PageKey, Rendered};
-use brickle::paint::{Canvas, DisplayList, GlyphCache, Layer, TileCache};
+use brickle::paint::{Canvas, DisplayList, GlyphCache, Layer, TileCache, TilePainter};
 use brickle::select::{self, Bands, FindText, Pos};
 use brickle::tab::{Input, Tab};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
@@ -531,7 +531,13 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         interstitial: None,
     };
     // Painted tiles of the current page; rebuilt when the page changes.
+    // Tiles are painted on their own threads, never on this one.
     let mut tiles: Option<TileCache> = None;
+    let painter = TilePainter::new(
+        std::thread::available_parallelism()
+            .map_or(2, |n| n.get())
+            .clamp(1, 3),
+    );
     let mut rendered = Rendered {
         list: vec![],
         atlas: vec![],
@@ -1656,6 +1662,9 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         ui.can_back = !history.is_empty();
         ui.can_forward = !forward.is_empty();
         ui.loading = loading;
+        if tiles.as_mut().is_some_and(|t| t.collect(&painter)) {
+            dirty = true; // tiles came back from the painters
+        }
         if dirty || loading {
             canvas = Canvas::new(w, h, rendered.background);
             if tiles.as_ref().is_some_and(|t| t.width() != page_w as usize) {
@@ -1670,7 +1679,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     rendered.background,
                 )
             });
-            tc.draw(&mut canvas, &ix.page, &rendered.atlas, scroll, bar as usize);
+            tc.draw(&mut canvas, scroll, bar as usize, Some(&painter));
             // Fixed and sticky boxes, where scrolling puts them.
             for (l, list) in &ix.layers {
                 canvas.paint(list, &rendered.atlas, scroll - l.shift(scroll), bar);
