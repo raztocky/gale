@@ -760,6 +760,42 @@ fn forms_submit_through_the_browser() {
     assert!(!sub.post);
 }
 
+/// A page that answers a POST remembers its form, so reloading it asks
+/// before sending the form again; one reached by a redirect after the POST
+/// (the usual pattern) is a plain GET and reloads freely.
+#[test]
+fn pages_answering_a_post_remember_their_form() {
+    use brickle::forms::Submission;
+    use brickle::tab::Tab;
+    let (port, _) = serve(vec![
+        ("/buy", "text/html", "<p>thanks".into()),
+        ("/send", "303 text/html\r\nLocation: /done", String::new()),
+        ("/done", "text/html", "<p>sent".into()),
+    ]);
+    let from = format!("http://127.0.0.1:{port}/");
+    let mut net = brickle::network::Network::empty();
+    let post = |path: &str| Submission {
+        url: format!("http://127.0.0.1:{port}{path}"),
+        post: true,
+        body: Some("item=1".into()),
+        content_type: Some("application/x-www-form-urlencoded".into()),
+    };
+    let tab = Tab::submit(&mut net, &post("/buy"), Some(&from), false, (800.0, 600.0));
+    assert_eq!(tab.resubmit, Some(post("/buy")));
+    let tab = Tab::submit(&mut net, &post("/send"), Some(&from), false, (800.0, 600.0));
+    assert!(tab.url.ends_with("/done"), "{}", tab.url);
+    assert_eq!(tab.resubmit, None);
+    let get = Submission {
+        post: false,
+        body: None,
+        ..post("/buy")
+    };
+    let tab = Tab::submit(&mut net, &get, Some(&from), false, (800.0, 600.0));
+    assert_eq!(tab.resubmit, None);
+    let tab = Tab::open(&mut net, &from, None, false);
+    assert_eq!(tab.resubmit, None);
+}
+
 /// Images go through the same rules as everything else: your rules and
 /// `$image` filters, first-party-only cookies, Firefox's headers. Only real
 /// images are accepted (no SVG, no HTML posing as an image), and they are

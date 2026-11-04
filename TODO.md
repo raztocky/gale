@@ -60,7 +60,7 @@ Tab between fields, Enter to submit, GET/POST (url-encoded, multipart, text/plai
 - [ ] Moving the caret, selecting text, copy and paste.
 - [ ] File uploads (`<input type=file>`).
 - [ ] Form validation (`required`, `pattern`), `<input type=number>` steppers, date pickers.
-- [ ] Ask before re-sending a POST on reload or back (reload currently does a GET).
+- [x] Ask before re-sending a POST on reload, back or forward (a page reached by a redirect after the POST reloads freely, as in Firefox).
 
 ## Tabs
 

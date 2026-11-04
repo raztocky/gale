@@ -194,6 +194,9 @@ pub struct Network {
     pub lists_loaded: usize,
     /// The cookie jar (see `cookies.rs` for the policy).
     pub cookies: Jar,
+    /// The last page loaded was the answer to a POST (not redirected to a
+    /// GET), so loading it again means sending the form again.
+    document_posted: bool,
 }
 
 pub fn config_dir() -> Option<PathBuf> {
@@ -235,6 +238,7 @@ impl Network {
             page_bytes: 0,
             lists_loaded: 0,
             cookies: Jar::new(),
+            document_posted: false,
         }
     }
 
@@ -401,7 +405,13 @@ impl Network {
         self.navigate_with(&sub.url, from, Some(&req))
     }
 
+    /// Whether the last page loaded was the answer to a POST.
+    pub fn document_posted(&self) -> bool {
+        self.document_posted
+    }
+
     fn navigate_with(&mut self, url: &str, from: Option<&str>, post: Option<&ScriptRequest>) -> Nav {
+        self.document_posted = false;
         self.page_stylesheets = 0;
         self.page_scripts = 0;
         self.page_script_requests = 0;
@@ -930,6 +940,9 @@ impl Network {
                     e.upgraded = upgraded;
                     e.insecure = insecure;
                     e.allowed_by = allowed_by;
+                    if dest == Dest::Document {
+                        self.document_posted = method == "POST";
+                    }
                     return Fetch::Done {
                         url: target,
                         body: resp.body,

@@ -87,6 +87,9 @@ pub struct Tab {
     pub script_navigate: Option<String>,
     /// Your text size, used when rendering.
     pub text_scale: f32,
+    /// The form submission this page answers, if loading it again means
+    /// sending the form again (a POST that wasn't redirected).
+    pub resubmit: Option<Submission>,
     backend: Backend,
 }
 
@@ -156,7 +159,12 @@ impl Tab {
         viewport: (f32, f32),
     ) -> Tab {
         let nav = net.submit_form(sub, from);
-        Tab::from_nav(net, nav, from, sandbox, viewport)
+        let posted = net.document_posted();
+        let mut tab = Tab::from_nav(net, nav, from, sandbox, viewport);
+        if posted && tab.interstitial.is_none() {
+            tab.resubmit = Some(sub.clone());
+        }
+        tab
     }
 
     fn from_nav(net: &mut Network, nav: Nav, from: Option<&str>, sandbox: bool, viewport: (f32, f32)) -> Tab {
@@ -176,6 +184,7 @@ impl Tab {
                     script_navigate: None,
                     backend: Backend::InProcess(Box::new(page)),
                     text_scale: 1.0,
+                    resubmit: None,
                 }
             }
         }
@@ -208,6 +217,7 @@ impl Tab {
             script_navigate: None,
             backend: Backend::Failed(String::new()),
             text_scale: 1.0,
+            resubmit: None,
         };
         let blocker_css = net.cosmetic_css(url);
         if !sandbox {

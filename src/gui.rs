@@ -157,6 +157,9 @@ const WHEEL_STEP: f32 = 48.0;
 /// The scrollbar's width, at the page's right edge, in interface units.
 const SCROLLBAR_W: f32 = 12.0;
 const FIND_H: f32 = 30.0;
+/// The "send the form again?" box.
+const RESEND_W: f32 = 460.0;
+const RESEND_H: f32 = 140.0;
 /// Drawn over selected text.
 const SELECTION: Color = Color {
     r: 0x33,
@@ -329,6 +332,9 @@ fn clean_paste(t: &str) -> String {
 /// History entries remember who opened them, so back/forward re-apply the
 /// same security checks.
 type Entry = (String, Option<String>);
+/// A page in the back/forward history, and the form it answers if going
+/// back to it means sending that form again.
+type Visit = (Entry, Option<Submission>);
 
 struct Ui {
     /// The address bar: what it shows, or what you're typing.
@@ -347,6 +353,9 @@ struct Ui {
     can_back: bool,
     can_forward: bool,
     loading: bool,
+    /// Asking whether to send a form again: for a reload (0) or a step
+    /// back (-1) or forward (1) onto a page that answered a form.
+    resend: Option<i32>,
 }
 
 /// What the window knows about the current page. The `Tab` itself may be
@@ -358,6 +367,7 @@ struct Info {
     title: String,
     log: Vec<LogEntry>,
     interstitial: Option<Action>,
+    resubmit: Option<Submission>,
 }
 
 impl Info {
@@ -368,6 +378,7 @@ impl Info {
             title: tab.title.clone(),
             log: tab.log.clone(),
             interstitial: tab.interstitial.clone(),
+            resubmit: tab.resubmit.clone(),
         }
     }
 }
@@ -520,8 +531,11 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
     let shared_scale = Arc::new(AtomicU32::new(DEFAULT_TEXT_SCALE.to_bits()));
     let (jobs, done_rx) = spawn_loader(net.clone(), sandboxed, shared_scale.clone());
 
-    let mut history: Vec<Entry> = Vec::new();
-    let mut forward: Vec<Entry> = Vec::new();
+    let mut history: Vec<Visit> = Vec::new();
+    let mut forward: Vec<Visit> = Vec::new();
+    // Set when you said yes to sending a form again: the next reload or
+    // history step goes ahead with it.
+    let mut resend_ok = false;
     let mut tab: Option<Tab> = None;
     let mut info = Info {
         url: start.to_string(),
@@ -529,6 +543,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         title: String::new(),
         log: vec![],
         interstitial: None,
+        resubmit: None,
     };
     // Painted tiles of the current page; rebuilt when the page changes.
     // Tiles are painted on their own threads, never on this one.
@@ -582,6 +597,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         text_scale: load_scale("text-size", &TEXT_SCALES, DEFAULT_TEXT_SCALE),
         can_back: false,
         can_forward: false,
+        resend: None,
         loading: false,
     };
     shared_scale.store(ui.text_scale.to_bits(), Ordering::Relaxed);
@@ -841,7 +857,9 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 .iter()
                 .map(|p| {
                     let can =
-                        p.tab.is_some() && p.busy.is_none() && !p.page_focus && p.pending_input.is_empty();
+                        p.tab.is_some() && p.busy.is_none() && !p.page_focus && p.pending_input.is_empty()
+                        // Reloading it would mean sending its form again.
+                        && p.info.resubmit.is_none();
                     (p.parked_at.elapsed(), can)
                 })
                 .collect();
@@ -923,6 +941,27 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 ui.menu = None;
                 dirty = true;
                 continue;
+            }
+            if let Some(dir) = ui.resend {
+                match key {
+                    Key::Enter | Key::NumPadEnter => {
+                        ui.resend = None;
+                        resend_ok = true;
+                        if dir == 0 {
+                            reload = true;
+                        } else {
+                            hist = dir;
+                        }
+                        dirty = true;
+                        continue;
+                    }
+                    Key::Escape => {
+                        ui.resend = None;
+                        dirty = true;
+                        continue;
+                    }
+                    _ => {}
+                }
             }
             let sizing = match key {
                 Key::Equal | Key::NumPadPlus => Some(1),
@@ -1351,6 +1390,23 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     .is_some_and(|u| net::scheme(u).starts_with("http"))
             {
                 tab_action = Some(TabAction::Background(link_under.clone().unwrap_or_default()));
+            } else if let (true, Some(dir), Some(i)) = (
+                down && !was_down,
+                ui.resend,
+                resend_buttons(page_w / k, bar / k)
+                    .iter()
+                    .position(|r| r.contains(lx, ly)),
+            ) {
+                ui.resend = None;
+                if i == 0 {
+                    resend_ok = true;
+                    if dir == 0 {
+                        reload = true;
+                    } else {
+                        hist = dir;
+                    }
+                }
+                dirty = true;
             } else if down && !was_down && ui.menu.is_some() {
                 // A click with a menu open picks an item, or just closes it.
                 let m = ui.menu.unwrap_or(0);
@@ -1578,6 +1634,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         if let Some(action) = tab_action {
             // What was decided for the old tab doesn't apply to the new one.
             navigate = None;
+            ui.resend = None;
             reload = false;
             hist = 0;
             macro_rules! switch_to {
@@ -1653,24 +1710,41 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         } else if navigate.is_some() || reload || hist != 0 {
             script_hops = 0;
         }
+        // Loading a page that answered a form means sending the form again:
+        // ask first (as Firefox does) rather than repeat a purchase or post.
+        let resends = match (reload, hist) {
+            (true, _) => info.resubmit.is_some(),
+            (_, -1) => history.last().is_some_and(|v| v.1.is_some()),
+            (_, 1) => forward.last().is_some_and(|v| v.1.is_some()),
+            _ => false,
+        };
+        if resends && !resend_ok && navigate.is_none() {
+            ui.resend = Some(if reload { 0 } else { hist });
+            reload = false;
+            hist = 0;
+            dirty = true;
+        }
+        if (navigate.is_some() || reload || hist != 0) && !resend_ok {
+            ui.resend = None;
+        }
+        resend_ok = false;
         // Navigation requests are queued and started when the loader is free.
+        let here = || ((info.url.clone(), info.opener.clone()), info.resubmit.clone());
         let moved = match hist {
-            -1 => history
-                .pop()
-                .inspect(|_| forward.push((info.url.clone(), info.opener.clone()))),
-            1 => forward
-                .pop()
-                .inspect(|_| history.push((info.url.clone(), info.opener.clone()))),
+            -1 => history.pop().inspect(|_| forward.push(here())),
+            1 => forward.pop().inspect(|_| history.push(here())),
             _ => None,
         };
         if reload {
             queued = Some((info.url.clone(), info.opener.clone()));
-        } else if let Some(entry) = moved {
+            queued_post = info.resubmit.clone();
+        } else if let Some((entry, post)) = moved {
             queued = Some(entry);
+            queued_post = post;
         } else if let Some((url, from)) = navigate {
             if !(url.starts_with("mailto:") || url.starts_with("javascript:")) {
                 if url != info.url {
-                    history.push((info.url.clone(), info.opener.clone()));
+                    history.push(here());
                     forward.clear();
                 }
                 ui.address.set(&url);
@@ -1798,6 +1872,9 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             if let Some(f) = &find {
                 draw_find(&mut canvas, f, page_w / k, &mut cache);
             }
+            if ui.resend.is_some() {
+                draw_resend(&mut canvas, page_w / k, bar / k, &mut cache);
+            }
             if let Some(m) = ui.menu {
                 draw_menu(&mut canvas, m, mouse.map(|(x, y)| (x / k, y / k)), &mut cache);
             }
@@ -1833,8 +1910,8 @@ struct Parked {
     tab: Option<Tab>,
     info: Info,
     rendered: Rendered,
-    history: Vec<Entry>,
-    forward: Vec<Entry>,
+    history: Vec<Visit>,
+    forward: Vec<Visit>,
     scroll: f32,
     busy: Option<Option<String>>,
     discard: bool,
@@ -1884,6 +1961,7 @@ impl Parked {
                 title: String::new(),
                 log: vec![],
                 interstitial: None,
+                resubmit: None,
             },
             rendered: blank_rendered(),
             history: vec![],
@@ -2851,6 +2929,97 @@ fn draw_status(c: &mut Canvas, ui: &Ui, page_w: f32, cache: &mut GlyphCache) {
     }
 }
 
+/// The "send the form again?" box: centred at the top of the page.
+fn resend_box(page_w: f32, top: f32) -> Rect {
+    let w = RESEND_W.min(page_w - 20.0).max(0.0);
+    Rect {
+        x: ((page_w - w) / 2.0).max(0.0),
+        y: top + 12.0,
+        w,
+        h: RESEND_H,
+    }
+}
+
+/// Its Resend and Cancel buttons.
+fn resend_buttons(page_w: f32, top: f32) -> [Rect; 2] {
+    let b = resend_box(page_w, top);
+    let button = |right: f32, w: f32| Rect {
+        x: b.x + b.w - right - w,
+        y: b.y + b.h - 40.0,
+        w,
+        h: 28.0,
+    };
+    [button(108.0, 90.0), button(12.0, 86.0)]
+}
+
+fn draw_resend(c: &mut Canvas, page_w: f32, top: f32, cache: &mut GlyphCache) {
+    let b = resend_box(page_w, top);
+    let edge = Edges {
+        t: 1.0,
+        r: 1.0,
+        b: 1.0,
+        l: 1.0,
+    };
+    c.fill(b.expand(edge), Color::rgb(0x3b, 0x82, 0xf6), BAR_H);
+    c.fill(b, Color::WHITE, BAR_H);
+    text(
+        c,
+        b.x + 14.0,
+        b.y + 26.0,
+        "Send the form again?",
+        BOLD,
+        14.0,
+        DARK,
+        cache,
+        BAR_H,
+    );
+    let line = "This page is the answer to a form you sent. Loading it again sends the form again,                 which can repeat an action such as a purchase or a post.";
+    let mut y = b.y + 50.0;
+    for l in wrap_words(line, b.w - 28.0, SANS, 12.5).iter().take(3) {
+        text(c, b.x + 14.0, y, l, SANS, 12.5, GRAY, cache, BAR_H);
+        y += 18.0;
+    }
+    let [resend, cancel] = resend_buttons(page_w, top);
+    c.fill(resend, Color::rgb(0x1d, 0x4e, 0xd8), BAR_H);
+    c.fill(cancel, CHROME, BAR_H);
+    for (r, label, color) in [(resend, "Resend", Color::WHITE), (cancel, "Cancel", DARK)] {
+        let tw = font::measure(SANS, 13.0, label);
+        text(
+            c,
+            r.x + (r.w - tw) / 2.0,
+            r.y + 19.0,
+            label,
+            SANS,
+            13.0,
+            color,
+            cache,
+            BAR_H,
+        );
+    }
+}
+
+/// Split `s` into lines no wider than `max_w`.
+fn wrap_words(s: &str, max_w: f32, font: usize, size: f32) -> Vec<String> {
+    let mut lines = vec![];
+    let mut cur = String::new();
+    for word in s.split_whitespace() {
+        let next = if cur.is_empty() {
+            word.to_string()
+        } else {
+            format!("{cur} {word}")
+        };
+        if !cur.is_empty() && font::measure(font, size, &next) > max_w {
+            lines.push(std::mem::replace(&mut cur, word.to_string()));
+        } else {
+            cur = next;
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
 /// Truncate `text` with an ellipsis so it fits in `max_w` pixels.
 /// The first character shown in an address bar `avail` px wide, so the
 /// cursor stays in view.
@@ -3024,6 +3193,7 @@ mod menu_tests {
             text_scale: DEFAULT_TEXT_SCALE,
             can_back: true,
             can_forward: false,
+            resend: None,
             loading: false,
         };
         ui.address.set("https://example.com/");
@@ -3035,6 +3205,9 @@ mod menu_tests {
             &mut cache,
         );
         draw_menu_bar(&mut c, &ui, &mut cache);
+        if std::env::var("MENU_RESEND").is_ok() {
+            draw_resend(&mut c, w as f32 / k, BAR_H, &mut cache);
+        }
         if let Some(m) = ui.menu {
             let (_, items) = menu_rects(m);
             draw_menu(
