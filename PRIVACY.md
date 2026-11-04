@@ -166,13 +166,23 @@ in `src/cookies.rs`.
   request panel (as "xhr"), and your rules, the blocker (including `$xmlhttprequest` rules),
   HTTPS-only and the local-network block all apply. Scripts can't set headers that are the
   browser's business (cookies, origin, referrer, user agent and the like).
-- **Other sites' data stays theirs (CORS).** A script may ask another site for something, but only
-  sees the answer if that site allows it (`Access-Control-Allow-Origin`). Otherwise the response
-  is withheld and the panel says so. Requests that would need a CORS "preflight" aren't sent at
-  all yet.
+- **Scripts only talk to their own site.** A script's `fetch`/`XMLHttpRequest` to another site
+  (another registrable domain: `api.example.com` is the same site as `www.example.com`) isn't
+  sent. Neither is an image, stylesheet or script a script puts on the page from another site,
+  so a script can't smuggle what it learned out in an image address. Files written in the page
+  as the server sent it load as usual. These show in the request panel as "BLOCKED (script
+  sending to another site)"; clicking one adds an allow rule for just that site and kind of
+  request (`@@||api.other.example^$xhr,domain=example.com`), which also overrides the filter
+  lists for it. What a script sends to its own site can't be stopped: the site could pass it on
+  from its servers anyway. The renderer tells the browser which files a script added; a
+  renderer taken over by an exploit could lie about that, though the sandbox still holds.
+- **Other sites' data stays theirs (CORS).** Where you allowed a script to reach another site, it
+  only sees the answer if that site allows it (`Access-Control-Allow-Origin`). Otherwise the
+  response is withheld and the panel says so. Requests that would need a CORS "preflight" aren't
+  sent at all yet.
 - **No beacons.** `navigator.sendBeacon` sends nothing, and an image a script makes but doesn't
   put on the page (`new Image().src = ...`, the usual tracking pixel) loads nothing. Images a
-  script adds to the page load like any other image (rule 10).
+  script adds to the page from its own site load like any other image (rule 10).
 - **Cookies for scripts** follow the cookie rules (rule 8): no third-party cookies, ever.
   `document.cookie` shows only the page's own non-HttpOnly cookies; scripts can't see, create or
   replace HttpOnly ones (those are how sites keep you logged in). `localStorage` and

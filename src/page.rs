@@ -14,7 +14,7 @@ use crate::js::{self, Dom, Runtime};
 use crate::net::{Dest, ScriptRequest};
 use crate::network::ScriptResponse;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -51,6 +51,9 @@ pub struct Page {
     /// absolute URL (the browser applies its checks, like a script's
     /// navigation).
     pub redirect: Option<String>,
+    /// With scripts: the files (absolute URLs) the document as the server
+    /// sent it refers to. Others were put there by scripts.
+    from_server: Option<HashSet<String>>,
 }
 
 /// Decoded image pixels a page may keep (the renderer has 4 GB in all).
@@ -106,6 +109,8 @@ pub struct Rendered {
 /// Fetches a subresource (absolute URL) for the page. In the sandboxed
 /// renderer this asks the browser process, which applies the security policy.
 pub type Fetcher<'f> = dyn FnMut(&str, Dest) -> Result<String, String> + 'f;
+/// Fetches an image's bytes; told whether a script put it on the page.
+pub type ImageFetcher<'f> = dyn FnMut(&str, bool) -> Result<Vec<u8>, String> + 'f;
 
 /// The browser's side of a page while its scripts run: everything that
 /// needs the network or the cookie jar is asked of it (over IPC in the
@@ -115,9 +120,18 @@ pub trait Host {
     fn fetch(&mut self, url: &str, dest: Dest) -> Result<String, String>;
     /// A script's `fetch`/`XMLHttpRequest`.
     fn request(&mut self, url: &str, req: ScriptRequest) -> Result<ScriptResponse, String>;
+    /// A stylesheet or script a script put on the page (the browser keeps
+    /// those to the page's site).
+    fn fetch_added(&mut self, url: &str, dest: Dest) -> Result<String, String> {
+        self.fetch(url, dest)
+    }
     /// An image's bytes.
     fn image(&mut self, url: &str) -> Result<Vec<u8>, String> {
         Err(format!("images are off, skipped {url}"))
+    }
+    /// An image a script put on the page.
+    fn image_added(&mut self, url: &str) -> Result<Vec<u8>, String> {
+        self.image(url)
     }
     /// A script set `document.cookie`.
     fn set_cookie(&mut self, value: &str);
@@ -204,10 +218,16 @@ impl Page {
         host: &mut dyn Host,
     ) -> (Page, Option<Runtime>, ScriptOutput) {
         let tree = html::parse(src);
+        // The server's own stylesheets, fetched before scripts can change
+        // anything, and every file the document refers to.
+        let mut first = Page::empty(url, blocker_css, true);
+        first.set_tree(tree.clone(), &mut |u, d| host.fetch(u, d));
+        let from_server = first.files();
         let mut rt = match Runtime::new(&tree, url, viewport) {
             Ok(rt) => rt,
             Err(e) => {
                 let mut page = Page::empty(url, blocker_css, false);
+                page.sheet_cache = first.sheet_cache;
                 page.set_tree(tree, &mut |u, d| host.fetch(u, d));
                 let out = ScriptOutput {
                     console: vec![format!("[brickle] {e}")],
@@ -218,7 +238,11 @@ impl Page {
         };
         rt.set_cookies(host.cookies());
         let until = Instant::now() + js::LOAD_BUDGET;
-        let mut loader = ScriptLoader { fetched: 0, until };
+        let mut loader = ScriptLoader {
+            fetched: 0,
+            until,
+            from_server: &from_server,
+        };
         for (id, src, code) in rt.document_scripts() {
             if Instant::now() >= until {
                 break;
@@ -235,7 +259,15 @@ impl Page {
         }
         loader.run_pending(&mut rt, host);
         let mut page = Page::empty(url, blocker_css, true);
-        page.set_tree(rt.tree(), &mut |u, d| host.fetch(u, d));
+        page.sheet_cache = first.sheet_cache;
+        page.set_tree(rt.tree(), &mut |u, d| {
+            if from_server.contains(u) {
+                host.fetch(u, d)
+            } else {
+                host.fetch_added(u, d)
+            }
+        });
+        page.from_server = Some(from_server);
         let out = ScriptOutput {
             console: rt.take_console(),
             navigate: rt.take_navigate(),
@@ -268,12 +300,14 @@ impl Page {
             text_scale: 1.0,
             title_px: 0.0,
             redirect: None,
+            from_server: None,
         }
     }
 
     /// Fetch and decode the document's images not tried yet. Decoding
     /// happens here, in the (sandboxed) renderer; `fetch` asks the browser.
-    pub fn load_images(&mut self, fetch: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>) {
+    /// `fetch` is told whether a script put the image there.
+    pub fn load_images(&mut self, fetch: &mut ImageFetcher) {
         let mut imgs = Vec::new();
         self.dom.walk(&mut imgs, &|n| n.tag() == Some("img"));
         let mut urls: Vec<String> = imgs
@@ -289,7 +323,7 @@ impl Page {
             let bytes = match data_url(&url) {
                 Some(b) => b,
                 None if url.starts_with("data:") => Err("unsupported data: address".into()),
-                None => fetch(&url),
+                None => fetch(&url, self.from_server.as_ref().is_some_and(|s| !s.contains(&url))),
             };
             let decoded = bytes.ok().and_then(|b| {
                 // A decoder bug must not take the page down with it.
@@ -308,6 +342,27 @@ impl Page {
     }
 
     /// Decoded images for the `<img>` elements in `tree`, by node.
+    /// Every file the document refers to, absolute: images, stylesheets
+    /// and scripts, and `url()`s in its stylesheets.
+    fn files(&self) -> HashSet<String> {
+        let mut out = HashSet::new();
+        let mut els = Vec::new();
+        self.dom
+            .walk(&mut els, &|n| matches!(n.tag(), Some("img" | "link" | "script")));
+        for e in els.iter().filter_map(|n| n.element()) {
+            let href = match e.tag.as_str() {
+                "img" => image_source(&self.url, e),
+                "link" => e.attrs.get("href").map(|h| net::resolve(&self.url, h)),
+                _ => e.attrs.get("src").map(|s| net::resolve(&self.url, s)),
+            };
+            out.extend(href);
+        }
+        for s in &self.sheets {
+            out.extend(css::urls(s).map(|u| net::resolve(&self.url, u)));
+        }
+        out
+    }
+
     /// The `background-image`s the page's elements use, absolute.
     fn background_urls(&self) -> Vec<String> {
         let mut all = vec![(0u8, ua_sheet())];
@@ -1006,17 +1061,24 @@ fn refresh_url(content: &str) -> Option<String> {
 }
 
 /// Runs scripts while a page loads, fetching external ones from the browser.
-struct ScriptLoader {
+struct ScriptLoader<'a> {
     fetched: usize,
     until: Instant,
+    /// See [`Page::files`]: scripts not in it were added by scripts.
+    from_server: &'a HashSet<String>,
 }
 
-impl ScriptLoader {
+impl ScriptLoader<'_> {
     fn run(&mut self, rt: &mut Runtime, id: u32, src: Option<String>, code: String, host: &mut dyn Host) {
         let (code, name) = match src {
             Some(url) if self.fetched < js::MAX_SCRIPTS => {
                 self.fetched += 1;
-                match host.fetch(&url, Dest::Script) {
+                let code = if self.from_server.contains(&url) {
+                    host.fetch(&url, Dest::Script)
+                } else {
+                    host.fetch_added(&url, Dest::Script)
+                };
+                match code {
                     Ok(code) => (code, url),
                     Err(_) => return, // shown in the request log
                 }
@@ -1185,7 +1247,7 @@ mod image_tests {
     fn load(html: &str) -> (Page, Vec<String>) {
         let mut page = Page::parse("https://example.com/", html, "", &mut |_, _| Err("none".into()));
         let mut asked = Vec::new();
-        page.load_images(&mut |u| {
+        page.load_images(&mut |u, _| {
             asked.push(u.to_string());
             let name = u.rsplit('/').next().unwrap_or("");
             let size = name.strip_suffix(".png").and_then(|s| s.split_once('x'));

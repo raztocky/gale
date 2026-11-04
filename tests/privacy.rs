@@ -559,8 +559,9 @@ fn cookies_follow_redirect_hops_and_values_stay_out_of_logs() {
 }
 
 /// JavaScript is off unless you allow a site. When on, scripts and their
-/// requests go through the same policy as everything else, CORS keeps
-/// other sites' responses from the page, and HttpOnly cookies stay hidden.
+/// requests go through the same policy as everything else, they can't send
+/// to other sites unless you allow it, CORS keeps other sites' responses
+/// from the page, and HttpOnly cookies stay hidden.
 #[test]
 fn javascript_is_off_by_default_and_its_requests_follow_the_rules() {
     let home = temp_dir("js");
@@ -582,7 +583,16 @@ fn javascript_is_off_by_default_and_its_requests_follow_the_rules() {
                e => console.log('cors blocked'));\
              fetch('http://localhost:{port}/custom', {{headers: {{'X-Custom': '1'}}}}).catch(e => console.log('no preflight'));\
              fetch('/collect').catch(e => console.log('filtered'));\
-             navigator.sendBeacon('/beacon');</script>\
+             navigator.sendBeacon('/beacon');\
+             for (const src of ['http://localhost:{port}/pixel.png?id=42', '/own.png']) {{\
+               const i = document.createElement('img'); i.src = src; document.body.appendChild(i);\
+             }}\
+             const s = document.createElement('script'); s.src = 'http://localhost:{port}/added.js';\
+             document.body.appendChild(s);\
+             const l = document.createElement('link'); l.rel = 'stylesheet';\
+             l.href = 'http://localhost:{port}/added.css'; document.body.appendChild(l);\
+             const o = document.createElement('script'); o.src = '/own.js'; document.body.appendChild(o);</script>\
+             <img src=http://localhost:{port}/listed.png>\
              <script src=/app.js></script><script src=/tracker.js></script>"
         );
         vec![
@@ -619,7 +629,7 @@ fn javascript_is_off_by_default_and_its_requests_follow_the_rules() {
     let out = brickle(&home).args(["dom", &url]).output().unwrap();
     let dom = String::from_utf8_lossy(&out.stdout);
     assert!(dom.contains("\"static\""), "{dom}");
-    assert_eq!(paths(&seen), vec!["/"]);
+    assert_eq!(paths(&seen), vec!["/", "/listed.png"]);
     seen.lock().unwrap().clear();
 
     // Allowed for the site.
@@ -628,6 +638,41 @@ fn javascript_is_off_by_default_and_its_requests_follow_the_rules() {
         .output()
         .unwrap();
     assert!(allow.status.success());
+    // Scripts can't send to other sites: not their requests, nor images
+    // they put on the page. Images in the page as sent load as usual.
+    let out = brickle(&home).args(["requests", &url]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for want in [
+        "[log] same-origin from api",
+        "BLOCKED (script sending to another site) xhr   http://localhost",
+        "BLOCKED (script sending to another site) img   http://localhost",
+    ] {
+        assert!(stdout.contains(want), "missing {want:?}:\n{stdout}");
+    }
+    let got = paths(&seen);
+    for p in ["/", "/app.js", "/api", "/own.png", "/own.js", "/listed.png"] {
+        assert!(got.contains(&p.to_string()), "{p} not requested: {got:?}");
+    }
+    for p in [
+        "/open",
+        "/closed",
+        "/custom",
+        "/pixel.png?id=42",
+        "/added.js",
+        "/added.css",
+    ] {
+        assert!(!got.contains(&p.to_string()), "{p} must not be sent: {got:?}");
+    }
+    seen.lock().unwrap().clear();
+
+    // Allowed for this site (the rule clicking the request adds): then CORS
+    // decides what the page may read.
+    std::fs::create_dir_all(home.join("config/brickle")).unwrap();
+    std::fs::write(
+        home.join("config/brickle/rules.txt"),
+        "@@||localhost^$xhr,domain=127.0.0.1\n",
+    )
+    .unwrap();
     let out = brickle(&home).args(["requests", &url]).output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     for want in [
@@ -648,7 +693,15 @@ fn javascript_is_off_by_default_and_its_requests_follow_the_rules() {
     for p in ["/", "/app.js", "/api", "/open", "/closed"] {
         assert!(got.contains(&p.to_string()), "{p} not requested: {got:?}");
     }
-    for p in ["/tracker.js", "/collect", "/custom", "/beacon"] {
+    for p in [
+        "/tracker.js",
+        "/collect",
+        "/custom",
+        "/beacon",
+        "/pixel.png?id=42",
+        "/added.js",
+        "/added.css",
+    ] {
         assert!(!got.contains(&p.to_string()), "{p} must not be sent: {got:?}");
     }
     let seen = seen.lock().unwrap();

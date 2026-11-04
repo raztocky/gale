@@ -2816,6 +2816,7 @@ fn draw_panel(
             | Outcome::MixedContent
             | Outcome::NotAllowed
             | Outcome::LocalNetwork
+            | Outcome::CrossSite { .. }
             | Outcome::BadCertificate(_) => RED,
             Outcome::NeedsHttpConsent | Outcome::Failed(_) | Outcome::OverLimit => AMBER,
             _ if e.insecure => AMBER,

@@ -65,6 +65,11 @@ pub enum Outcome {
     LocalNetwork,
     /// The server's certificate failed verification.
     BadCertificate(String),
+    /// A page's script sending to another site (a request it made, or a
+    /// file it put on the page). `allow` is the rule that would let it.
+    CrossSite {
+        allow: String,
+    },
     Failed(String),
 }
 
@@ -560,9 +565,41 @@ impl Network {
         }
     }
 
+    /// Scripts may only send to their page's site: a request a script made,
+    /// or a file it put on the page (`added`), for another site is refused
+    /// unless one of your allow rules lets it through. Same-site and
+    /// `data:` addresses pass.
+    pub fn script_added(&mut self, page_url: &str, url: &str, dest: Dest) -> Result<(), String> {
+        let site = cookies::site(page_url);
+        if url.starts_with("data:")
+            || cookies::site(url) == site
+            || self
+                .user
+                .allows(&Req::new(url, Some(page_url), filter_dest(dest)))
+                .is_some()
+        {
+            return Ok(());
+        }
+        let kind = match dest {
+            Dest::Xhr => "xhr",
+            Dest::Image => "image",
+            Dest::Script => "script",
+            _ => "stylesheet",
+        };
+        let allow = format!("@@||{}^${kind},domain={site}", filter::host_of(url));
+        self.record(url, dest, Outcome::CrossSite { allow }, vec![]);
+        Err(format!(
+            "scripts may only send to this page's site, skipped {url}"
+        ))
+    }
+
     /// Fetch an image for the page at `page_url` (the browser's own record
     /// of the page). Only its bytes come back: it is decoded in the renderer.
-    pub fn image(&mut self, page_url: &str, url: &str) -> Result<Vec<u8>, String> {
+    /// `added`: a script put it on the page (see [`Network::script_added`]).
+    pub fn image(&mut self, page_url: &str, url: &str, added: bool) -> Result<Vec<u8>, String> {
+        if added {
+            self.script_added(page_url, url, Dest::Image)?;
+        }
         self.page_images += 1;
         let why = if self.page_images > MAX_IMAGES {
             Some("too many images")
@@ -594,7 +631,8 @@ impl Network {
     /// A request from a page's script (`fetch`, `XMLHttpRequest`). The page
     /// URL is the browser's own record of the page, not the renderer's word.
     ///
-    /// Same-origin requests go ahead; cross-origin ones only if they need no
+    /// Requests to other sites are refused (see [`Network::script_added`]).
+    /// Within the site, cross-origin ones go ahead only if they need no
     /// CORS preflight (which Brickle doesn't do yet), and the page only sees
     /// the response if the server allows it (`Access-Control-Allow-Origin`).
     /// Every other rule (your rules, the blocker, HTTPS-only, the
@@ -637,6 +675,7 @@ impl Network {
             return Err(format!("not a valid address: {url}"));
         };
         let target: String = target.into();
+        self.script_added(page_url, &target, dest)?;
         let cross = !same_origin(page_url, &target);
         if cross && !is_cors_simple(&req) {
             self.record(&target, dest, Outcome::NotAllowed, vec![]);
@@ -1037,6 +1076,7 @@ impl Network {
         match &e.outcome {
             Outcome::Denied { rule } if self.user_rules.contains(rule) => (rule.clone(), "unblock"),
             Outcome::Blocked { .. } => (format!("@@||{host}^"), "allow"),
+            Outcome::CrossSite { allow } => (allow.clone(), "allow"),
             _ if e.allowed_by.as_ref().is_some_and(|r| self.user_rules.contains(r)) => {
                 (e.allowed_by.clone().unwrap_or_default(), "stop allowing")
             }
@@ -1381,14 +1421,17 @@ mod tests {
         let page = format!("file://{}/page.html", dir.display());
         let mut n = Network::empty();
         // A local page's images are read as bytes, untouched.
-        assert_eq!(n.image(&page, &img).unwrap(), b"\x89PNG\r\n\x1a\nnot really");
+        assert_eq!(
+            n.image(&page, &img, false).unwrap(),
+            b"\x89PNG\r\n\x1a\nnot really"
+        );
         // A website's are not.
-        assert!(n.image("https://evil.example/", &img).is_err());
+        assert!(n.image("https://evil.example/", &img, false).is_err());
         assert_eq!(n.take_log().last().unwrap().outcome, Outcome::NotAllowed);
         // Past the per-page count, nothing more is fetched.
         n.page_images = MAX_IMAGES;
         assert!(n
-            .image("https://budget.example/", "https://budget.example/x.png")
+            .image("https://budget.example/", "https://budget.example/x.png", false)
             .unwrap_err()
             .contains("too many images"));
         assert_eq!(n.take_log()[0].outcome, Outcome::OverLimit);
@@ -1396,14 +1439,14 @@ mod tests {
         n.restart_page_budget();
         n.image_bytes = IMAGE_BYTE_BUDGET + 1;
         assert!(n
-            .image("https://budget.example/", "https://budget.example/x.png")
+            .image("https://budget.example/", "https://budget.example/x.png", false)
             .unwrap_err()
             .contains("too large"));
         assert_eq!(net::requests_sent_to("https://budget.example/"), 0);
         // Images can't come from the local network either.
         n.restart_page_budget();
         assert!(n
-            .image("https://evil.example/", "http://192.168.1.1/cam.jpg")
+            .image("https://evil.example/", "http://192.168.1.1/cam.jpg", false)
             .is_err());
         assert_eq!(n.take_log().last().unwrap().outcome, Outcome::LocalNetwork);
         let _ = std::fs::remove_dir_all(&dir);

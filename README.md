@@ -106,7 +106,7 @@ when a page actually uses them.
 
 ## Security
 
-JavaScript is off unless you allow a site; its requests go through the same rules as everything else. Cookies are first-party only and deleted on close unless you keep a site (see PRIVACY.md). Privacy protections are
+JavaScript is off unless you allow a site; its requests go through the same rules as everything else, and scripts can't send anything to other sites unless you allow it. Cookies are first-party only and deleted on close unless you keep a site (see PRIVACY.md). Privacy protections are
 described in [PRIVACY.md](PRIVACY.md). Security measures:
 
 - **Sandboxed renderer (Linux).** Each page is parsed, laid out and its text rasterized in its own

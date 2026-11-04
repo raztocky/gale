@@ -50,13 +50,12 @@ impl<R: Read, W: Write> IpcHost<'_, R, W> {
         }
         r
     }
-}
 
-impl<R: Read, W: Write> Host for IpcHost<'_, R, W> {
-    fn fetch(&mut self, url: &str, dest: Dest) -> Result<String, String> {
+    fn file(&mut self, url: &str, dest: Dest, added: bool) -> Result<String, String> {
         match self.ask(FromRenderer::Fetch {
             url: url.to_string(),
             dest,
+            added,
         })? {
             ToRenderer::FetchReply(r) => r,
             _ => {
@@ -66,10 +65,11 @@ impl<R: Read, W: Write> Host for IpcHost<'_, R, W> {
         }
     }
 
-    fn image(&mut self, url: &str) -> Result<Vec<u8>, String> {
+    fn picture(&mut self, url: &str, added: bool) -> Result<Vec<u8>, String> {
         match self.ask(FromRenderer::Fetch {
             url: url.to_string(),
             dest: Dest::Image,
+            added,
         })? {
             ToRenderer::ImageReply(r) => r,
             _ => {
@@ -77,6 +77,24 @@ impl<R: Read, W: Write> Host for IpcHost<'_, R, W> {
                 Err("protocol error".into())
             }
         }
+    }
+}
+
+impl<R: Read, W: Write> Host for IpcHost<'_, R, W> {
+    fn fetch(&mut self, url: &str, dest: Dest) -> Result<String, String> {
+        self.file(url, dest, false)
+    }
+
+    fn fetch_added(&mut self, url: &str, dest: Dest) -> Result<String, String> {
+        self.file(url, dest, true)
+    }
+
+    fn image(&mut self, url: &str) -> Result<Vec<u8>, String> {
+        self.picture(url, false)
+    }
+
+    fn image_added(&mut self, url: &str) -> Result<Vec<u8>, String> {
+        self.picture(url, true)
     }
 
     fn request(&mut self, url: &str, req: ScriptRequest) -> Result<ScriptResponse, String> {
@@ -136,7 +154,13 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                     let p = Page::parse(&url, &html, &blocker_css, &mut |u, d| host.fetch(u, d));
                     (p, None, ScriptOutput::default())
                 };
-                p.load_images(&mut |u| host.image(u));
+                p.load_images(&mut |u, added| {
+                    if added {
+                        host.image_added(u)
+                    } else {
+                        host.image(u)
+                    }
+                });
                 if let Some(e) = host.broken {
                     return Err(e);
                 }
@@ -196,7 +220,13 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                         p.refresh(rt);
                         done.changed = true;
                         // Scripts may have added images.
-                        p.load_images(&mut |u| host.image(u));
+                        p.load_images(&mut |u, added| {
+                            if added {
+                                host.image_added(u)
+                            } else {
+                                host.image(u)
+                            }
+                        });
                     }
                     if let Some(e) = host.broken {
                         return Err(e);

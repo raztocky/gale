@@ -85,6 +85,9 @@ pub enum FromRenderer {
     Fetch {
         url: String,
         dest: Dest,
+        /// A script put it on the page: it wasn't in the document as the
+        /// server sent it (the browser keeps those to the page's site).
+        added: bool,
     },
     Loaded {
         title: String,
@@ -522,7 +525,7 @@ impl FromRenderer {
     pub fn encode(&self) -> Vec<u8> {
         let mut e = Enc::default();
         match self {
-            FromRenderer::Fetch { url, dest } => {
+            FromRenderer::Fetch { url, dest, added } => {
                 e.u8(1);
                 e.str(url);
                 e.u8(match dest {
@@ -530,6 +533,7 @@ impl FromRenderer {
                     Dest::Image => 3,
                     _ => 1,
                 });
+                e.u8(*added as u8);
             }
             FromRenderer::Loaded {
                 title,
@@ -688,6 +692,7 @@ impl FromRenderer {
                     3 => Dest::Image,
                     t => return Err(format!("invalid request type {t}")),
                 },
+                added: d.bool()?,
             },
             2 => FromRenderer::Loaded {
                 title: d.str()?,
@@ -1005,14 +1010,17 @@ mod tests {
             FromRenderer::Fetch {
                 url: "https://a/b.css".into(),
                 dest: Dest::Stylesheet,
+                added: false,
             },
             FromRenderer::Fetch {
                 url: "https://a/b.js".into(),
                 dest: Dest::Script,
+                added: true,
             },
             FromRenderer::Fetch {
                 url: "https://a/b.png".into(),
                 dest: Dest::Image,
+                added: true,
             },
             FromRenderer::Loaded {
                 title: "T".into(),

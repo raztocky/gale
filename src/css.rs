@@ -185,6 +185,19 @@ pub fn resolve_urls(sheet: &mut Stylesheet, base: &str) {
     }
 }
 
+/// The `url()`s in a stylesheet, as written (`data:` ones left out).
+pub fn urls(sheet: &Stylesheet) -> impl Iterator<Item = &str> {
+    sheet
+        .rules
+        .iter()
+        .flat_map(|r| &r.declarations)
+        .flat_map(|d| &d.values)
+        .filter_map(|v| match v {
+            Value::Url(u) if !u.starts_with("data:") => Some(u.as_str()),
+            _ => None,
+        })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Unit {
     Px,

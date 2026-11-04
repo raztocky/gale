@@ -46,8 +46,15 @@ impl Host for NetHost<'_> {
     fn fetch(&mut self, url: &str, dest: Dest) -> Result<String, String> {
         self.net.subresource(&self.page, url, dest)
     }
+    fn fetch_added(&mut self, url: &str, dest: Dest) -> Result<String, String> {
+        self.net.script_added(&self.page, url, dest)?;
+        self.net.subresource(&self.page, url, dest)
+    }
     fn image(&mut self, url: &str) -> Result<Vec<u8>, String> {
-        self.net.image(&self.page, url)
+        self.net.image(&self.page, url, false)
+    }
+    fn image_added(&mut self, url: &str) -> Result<Vec<u8>, String> {
+        self.net.image(&self.page, url, true)
     }
     fn request(&mut self, url: &str, req: ScriptRequest) -> Result<ScriptResponse, String> {
         self.net.script_request(&self.page, url, req)
@@ -229,7 +236,7 @@ impl Tab {
             let page_url = url.to_string();
             let mut fetch = |target: &str, dest: Dest| net.subresource(&page_url, target, dest);
             let mut page = Page::parse(url, html, &blocker_css, &mut fetch);
-            page.load_images(&mut |u| net.image(&page_url, u));
+            page.load_images(&mut |u, _| net.image(&page_url, u, false));
             tab.title = page.title.clone();
             tab.backend = Backend::InProcess(Box::new(page));
             tab.log = net.take_log();
@@ -548,13 +555,24 @@ impl Renderer {
                 FromRenderer::Fetch {
                     url,
                     dest: Dest::Image,
+                    added,
                 } if fetches < MAX_FETCHES => {
                     fetches += 1;
-                    self.send(ToRenderer::ImageReply(host.image(&url)))?
+                    let r = if added {
+                        host.image_added(&url)
+                    } else {
+                        host.image(&url)
+                    };
+                    self.send(ToRenderer::ImageReply(r))?
                 }
-                FromRenderer::Fetch { url, dest } if fetches < MAX_FETCHES => {
+                FromRenderer::Fetch { url, dest, added } if fetches < MAX_FETCHES => {
                     fetches += 1;
-                    self.send(ToRenderer::FetchReply(host.fetch(&url, dest)))?
+                    let r = if added {
+                        host.fetch_added(&url, dest)
+                    } else {
+                        host.fetch(&url, dest)
+                    };
+                    self.send(ToRenderer::FetchReply(r))?
                 }
                 FromRenderer::Fetch { .. } => {
                     return Err(self.kill("renderer made too many requests and was killed"))
@@ -694,6 +712,7 @@ except BrokenPipeError:
         hex(F::Fetch {
             url: url.into(),
             dest: Dest::Stylesheet,
+            added: false,
         })
     }
     fn loaded() -> String {
