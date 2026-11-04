@@ -10,7 +10,7 @@ default = ["gui"]
 gui = ["dep:minifb", "dep:arboard"]
 
 [dependencies]
-png = "0.17"
+png = "0.18"
 url = "2"
 rustls = { version = "0.23", default-features = false }
 # JavaScript engine: pure Rust interpreter, no JIT. Runs only in the sandboxed renderer.
