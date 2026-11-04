@@ -74,10 +74,15 @@ Limits, honestly:
 - Brickle's TLS handshake comes from rustls, not Firefox's NSS, so services doing TLS
   fingerprinting (JA3/JA4) can tell the difference. It can't be made to match: Firefox offers
   cipher suites rustls doesn't implement and extensions rustls has no way to send, and it offers
-  HTTP/2, which Brickle doesn't speak yet. A handshake tweaked to be "closer" would still not be
+  HTTP/2, which Brickle doesn't speak. A handshake tweaked to be "closer" would still not be
   Firefox's, and it would be one only Brickle sends, so it would single you out. Brickle keeps
-  the stock rustls handshake instead, which it shares with every other rustls client
-  (`tls_handshake_is_stock_rustls` in `src/net.rs` checks it stays that way).
+  the stock rustls handshake instead, with one change: it never resumes a TLS session. Every
+  connection is a full handshake, because a resumed session hands the server a ticket it issued
+  earlier, and a host embedded on many sites (a CDN, an analytics server) could use it to link
+  your visits across sites, whatever your cookies. That leaves out the one extension that asks
+  for TLS 1.2 tickets; otherwise the handshake is any rustls client's
+  (`tls_handshake_is_stock_rustls_without_resumption` in `src/net.rs` checks both). Connections
+  aren't reused either, so nothing carries over from one request to the next.
 - Brickle sends no `Referer` header at all, which is stricter than Firefox's default.
 - JavaScript is off unless you allow a site (rule 9). With it off there is very little else to
   fingerprint. With it on, scripts see Firefox's `navigator` values, a fixed 1920x1080 screen,

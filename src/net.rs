@@ -299,13 +299,18 @@ pub fn tls_config() -> Arc<rustls::ClientConfig> {
             let verifier = Arc::new(
                 crate::crlite::Verifier::new(Arc::new(roots)).expect("building the certificate verifier"),
             );
-            let config =
+            let mut config =
                 rustls::ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
                     .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])
                     .expect("the ring provider supports TLS 1.2 and 1.3")
                     .dangerous()
                     .with_custom_certificate_verifier(verifier)
                     .with_no_client_auth();
+            // A full handshake every time: a resumed session hands the
+            // server a ticket it issued earlier, which a host embedded on
+            // many sites (a CDN, an analytics server) could use to link your
+            // visits across sites, cookies or not.
+            config.resumption = rustls::client::Resumption::disabled();
             Arc::new(config)
         })
         .clone()
@@ -1401,14 +1406,69 @@ mod tests {
     /// rustls client: matching Firefox's isn't possible with rustls, and a
     /// handshake of our own would make Brickle users stand out.
     #[test]
-    fn tls_handshake_is_stock_rustls() {
-        let mut ours = client_hello(ureq::AgentBuilder::new().tls_config(tls_config()).build());
+    fn tls_handshake_is_stock_rustls_without_resumption() {
+        const SESSION_TICKET: u16 = 35;
+        const PRE_SHARED_KEY: u16 = 41;
+        let agent = ureq::AgentBuilder::new().tls_config(tls_config()).build();
+        let mut ours = client_hello(agent.clone());
         let mut stock = client_hello(ureq::AgentBuilder::new().build());
         // rustls shuffles extensions on every connection (as Chrome does).
         ours.1.sort();
         stock.1.sort();
         assert!(!ours.0.is_empty() && ours.1.len() > 5);
+        // The one difference: no TLS 1.2 ticket is asked for.
+        stock.1.retain(|(e, _)| *e != SESSION_TICKET);
         assert_eq!(ours, stock);
+        // And a second connection offers nothing from the first.
+        let again = client_hello(agent);
+        assert!(
+            !again
+                .1
+                .iter()
+                .any(|(e, _)| [SESSION_TICKET, PRE_SHARED_KEY].contains(e)),
+            "{again:?}"
+        );
+    }
+
+    /// Against a real server (needs the network): a second connection is a
+    /// full handshake again, where stock rustls would resume the first.
+    #[test]
+    #[ignore]
+    fn tls_sessions_are_never_resumed_live() {
+        use rustls::HandshakeKind;
+        use std::io::Write;
+        fn handshake(config: Arc<rustls::ClientConfig>) -> Option<HandshakeKind> {
+            let name = rustls::pki_types::ServerName::try_from("example.com").unwrap();
+            let mut conn = rustls::ClientConnection::new(config, name).unwrap();
+            let mut sock = std::net::TcpStream::connect("example.com:443").unwrap();
+            while conn.is_handshaking() {
+                conn.complete_io(&mut sock).unwrap();
+            }
+            // TLS 1.3 tickets arrive after the handshake.
+            conn.writer()
+                .write_all(b"HEAD / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            let _ = conn.complete_io(&mut sock);
+            let _ = conn.complete_io(&mut sock);
+            conn.handshake_kind()
+        }
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add_parsable_certificates(rustls_native_certs::load_native_certs().unwrap());
+        let stock = Arc::new(
+            rustls::ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        handshake(stock.clone());
+        assert_eq!(
+            handshake(stock),
+            Some(HandshakeKind::Resumed),
+            "the control should resume"
+        );
+        handshake(tls_config());
+        assert_eq!(handshake(tls_config()), Some(HandshakeKind::Full));
     }
 
     #[test]
