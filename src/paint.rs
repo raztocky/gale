@@ -639,6 +639,9 @@ pub struct Canvas {
     /// browser draws its own interface at your interface size with it);
     /// display lists are always painted at 1.
     pub scale: f32,
+    /// `fill` and `text` colours go through [`dark_variant`] (the browser's
+    /// own interface in dark mode); display lists are painted as they are.
+    pub dark: bool,
 }
 
 type GlyphKey = (usize, char, u32);
@@ -651,6 +654,60 @@ pub struct GlyphCache {
 }
 
 /// Smallest text size the painter will rasterize, in px.
+/// A colour for a dark interface designed in light colours: its lightness
+/// flipped (white becomes near-black, near-black text light grey), with
+/// its hue and saturation kept, so blues stay blue and reds red.
+pub fn dark_variant(c: Color) -> Color {
+    let [r, g, b] = [c.r, c.g, c.b].map(|v| v as f32 / 255.0);
+    let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+    let l = (max + min) / 2.0;
+    // Flip, but keep off pure black and white: 1.0 -> 0.12, 0.0 -> 0.9.
+    let l2 = 0.12 + 0.78 * (1.0 - l);
+    if max - min < 1e-6 {
+        let v = (l2 * 255.0).round() as u8;
+        return Color {
+            r: v,
+            g: v,
+            b: v,
+            a: c.a,
+        };
+    }
+    let d = max - min;
+    let s = if l > 0.5 {
+        d / (2.0 - max - min)
+    } else {
+        d / (max + min)
+    };
+    let h = if max == r {
+        ((g - b) / d).rem_euclid(6.0)
+    } else if max == g {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    } / 6.0;
+    let q = if l2 < 0.5 { l2 * (1.0 + s) } else { l2 + s - l2 * s };
+    let p = 2.0 * l2 - q;
+    let channel = |t: f32| {
+        let t = t.rem_euclid(1.0);
+        let v = if t < 1.0 / 6.0 {
+            p + (q - p) * 6.0 * t
+        } else if t < 0.5 {
+            q
+        } else if t < 2.0 / 3.0 {
+            p + (q - p) * (2.0 / 3.0 - t) * 6.0
+        } else {
+            p
+        };
+        (v * 255.0).round().clamp(0.0, 255.0) as u8
+    };
+    Color {
+        r: channel(h + 1.0 / 3.0),
+        g: channel(h),
+        b: channel(h - 1.0 / 3.0),
+        a: c.a,
+    }
+}
+
 pub const MIN_TEXT_SIZE: f32 = 1.0;
 
 const GLYPH_CACHE_BYTES: usize = 32 * 1024 * 1024;
@@ -662,6 +719,7 @@ impl Canvas {
             width,
             height,
             scale: 1.0,
+            dark: false,
         }
     }
 
@@ -770,6 +828,7 @@ impl Canvas {
     }
 
     pub fn fill(&mut self, r: Rect, color: Color, clip_top: f32) {
+        let color = if self.dark { dark_variant(color) } else { color };
         let k = self.scale;
         let (r, clip_top) = (
             Rect {
@@ -806,6 +865,7 @@ impl Canvas {
     ) {
         let k = self.scale;
         let (x, baseline, size, clip_top) = (x * k, baseline * k, size * k, clip_top * k);
+        let color = if self.dark { dark_variant(color) } else { color };
         // fontdue corrupts memory when rasterizing at tiny (subnormal) sizes
         // (found by fuzzing). Text under MIN_TEXT_SIZE is invisible anyway.
         if !(MIN_TEXT_SIZE..=crate::style::MAX_FONT_SIZE).contains(&size) || font_idx >= font::COUNT {
@@ -1123,5 +1183,32 @@ mod tests {
             })
             .sum();
         assert_eq!(placed, 9);
+    }
+}
+
+#[cfg(test)]
+mod dark_tests {
+    use super::*;
+
+    #[test]
+    fn dark_variant_flips_lightness_and_keeps_hue() {
+        let w = dark_variant(Color::WHITE);
+        assert!(w.r == w.g && w.g == w.b && w.r < 40, "white -> near black: {w:?}");
+        let k = dark_variant(Color::rgb(0x22, 0x22, 0x22));
+        assert!(k.r > 200, "dark text -> light: {k:?}");
+        let red = dark_variant(Color::rgb(0xc0, 0x1c, 0x1c));
+        assert!(red.r > red.g + 80 && red.r > red.b + 80, "still red: {red:?}");
+        let blue = dark_variant(Color::rgb(0xdb, 0xea, 0xfe));
+        assert!(
+            blue.b > blue.r && blue.b < 100,
+            "pale blue -> dark blue: {blue:?}"
+        );
+        let half = dark_variant(Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 90,
+        });
+        assert_eq!(half.a, 90, "alpha kept");
     }
 }

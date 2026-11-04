@@ -13,7 +13,7 @@ use brickle::paint::{Canvas, DisplayList, GlyphCache, Layer, TileCache};
 use brickle::select::{self, Bands, FindText, Pos};
 use brickle::tab::{Input, Tab};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -43,6 +43,13 @@ fn ui_scale() -> f32 {
 /// The top bars' height in window pixels: where the page starts.
 fn bar_h() -> f32 {
     (BAR_H * ui_scale()).round()
+}
+
+/// The interface is dark (the default) or light.
+static DARK_UI: AtomicBool = AtomicBool::new(true);
+
+fn theme_file() -> Option<std::path::PathBuf> {
+    brickle::network::config_dir().map(|d| d.join("interface-theme"))
 }
 
 /// Interface sizes the View menu and Ctrl+Alt+=/- step through.
@@ -94,6 +101,11 @@ const MENUS: [(&str, &[MenuItem]); 4] = [
                 "Normal interface size",
                 "Ctrl+Alt+0",
                 (Key::Key0, true, false, true),
+            ),
+            item(
+                "Light / dark interface",
+                "Ctrl+Shift+D",
+                (Key::D, true, true, false),
             ),
             item("Requests panel", "F12", (Key::F12, false, false, false)),
         ],
@@ -569,6 +581,11 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
     shared_scale.store(ui.text_scale.to_bits(), Ordering::Relaxed);
     UI_SCALE.store(
         load_scale("interface-size", &UI_SCALES, 1.0).to_bits(),
+        Ordering::Relaxed,
+    );
+    let theme = theme_file().and_then(|f| std::fs::read_to_string(f).ok());
+    DARK_UI.store(
+        theme.as_deref().map(str::trim) != Some("light"),
         Ordering::Relaxed,
     );
     // A menu item picked: the shortcut it presses, next frame.
@@ -1121,6 +1138,16 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 }
                 Key::R if ctrl => reload = true,
                 Key::Q if ctrl => quit = true,
+                Key::D if ctrl && shift => {
+                    let dark = !DARK_UI.load(Ordering::Relaxed);
+                    DARK_UI.store(dark, Ordering::Relaxed);
+                    if let Some(f) = theme_file() {
+                        let _ = f.parent().map(std::fs::create_dir_all);
+                        let _ = std::fs::write(f, if dark { "dark\n" } else { "light\n" });
+                    }
+                    ui.flash = Some(format!("{} interface", if dark { "Dark" } else { "Light" }));
+                    dirty = true;
+                }
                 Key::F5 => reload = true,
                 Key::F12 => ui.panel = !ui.panel,
                 Key::E if ctrl && shift => ui.panel = !ui.panel,
@@ -1674,8 +1701,9 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     canvas.fill(r, SELECTION, bar);
                 }
             }
-            // The bars and panels, in interface units.
+            // The bars and panels, in interface units and colours.
             canvas.scale = k;
+            canvas.dark = DARK_UI.load(Ordering::Relaxed);
             draw_chrome(
                 &mut canvas,
                 &ui,
@@ -1738,6 +1766,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 draw_menu(&mut canvas, m, mouse.map(|(x, y)| (x / k, y / k)), &mut cache);
             }
             canvas.scale = 1.0;
+            canvas.dark = false;
             dirty = false;
         }
         window
@@ -2437,6 +2466,8 @@ fn draw_chrome(
             w: SCROLLBAR_W - 4.0,
             h: thumb / c.scale,
         };
+        // Over the page, so in the page's colours, not the interface's.
+        let dark = std::mem::replace(&mut c.dark, false);
         c.fill(
             bar,
             Color {
@@ -2447,6 +2478,7 @@ fn draw_chrome(
             },
             BAR_H,
         );
+        c.dark = dark;
     }
 }
 
@@ -2901,6 +2933,7 @@ mod menu_tests {
             .unwrap_or(1.0);
         let mut c = Canvas::new(1100, (260.0 * k) as usize, Color::WHITE);
         c.scale = k;
+        c.dark = std::env::var("MENU_LIGHT").is_err();
         let mut cache = GlyphCache::default();
         let mut ui = Ui {
             address: LineEdit::new(64),

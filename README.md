@@ -55,6 +55,7 @@ size, and clicking the percentage between them goes back to the normal size.
 | Select text | drag, double-click a word, `Ctrl+A` for the page, `Esc` to clear |
 | Text size | `Ctrl+=` bigger, `Ctrl+-` smaller, `Ctrl+0` normal (125%, remembered between runs) |
 | Interface size (menus, tabs, address bar, panels) | `Ctrl+Alt+=` bigger, `Ctrl+Alt+-` smaller, `Ctrl+Alt+0` normal, also in the View menu (remembered) |
+| Light / dark interface (dark by default; pages keep their own colours) | `Ctrl+Shift+D`, or View menu (remembered) |
 | Quit | `Ctrl+Q` |
 | Copy / paste | `Ctrl+C` copies the selection (or the address); `Ctrl+V` or `Shift+Insert` pastes into the address bar or a form field |
 
