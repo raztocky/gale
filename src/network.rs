@@ -202,6 +202,8 @@ pub struct Network {
     /// The last page loaded was the answer to a POST (not redirected to a
     /// GET), so loading it again means sending the form again.
     document_posted: bool,
+    /// CORS preflights that said yes, until when (for this session only).
+    preflights: std::collections::HashMap<String, std::time::Instant>,
 }
 
 pub fn config_dir() -> Option<PathBuf> {
@@ -244,6 +246,7 @@ impl Network {
             lists_loaded: 0,
             cookies: Jar::new(),
             document_posted: false,
+            preflights: Default::default(),
         }
     }
 
@@ -632,9 +635,9 @@ impl Network {
     /// URL is the browser's own record of the page, not the renderer's word.
     ///
     /// Requests to other sites are refused (see [`Network::script_added`]).
-    /// Within the site, cross-origin ones go ahead only if they need no
-    /// CORS preflight (which Brickle doesn't do yet), and the page only sees
-    /// the response if the server allows it (`Access-Control-Allow-Origin`).
+    /// Cross-origin ones that aren't "simple" are sent only after a CORS
+    /// preflight says the server takes them, and the page only sees the
+    /// response if the server allows it (`Access-Control-Allow-Origin`).
     /// Every other rule (your rules, the blocker, HTTPS-only, the
     /// local-network block, cookies) applies as for any request.
     pub fn script_request(
@@ -677,16 +680,13 @@ impl Network {
         let target: String = target.into();
         self.script_added(page_url, &target, dest)?;
         let cross = !same_origin(page_url, &target);
-        if cross && !is_cors_simple(&req) {
-            self.record(&target, dest, Outcome::NotAllowed, vec![]);
-            return Err(
-                "this cross-origin request needs a CORS preflight, which Brickle doesn't support yet".into(),
-            );
-        }
         // After the page has loaded, each script request gets its own time.
         let now = std::time::Instant::now();
         if now >= self.deadline {
             self.deadline = now + SCRIPT_REQUEST_TIME;
+        }
+        if cross && !is_cors_simple(&req) {
+            self.preflight(page_url, &target, &req)?;
         }
         let creds = req.credentials;
         match self.fetch_with(&target, Some(page_url), dest, Some(&req)) {
@@ -738,6 +738,98 @@ impl Network {
             Fetch::FilterBlocked { url, .. } => Err(format!("blocked {url}")),
             Fetch::Certificate { host, err } => Err(format!("{host}: {err}")),
         }
+    }
+
+    /// Ask the server whether this page may send `req` (an `OPTIONS`
+    /// request without cookies, through the same checks as any other).
+    fn preflight(&mut self, page_url: &str, target: &str, req: &ScriptRequest) -> Result<(), String> {
+        let origin = origin_of(page_url);
+        let creds = req.credentials == Credentials::Include;
+        let mut names: Vec<String> = req
+            .headers
+            .iter()
+            .filter(|(k, v)| !cors_safelisted(k, v))
+            .map(|(k, _)| k.to_ascii_lowercase())
+            .collect();
+        names.sort();
+        names.dedup();
+        let key = format!("{origin} {target} {creds} {} {}", req.method, names.join(","));
+        let now = std::time::Instant::now();
+        if self.preflights.get(&key).is_some_and(|until| *until > now) {
+            return Ok(());
+        }
+        let mut headers = vec![("Access-Control-Request-Method".to_string(), req.method.clone())];
+        if !names.is_empty() {
+            headers.push(("Access-Control-Request-Headers".to_string(), names.join(",")));
+        }
+        let ask = ScriptRequest {
+            method: "OPTIONS".into(),
+            headers,
+            body: None,
+            credentials: Credentials::Omit,
+        };
+        let refused = |why: String| format!("CORS preflight: {} {why}", filter::host_of(target));
+        let (status, got) = match self.fetch_with(target, Some(page_url), Dest::Xhr, Some(&ask)) {
+            Fetch::Done {
+                url, status, headers, ..
+            } if url == target => (status, headers),
+            Fetch::Done { .. } => return Err(refused("redirected the preflight".into())),
+            Fetch::Stopped(why) => return Err(why),
+            _ => return Err(refused("couldn't be asked".into())),
+        };
+        let header = |name: &str| {
+            got.iter()
+                .filter(|(k, _)| k == name)
+                .map(|(_, v)| v.trim().to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let list = |name: &str| -> Vec<String> {
+            header(name)
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+        let acao = header("access-control-allow-origin");
+        let methods = list("access-control-allow-methods");
+        let allowed_headers: Vec<String> = list("access-control-allow-headers")
+            .into_iter()
+            .map(|h| h.to_ascii_lowercase())
+            .collect();
+        let why = if !(200..300).contains(&status) {
+            Some(format!("answered HTTP {status}"))
+        } else if !(acao == origin || (acao == "*" && !creds)) {
+            Some("didn't allow this page".into())
+        } else if creds && header("access-control-allow-credentials") != "true" {
+            Some("didn't allow cookies".into())
+        } else if !(matches!(req.method.as_str(), "GET" | "HEAD" | "POST")
+            || methods.contains(&req.method)
+            || (!creds && methods.iter().any(|m| m == "*")))
+        {
+            Some(format!("didn't allow {}", req.method))
+        } else {
+            names
+                .iter()
+                .find(|h| {
+                    !allowed_headers.contains(h)
+                        && !(!creds && *h != "authorization" && allowed_headers.iter().any(|a| a == "*"))
+                })
+                .map(|h| format!("didn't allow the {h} header"))
+        };
+        if let Some(why) = why {
+            if let Some(e) = self.log.last_mut() {
+                e.cors_blocked = true;
+            }
+            return Err(refused(why));
+        }
+        let age = header("access-control-max-age")
+            .parse::<u64>()
+            .unwrap_or(5)
+            .min(7200);
+        self.preflights
+            .insert(key, now + std::time::Duration::from_secs(age));
+        Ok(())
     }
 
     /// `document.cookie` for a page's scripts: its cookies, except HttpOnly
@@ -1206,17 +1298,22 @@ fn allowed_script_headers(headers: Vec<(String, String)>) -> Vec<(String, String
 /// A cross-origin request that needs no preflight (Fetch spec "CORS-safelisted").
 fn is_cors_simple(req: &ScriptRequest) -> bool {
     matches!(req.method.as_str(), "GET" | "HEAD" | "POST")
-        && req.headers.iter().all(|(k, v)| match k.as_str() {
-            "accept" | "accept-language" | "content-language" => v.len() <= 128,
-            "content-type" => {
-                let mime = v.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
-                matches!(
-                    mime.as_str(),
-                    "application/x-www-form-urlencoded" | "multipart/form-data" | "text/plain"
-                )
-            }
-            _ => false,
-        })
+        && req.headers.iter().all(|(k, v)| cors_safelisted(k, v))
+}
+
+/// A request header a page may send anywhere without a preflight.
+fn cors_safelisted(name: &str, value: &str) -> bool {
+    match name.to_ascii_lowercase().as_str() {
+        "accept" | "accept-language" | "content-language" => value.len() <= 128,
+        "content-type" => {
+            let mime = value.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+            matches!(
+                mime.as_str(),
+                "application/x-www-form-urlencoded" | "multipart/form-data" | "text/plain"
+            )
+        }
+        _ => false,
+    }
 }
 
 /// Response headers a page may read: for cross-origin responses only the

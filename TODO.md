@@ -45,7 +45,7 @@ clicks, no network for scripts. Rules that still apply to what's next:
 - Cookie selection and network authorization stay in the browser process, using the browser's
   own record of the page's origin, never what the renderer claims.
 - [x] `fetch`/XHR through the browser, with same-origin policy, CORS and credentials rules.
-- [ ] CORS preflight (`OPTIONS`) for non-simple cross-origin requests.
+- [x] CORS preflight (`OPTIONS`) for non-simple cross-origin requests.
 - [x] Scripts can't send to other sites (requests, or files they put on the page) unless you allow it.
 - [x] `document.cookie` for non-HttpOnly cookies, answered by the browser.
 - [ ] JavaScript modules (`type=module`, `import`).

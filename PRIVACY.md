@@ -183,8 +183,10 @@ in `src/cookies.rs`.
   renderer taken over by an exploit could lie about that, though the sandbox still holds.
 - **Other sites' data stays theirs (CORS).** Where you allowed a script to reach another site, it
   only sees the answer if that site allows it (`Access-Control-Allow-Origin`). Otherwise the
-  response is withheld and the panel says so. Requests that would need a CORS "preflight" aren't
-  sent at all yet.
+  response is withheld and the panel says so. A request that isn't "simple" (another method,
+  or headers of its own) is sent only after a CORS preflight: an `OPTIONS` request without
+  cookies, through the same checks, asking whether the server takes it. Yes answers are
+  remembered for the session, for as long as the server says (at most two hours).
 - **No beacons.** `navigator.sendBeacon` sends nothing, and an image a script makes but doesn't
   put on the page (`new Image().src = ...`, the usual tracking pixel) loads nothing. Images a
   script adds to the page from its own site load like any other image (rule 10).

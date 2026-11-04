@@ -581,7 +581,9 @@ fn javascript_is_off_by_default_and_its_requests_follow_the_rules() {
              fetch('http://localhost:{port}/open').then(r => r.text()).then(t => console.log('cors ok', t));\
              fetch('http://localhost:{port}/closed').then(r => r.text()).then(t => console.log('LEAK', t),\
                e => console.log('cors blocked'));\
-             fetch('http://localhost:{port}/custom', {{headers: {{'X-Custom': '1'}}}}).catch(e => console.log('no preflight'));\
+             fetch('http://localhost:{port}/custom', {{headers: {{'X-Custom': '1'}}}}).catch(e => console.log('preflight refused'));\
+             fetch('http://localhost:{port}/put', {{method: 'PUT', headers: {{'X-Custom': '1'}}}})\
+               .then(r => r.text()).then(t => console.log('preflight ok', t));\
              fetch('/collect').catch(e => console.log('filtered'));\
              navigator.sendBeacon('/beacon');\
              for (const src of ['http://localhost:{port}/pixel.png?id=42', '/own.png']) {{\
@@ -614,6 +616,12 @@ fn javascript_is_off_by_default_and_its_requests_follow_the_rules() {
                 "public data".into(),
             ),
             ("/closed", "text/plain", "private data".into()),
+            (
+                "/put",
+                "text/plain\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: PUT\r\n\
+                 Access-Control-Allow-Headers: X-Custom",
+                "put done".into(),
+            ),
         ]
     });
     let url = format!("http://127.0.0.1:{port}/");
@@ -657,6 +665,7 @@ fn javascript_is_off_by_default_and_its_requests_follow_the_rules() {
         "/open",
         "/closed",
         "/custom",
+        "/put",
         "/pixel.png?id=42",
         "/added.js",
         "/added.css",
@@ -680,7 +689,8 @@ fn javascript_is_off_by_default_and_its_requests_follow_the_rules() {
         "[log] same-origin from api",
         "[log] cors ok public data",
         "[log] cors blocked",
-        "[log] no preflight",
+        "[log] preflight refused",
+        "[log] preflight ok put done",
         "[log] filtered",
         "BLOCKED  js",
         "BLOCKED  xhr",
@@ -693,10 +703,31 @@ fn javascript_is_off_by_default_and_its_requests_follow_the_rules() {
     for p in ["/", "/app.js", "/api", "/open", "/closed"] {
         assert!(got.contains(&p.to_string()), "{p} not requested: {got:?}");
     }
+    // A preflight (no cookies) for each non-simple request; only the one the
+    // server agreed to was sent.
+    let lines: Vec<String> = seen.lock().unwrap().iter().map(|r| r[0].clone()).collect();
+    for want in ["OPTIONS /custom ", "OPTIONS /put ", "PUT /put "] {
+        assert!(
+            lines.iter().any(|l| l.starts_with(want)),
+            "no {want:?}: {lines:?}"
+        );
+    }
+    assert!(!lines.iter().any(|l| l.starts_with("GET /custom")), "{lines:?}");
+    {
+        let seen = seen.lock().unwrap();
+        let ask = seen.iter().find(|r| r[0].starts_with("OPTIONS /put ")).unwrap();
+        let has = |h: &str| ask.iter().any(|l| l.eq_ignore_ascii_case(h));
+        assert!(has(&format!("Origin: http://127.0.0.1:{port}")), "{ask:?}");
+        assert!(has("Access-Control-Request-Method: PUT"), "{ask:?}");
+        assert!(has("Access-Control-Request-Headers: x-custom"), "{ask:?}");
+        assert!(
+            !ask.iter().any(|l| l.to_ascii_lowercase().starts_with("cookie:")),
+            "{ask:?}"
+        );
+    }
     for p in [
         "/tracker.js",
         "/collect",
-        "/custom",
         "/beacon",
         "/pixel.png?id=42",
         "/added.js",
