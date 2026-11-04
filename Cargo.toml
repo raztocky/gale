@@ -12,7 +12,12 @@ gui = ["dep:minifb", "dep:arboard"]
 [dependencies]
 png = "0.17"
 url = "2"
-rustls = { version = "0.23", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.7"
+# Certificate revocation (CRLite) filters, and the SHA-256 that keys them.
+clubcard-crlite = { version = "0.6", default-features = false }
+ring = "0.17"
+serde_json = "1"
 # JavaScript engine: pure Rust interpreter, no JIT. Runs only in the sandboxed renderer.
 boa_engine = { version = "0.22", default-features = false, features = ["annex-b"] }
 ureq = { version = "2", features = ["native-certs", "gzip", "brotli"] }

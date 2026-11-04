@@ -14,13 +14,15 @@ USAGE:
   brickle render URL|FILE [-o out.png] [-w WIDTH]   render a full page to PNG
   brickle dom URL|FILE                              print the parsed DOM tree
   brickle requests URL|FILE                         list every request a page makes
-  brickle filters update                            download the filter lists (prints each request)
+  brickle filters update                            download the filter lists and certificate
+                                                    revocation data (prints each request)
   brickle filters status                            show installed filter lists
   brickle cookies                                   list sites whose cookies are kept, and saved cookies
   brickle cookies keep|unkeep SITE                  keep a site's cookies after closing, or stop
   brickle cookies forget SITE                       delete a site's saved cookies
   brickle js                                        list sites where JavaScript is on
   brickle js allow|block SITE                       turn JavaScript on or off for a site
+  brickle dns [RESOLVER|system]                     show or pick the DNS-over-HTTPS resolver
   brickle sandbox-test                              check the renderer sandbox works here
 
 OPTIONS:
@@ -180,6 +182,7 @@ fn run(args: Vec<String>, sandboxed: bool, filters: bool, panel: bool, js: bool)
         }
         Some("cookies") => cookies_cmd(&args[1..]),
         Some("js") => js_cmd(&args[1..]),
+        Some("dns") => dns_cmd(&args[1..]),
         Some("-h") | Some("--help") => {
             print!("{USAGE}");
             Ok(())
@@ -255,6 +258,36 @@ fn js_cmd(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         _ => Err(USAGE.to_string()),
+    }
+}
+
+fn dns_cmd(args: &[String]) -> Result<(), String> {
+    use brickle::doh;
+    match args.first() {
+        None => {
+            match doh::provider() {
+                Some(p) => println!("Looking up sites with DNS over HTTPS: {} ({}).", p.name, p.about),
+                None => println!("Looking up sites with your system's resolver, in plain text."),
+            }
+            println!("\nResolvers (`brickle dns NAME` picks one):");
+            for p in &doh::PROVIDERS {
+                println!("  {:<11} {}", p.name, p.about);
+            }
+            println!(
+                "  {:<11} your system's resolver: your network and ISP see every site you visit",
+                doh::SYSTEM
+            );
+            Ok(())
+        }
+        Some(name) => {
+            let p = doh::parse_setting(name)?;
+            doh::save_setting(p)?;
+            match p {
+                Some(p) => println!("Brickle will look up sites with {} from now on.", p.name),
+                None => println!("Brickle will use your system's resolver from now on."),
+            }
+            Ok(())
+        }
     }
 }
 

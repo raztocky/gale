@@ -445,6 +445,18 @@ impl Network {
                 },
                 url,
             },
+            Fetch::Certificate { host, err } if err.ends_with("Revoked") => Nav::Page {
+                html: interstitial_page(
+                    "This site's certificate has been revoked",
+                    &format!(
+                        "The certificate presented by <b>{}</b> was revoked by the authority that issued \
+                         it, usually because its private key was stolen or it was issued by mistake. \
+                         Whoever is answering may not be the real site, so Brickle didn't load it.",
+                        esc(&host)
+                    ),
+                ),
+                url: url.to_string(),
+            },
             Fetch::Certificate { host, err } => Nav::Page {
                 html: interstitial_page(
                     "Brickle couldn't verify this site's identity",

@@ -6,7 +6,7 @@
 
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Longest a single request may take.
@@ -228,17 +228,130 @@ pub fn is_local_host(host: &str) -> bool {
 /// local-network address.
 pub const LOCAL_NETWORK_ERR: &str = "blocked: resolves to a local network address";
 
-/// DNS resolver that drops local-network addresses. ureq connects to
-/// exactly the addresses it returns, so a site can't pass this check and
-/// then re-point its DNS at your router (DNS rebinding).
-struct PublicOnly;
+/// Brickle's TLS settings: the same as ureq's own (the *ring* provider,
+/// TLS 1.2 and 1.3, your system's trusted roots), so the handshake is
+/// unchanged, plus revocation checking. Built once.
+pub fn tls_config() -> Arc<rustls::ClientConfig> {
+    static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let mut roots = rustls::RootCertStore::empty();
+            match rustls_native_certs::load_native_certs() {
+                Ok(certs) => {
+                    roots.add_parsable_certificates(certs);
+                }
+                Err(e) => eprintln!("brickle: loading trusted certificates: {e}"),
+            }
+            // The standard checks, plus revocation (see `crlite.rs`).
+            let verifier = Arc::new(
+                crate::crlite::Verifier::new(Arc::new(roots)).expect("building the certificate verifier"),
+            );
+            let config =
+                rustls::ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
+                    .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])
+                    .expect("the ring provider supports TLS 1.2 and 1.3")
+                    .dangerous()
+                    .with_custom_certificate_verifier(verifier)
+                    .with_no_client_auth();
+            Arc::new(config)
+        })
+        .clone()
+}
 
-impl ureq::Resolver for PublicOnly {
+/// Reaches a DNS-over-HTTPS resolver at its built-in addresses only.
+struct Fixed(&'static crate::doh::Provider);
+
+impl ureq::Resolver for Fixed {
     fn resolve(&self, netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
-        use std::net::ToSocketAddrs;
-        let addrs: Vec<_> = netloc
-            .to_socket_addrs()?
-            .filter(|a| !is_local_ip(a.ip()))
+        let (host, port) = netloc.rsplit_once(':').unwrap_or((netloc, "443"));
+        if host != self.0.host {
+            return Err(std::io::Error::other("not the DNS resolver"));
+        }
+        let port = port.parse().unwrap_or(443);
+        Ok(self
+            .0
+            .addrs
+            .iter()
+            .map(|a| std::net::SocketAddr::new(*a, port))
+            .collect())
+    }
+}
+
+/// Send a DNS query to a DNS-over-HTTPS resolver (see `doh.rs`) and return
+/// its answer, at most `doh::MAX_RESPONSE` bytes. One connection per
+/// resolver is kept open between lookups.
+pub fn doh_exchange(p: &'static crate::doh::Provider, query: &[u8]) -> Result<Vec<u8>, String> {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static AGENTS: OnceLock<Mutex<HashMap<&'static str, ureq::Agent>>> = OnceLock::new();
+    let agent = AGENTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(p.name)
+        .or_insert_with(|| {
+            ureq::AgentBuilder::new()
+                .resolver(Fixed(p))
+                .timeout_connect(Duration::from_secs(5))
+                .timeout(Duration::from_secs(8))
+                .redirects(0)
+                // The resolver is only asked when there's no proxy.
+                .try_proxy_from_env(false)
+                .tls_config(tls_config())
+                .build()
+        })
+        .clone();
+    let resp = agent
+        .post(p.url)
+        .set("Accept", "application/dns-message")
+        .set("Content-Type", "application/dns-message")
+        .set("User-Agent", &user_agent())
+        .send_bytes(query)
+        .map_err(|e| match e {
+            ureq::Error::Status(s, _) => format!("HTTP {s}"),
+            e => e.to_string(),
+        })?;
+    if resp.content_type() != "application/dns-message" {
+        return Err(format!("unexpected answer type {}", resp.content_type()));
+    }
+    let mut body = Vec::new();
+    resp.into_reader()
+        .take(crate::doh::MAX_RESPONSE as u64 + 1)
+        .read_to_end(&mut body)
+        .map_err(|e| e.to_string())?;
+    Ok(body)
+}
+
+/// Finds the addresses to connect to: with DNS over HTTPS (see `doh.rs`)
+/// unless you chose your system's resolver, which is always used for local
+/// names (`localhost`, `*.local`, ...). With `public_only`, local-network
+/// addresses are dropped; ureq connects to exactly the addresses returned,
+/// so a site can't pass this check and then re-point its DNS at your router
+/// (DNS rebinding).
+struct Resolve {
+    public_only: bool,
+}
+
+impl ureq::Resolver for Resolve {
+    fn resolve(&self, netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+        let (host, port) = netloc
+            .rsplit_once(':')
+            .and_then(|(h, p)| Some((h, p.parse::<u16>().ok()?)))
+            .ok_or_else(|| std::io::Error::other(format!("bad address {netloc}")))?;
+        let bare = host.trim_start_matches('[').trim_end_matches(']');
+        let addrs: Vec<SocketAddr> = match (bare.parse::<IpAddr>(), crate::doh::provider()) {
+            (Ok(ip), _) => vec![SocketAddr::new(ip, port)],
+            (Err(_), Some(p)) if !is_local_host(bare) => crate::doh::lookup(p, bare)
+                .map_err(std::io::Error::other)?
+                .into_iter()
+                .map(|ip| SocketAddr::new(ip, port))
+                .collect(),
+            _ => netloc.to_socket_addrs()?.collect(),
+        };
+        let addrs: Vec<_> = addrs
+            .into_iter()
+            .filter(|a| !self.public_only || !is_local_ip(a.ip()))
             .collect();
         if addrs.is_empty() {
             return Err(std::io::Error::new(
@@ -546,12 +659,13 @@ fn http_get_timeout(
         .timeout_connect(timeout.min(Duration::from_secs(10)))
         .timeout(timeout)
         .redirects(0)
+        .tls_config(tls_config())
         .try_proxy_from_env(!bypass_proxy(&host));
     // Through a proxy, the proxy resolves the name (and our resolver would
     // only see the proxy's own, often local, address), so only the literal
     // check above applies.
-    if public_only && !proxied {
-        builder = builder.resolver(PublicOnly);
+    if !proxied {
+        builder = builder.resolver(Resolve { public_only });
     }
     let agent = builder.build();
     let site = fetch_site(initiator, url);
@@ -714,6 +828,8 @@ fn http_get_timeout(
     if dest == Dest::Image && !image {
         return Err(NetError::Other(format!("not an image ({ctype})")));
     }
+    // Downloads you asked for (revocation data) may be binary.
+    let image = image || (dest == Dest::Download && !texty);
     if !texty && !image {
         return Err(NetError::Other(format!("can't display content of type {ctype}")));
     }
@@ -1141,11 +1257,66 @@ mod tests {
         assert_eq!(fetch_site(Some("https://a.com/"), "https://b.com/"), "cross-site");
     }
 
+    /// The first TLS record a client sends to a local listener: its
+    /// ClientHello's cipher suites and extensions, minus the per-connection
+    /// random parts (key shares).
+    fn client_hello(agent: ureq::Agent) -> (Vec<u8>, Vec<(u16, Vec<u8>)>) {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let _ = agent.get(&format!("https://localhost:{port}/")).call();
+        });
+        let (mut s, _) = listener.accept().unwrap();
+        let mut head = [0u8; 5];
+        s.read_exact(&mut head).unwrap();
+        let mut b = vec![0u8; u16::from_be_bytes([head[3], head[4]]) as usize];
+        s.read_exact(&mut b).unwrap();
+        // Handshake header (4), version (2), random (32), session id.
+        let mut i = 4 + 2 + 32;
+        i += 1 + b[i] as usize;
+        let n = u16::from_be_bytes([b[i], b[i + 1]]) as usize;
+        let suites = b[i + 2..i + 2 + n].to_vec();
+        i += 2 + n;
+        i += 1 + b[i] as usize; // compression methods
+        let end = i + 2 + u16::from_be_bytes([b[i], b[i + 1]]) as usize;
+        i += 2;
+        let mut exts = vec![];
+        while i < end {
+            let t = u16::from_be_bytes([b[i], b[i + 1]]);
+            let len = u16::from_be_bytes([b[i + 2], b[i + 3]]) as usize;
+            // key_share's keys are fresh each time; keep only its groups.
+            let body = if t == 51 {
+                vec![]
+            } else {
+                b[i + 4..i + 4 + len].to_vec()
+            };
+            exts.push((t, body));
+            i += 4 + len;
+        }
+        (suites, exts)
+    }
+
+    /// Revocation checking swaps in Brickle's own certificate verifier, but
+    /// the handshake must stay byte-for-byte that of every other ureq and
+    /// rustls client: matching Firefox's isn't possible with rustls, and a
+    /// handshake of our own would make Brickle users stand out.
+    #[test]
+    fn tls_handshake_is_stock_rustls() {
+        let mut ours = client_hello(ureq::AgentBuilder::new().tls_config(tls_config()).build());
+        let mut stock = client_hello(ureq::AgentBuilder::new().build());
+        // rustls shuffles extensions on every connection (as Chrome does).
+        ours.1.sort();
+        stock.1.sort();
+        assert!(!ours.0.is_empty() && ours.1.len() > 5);
+        assert_eq!(ours, stock);
+    }
+
     #[test]
     fn resolver_drops_local_addresses() {
         use ureq::Resolver;
         // `localhost` resolves to loopback via /etc/hosts: no network needed.
-        let err = PublicOnly.resolve("localhost:80").unwrap_err();
+        let err = Resolve { public_only: true }.resolve("localhost:80").unwrap_err();
         assert!(err.to_string().contains(LOCAL_NETWORK_ERR));
     }
 

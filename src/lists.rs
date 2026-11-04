@@ -175,8 +175,16 @@ pub fn update(log: &mut dyn FnMut(&str)) -> Result<(), String> {
             }
         }
     }
+    log("Certificate revocation data (CRLite):");
+    match crate::crlite::update(log) {
+        Ok(()) => log(&format!("  {}", crate::crlite::status())),
+        Err(e) => {
+            failed += 1;
+            log(&format!("  FAILED: {e} (keeping the previous copy, if any)"));
+        }
+    }
     if failed > 0 {
-        Err(format!("{failed} list(s) failed to update"))
+        Err(format!("{failed} download(s) failed"))
     } else {
         Ok(())
     }
@@ -203,5 +211,6 @@ pub fn status() -> Vec<String> {
             Err(_) => out.push(format!("  {:<28} missing", list.name)),
         }
     }
+    out.push(crate::crlite::status());
     out
 }

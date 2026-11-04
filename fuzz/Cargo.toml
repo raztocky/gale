@@ -99,3 +99,15 @@ name = "response"
 path = "fuzz_targets/response.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "dns"
+path = "fuzz_targets/dns.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "certs"
+path = "fuzz_targets/certs.rs"
+test = false
+doc = false

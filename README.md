@@ -125,6 +125,12 @@ described in [PRIVACY.md](PRIVACY.md). Security measures:
   a page controls. It kills a renderer that hangs for 20 s or sends a malformed message, then
   shows an error page. Run `brickle sandbox-test` to see it block file reads, network and exec on your
   machine.
+- **DNS over HTTPS.** Site lookups go to an encrypted resolver (Cloudflare by default, as in
+  Firefox; `brickle dns` picks Wikimedia DNS or AdGuard instead), never in plain text to your
+  network, unless you choose `brickle dns system`.
+- **Revoked certificates are refused.** Brickle checks certificates against CRLite filters
+  (Mozilla's revocation data, as in Firefox) on your own computer, so no certificate authority
+  sees which sites you visit. `brickle filters update` downloads them along with the filter lists.
 - **Web pages can't reach your local network.** A public website can't make Brickle send
   requests to your router, printer or other devices (`192.168.x.x`, `localhost`, …). This is
   checked after the DNS lookup, on the exact address Brickle connects to, so a site can't sneak

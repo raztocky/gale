@@ -4,3 +4,6 @@ purpose; it protects nothing.
 
 `tiny*`: small images in each format Brickle decodes, for `src/image.rs`'s tests and as seeds
 for the `image` fuzz target.
+
+`example-com*.der`: example.com's public TLS certificate and its issuer (November 2026), for the
+certificate parsing in `src/crlite.rs`.

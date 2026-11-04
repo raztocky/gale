@@ -2,7 +2,9 @@
 #![forbid(unsafe_code)]
 
 pub mod cookies;
+pub mod crlite;
 pub mod css;
+pub mod doh;
 pub mod dom;
 pub mod filter;
 pub mod font;

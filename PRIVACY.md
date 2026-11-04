@@ -13,8 +13,17 @@ pings, experiments or A/B tests. There is no account and no sync.
 
 Brickle connects to the network only when **you** load a page (typing an address, clicking a
 link, reloading, going back or forward) and for that page's own resources, or when you run
-`brickle filters update`. It doesn't prefetch or preconnect, it doesn't update anything in the
+`brickle filters update` (filter lists, and the certificate revocation data described in rule 5). It doesn't prefetch or preconnect, it doesn't update anything in the
 background, and it makes no requests at startup.
+
+Looking up a site's address (DNS) is part of loading it. Brickle does it with **DNS over
+HTTPS**, so your network and ISP can't see or change which sites you look up: by default it asks
+Cloudflare (Firefox's default resolver), reached at a fixed address so finding it needs no plain
+DNS. `brickle dns` shows the choices (Cloudflare, Wikimedia DNS, AdGuard) and picks one;
+`brickle dns system` goes back to your system's resolver. If the resolver can't be reached, the
+page doesn't load: Brickle never falls back to plain-text DNS on its own. Local names
+(`localhost`, `*.local`, …) always use your system's resolver, and through a proxy the proxy
+looks names up.
 
 What you type in the address bar goes nowhere until you press Enter: there are no suggestions.
 If it isn't an address (it has spaces, or is a single word with no dot), Enter searches for it on
@@ -58,7 +67,12 @@ its own. The version is `FIREFOX_VERSION` in `src/net.rs`; update it when Firefo
 
 Limits, honestly:
 - Brickle's TLS handshake comes from rustls, not Firefox's NSS, so services doing TLS
-  fingerprinting (JA3/JA4) can tell the difference.
+  fingerprinting (JA3/JA4) can tell the difference. It can't be made to match: Firefox offers
+  cipher suites rustls doesn't implement and extensions rustls has no way to send, and it offers
+  HTTP/2, which Brickle doesn't speak yet. A handshake tweaked to be "closer" would still not be
+  Firefox's, and it would be one only Brickle sends, so it would single you out. Brickle keeps
+  the stock rustls handshake instead, which it shares with every other rustls client
+  (`tls_handshake_is_stock_rustls` in `src/net.rs` checks it stays that way).
 - Brickle sends no `Referer` header at all, which is stricter than Firefox's default.
 - JavaScript is off unless you allow a site (rule 9). With it off there is very little else to
   fingerprint. With it on, scripts see Firefox's `navigator` values, a fixed 1920x1080 screen,
@@ -82,6 +96,14 @@ exempt, as in Firefox.
 A certificate that fails verification is not the same as "no HTTPS": it can mean someone is
 intercepting the connection. Brickle shows a certificate error page with no way to continue,
 and never offers plain HTTP instead.
+
+Certificates are checked for **revocation** with CRLite, as in Firefox: compact filters of every
+revoked certificate, downloaded by `brickle filters update` (from the rustls project's
+republication of Mozilla's data, each file checked against its published SHA-256). Everyone
+downloads the same files and the lookup happens on your computer, so no certificate authority
+learns which sites you visit (unlike OCSP). A revoked certificate is refused like any invalid
+one, with no way to continue. Without the data, or for certificates newer than it, sites load as
+before; `brickle filters status` shows how old it is.
 
 *Enforced by:* `https_only_asks_before_using_plain_http` and
 `bad_certificates_are_refused_not_downgraded` in `tests/privacy.rs`.
