@@ -10,7 +10,6 @@ default = ["gui"]
 gui = ["dep:minifb", "dep:arboard"]
 
 [dependencies]
-fontdue = "0.9"
 png = "0.17"
 url = "2"
 rustls = { version = "0.23", default-features = false }
@@ -22,12 +21,12 @@ psl = "2.1.246"
 flate2 = "1.1.10"
 ruzstd = "0.9.1"
 unicode-linebreak = "0.1.5"
-read-fonts = "0.46.0"
 # Image decoders (pure Rust). Images are only ever decoded in the sandboxed renderer.
 zune-jpeg = "0.5.15"
 gif = { version = "0.14.2", default-features = false, features = ["std"] }
 image-webp = "0.2.4"
 arboard = { version = "3.7.0", default-features = false, optional = true }
+skrifa = "0.49"
 
 # The renderer sandbox (Landlock + seccomp + rlimits) is Linux-only.
 [target.'cfg(target_os = "linux")'.dependencies]

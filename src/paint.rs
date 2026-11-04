@@ -103,7 +103,7 @@ pub fn rasterize_indexed(ops: Vec<DrawOp>) -> (DisplayList, Vec<GlyphBitmap>, Ve
     let mut starts = Vec::with_capacity(ops.len() + 1);
     let mut atlas: Vec<GlyphBitmap> = Vec::new();
     let mut atlas_bytes = 0usize;
-    let mut ids: HashMap<AtlasKey, Option<(u32, fontdue::Metrics)>> = HashMap::new();
+    let mut ids: HashMap<AtlasKey, Option<(u32, font::Metrics)>> = HashMap::new();
     let mut list = Vec::with_capacity(ops.len());
     // Images scaled to the size they're drawn at, so the browser gets no
     // more pixels than it shows. The same image at the same size is sent once.
@@ -190,13 +190,12 @@ pub fn rasterize_indexed(ops: Vec<DrawOp>) -> (DisplayList, Vec<GlyphBitmap>, Ve
                 for ch in text.chars() {
                     // Per character: the style's font, or a fallback that has it.
                     let fi = font::resolve(font, ch);
-                    let f = font::font(fi);
                     let key = (fi, ch, (size * 4.0) as u32, italic);
                     let entry = ids.entry(key).or_insert_with(|| {
                         if atlas_bytes > MAX_ATLAS_BYTES {
                             return None;
                         }
-                        let (m, bitmap) = f.rasterize(ch, size);
+                        let (m, bitmap) = font::rasterize(fi, ch, size);
                         let bmp = if italic && font::fake_italic(fi) {
                             skew(&m, &bitmap)
                         } else {
@@ -235,7 +234,7 @@ pub fn rasterize_indexed(ops: Vec<DrawOp>) -> (DisplayList, Vec<GlyphBitmap>, Ve
 }
 
 /// Synthetic italics: shear the bitmap to the right, more at the top.
-fn skew(m: &fontdue::Metrics, bitmap: &[u8]) -> GlyphBitmap {
+fn skew(m: &font::Metrics, bitmap: &[u8]) -> GlyphBitmap {
     let extra = (m.height as f32 * 0.2).ceil() as usize;
     let w = m.width + extra;
     let mut data = vec![0u8; w * m.height];
@@ -649,7 +648,7 @@ type GlyphKey = (usize, char, u32);
 /// Rasterized glyphs. Bounded so a page can't grow it without limit.
 #[derive(Default)]
 pub struct GlyphCache {
-    map: HashMap<GlyphKey, (fontdue::Metrics, Vec<u8>)>,
+    map: HashMap<GlyphKey, (font::Metrics, Vec<u8>)>,
     bytes: usize,
 }
 
@@ -866,7 +865,7 @@ impl Canvas {
         let k = self.scale;
         let (x, baseline, size, clip_top) = (x * k, baseline * k, size * k, clip_top * k);
         let color = if self.dark { dark_variant(color) } else { color };
-        // fontdue corrupts memory when rasterizing at tiny (subnormal) sizes
+        // fontdue (the old rasterizer) corrupted memory at tiny (subnormal) sizes
         // (found by fuzzing). Text under MIN_TEXT_SIZE is invisible anyway.
         if !(MIN_TEXT_SIZE..=crate::style::MAX_FONT_SIZE).contains(&size) || font_idx >= font::COUNT {
             return;
@@ -874,14 +873,13 @@ impl Canvas {
         let mut pen = x;
         for ch in text.chars() {
             let fi = font::resolve(font_idx, ch);
-            let f = font::font(fi);
             let key = (fi, ch, (size * 4.0) as u32);
             if !cache.map.contains_key(&key) {
                 if cache.bytes > GLYPH_CACHE_BYTES {
                     cache.map.clear();
                     cache.bytes = 0;
                 }
-                let g = f.rasterize(ch, size);
+                let g = font::rasterize(fi, ch, size);
                 cache.bytes += g.1.len() + 64;
                 cache.map.insert(key, g);
             }
@@ -1076,7 +1074,8 @@ mod tests {
 
     #[test]
     fn tiny_and_odd_text_sizes_are_safe() {
-        // Found by fuzzing: subnormal sizes made fontdue write out of bounds.
+        // Found by fuzzing: subnormal sizes made fontdue (since replaced) write
+        // out of bounds. Still kept off the rasterizer.
         let mut c = Canvas::new(32, 32, Color::WHITE);
         let mut cache = GlyphCache::default();
         for size in [1e-45, 9.18e-41, 1e-7, 0.5, 0.0, -3.0, f32::NAN, 1e9] {

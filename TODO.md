@@ -22,7 +22,7 @@ Planned work, roughly in priority order. Items marked *discuss* need a decision 
 - [ ] Thai/Lao/Khmer word breaking (needs a dictionary)
 - [ ] Draw the browser's own UI text in a sandboxed helper too
 
-- [ ] Replace fontdue: it depends on `ttf-parser`, which is now unmaintained (RUSTSEC-2026-0192).
+- [x] Replace fontdue: it depends on `ttf-parser`, which is now unmaintained (RUSTSEC-2026-0192).
       A rasterizer on Google's maintained fontations stack (`skrifa` outlines) would also line up
       with HarfRust, which uses the same font-reading crates
 
