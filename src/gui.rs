@@ -666,6 +666,8 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     ui.address.text.clone()
                 },
                 script_hops,
+                parked_at: Instant::now(),
+                discarded: false,
             }
         };
     }
@@ -696,6 +698,11 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             ui.panel_scroll = 0.0;
             script_hops = p.script_hops;
             tiles = None;
+            if p.discarded && busy.is_none() {
+                // Its renderer was let go: load it again, from where it
+                // was opened, so the same checks apply.
+                queued = Some((info.url.clone(), info.opener.clone()));
+            }
             let title = if info.title.is_empty() {
                 &info.url
             } else {
@@ -826,6 +833,23 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 window.set_title(&format!("{title} — Brickle Browser"));
             }
             dirty = true;
+        }
+        // Let long-unused background tabs' renderers go (checked about
+        // once a second).
+        if frame.is_multiple_of(60) {
+            let state: Vec<_> = parked
+                .iter()
+                .map(|p| {
+                    let can =
+                        p.tab.is_some() && p.busy.is_none() && !p.page_focus && p.pending_input.is_empty();
+                    (p.parked_at.elapsed(), can)
+                })
+                .collect();
+            for i in tabs_to_discard(&state) {
+                let p = &mut parked[i];
+                p.tab = None; // ends its renderer process
+                p.discarded = true;
+            }
         }
         // Start queued work once idle.
         if busy.is_none() {
@@ -1822,6 +1846,30 @@ struct Parked {
     stop: net::Cancel,
     address: String,
     script_hops: u32,
+    /// When it went to the background.
+    parked_at: Instant,
+    /// Its renderer was let go; switching to it loads the page again.
+    discarded: bool,
+}
+
+/// A background tab left alone this long gives up its renderer (the process,
+/// its memory and the page's scripts); switching back reloads it.
+const DISCARD_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// Most background tabs that keep a renderer; the longest-unused go first.
+const MAX_LIVE_BACKGROUND: usize = 6;
+
+/// Which background tabs to discard, given how long each has been in the
+/// background and whether it can be (it has a renderer, isn't loading, and
+/// you weren't typing in it).
+fn tabs_to_discard(tabs: &[(std::time::Duration, bool)]) -> Vec<usize> {
+    let mut live: Vec<usize> = (0..tabs.len()).filter(|&i| tabs[i].1).collect();
+    // Most recently used first.
+    live.sort_by_key(|&i| tabs[i].0);
+    live.into_iter()
+        .enumerate()
+        .filter(|&(n, i)| n >= MAX_LIVE_BACKGROUND || tabs[i].0 >= DISCARD_AFTER)
+        .map(|(_, i)| i)
+        .collect()
 }
 
 impl Parked {
@@ -1851,6 +1899,8 @@ impl Parked {
             stop,
             address: url.to_string(),
             script_hops: 0,
+            parked_at: Instant::now(),
+            discarded: false,
         }
     }
 
@@ -2887,6 +2937,22 @@ mod menu_tests {
         assert_eq!(step(1.3, 1), 1.5);
         assert_eq!(step(1.3, -1), 1.25);
         assert_eq!(step_scale(&UI_SCALES, 1.0, 1), 1.25);
+    }
+
+    #[test]
+    fn idle_and_surplus_background_tabs_are_discarded() {
+        use std::time::Duration;
+        let min = |m: u64| Duration::from_secs(m * 60);
+        // Recent ones stay; one left alone for 11 minutes goes.
+        assert_eq!(
+            tabs_to_discard(&[(min(1), true), (min(11), true), (min(3), true)]),
+            [1]
+        );
+        // One that's loading or being typed in stays, however old.
+        assert!(tabs_to_discard(&[(min(60), false)]).is_empty());
+        // Past MAX_LIVE_BACKGROUND, the longest-unused go first.
+        let many: Vec<_> = (0..9).map(|i| (Duration::from_secs(i), true)).collect();
+        assert_eq!(tabs_to_discard(&many), [6, 7, 8]);
     }
 
     #[test]

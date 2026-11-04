@@ -144,10 +144,14 @@ described in [PRIVACY.md](PRIVACY.md). Security measures:
   - A page and its stylesheets get 30 s and 32 MB in total.
   - At most 16 external stylesheets and 5,000 rules per sheet.
   - Element nesting depth 256 and 100,000 nodes per page.
-  - Selectors up to 32 parts, and matching can't blow up exponentially.
+  - Selectors up to 32 parts and 8 levels of `:not()`/`:is()`/`:has()`, and matching has a
+    step budget per page, so crafted selectors can't stall it.
   - Fonts capped at 256 px, and the glyph cache is bounded.
 - **A slow or hostile page can't freeze the window.** Loading and layout run on a background
-  thread; `Esc` stops a load.
+  thread and page tiles are painted on their own threads; `Esc` stops a load.
+- **Background tabs let go of their renderer** after 10 minutes unused, or once more than 6 are
+  live (longest-unused first), which ends their scripts and frees their memory. Switching back
+  reloads the page.
 - **No `unsafe` code** in Brickle itself (`#![forbid(unsafe_code)]`).
 - **Fuzzed.** `fuzz/` has [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets for the
   HTML parser, the CSS parser, the whole render pipeline, the IPC decoder, the filter engine,

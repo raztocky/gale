@@ -67,4 +67,4 @@ Tab between fields, Enter to submit, GET/POST (url-encoded, multipart, text/plai
 Done: tab strip, new/close/switch (keyboard and mouse), links in background tabs, each tab with
 its own renderer, history, scroll and form focus.
 - [ ] Reopen closed tab (`Ctrl+Shift+T`), drag to reorder.
-- [ ] Discard the renderers of tabs left in the background for a long time.
+- [x] Discard the renderers of tabs left in the background for a long time (10 minutes, or past 6 live background tabs; they reload when shown).
