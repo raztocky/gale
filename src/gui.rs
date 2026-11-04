@@ -28,6 +28,23 @@ const TABS_Y: f32 = MENU_H;
 const MENU_ITEM_H: f32 = 26.0;
 const MENU_W: f32 = 250.0;
 
+/// Your interface size: the menu bar, tabs, address bar, panels and status
+/// bar are laid out in interface units, drawn and hit-tested this many
+/// pixels to the unit. (An f32's bits.)
+static UI_SCALE: AtomicU32 = AtomicU32::new(0x3f80_0000);
+
+fn ui_scale() -> f32 {
+    f32::from_bits(UI_SCALE.load(Ordering::Relaxed))
+}
+
+/// The top bars' height in window pixels: where the page starts.
+fn bar_h() -> f32 {
+    (BAR_H * ui_scale()).round()
+}
+
+/// Interface sizes the View menu and Ctrl+Alt+=/- step through.
+const UI_SCALES: [f32; 7] = [0.8, 0.9, 1.0, 1.25, 1.5, 1.75, 2.0];
+
 /// Text sizes the menu and Ctrl+=/Ctrl+- step through.
 const TEXT_SCALES: [f32; 12] = [0.5, 0.67, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0];
 const DEFAULT_TEXT_SCALE: f32 = 1.25;
@@ -68,6 +85,13 @@ const MENUS: [(&str, &[MenuItem]); 4] = [
             item("Bigger text", "Ctrl+=", (Key::Equal, true, false, false)),
             item("Smaller text", "Ctrl+-", (Key::Minus, true, false, false)),
             item("Normal text size", "Ctrl+0", (Key::Key0, true, false, false)),
+            item("Bigger interface", "Ctrl+Alt+=", (Key::Equal, true, false, true)),
+            item("Smaller interface", "Ctrl+Alt+-", (Key::Minus, true, false, true)),
+            item(
+                "Normal interface size",
+                "Ctrl+Alt+0",
+                (Key::Key0, true, false, true),
+            ),
             item("Requests panel", "F12", (Key::F12, false, false, false)),
         ],
     ),
@@ -178,7 +202,8 @@ impl Find {
     fn scroll_to(&self, r: &Rendered, scroll: f32, view_h: f32, max_scroll: f32) -> Option<f32> {
         let (start, _) = *self.matches.get(self.current)?;
         let rect = r.texts.get(start.0)?.rect;
-        let visible = rect.y >= scroll && rect.y + rect.h <= scroll + view_h - FIND_H - STATUS_H;
+        let visible =
+            rect.y >= scroll && rect.y + rect.h <= scroll + view_h - (FIND_H + STATUS_H) * ui_scale();
         (!visible).then(|| (rect.y - view_h / 3.0).clamp(0.0, max_scroll))
     }
 }
@@ -216,7 +241,7 @@ impl PageIndex {
     /// The page point under window point (`mx`, `my`): on a fixed or sticky
     /// layer if one is there (topmost first), else on the scrolled page.
     fn page_point(&self, mx: f32, my: f32, scroll: f32) -> (f32, f32) {
-        let vy = my - BAR_H;
+        let vy = my - bar_h();
         for (l, _) in self.layers.iter().rev() {
             let y = vy + scroll - l.shift(scroll);
             if l.bounds.contains(mx, y) {
@@ -525,9 +550,13 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         panel_scroll: 0.0,
         flash: None,
         menu: None,
-        text_scale: load_text_scale(),
+        text_scale: load_scale("text-size", &TEXT_SCALES, DEFAULT_TEXT_SCALE),
     };
     shared_scale.store(ui.text_scale.to_bits(), Ordering::Relaxed);
+    UI_SCALE.store(
+        load_scale("interface-size", &UI_SCALES, 1.0).to_bits(),
+        Ordering::Relaxed,
+    );
     // A menu item picked: the shortcut it presses, next frame.
     let mut menu_press: Option<(Key, bool, bool, bool)> = None;
     let mut quit = false;
@@ -566,7 +595,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             url: start.to_string(),
             from: None,
             w: w as f32,
-            h: h as f32 - BAR_H,
+            h: h as f32 - bar_h(),
             cancel: stop.clone(),
             post: None,
         },
@@ -652,7 +681,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                         url: url.clone(),
                         from: $from,
                         w: page_w_now(&ui, w),
-                        h: h as f32 - BAR_H,
+                        h: h as f32 - bar_h(),
                         cancel: cancel.clone(),
                         post: None,
                     },
@@ -689,12 +718,11 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             (w, h) = (nw, nh);
             dirty = true;
         }
-        let page_w = if ui.panel {
-            (w as f32 - PANEL_W).max(200.0)
-        } else {
-            w as f32
-        };
-        let view_h = h as f32 - BAR_H;
+        let page_w = page_w_now(&ui, w);
+        // Window pixels per interface unit, and where the page starts.
+        let k = ui_scale();
+        let bar = bar_h();
+        let view_h = h as f32 - bar;
 
         // Results from the loader.
         while let Ok((id, done)) = done_rx.try_recv() {
@@ -833,27 +861,44 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 dirty = true;
                 continue;
             }
-            if ctrl
-                && matches!(
-                    key,
-                    Key::Equal | Key::NumPadPlus | Key::Minus | Key::NumPadMinus | Key::Key0 | Key::NumPad0
-                )
-            {
-                let next = match key {
-                    Key::Equal | Key::NumPadPlus => step_text_scale(ui.text_scale, 1),
-                    Key::Minus | Key::NumPadMinus => step_text_scale(ui.text_scale, -1),
-                    _ => DEFAULT_TEXT_SCALE,
-                };
-                if next != ui.text_scale {
-                    ui.text_scale = next;
-                    shared_scale.store(next.to_bits(), Ordering::Relaxed);
-                    save_text_scale(next);
-                    need_layout = true;
-                    for p in &mut parked {
-                        p.laid_out_at = (0.0, 0.0);
+            let sizing = match key {
+                Key::Equal | Key::NumPadPlus => Some(1),
+                Key::Minus | Key::NumPadMinus => Some(-1),
+                Key::Key0 | Key::NumPad0 => Some(0),
+                _ => None,
+            };
+            if let (true, Some(dir)) = (ctrl, sizing) {
+                if alt {
+                    // Interface size: the page is laid out again for the
+                    // new space it gets.
+                    let cur = ui_scale();
+                    let next = if dir == 0 {
+                        1.0
+                    } else {
+                        step_scale(&UI_SCALES, cur, dir)
+                    };
+                    if next != cur {
+                        UI_SCALE.store(next.to_bits(), Ordering::Relaxed);
+                        save_scale("interface-size", next);
                     }
+                    ui.flash = Some(format!("Interface size {}%", (next * 100.0).round()));
+                } else {
+                    let next = if dir == 0 {
+                        DEFAULT_TEXT_SCALE
+                    } else {
+                        step_scale(&TEXT_SCALES, ui.text_scale, dir)
+                    };
+                    if next != ui.text_scale {
+                        ui.text_scale = next;
+                        shared_scale.store(next.to_bits(), Ordering::Relaxed);
+                        save_scale("text-size", next);
+                        need_layout = true;
+                        for p in &mut parked {
+                            p.laid_out_at = (0.0, 0.0);
+                        }
+                    }
+                    ui.flash = Some(format!("Text size {}%", (ui.text_scale * 100.0).round()));
                 }
-                ui.flash = Some(format!("Text size {}%", (ui.text_scale * 100.0).round()));
                 dirty = true;
                 continue;
             }
@@ -1118,7 +1163,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
 
         // Mouse
         let mouse = window.get_mouse_pos(MouseMode::Discard);
-        let over_panel = ui.panel && mouse.is_some_and(|(mx, my)| mx >= page_w && my > BAR_H);
+        let over_panel = ui.panel && mouse.is_some_and(|(mx, my)| mx >= page_w && my > bar);
         if let Some((_, dy)) = window.get_scroll_wheel() {
             if over_panel {
                 ui.panel_scroll = (ui.panel_scroll - dy * 3.0).max(0.0);
@@ -1128,16 +1173,18 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             dirty = true;
         }
         scroll = scroll.clamp(0.0, max_scroll);
-        let badge = badge_rect(&info.log, w as f32);
+        let badge = badge_rect(&info.log, w as f32 / ui_scale());
         let down = window.get_mouse_down(MouseButton::Left);
         if let Some((mx, my)) = mouse {
+            // The pointer in interface units, for the bars and panels.
+            let (lx, ly) = (mx / k, my / k);
             let row = if over_panel {
-                panel_row(&info.log, my, ui.panel_scroll)
+                panel_row(&info.log, ly, ui.panel_scroll)
             } else {
                 None
             };
             let button = if over_panel && net::scheme(&info.url).starts_with("http") {
-                site_button_at(page_w, mx, my)
+                site_button_at(page_w / k, lx, ly)
             } else {
                 None
             };
@@ -1161,7 +1208,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     }
                     Err(_) => "Loading…".to_string(),
                 })
-            } else if let Some(t) = text_size_control_at(w as f32, mx, my) {
+            } else if let Some(t) = text_size_control_at(w as f32 / k, lx, ly) {
                 Some(
                     match t {
                         -1 => "Smaller text (Ctrl+-)",
@@ -1170,9 +1217,9 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     }
                     .into(),
                 )
-            } else if badge.contains(mx, my) {
+            } else if badge.contains(lx, ly) {
                 Some("Show every request this page made (F12)".into())
-            } else if my > BAR_H && mx < page_w {
+            } else if my > bar && mx < page_w {
                 ix.link_at_window(&rendered, mx, my, scroll)
                     .map(|s| s.to_string())
             } else {
@@ -1183,7 +1230,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 dirty = true;
             }
             // With a menu open, pointing at another menu's title opens it.
-            if let (Some(m), Some(t)) = (ui.menu, menu_title_at(mx, my)) {
+            if let (Some(m), Some(t)) = (ui.menu, menu_title_at(lx, ly)) {
                 if m != t {
                     ui.menu = Some(t);
                     dirty = true;
@@ -1193,7 +1240,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 dirty = true; // the item under the pointer is highlighted
             }
             let mid = window.get_mouse_down(MouseButton::Middle);
-            if mid && !was_mid && my > BAR_H && mx < page_w {
+            if mid && !was_mid && my > bar && mx < page_w {
                 if let Some(l) = ix.link_at_window(&rendered, mx, my, scroll) {
                     let url = net::resolve(&info.url, l);
                     if matches!(net::scheme(&url).as_str(), "http" | "https" | "file") {
@@ -1202,7 +1249,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 }
             }
             was_mid = mid;
-            let link_under = (my > BAR_H && mx < page_w)
+            let link_under = (my > bar && mx < page_w)
                 .then(|| {
                     ix.link_at_window(&rendered, mx, my, scroll)
                         .map(|l| net::resolve(&info.url, l))
@@ -1219,44 +1266,44 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             } else if down && !was_down && ui.menu.is_some() {
                 // A click with a menu open picks an item, or just closes it.
                 let m = ui.menu.unwrap_or(0);
-                if let Some(i) = menu_item_at(m, mx, my) {
+                if let Some(i) = menu_item_at(m, lx, ly) {
                     menu_press = Some(MENUS[m].1[i].press);
                 }
-                ui.menu = menu_title_at(mx, my).filter(|&t| t != m);
+                ui.menu = menu_title_at(lx, ly).filter(|&t| t != m);
                 dirty = true;
             } else if down && !was_down {
                 ui.flash = None;
-                if my < MENU_H {
-                    if let Some(t) = menu_title_at(mx, my) {
+                if ly < MENU_H {
+                    if let Some(t) = menu_title_at(lx, ly) {
                         ui.menu = Some(t);
                         if ui.editing {
                             ui.editing = false;
                             ui.address.set(&info.url);
                         }
-                    } else if let Some(t) = text_size_control_at(w as f32, mx, my) {
+                    } else if let Some(t) = text_size_control_at(w as f32 / k, lx, ly) {
                         menu_press = Some(match t {
                             -1 => (Key::Minus, true, false, false),
                             1 => (Key::Equal, true, false, false),
                             _ => (Key::Key0, true, false, false),
                         });
                     }
-                } else if my < TABS_Y + TABS_H {
-                    let (rects, plus) = tab_rects(order.len(), w as f32);
-                    if plus.contains(mx, my) {
+                } else if ly < TABS_Y + TABS_H {
+                    let (rects, plus) = tab_rects(order.len(), w as f32 / k);
+                    if plus.contains(lx, ly) {
                         tab_action = Some(TabAction::New);
-                    } else if let Some(i) = rects.iter().position(|(r, _)| r.contains(mx, my)) {
-                        tab_action = Some(if rects[i].1.contains(mx, my) {
+                    } else if let Some(i) = rects.iter().position(|(r, _)| r.contains(lx, ly)) {
+                        tab_action = Some(if rects[i].1.contains(lx, ly) {
                             TabAction::Close(order[i])
                         } else {
                             TabAction::Switch(i)
                         });
                     }
-                } else if badge.contains(mx, my) {
+                } else if badge.contains(lx, ly) {
                     ui.panel = !ui.panel;
-                } else if my < BAR_H {
+                } else if my < bar {
                     if ui.editing {
                         // Already typing: put the cursor where you clicked.
-                        let at = address_index(&ui.address, badge.x - 40.0, mx - 20.0);
+                        let at = address_index(&ui.address, badge.x - 40.0, lx - 20.0);
                         ui.address.move_to(at, shift);
                     } else {
                         ui.editing = true;
@@ -1306,7 +1353,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                         Err(_) => "Wait for the page to finish loading".into(),
                     });
                 } else if over_panel {
-                } else if my > BAR_H {
+                } else if my > bar {
                     // The page gets the click when you let go (below), so
                     // that dragging can select text instead.
                     press = Some((mx, my));
@@ -1320,7 +1367,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                         Some((Instant::now(), mx, my))
                     };
                     word_press = double;
-                    sel = match select::hit(&rendered.texts, &ix.text, mx, my - BAR_H + scroll) {
+                    sel = match select::hit(&rendered.texts, &ix.text, mx, my - bar + scroll) {
                         Some(p) if double => select::word(&rendered.texts, p),
                         Some(p) => Some((p, p)),
                         None => None,
@@ -1345,7 +1392,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                         dragged = true;
                     }
                     if dragged && !word_press {
-                        let to = select::hit(&rendered.texts, &ix.text, mx, my - BAR_H + scroll);
+                        let to = select::hit(&rendered.texts, &ix.text, mx, my - bar + scroll);
                         if let (Some((from, _)), Some(to)) = (sel, to) {
                             if sel != Some((from, to)) {
                                 sel = Some((from, to));
@@ -1366,7 +1413,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                         // The page sees the click first (form controls, scripts);
                         // the link is followed after, unless a script prevents it.
                         let link = ix
-                            .link_at(&rendered, mx, my - BAR_H + scroll)
+                            .link_at(&rendered, mx, my - bar + scroll)
                             .map(|l| l.to_string());
                         if let Some(t) = tab.take() {
                             let _ = jobs.send((
@@ -1531,10 +1578,10 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     rendered.background,
                 )
             });
-            tc.draw(&mut canvas, &ix.page, &rendered.atlas, scroll, BAR_H as usize);
+            tc.draw(&mut canvas, &ix.page, &rendered.atlas, scroll, bar as usize);
             // Fixed and sticky boxes, where scrolling puts them.
             for (l, list) in &ix.layers {
-                canvas.paint(list, &rendered.atlas, scroll - l.shift(scroll), BAR_H);
+                canvas.paint(list, &rendered.atlas, scroll - l.shift(scroll), bar);
             }
             if let Some(f) = &find {
                 let shown = |(a, _): &(Pos, Pos)| {
@@ -1547,32 +1594,34 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     for r in select::highlights(&rendered.texts, &ix.text, m.0, m.1, scroll, scroll + view_h)
                     {
                         let r = Rect {
-                            y: r.y - scroll + BAR_H,
+                            y: r.y - scroll + bar,
                             w: r.w.min(page_w - r.x),
                             ..r
                         };
-                        canvas.fill(r, color, BAR_H);
+                        canvas.fill(r, color, bar);
                     }
                 }
             }
             if let Some((a, b)) = sel {
                 for r in select::highlights(&rendered.texts, &ix.text, a, b, scroll, scroll + view_h) {
                     let r = Rect {
-                        y: r.y - scroll + BAR_H,
+                        y: r.y - scroll + bar,
                         w: r.w.min(page_w - r.x),
                         ..r
                     };
-                    canvas.fill(r, SELECTION, BAR_H);
+                    canvas.fill(r, SELECTION, bar);
                 }
             }
+            // The bars and panels, in interface units.
+            canvas.scale = k;
             draw_chrome(
                 &mut canvas,
                 &ui,
                 &info.log,
                 scroll,
                 max_scroll,
-                view_h,
-                page_w,
+                view_h / k,
+                page_w / k,
                 &mut cache,
             );
             let titles: Vec<(String, bool)> = order
@@ -1595,7 +1644,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             draw_menu_bar(&mut canvas, &ui, &mut cache);
             if loading {
                 // Indeterminate progress bar under the address bar.
-                let x = (frame % 120) as f32 / 120.0 * (w as f32 + 200.0) - 200.0;
+                let x = (frame % 120) as f32 / 120.0 * (w as f32 / k + 200.0) - 200.0;
                 canvas.fill(
                     Rect {
                         x,
@@ -1615,17 +1664,18 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     &info.log,
                     n.as_deref(),
                     ui.panel_scroll,
-                    page_w,
+                    page_w / k,
                     &mut cache,
                 );
             }
-            draw_status(&mut canvas, &ui, page_w, &mut cache);
+            draw_status(&mut canvas, &ui, page_w / k, &mut cache);
             if let Some(f) = &find {
-                draw_find(&mut canvas, f, page_w, &mut cache);
+                draw_find(&mut canvas, f, page_w / k, &mut cache);
             }
             if let Some(m) = ui.menu {
-                draw_menu(&mut canvas, m, mouse, &mut cache);
+                draw_menu(&mut canvas, m, mouse.map(|(x, y)| (x / k, y / k)), &mut cache);
             }
+            canvas.scale = 1.0;
             dirty = false;
         }
         window
@@ -1763,7 +1813,7 @@ fn blank_rendered() -> Rendered {
 
 fn page_w_now(ui: &Ui, w: usize) -> f32 {
     if ui.panel {
-        (w as f32 - PANEL_W).max(200.0)
+        (w as f32 - PANEL_W * ui_scale()).max(200.0).round()
     } else {
         w as f32
     }
@@ -1799,7 +1849,7 @@ fn tab_rects(n: usize, w: f32) -> (Vec<(Rect, Rect)>, Rect) {
 }
 
 fn draw_tabs(c: &mut Canvas, titles: &[(String, bool)], cache: &mut GlyphCache) {
-    let w = c.width as f32;
+    let w = c.size().0;
     let (rects, plus) = tab_rects(titles.len(), w);
     for ((title, current), (r, close)) in titles.iter().zip(&rects) {
         let bg = if *current {
@@ -1835,16 +1885,12 @@ fn draw_tabs(c: &mut Canvas, titles: &[(String, bool)], cache: &mut GlyphCache) 
     text(c, plus.x + 7.0, plus.y + 16.0, "+", BOLD, 16.0, GRAY, cache, 0.0);
 }
 
-/// The next text size up (`dir` 1) or down (-1) from `cur`.
-fn step_text_scale(cur: f32, dir: i32) -> f32 {
+/// The next size in `steps` up (`dir` 1) or down (-1) from `cur`.
+fn step_scale(steps: &[f32], cur: f32, dir: i32) -> f32 {
     if dir > 0 {
-        TEXT_SCALES
-            .iter()
-            .copied()
-            .find(|&s| s > cur + 0.001)
-            .unwrap_or(cur)
+        steps.iter().copied().find(|&s| s > cur + 0.001).unwrap_or(cur)
     } else {
-        TEXT_SCALES
+        steps
             .iter()
             .rev()
             .copied()
@@ -1853,25 +1899,20 @@ fn step_text_scale(cur: f32, dir: i32) -> f32 {
     }
 }
 
-fn text_scale_file() -> Option<std::path::PathBuf> {
-    brickle::network::config_dir().map(|d| d.join("text-size"))
-}
-
-/// Your text size from last time, or the default.
-fn load_text_scale() -> f32 {
-    text_scale_file()
-        .and_then(|f| std::fs::read_to_string(f).ok())
+/// A size remembered in `~/.config/brickle/<name>` (`text-size`,
+/// `interface-size`), kept within `steps`; `default` if there's none.
+fn load_scale(name: &str, steps: &[f32], default: f32) -> f32 {
+    brickle::network::config_dir()
+        .and_then(|d| std::fs::read_to_string(d.join(name)).ok())
         .and_then(|t| t.trim().parse::<f32>().ok())
         .filter(|s| s.is_finite())
-        .map_or(DEFAULT_TEXT_SCALE, |s| {
-            s.clamp(TEXT_SCALES[0], TEXT_SCALES[TEXT_SCALES.len() - 1])
-        })
+        .map_or(default, |s| s.clamp(steps[0], steps[steps.len() - 1]))
 }
 
-fn save_text_scale(scale: f32) {
-    if let Some(f) = text_scale_file() {
-        let _ = f.parent().map(std::fs::create_dir_all);
-        let _ = std::fs::write(f, format!("{scale}\n"));
+fn save_scale(name: &str, scale: f32) {
+    if let Some(d) = brickle::network::config_dir() {
+        let _ = std::fs::create_dir_all(&d);
+        let _ = std::fs::write(d.join(name), format!("{scale}\n"));
     }
 }
 
@@ -1945,7 +1986,7 @@ fn text_size_control_at(w: f32, mx: f32, my: f32) -> Option<i32> {
 }
 
 fn draw_menu_bar(c: &mut Canvas, ui: &Ui, cache: &mut GlyphCache) {
-    let w = c.width as f32;
+    let w = c.size().0;
     c.fill(
         Rect {
             x: 0.0,
@@ -2124,7 +2165,7 @@ fn draw_chrome(
     page_w: f32,
     cache: &mut GlyphCache,
 ) {
-    let w = c.width as f32;
+    let w = c.size().0;
     c.fill(
         Rect {
             x: 0.0,
@@ -2302,7 +2343,7 @@ fn draw_panel(
     x0: f32,
     cache: &mut GlyphCache,
 ) {
-    let (w, h) = (c.width as f32, c.height as f32);
+    let (w, h) = (c.size().0, c.size().1);
     let pw = w - x0;
     c.fill(
         Rect {
@@ -2479,7 +2520,7 @@ fn draw_panel(
 /// The find bar, at the bottom right of the page: the query with its
 /// cursor, and which match you're on.
 fn draw_find(c: &mut Canvas, f: &Find, page_w: f32, cache: &mut GlyphCache) {
-    let h = c.height as f32;
+    let h = c.size().1;
     let bar = Rect {
         x: (page_w - FIND_W - 10.0).max(0.0),
         y: h - STATUS_H - FIND_H - 6.0,
@@ -2565,7 +2606,7 @@ fn draw_find(c: &mut Canvas, f: &Find, page_w: f32, cache: &mut GlyphCache) {
 }
 
 fn draw_status(c: &mut Canvas, ui: &Ui, page_w: f32, cache: &mut GlyphCache) {
-    let h = c.height as f32;
+    let h = c.size().1;
     let msg = ui.flash.as_deref().or(ui.hover.as_deref());
     if let Some(msg) = msg {
         let shown = if msg.contains("://") && !msg.starts_with("Click") {
@@ -2677,13 +2718,15 @@ mod menu_tests {
 
     #[test]
     fn text_size_steps_and_limits() {
-        assert_eq!(step_text_scale(1.25, 1), 1.5);
-        assert_eq!(step_text_scale(1.25, -1), 1.1);
-        assert_eq!(step_text_scale(3.0, 1), 3.0);
-        assert_eq!(step_text_scale(0.5, -1), 0.5);
+        let step = |cur, dir| step_scale(&TEXT_SCALES, cur, dir);
+        assert_eq!(step(1.25, 1), 1.5);
+        assert_eq!(step(1.25, -1), 1.1);
+        assert_eq!(step(3.0, 1), 3.0);
+        assert_eq!(step(0.5, -1), 0.5);
         // A size from an edited settings file still steps sensibly.
-        assert_eq!(step_text_scale(1.3, 1), 1.5);
-        assert_eq!(step_text_scale(1.3, -1), 1.25);
+        assert_eq!(step(1.3, 1), 1.5);
+        assert_eq!(step(1.3, -1), 1.25);
+        assert_eq!(step_scale(&UI_SCALES, 1.0, 1), 1.25);
     }
 
     #[test]
@@ -2716,7 +2759,12 @@ mod menu_tests {
     #[test]
     #[ignore]
     fn menu_bar_picture() {
-        let mut c = Canvas::new(1100, 260, Color::WHITE);
+        let k: f32 = std::env::var("MENU_SCALE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1.0);
+        let mut c = Canvas::new(1100, (260.0 * k) as usize, Color::WHITE);
+        c.scale = k;
         let mut cache = GlyphCache::default();
         let mut ui = Ui {
             address: LineEdit::new(64),
@@ -2729,7 +2777,8 @@ mod menu_tests {
             text_scale: DEFAULT_TEXT_SCALE,
         };
         ui.address.set("https://example.com/");
-        draw_chrome(&mut c, &ui, &[], 0.0, 0.0, 160.0, 1100.0, &mut cache);
+        let w = c.size().0;
+        draw_chrome(&mut c, &ui, &[], 0.0, 0.0, 160.0, w, &mut cache);
         draw_tabs(
             &mut c,
             &[("Example Domain".into(), true), ("Docs".into(), false)],

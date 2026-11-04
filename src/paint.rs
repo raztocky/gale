@@ -635,6 +635,10 @@ pub struct Canvas {
     pub pixels: Vec<u32>,
     pub width: usize,
     pub height: usize,
+    /// `fill` and `text` coordinates and sizes are multiplied by this (the
+    /// browser draws its own interface at your interface size with it);
+    /// display lists are always painted at 1.
+    pub scale: f32,
 }
 
 type GlyphKey = (usize, char, u32);
@@ -657,7 +661,13 @@ impl Canvas {
             pixels: vec![pack(bg); width * height],
             width,
             height,
+            scale: 1.0,
         }
+    }
+
+    /// The canvas size in `scale`d units.
+    pub fn size(&self) -> (f32, f32) {
+        (self.width as f32 / self.scale, self.height as f32 / self.scale)
     }
 
     /// Paint a display list. Glyph ids must index `atlas` (the IPC decoder
@@ -760,6 +770,16 @@ impl Canvas {
     }
 
     pub fn fill(&mut self, r: Rect, color: Color, clip_top: f32) {
+        let k = self.scale;
+        let (r, clip_top) = (
+            Rect {
+                x: r.x * k,
+                y: r.y * k,
+                w: r.w * k,
+                h: r.h * k,
+            },
+            clip_top * k,
+        );
         let x0 = r.x.round().max(0.0) as usize;
         let y0 = r.y.round().max(clip_top).max(0.0) as usize;
         let x1 = ((r.x + r.w).round().max(0.0) as usize).min(self.width);
@@ -784,6 +804,8 @@ impl Canvas {
         cache: &mut GlyphCache,
         clip_top: f32,
     ) {
+        let k = self.scale;
+        let (x, baseline, size, clip_top) = (x * k, baseline * k, size * k, clip_top * k);
         // fontdue corrupts memory when rasterizing at tiny (subnormal) sizes
         // (found by fuzzing). Text under MIN_TEXT_SIZE is invisible anyway.
         if !(MIN_TEXT_SIZE..=crate::style::MAX_FONT_SIZE).contains(&size) || font_idx >= font::COUNT {

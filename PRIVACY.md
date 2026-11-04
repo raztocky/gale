@@ -204,6 +204,7 @@ in `src/select.rs`.
 - `~/.config/brickle/js-sites.txt`: the sites where you allowed JavaScript.
 - `~/.config/brickle/keep-cookies.txt` and `~/.local/share/brickle/cookies.txt`: the sites whose
   cookies you keep, and those cookies.
-- `~/.config/brickle/text-size`: your text size, one number, the same for every site.
+- `~/.config/brickle/text-size` and `interface-size`: your text and interface sizes, one number
+  each, the same for every site.
 
 There is no history file. Back/forward history exists only in memory while the window is open.
