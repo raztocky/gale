@@ -99,7 +99,7 @@ pub fn control_at(dom: &Dom, uid: u32) -> Option<u32> {
     None
 }
 
-fn by_id(dom: &Dom, want: &str) -> Option<u32> {
+pub(crate) fn by_id(dom: &Dom, want: &str) -> Option<u32> {
     let mut d = Vec::new();
     dom.descendants(0, &mut d);
     d.into_iter()
@@ -197,8 +197,10 @@ fn set_value(dom: &mut Dom, id: u32, v: &str) {
 pub enum Activation {
     /// A field that takes typing now has the focus.
     Focus(u32),
-    /// A checkbox, radio button or select changed.
+    /// A checkbox or radio button changed.
     Changed(u32),
+    /// A select's options should be shown.
+    Open(u32),
     /// Submit `form` (with this submit button).
     Submit { form: u32, submitter: u32 },
     /// Reset `form` to its original values (not supported: nothing).
@@ -242,20 +244,8 @@ pub fn activate(dom: &mut Dom, id: u32) -> Activation {
             dom.set_attr(id, "checked", "");
             Activation::Changed(id)
         }
-        Some(Control::Select) => {
-            // No drop-down yet: each click picks the next option.
-            let opts = options(dom, id);
-            if opts.len() > 1 {
-                let cur = selected_option(dom, id).and_then(|s| opts.iter().position(|&o| o == s));
-                let next = opts[cur.map(|i| (i + 1) % opts.len()).unwrap_or(0)];
-                for &o in &opts {
-                    dom.remove_attr(o, "selected");
-                }
-                dom.set_attr(next, "selected", "");
-                return Activation::Changed(id);
-            }
-            Activation::Nothing
-        }
+        // The page shows its options to pick from.
+        Some(Control::Select) => Activation::Open(id),
         Some(Control::Submit) => match form_of(dom, id) {
             Some(form) => Activation::Submit { form, submitter: id },
             None => Activation::Nothing,
@@ -298,6 +288,266 @@ pub fn toggle_details(dom: &mut Dom, uid: u32) -> Option<u32> {
         cur = dom.parent(id);
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Editing: the caret and selection in the focused field
+// ---------------------------------------------------------------------------
+
+/// The caret in the focused field and the other end of the selection, as
+/// character positions in its value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Caret {
+    pub at: usize,
+    pub anchor: Option<usize>,
+}
+
+/// Where a key moves the caret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Move {
+    Left {
+        word: bool,
+    },
+    Right {
+        word: bool,
+    },
+    /// The start or end of the line (the field, for one-line fields).
+    Home,
+    End,
+    /// The line above or below, in a textarea.
+    Up,
+    Down,
+}
+
+impl Caret {
+    /// At the end of the field's value.
+    pub fn at_end(dom: &Dom, id: u32) -> Caret {
+        Caret {
+            at: value(dom, id).chars().count(),
+            anchor: None,
+        }
+    }
+
+    /// The selected range, if any, kept inside `len` characters.
+    pub fn range(&self, len: usize) -> Option<(usize, usize)> {
+        let (a, b) = (self.at.min(len), self.anchor?.min(len));
+        (a != b).then(|| (a.min(b), a.max(b)))
+    }
+
+    fn clamp(&mut self, len: usize) {
+        self.at = self.at.min(len);
+        self.anchor = self.anchor.map(|a| a.min(len));
+    }
+}
+
+/// The value as characters, if `id` is a field that takes typing.
+fn chars_of(dom: &Dom, id: u32) -> Option<Vec<char>> {
+    kind(dom, id)
+        .filter(|k| k.takes_typing())
+        .map(|_| value(dom, id).chars().collect())
+}
+
+/// Type (or paste) `text` at the caret, replacing the selection.
+pub fn insert(dom: &mut Dom, id: u32, caret: &mut Caret, text: &str) -> bool {
+    if dom.element(id).is_some_and(|e| e.attrs.contains_key("readonly")) {
+        return false;
+    }
+    let Some(v) = chars_of(dom, id) else { return false };
+    let text: String = if kind(dom, id) == Some(Control::TextArea) {
+        text.replace("\r\n", "\n").replace('\r', "\n")
+    } else {
+        text.chars().filter(|c| *c != '\n' && *c != '\r').collect()
+    };
+    caret.clamp(v.len());
+    let (s, e) = caret.range(v.len()).unwrap_or((caret.at, caret.at));
+    if text.is_empty() && s == e {
+        return false;
+    }
+    let new: String = v[..s]
+        .iter()
+        .chain(text.chars().collect::<Vec<_>>().iter())
+        .chain(&v[e..])
+        .collect();
+    set_value(dom, id, &new);
+    let len = value(dom, id).chars().count();
+    *caret = Caret {
+        at: (s + text.chars().count()).min(len),
+        anchor: None,
+    };
+    true
+}
+
+/// Backspace (`forward`: Delete), by a character or (`word`) a word, or
+/// the selection if there is one.
+pub fn delete(dom: &mut Dom, id: u32, caret: &mut Caret, forward: bool, word: bool) -> bool {
+    if dom.element(id).is_some_and(|e| e.attrs.contains_key("readonly")) {
+        return false;
+    }
+    let Some(v) = chars_of(dom, id) else { return false };
+    caret.clamp(v.len());
+    if caret.range(v.len()).is_none() {
+        let to = step(
+            &v,
+            caret.at,
+            if forward {
+                Move::Right { word }
+            } else {
+                Move::Left { word }
+            },
+        );
+        if to == caret.at {
+            return false;
+        }
+        caret.anchor = Some(to);
+    }
+    insert(dom, id, caret, "")
+}
+
+/// Move the caret; with `select`, the selection's other end stays put.
+pub fn move_caret(dom: &Dom, id: u32, caret: &mut Caret, m: Move, select: bool) {
+    let Some(v) = chars_of(dom, id) else { return };
+    caret.clamp(v.len());
+    let to = match (caret.range(v.len()), m, select) {
+        // Left or Right without Shift ends a selection at that side.
+        (Some((s, _)), Move::Left { word: false }, false) => s,
+        (Some((_, e)), Move::Right { word: false }, false) => e,
+        _ => step(&v, caret.at, m),
+    };
+    caret.anchor = if select {
+        caret.anchor.or(Some(caret.at))
+    } else {
+        None
+    };
+    caret.at = to;
+}
+
+pub fn select_all(dom: &Dom, id: u32, caret: &mut Caret) {
+    if let Some(v) = chars_of(dom, id) {
+        *caret = Caret {
+            at: v.len(),
+            anchor: Some(0),
+        };
+    }
+}
+
+/// The selected text, to copy. Never from a password field.
+pub fn selected_text(dom: &Dom, id: u32, caret: &Caret) -> Option<String> {
+    if matches!(kind(dom, id), Some(Control::Text { password: true })) {
+        return None;
+    }
+    let v = chars_of(dom, id)?;
+    let (s, e) = caret.range(v.len())?;
+    Some(v[s..e].iter().collect())
+}
+
+/// Where `m` takes the caret from `at` in `v`.
+fn step(v: &[char], at: usize, m: Move) -> usize {
+    let at = at.min(v.len());
+    let line_start = |p: usize| v[..p].iter().rposition(|&c| c == '\n').map_or(0, |i| i + 1);
+    let line_end = |p: usize| v[p..].iter().position(|&c| c == '\n').map_or(v.len(), |i| p + i);
+    match m {
+        Move::Left { word: false } => at.saturating_sub(1),
+        Move::Right { word: false } => (at + 1).min(v.len()),
+        // To the start of this word (or the one before, from its start).
+        Move::Left { word: true } => {
+            let mut p = at;
+            while p > 0 && !v[p - 1].is_alphanumeric() {
+                p -= 1;
+            }
+            while p > 0 && v[p - 1].is_alphanumeric() {
+                p -= 1;
+            }
+            p
+        }
+        Move::Right { word: true } => {
+            let mut p = at;
+            while p < v.len() && !v[p].is_alphanumeric() {
+                p += 1;
+            }
+            while p < v.len() && v[p].is_alphanumeric() {
+                p += 1;
+            }
+            p
+        }
+        Move::Home => line_start(at),
+        Move::End => line_end(at),
+        Move::Up | Move::Down => {
+            let start = line_start(at);
+            let col = at - start;
+            if m == Move::Up {
+                if start == 0 {
+                    return 0;
+                }
+                let prev = line_start(start - 1);
+                (prev + col).min(start - 1)
+            } else {
+                let end = line_end(at);
+                if end == v.len() {
+                    return v.len();
+                }
+                let next = end + 1;
+                (next + col).min(line_end(next))
+            }
+        }
+    }
+}
+
+/// Up or Down in a `<select>`: pick the option before or after. Returns
+/// whether it changed.
+pub fn step_option(dom: &mut Dom, id: u32, down: bool) -> bool {
+    if kind(dom, id) != Some(Control::Select) {
+        return false;
+    }
+    let opts: Vec<u32> = options(dom, id)
+        .into_iter()
+        .filter(|&o| !disabled_option(dom, o))
+        .collect();
+    let cur = selected_option(dom, id).and_then(|s| opts.iter().position(|&o| o == s));
+    let next = match (cur, down) {
+        (Some(i), true) => opts.get(i + 1),
+        (Some(i), false) => i.checked_sub(1).and_then(|i| opts.get(i)),
+        (None, _) => opts.first(),
+    };
+    match next {
+        Some(&n) => choose_option(dom, id, n),
+        None => false,
+    }
+}
+
+/// Make `opt` the select's chosen option. Returns whether it changed.
+pub fn choose_option(dom: &mut Dom, select: u32, opt: u32) -> bool {
+    let opts = options(dom, select);
+    if !opts.contains(&opt) || disabled_option(dom, opt) || selected_option(dom, select) == Some(opt) {
+        return false;
+    }
+    for &o in &opts {
+        dom.remove_attr(o, "selected");
+    }
+    dom.set_attr(opt, "selected", "");
+    true
+}
+
+/// The `<select>` an option belongs to.
+pub fn select_of(dom: &Dom, opt: u32) -> Option<u32> {
+    if dom.element(opt)?.tag != "option" {
+        return None;
+    }
+    let mut p = dom.parent(opt);
+    while let Some(id) = p {
+        if kind(dom, id) == Some(Control::Select) {
+            return Some(id);
+        }
+        p = dom.parent(id);
+    }
+    None
+}
+
+fn disabled_option(dom: &Dom, opt: u32) -> bool {
+    dom.element(opt).is_some_and(|e| e.attrs.contains_key("disabled"))
+        || dom
+            .parent(opt)
+            .and_then(|g| dom.element(g))
+            .is_some_and(|g| g.tag == "optgroup" && g.attrs.contains_key("disabled"))
 }
 
 /// Type text into a field. Returns whether anything changed.
@@ -485,6 +735,13 @@ pub const UA_CSS: &str = "
 .-brickle-select { padding: 1px 6px; background-color: #e9e9ed; }
 .-brickle-placeholder { color: #757575 }
 .-brickle-focus { border-color: #0060df; border-width: 2px; }
+.-brickle-selected { background-color: #0060df; color: white; }
+.-brickle-options { display: block; position: absolute; top: 100%; left: 0; z-index: 2147483647;
+  background-color: white; color: black; border: 1px solid #8f8f9d; padding: 2px 0; white-space: nowrap;
+  text-align: left; font-weight: normal; }
+.-brickle-option { display: block; padding: 1px 8px; }
+.-brickle-chosen { background-color: #0060df; color: white; }
+.-brickle-off { color: #8f8f9d; }
 ";
 
 fn add_class(n: &mut Node, class: &str) {
@@ -510,18 +767,54 @@ fn placeholder(s: &str) -> Node {
 /// Give form controls something to draw: their value or placeholder, a
 /// button's label, the selected option; mark the focused field. Works on
 /// a copy of the tree used only for rendering.
-pub fn decorate(n: &mut Node, focus: Option<u32>) {
-    let focused = focus.is_some_and(|f| f == n.uid && n.uid != 0);
+/// What the page's form controls show beyond their values.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Decor {
+    /// The focused control, and its caret if it takes typing.
+    pub focus: Option<u32>,
+    pub caret: Caret,
+    /// The `<select>` whose options are shown.
+    pub open: Option<u32>,
+}
+
+/// Most options an open select lists.
+const MAX_SHOWN_OPTIONS: usize = 1000;
+
+pub fn decorate(n: &mut Node, d: &Decor) {
+    let focused = d.focus.is_some_and(|f| f == n.uid && n.uid != 0);
     let Some(e) = n.element().cloned() else { return };
     let Some(kind) = control(&e) else {
         for c in &mut n.children {
-            decorate(c, focus);
+            decorate(c, d);
         }
         return;
     };
-    let caret = if focused { "▏" } else { "" };
     let val = e.attrs.get("value").cloned().unwrap_or_default();
     let ph = e.attrs.get("placeholder").cloned().unwrap_or_default();
+    // A field's text, with the caret or the selection where they are.
+    let edited = |shown: &str| -> Vec<Node> {
+        let chars: Vec<char> = shown.chars().collect();
+        let part = |a: usize, b: usize| -> String { chars[a..b].iter().collect() };
+        let end = chars.len();
+        if !focused {
+            return vec![text_child(&format!("{shown}\u{200b}"))];
+        }
+        match d.caret.range(end) {
+            Some((s, e)) => {
+                let mut attrs = AttrMap::new();
+                attrs.insert("class".into(), "-brickle-selected".into());
+                vec![
+                    text_child(&part(0, s)),
+                    dom::elem("span".into(), attrs, vec![text_child(&part(s, e))]),
+                    text_child(&format!("{}\u{200b}", part(e, end))),
+                ]
+            }
+            None => {
+                let at = d.caret.at.min(end);
+                vec![text_child(&format!("{}▏{}\u{200b}", part(0, at), part(at, end)))]
+            }
+        }
+    };
     match kind {
         Control::Hidden => add_class(n, "-brickle-hidden"),
         Control::Text { password } => {
@@ -534,7 +827,7 @@ pub fn decorate(n: &mut Node, focus: Option<u32>) {
             n.children = if shown.is_empty() && !ph.is_empty() && !focused {
                 vec![placeholder(&ph)]
             } else {
-                vec![text_child(&format!("{shown}{caret}\u{200b}"))]
+                edited(&shown)
             };
         }
         Control::TextArea => {
@@ -543,7 +836,7 @@ pub fn decorate(n: &mut Node, focus: Option<u32>) {
             n.children = if text.is_empty() && !ph.is_empty() && !focused {
                 vec![placeholder(&ph)]
             } else {
-                vec![text_child(&format!("{text}{caret}\u{200b}"))]
+                edited(&text)
             };
         }
         Control::Checkbox | Control::Radio => {
@@ -569,7 +862,48 @@ pub fn decorate(n: &mut Node, focus: Option<u32>) {
                 .or(opts.first())
                 .map(|o| o.text_content().split_whitespace().collect::<Vec<_>>().join(" "))
                 .unwrap_or_default();
-            n.children = vec![text_child(&format!("{chosen} ▾"))];
+            let chosen_uid = opts
+                .iter()
+                .find(|o| o.element().is_some_and(|e| e.attrs.contains_key("selected")))
+                .or(opts.first())
+                .map(|o| o.uid);
+            let mut children = vec![text_child(&format!("{chosen} ▾"))];
+            if d.open.is_some_and(|o| o == n.uid && n.uid != 0) {
+                // The options, in a box under the select. Each carries its
+                // option's uid, so a click on it picks that option.
+                let items = opts
+                    .iter()
+                    .take(MAX_SHOWN_OPTIONS)
+                    .map(|o| {
+                        let label = o.text_content().split_whitespace().collect::<Vec<_>>().join(" ");
+                        let off = o.element().is_some_and(|e| e.attrs.contains_key("disabled"));
+                        let mut class = "-brickle-option".to_string();
+                        if Some(o.uid) == chosen_uid {
+                            class.push_str(" -brickle-chosen");
+                        }
+                        if off {
+                            class.push_str(" -brickle-off");
+                        }
+                        let mut attrs = AttrMap::new();
+                        attrs.insert("class".into(), class);
+                        // An empty option still gets a line.
+                        let mut t = text_child(if label.is_empty() { "\u{a0}" } else { &label });
+                        t.uid = o.uid;
+                        let mut item = dom::elem("brickle-option".into(), attrs, vec![t]);
+                        item.uid = o.uid;
+                        item
+                    })
+                    .collect();
+                let mut attrs = AttrMap::new();
+                attrs.insert("class".into(), "-brickle-options".into());
+                children.push(dom::elem("brickle-options".into(), attrs, items));
+                // The list is placed against the select.
+                if let NodeType::Element(e) = &mut n.node_type {
+                    let style = e.attrs.entry("style".into()).or_default();
+                    style.push_str(";position:relative");
+                }
+            }
+            n.children = children;
         }
         Control::Submit | Control::Reset | Control::Button | Control::File if e.tag == "input" => {
             add_class(n, "-brickle-button");
@@ -587,7 +921,7 @@ pub fn decorate(n: &mut Node, focus: Option<u32>) {
             // <button>: keep its own content.
             add_class(n, "-brickle-button");
             for c in &mut n.children {
-                decorate(c, focus);
+                decorate(c, d);
             }
         }
     }
@@ -612,7 +946,7 @@ mod tests {
     fn button_labels() {
         let label = |html: &str| {
             let mut n = crate::html::parse(html);
-            decorate(&mut n, None);
+            decorate(&mut n, &Decor::default());
             let mut b = Vec::new();
             n.walk(&mut b, &|c| c.tag() == Some("input"));
             b[0].text_content()
@@ -678,8 +1012,11 @@ mod tests {
         assert_eq!(control_at(&d, lab), Some(l));
         activate(&mut d, l);
         assert_eq!(value(&d, color), "Red");
-        activate(&mut d, color);
+        // A click shows its options; Down picks the next one.
+        assert_eq!(activate(&mut d, color), Activation::Open(color));
+        assert!(step_option(&mut d, color, true));
         assert_eq!(value(&d, color), "g");
+        assert!(!step_option(&mut d, color, true), "already the last");
         let Activation::Submit { form, submitter } = activate(&mut d, b) else {
             panic!()
         };
@@ -723,13 +1060,81 @@ mod tests {
     }
 
     #[test]
+    fn caret_and_selection_editing() {
+        let mut d = dom(
+            "<input id=q><textarea id=t></textarea><input id=pw type=password><input id=ro readonly value=x>",
+        );
+        let (q, t, pw, ro) = (find(&d, "q"), find(&d, "t"), find(&d, "pw"), find(&d, "ro"));
+        let mut c = Caret::at_end(&d, q);
+        insert(&mut d, q, &mut c, "hello world");
+        // Typing in the middle.
+        for _ in 0..6 {
+            move_caret(&d, q, &mut c, Move::Left { word: false }, false);
+        }
+        insert(&mut d, q, &mut c, ",");
+        assert_eq!(value(&d, q), "hello, world");
+        // Ctrl+Shift+Right selects the next word; typing replaces it.
+        move_caret(&d, q, &mut c, Move::Right { word: true }, true);
+        assert_eq!(selected_text(&d, q, &c).as_deref(), Some(" world"));
+        insert(&mut d, q, &mut c, " there");
+        assert_eq!(value(&d, q), "hello, there");
+        // Ctrl+Backspace deletes a word, Delete the character after.
+        delete(&mut d, q, &mut c, false, true);
+        assert_eq!(value(&d, q), "hello, ");
+        move_caret(&d, q, &mut c, Move::Home, false);
+        delete(&mut d, q, &mut c, true, false);
+        assert_eq!((value(&d, q).as_str(), c.at), ("ello, ", 0));
+        assert!(
+            !delete(&mut d, q, &mut c, false, false),
+            "nothing before the start"
+        );
+        // Left without Shift ends the selection at its start.
+        select_all(&d, q, &mut c);
+        move_caret(&d, q, &mut c, Move::Left { word: false }, false);
+        assert_eq!(c, Caret { at: 0, anchor: None });
+        // Lines in a textarea: Up and Down keep the column.
+        let mut c = Caret::default();
+        insert(&mut d, t, &mut c, "abcd\r\nef\nghij");
+        assert_eq!(value(&d, t), "abcd\nef\nghij");
+        move_caret(&d, t, &mut c, Move::Up, false);
+        assert_eq!(c.at, 7, "end of the short line");
+        move_caret(&d, t, &mut c, Move::Up, false);
+        assert_eq!(c.at, 2);
+        move_caret(&d, t, &mut c, Move::Down, true);
+        move_caret(&d, t, &mut c, Move::End, true);
+        assert_eq!(selected_text(&d, t, &c).as_deref(), Some("cd\nef"));
+        // Passwords can't be copied; read-only fields can't be changed.
+        let mut c = Caret::default();
+        insert(&mut d, pw, &mut c, "secret");
+        select_all(&d, pw, &mut c);
+        assert_eq!(selected_text(&d, pw, &c), None);
+        let mut c = Caret::at_end(&d, ro);
+        assert!(!insert(&mut d, ro, &mut c, "y") && !delete(&mut d, ro, &mut c, false, false));
+        // A caret past a value scripts shortened is safe.
+        let mut c = Caret {
+            at: 99,
+            anchor: Some(50),
+        };
+        assert_eq!(selected_text(&d, q, &c), None);
+        insert(&mut d, q, &mut c, "!");
+        assert_eq!(value(&d, q), "ello, !");
+    }
+
+    #[test]
     fn controls_get_something_to_draw() {
         let mut d =
             dom("<input id=a placeholder='Search'><input type=password value=abc id=p><input type=submit>");
         let p = find(&d, "p");
         let _ = &mut d;
         let mut tree = d.to_tree();
-        decorate(&mut tree, Some(p));
+        decorate(
+            &mut tree,
+            &Decor {
+                focus: Some(p),
+                caret: Caret { at: 3, anchor: None },
+                open: None,
+            },
+        );
         let mut out = String::new();
         tree.dump(0, &mut out);
         assert!(

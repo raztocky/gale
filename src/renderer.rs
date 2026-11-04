@@ -244,6 +244,7 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                         console,
                         submit: done.submit,
                         focus: done.focus,
+                        copied: done.copied,
                     },
                 )?;
             }

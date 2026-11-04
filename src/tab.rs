@@ -115,9 +115,15 @@ pub struct Click {
     /// A form was submitted: go here (the browser checks it like any
     /// navigation).
     pub submit: Option<Submission>,
-    /// A field that takes typing has the focus.
+    /// A form control has the keyboard.
     pub focus: bool,
+    /// Text copied or cut from a field, for the clipboard (only after a
+    /// Copy or Cut key, and at most [`MAX_COPIED`] bytes).
+    pub copied: Option<String>,
 }
+
+/// Most text a page may hand the clipboard from one Copy or Cut.
+pub const MAX_COPIED: usize = 1024 * 1024;
 
 /// Something you did to a page.
 #[derive(Debug, Clone, PartialEq)]
@@ -280,6 +286,7 @@ impl Tab {
             Backend::Failed(_) => return Click::default(),
             Backend::InProcess(page) => {
                 let until = Instant::now() + crate::js::EVENT_BUDGET;
+                let copy_key = matches!(input, Input::Key(Key::Copy | Key::Cut));
                 let done = match input {
                     Input::Click(x, y) => page.click_at(None, x, y, until),
                     Input::Type(t) => page.type_text(None, &t),
@@ -291,6 +298,7 @@ impl Tab {
                     navigate: None,
                     submit: done.submit,
                     focus: done.focus,
+                    copied: done.copied.filter(|c| copy_key && c.len() <= MAX_COPIED),
                 };
             }
             Backend::Sandboxed(r) => r,
@@ -299,6 +307,7 @@ impl Tab {
             net,
             page: self.url.clone(),
         };
+        let copy_key = matches!(input, Input::Key(Key::Copy | Key::Cut));
         let msg = match input {
             Input::Click(x, y) => ToRenderer::Click { x, y },
             Input::Type(t) => ToRenderer::Type(t),
@@ -313,6 +322,7 @@ impl Tab {
                     console,
                     submit,
                     focus,
+                    copied,
                 } => Ok((
                     Click {
                         prevented,
@@ -320,6 +330,9 @@ impl Tab {
                         navigate,
                         submit,
                         focus,
+                        // The renderer can't put text on the clipboard
+                        // unless you asked to copy.
+                        copied: copied.filter(|c| copy_key && c.len() <= MAX_COPIED),
                     },
                     console,
                 )),

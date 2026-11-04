@@ -810,6 +810,13 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 // Scripts and form controls had their say; now a form
                 // submission, a script's navigation, or the link.
                 page_focus = click.focus;
+                if let Some(t) = &click.copied {
+                    ui.flash = Some(if clip.copy(t) {
+                        "Copied".into()
+                    } else {
+                        "Couldn't reach the clipboard".into()
+                    });
+                }
                 if let Some(sub) = &click.submit {
                     submitted = Some(sub.clone());
                 } else if let Some(to) = &click.navigate {
@@ -1178,12 +1185,23 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 }
             }
             if page_focus {
-                // A form field has the keyboard.
+                // A form control has the keyboard.
+                let (select, word) = (shift, ctrl);
                 let k = match key {
-                    Key::Backspace => Some(PageKey::Backspace),
+                    Key::Backspace => Some(PageKey::Backspace { word }),
+                    Key::Delete => Some(PageKey::Delete { word }),
                     Key::Enter | Key::NumPadEnter => Some(PageKey::Enter),
                     Key::Tab => Some(PageKey::Tab),
                     Key::Escape => Some(PageKey::Escape),
+                    Key::Left if !alt => Some(PageKey::Left { select, word }),
+                    Key::Right if !alt => Some(PageKey::Right { select, word }),
+                    Key::Home => Some(PageKey::Home { select }),
+                    Key::End => Some(PageKey::End { select }),
+                    Key::Up => Some(PageKey::Up { select }),
+                    Key::Down => Some(PageKey::Down { select }),
+                    Key::A if ctrl => Some(PageKey::SelectAll),
+                    Key::C | Key::Insert if ctrl => Some(PageKey::Copy),
+                    Key::X if ctrl => Some(PageKey::Cut),
                     _ => None,
                 };
                 if let Some(k) = k {

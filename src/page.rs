@@ -36,8 +36,11 @@ pub struct Page {
     /// The page's editable DOM when it has no scripts (with scripts, the
     /// script runtime holds it). Typing and form controls change it.
     arena: Option<Dom>,
-    /// The form field that has the keyboard.
+    /// The form control that has the keyboard, and the caret in it.
     pub focus: Option<u32>,
+    caret: forms::Caret,
+    /// The `<select>` showing its options.
+    open_select: Option<u32>,
     /// Images by URL: decoded, or `None` if they couldn't be loaded.
     images: HashMap<String, Option<Decoded>>,
     /// Bytes of decoded pixels kept in `images`.
@@ -68,17 +71,30 @@ pub struct Interaction {
     pub changed: bool,
     /// A form was submitted: the browser should go here.
     pub submit: Option<Submission>,
-    /// A field that takes typing has the focus.
+    /// A form control has the keyboard.
     pub focus: bool,
+    /// Text you copied or cut from a field, for the clipboard.
+    pub copied: Option<String>,
 }
 
-/// A key that does something in a form field.
+/// A key that does something in a form control. `select` is Shift held
+/// (extending the selection), `word` is Ctrl (by words).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
-    Backspace,
+    Backspace { word: bool },
+    Delete { word: bool },
     Enter,
     Tab,
     Escape,
+    Left { select: bool, word: bool },
+    Right { select: bool, word: bool },
+    Home { select: bool },
+    End { select: bool },
+    Up { select: bool },
+    Down { select: bool },
+    SelectAll,
+    Copy,
+    Cut,
 }
 
 /// What scripts left behind while a page loaded.
@@ -295,6 +311,8 @@ impl Page {
             hits: RefCell::new(Vec::new()),
             arena: None,
             focus: None,
+            caret: forms::Caret::default(),
+            open_select: None,
             images: HashMap::new(),
             image_bytes: 0,
             text_scale: 1.0,
@@ -510,7 +528,27 @@ impl Page {
     pub fn click_at(&mut self, mut rt: Option<&mut Runtime>, x: f32, y: f32, until: Instant) -> Interaction {
         let mut out = Interaction::default();
         let before = self.dom_version(rt.as_deref_mut());
-        let Some(uid) = self.hit(x, y) else {
+        let hit = self.hit(x, y);
+        // With a select's options showing, a click picks one or closes
+        // them; it does nothing else.
+        if let Some(sel) = self.open_select.take() {
+            let picked = hit.and_then(|uid| {
+                self.with_dom(rt.as_deref_mut(), |d| {
+                    (forms::select_of(d, uid) == Some(sel) && forms::choose_option(d, sel, uid))
+                        .then_some(sel)
+                })
+                .flatten()
+            });
+            if let (Some(sel), Some(rt)) = (picked, rt.as_deref_mut()) {
+                rt.fire(sel, "input", true, false);
+                rt.fire(sel, "change", true, false);
+            }
+            let was = self.focus;
+            self.finish(rt, before, was, &mut out);
+            out.changed = true;
+            return out;
+        }
+        let Some(uid) = hit else {
             self.focus = None;
             return out;
         };
@@ -527,6 +565,9 @@ impl Page {
                 Some(Activation::Focus(f)) => {
                     self.focus = Some(f);
                     if was_focus != Some(f) {
+                        if let Some(c) = self.with_dom(rt.as_deref_mut(), |d| forms::Caret::at_end(d, f)) {
+                            self.caret = c;
+                        }
                         if let Some(rt) = rt.as_deref_mut() {
                             rt.fire(f, "focus", false, false);
                         }
@@ -537,6 +578,11 @@ impl Page {
                         rt.fire(c, "input", true, false);
                         rt.fire(c, "change", true, false);
                     }
+                }
+                Some(Activation::Open(c)) => {
+                    self.focus = Some(c);
+                    self.open_select = Some(c);
+                    out.changed = true;
                 }
                 Some(Activation::Submit { form, submitter }) => {
                     out.submit = self.submit(rt.as_deref_mut(), form, Some(submitter));
@@ -555,12 +601,14 @@ impl Page {
         out
     }
 
-    /// You typed text into the focused field.
+    /// You typed text into the focused field (or pasted it).
     pub fn type_text(&mut self, mut rt: Option<&mut Runtime>, text: &str) -> Interaction {
         let mut out = Interaction::default();
         let Some(f) = self.focus else { return out };
         let before = self.dom_version(rt.as_deref_mut());
-        let typed = self.with_dom(rt.as_deref_mut(), |d| forms::type_text(d, f, text)) == Some(true);
+        let mut caret = self.caret;
+        let typed = self.with_dom(rt.as_deref_mut(), |d| forms::insert(d, f, &mut caret, text)) == Some(true);
+        self.caret = caret;
         if typed {
             if let Some(rt) = rt.as_deref_mut() {
                 rt.fire(f, "input", true, false);
@@ -570,27 +618,40 @@ impl Page {
         out
     }
 
-    /// You pressed a key with a field focused.
+    /// You pressed a key with a form control focused.
     pub fn key(&mut self, mut rt: Option<&mut Runtime>, key: Key) -> Interaction {
+        use forms::Move;
         let mut out = Interaction::default();
         let before = self.dom_version(rt.as_deref_mut());
-        let was = self.focus;
+        let (was, was_open, mut caret) = (self.focus, self.open_select, self.caret);
+        let is = |p: &mut Page, rt: Option<&mut Runtime>, f: u32, tag: &str| {
+            p.with_dom(rt, |d| d.element(f).is_some_and(|e| e.tag == tag))
+                .unwrap_or(false)
+        };
+        // The value changed by editing, or a select's choice changed.
+        let (mut input, mut change) = (false, false);
         match (key, self.focus) {
-            (Key::Backspace, Some(f)) => {
-                if self.with_dom(rt.as_deref_mut(), |d| forms::backspace(d, f)) == Some(true) {
-                    if let Some(rt) = rt.as_deref_mut() {
-                        rt.fire(f, "input", true, false);
-                    }
+            (Key::Escape, _) => {
+                if self.open_select.take().is_none() {
+                    self.focus = None;
                 }
             }
+            (Key::Enter, Some(f)) if self.open_select == Some(f) => self.open_select = None,
+            (Key::Up { .. } | Key::Down { .. }, Some(f)) if is(self, rt.as_deref_mut(), f, "select") => {
+                let down = matches!(key, Key::Down { .. });
+                change = self.with_dom(rt.as_deref_mut(), |d| forms::step_option(d, f, down)) == Some(true);
+                input = change;
+            }
+            (Key::Backspace { word } | Key::Delete { word }, Some(f)) => {
+                let forward = matches!(key, Key::Delete { .. });
+                input = self.with_dom(rt.as_deref_mut(), |d| {
+                    forms::delete(d, f, &mut caret, forward, word)
+                }) == Some(true);
+            }
             (Key::Enter, Some(f)) => {
-                let textarea = self
-                    .with_dom(rt.as_deref_mut(), |d| {
-                        d.element(f).is_some_and(|e| e.tag == "textarea")
-                    })
-                    .unwrap_or(false);
-                if textarea {
-                    self.with_dom(rt.as_deref_mut(), |d| forms::type_text(d, f, "\n"));
+                if is(self, rt.as_deref_mut(), f, "textarea") {
+                    input = self.with_dom(rt.as_deref_mut(), |d| forms::insert(d, f, &mut caret, "\n"))
+                        == Some(true);
                 } else if let Some((form, submitter)) = self
                     .with_dom(rt.as_deref_mut(), |d| forms::implicit_submit(d, f))
                     .flatten()
@@ -601,15 +662,64 @@ impl Page {
                     out.submit = self.submit(rt.as_deref_mut(), form, submitter);
                 }
             }
+            (
+                Key::Left { select, .. }
+                | Key::Right { select, .. }
+                | Key::Home { select }
+                | Key::End { select }
+                | Key::Up { select }
+                | Key::Down { select },
+                Some(f),
+            ) => {
+                let m = match key {
+                    Key::Left { word, .. } => Move::Left { word },
+                    Key::Right { word, .. } => Move::Right { word },
+                    Key::Home { .. } => Move::Home,
+                    Key::End { .. } => Move::End,
+                    Key::Up { .. } => Move::Up,
+                    _ => Move::Down,
+                };
+                self.with_dom(rt.as_deref_mut(), |d| {
+                    forms::move_caret(d, f, &mut caret, m, select)
+                });
+            }
+            (Key::SelectAll, Some(f)) => {
+                self.with_dom(rt.as_deref_mut(), |d| forms::select_all(d, f, &mut caret));
+            }
+            (Key::Copy | Key::Cut, Some(f)) => {
+                out.copied = self
+                    .with_dom(rt.as_deref_mut(), |d| forms::selected_text(d, f, &caret))
+                    .flatten();
+                if key == Key::Cut && out.copied.is_some() {
+                    input = self.with_dom(rt.as_deref_mut(), |d| forms::insert(d, f, &mut caret, ""))
+                        == Some(true);
+                }
+            }
             (Key::Tab, _) => {
+                self.open_select = None;
                 self.focus = self
                     .with_dom(rt.as_deref_mut(), |d| forms::next_field(d, was))
                     .flatten();
+                if let Some(f) = self.focus {
+                    caret = self
+                        .with_dom(rt.as_deref_mut(), |d| forms::Caret::at_end(d, f))
+                        .unwrap_or_default();
+                }
             }
-            (Key::Escape, _) => self.focus = None,
             _ => {}
         }
+        if let (Some(f), Some(rt)) = (self.focus, rt.as_deref_mut()) {
+            if input {
+                rt.fire(f, "input", true, false);
+            }
+            if change {
+                rt.fire(f, "change", true, false);
+            }
+        }
+        let moved = caret != self.caret || self.open_select != was_open;
+        self.caret = caret;
         self.finish(rt, before, was, &mut out);
+        out.changed |= moved;
         out
     }
 
@@ -669,7 +779,14 @@ impl Page {
         };
         // Form controls get their value, label or placeholder to draw.
         let mut tree = self.dom.clone();
-        forms::decorate(&mut tree, self.focus);
+        forms::decorate(
+            &mut tree,
+            &forms::Decor {
+                focus: self.focus,
+                caret: self.caret,
+                open: self.open_select,
+            },
+        );
         let images = self.images_by_node(&tree);
         let styled = style::style_tree(&tree, &ctx);
         let root = layout::layout_tree_with_images(&styled, (width, viewport_h), &images);
@@ -1567,6 +1684,70 @@ mod text_tests {
             &mut |_, _| Err("none".into()),
         );
         assert_eq!(text(&page), "A + B");
+    }
+
+    #[test]
+    fn select_drop_down_and_field_keys() {
+        let mut page = Page::parse(
+            "https://example.com/",
+            "<form><select id=s><option>Apple<option value=b>Banana<option disabled>Cherry</select>\
+             <p>below</p><input id=q value=ab></form>",
+            "",
+            &mut |_, _| Err("none".into()),
+        );
+        let until = Instant::now() + std::time::Duration::from_secs(5);
+        let at = |p: &Page, word: &str| {
+            let r = p.render(800.0, 600.0);
+            let t = r.texts.iter().rev().find(|t| t.text.contains(word)).unwrap().rect;
+            (t.x + t.w / 2.0, t.y + t.h / 2.0)
+        };
+        let words = |p: &Page| {
+            let r = p.render(800.0, 600.0);
+            let all: String = r.texts.iter().map(|t| t.text.clone() + " ").collect();
+            all.split_whitespace().collect::<Vec<_>>().join(" ")
+        };
+        let value = |p: &mut Page, id: &str| {
+            p.with_dom(None, |d| {
+                let n = forms::by_id(d, id).unwrap();
+                forms::value(d, n)
+            })
+            .unwrap()
+        };
+        assert!(!words(&page).contains("Banana"));
+        let (x, y) = at(&page, "Apple");
+        let out = page.click_at(None, x, y, until);
+        assert!(out.changed && out.focus);
+        assert!(words(&page).contains("Apple Banana Cherry"), "{}", words(&page));
+        // The list covers what's under it; a disabled option does nothing.
+        let (x, y) = at(&page, "Cherry");
+        page.click_at(None, x, y, until);
+        assert_eq!(value(&mut page, "s"), "Apple");
+        assert!(!words(&page).contains("Banana"), "closed after a click");
+        let (x, y) = at(&page, "Apple");
+        page.click_at(None, x, y, until);
+        let (x, y) = at(&page, "Banana");
+        page.click_at(None, x, y, until);
+        assert_eq!(value(&mut page, "s"), "b");
+        // Keys: Up picks the option before.
+        page.key(None, Key::Up { select: false });
+        assert_eq!(value(&mut page, "s"), "Apple");
+        // A text field: the caret starts at the end and moves.
+        let (x, y) = at(&page, "ab");
+        page.click_at(None, x, y, until);
+        page.key(
+            None,
+            Key::Left {
+                select: false,
+                word: false,
+            },
+        );
+        page.type_text(None, "X");
+        assert_eq!(value(&mut page, "q"), "aXb");
+        page.key(None, Key::Home { select: true });
+        assert_eq!(page.key(None, Key::Copy).copied.as_deref(), Some("aX"));
+        assert_eq!(page.key(None, Key::Cut).copied.as_deref(), Some("aX"));
+        assert_eq!(value(&mut page, "q"), "b");
+        assert_eq!(page.key(None, Key::Copy).copied, None, "nothing selected");
     }
 
     #[test]

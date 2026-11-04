@@ -113,8 +113,11 @@ pub enum FromRenderer {
         console: Vec<String>,
         /// A form was submitted (the browser checks it like any navigation).
         submit: Option<Submission>,
-        /// A field that takes typing has the focus.
+        /// A form control has the keyboard.
         focus: bool,
+        /// Text copied or cut from a field (the browser only takes it
+        /// after you pressed Ctrl+C or Ctrl+X).
+        copied: Option<String>,
     },
 }
 
@@ -407,12 +410,24 @@ impl ToRenderer {
             }
             ToRenderer::Key(k) => {
                 e.u8(9);
-                e.u8(match k {
-                    Key::Backspace => 1,
-                    Key::Enter => 2,
-                    Key::Tab => 3,
-                    Key::Escape => 4,
-                });
+                let (code, select, word) = match *k {
+                    Key::Backspace { word } => (1, false, word),
+                    Key::Enter => (2, false, false),
+                    Key::Tab => (3, false, false),
+                    Key::Escape => (4, false, false),
+                    Key::Delete { word } => (5, false, word),
+                    Key::Left { select, word } => (6, select, word),
+                    Key::Right { select, word } => (7, select, word),
+                    Key::Home { select } => (8, select, false),
+                    Key::End { select } => (9, select, false),
+                    Key::Up { select } => (10, select, false),
+                    Key::Down { select } => (11, select, false),
+                    Key::SelectAll => (12, false, false),
+                    Key::Copy => (13, false, false),
+                    Key::Cut => (14, false, false),
+                };
+                e.u8(code);
+                e.u8(select as u8 | (word as u8) << 1);
             }
             ToRenderer::FetchReply(r) => {
                 e.u8(2);
@@ -485,13 +500,31 @@ impl ToRenderer {
             },
             7 => ToRenderer::Cookies(d.str()?),
             8 => ToRenderer::Type(d.str()?),
-            9 => ToRenderer::Key(match d.u8()? {
-                1 => Key::Backspace,
-                2 => Key::Enter,
-                3 => Key::Tab,
-                4 => Key::Escape,
-                k => return Err(format!("unknown key {k}")),
-            }),
+            9 => {
+                let code = d.u8()?;
+                let flags = d.u8()?;
+                if flags > 3 {
+                    return Err(format!("unknown key flags {flags}"));
+                }
+                let (select, word) = (flags & 1 != 0, flags & 2 != 0);
+                ToRenderer::Key(match code {
+                    1 => Key::Backspace { word },
+                    2 => Key::Enter,
+                    3 => Key::Tab,
+                    4 => Key::Escape,
+                    5 => Key::Delete { word },
+                    6 => Key::Left { select, word },
+                    7 => Key::Right { select, word },
+                    8 => Key::Home { select },
+                    9 => Key::End { select },
+                    10 => Key::Up { select },
+                    11 => Key::Down { select },
+                    12 => Key::SelectAll,
+                    13 => Key::Copy,
+                    14 => Key::Cut,
+                    k => return Err(format!("unknown key {k}")),
+                })
+            }
             5 => ToRenderer::Click {
                 x: d.f32()?,
                 y: d.f32()?,
@@ -568,6 +601,7 @@ impl FromRenderer {
                 console,
                 submit,
                 focus,
+                copied,
             } => {
                 e.u8(5);
                 e.u8(*prevented as u8);
@@ -585,6 +619,7 @@ impl FromRenderer {
                     None => e.u8(0),
                 }
                 e.u8(*focus as u8);
+                e.opt_str(copied);
             }
             FromRenderer::Rendered(r) => {
                 e.u8(3);
@@ -730,6 +765,7 @@ impl FromRenderer {
                     None
                 },
                 focus: d.bool()?,
+                copied: d.opt_str()?,
             },
             3 => {
                 let height = d.f32()?.max(0.0);
@@ -1044,6 +1080,7 @@ mod tests {
                 console: vec![],
                 submit: None,
                 focus: true,
+                copied: Some("copied text".into()),
             },
             FromRenderer::Clicked {
                 prevented: false,
@@ -1057,6 +1094,7 @@ mod tests {
                     content_type: Some("application/x-www-form-urlencoded".into()),
                 }),
                 focus: false,
+                copied: None,
             },
             FromRenderer::Rendered(sample()),
             FromRenderer::Dom("<html>".into()),
@@ -1091,6 +1129,17 @@ mod tests {
             ToRenderer::Click { x: 10.0, y: 20.0 },
             ToRenderer::Type("héllo".into()),
             ToRenderer::Key(Key::Enter),
+            ToRenderer::Key(Key::Backspace { word: true }),
+            ToRenderer::Key(Key::Left {
+                select: true,
+                word: false,
+            }),
+            ToRenderer::Key(Key::Right {
+                select: true,
+                word: true,
+            }),
+            ToRenderer::Key(Key::End { select: false }),
+            ToRenderer::Key(Key::Cut),
             ToRenderer::FetchReply(Ok("css".into())),
             ToRenderer::FetchReply(Err("nope".into())),
             ToRenderer::ImageReply(Ok(vec![0x89, b'P', 0, 255])),
