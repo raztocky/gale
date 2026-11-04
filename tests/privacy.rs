@@ -207,7 +207,7 @@ fn cosmetic_filters_hide_elements() {
     }
     // With the hiding rule the page is one paragraph shorter.
     let height = |p: &PathBuf| {
-        let d = png::Decoder::new(std::fs::File::open(p).unwrap());
+        let d = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(p).unwrap()));
         d.read_info().unwrap().info().height
     };
     assert!(
@@ -888,9 +888,9 @@ fn images_follow_the_rules() {
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    let d = png::Decoder::new(std::fs::File::open(&png_out).unwrap());
+    let d = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(&png_out).unwrap()));
     let mut r = d.read_info().unwrap();
-    let mut buf = vec![0; r.output_buffer_size()];
+    let mut buf = vec![0; r.output_buffer_size().unwrap()];
     let info = r.next_frame(&mut buf).unwrap();
     let px = info.color_type.samples();
     let grey = buf

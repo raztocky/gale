@@ -126,7 +126,9 @@ fn decode_png(bytes: &[u8]) -> Result<Bitmap, String> {
     let mut d = png::Decoder::new_with_limits(Cursor::new(bytes), png::Limits { bytes: budget(w, h) });
     d.set_transformations(png::Transformations::normalize_to_color8());
     let mut r = d.read_info().map_err(err)?;
-    let mut buf = vec![0; r.output_buffer_size()];
+    // None if the size doesn't fit in memory at all.
+    let size = r.output_buffer_size().ok_or("PNG: image too large")?;
+    let mut buf = vec![0; size];
     let out = r.next_frame(&mut buf).map_err(err)?;
     buf.truncate(out.buffer_size());
     let px = w as usize * h as usize;
