@@ -1148,6 +1148,38 @@
   for (const k of ['group', 'groupCollapsed', 'groupEnd', 'time', 'timeEnd', 'timeLog', 'count', 'assert', 'table', 'dir', 'clear'])
     consoleObj[k] = () => {};
 
+  // Base64 of "binary strings" (one byte per character).
+  const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  const badChars = (what) => Object.assign(new Error(`${what}: invalid character`), { name: 'InvalidCharacterError' });
+  function btoa(data) {
+    const s = str(data);
+    let out = '';
+    for (let i = 0; i < s.length; i += 3) {
+      const c = [s.charCodeAt(i), s.charCodeAt(i + 1), s.charCodeAt(i + 2)];
+      if (c.some((x) => x > 255)) throw badChars('btoa');
+      const n = (c[0] << 16) | ((c[1] || 0) << 8) | (c[2] || 0);
+      out += B64[n >> 18] + B64[(n >> 12) & 63];
+      out += i + 1 < s.length ? B64[(n >> 6) & 63] : '=';
+      out += i + 2 < s.length ? B64[n & 63] : '=';
+    }
+    return out;
+  }
+  function atob(data) {
+    let s = str(data).replace(/[\t\n\f\r ]/g, '');
+    if (s.length % 4 === 0) s = s.replace(/==?$/, '');
+    if (s.length % 4 === 1 || /[^A-Za-z0-9+/]/.test(s)) throw badChars('atob');
+    let out = '', bits = 0, n = 0;
+    for (const ch of s) {
+      n = (n << 6) | B64.indexOf(ch);
+      bits += 6;
+      if (bits >= 8) {
+        bits -= 8;
+        out += String.fromCharCode((n >> bits) & 255);
+      }
+    }
+    return out;
+  }
+
   // ------------------------------------------------------------ the globals
   const defs = {
     window: G, self: G, top: G, parent: G, frames: G, globalThis: G,
@@ -1167,6 +1199,7 @@
     cancelIdleCallback: (id) => { timers.delete(id); },
     queueMicrotask: (fn) => { Promise.resolve().then(fn); },
     fetch, Headers, Request, Response, AbortController, AbortSignal, FormData, TextEncoder, TextDecoder,
+    btoa, atob,
     // Images aren't loaded (Brickle doesn't show images yet), so these are
     // plain elements: setting src requests nothing.
     Image: function Image(w, h) {

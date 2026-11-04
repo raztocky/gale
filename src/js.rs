@@ -1332,6 +1332,30 @@ mod tests {
     }
 
     #[test]
+    fn base64() {
+        let (mut rt, _) = run(
+            "",
+            r#"
+            console.log(btoa(''), btoa('f'), btoa('fo'), btoa('foo'), btoa('\xff\x00'));
+            console.log(atob('Zm9v'), atob(' Zm 8= '), atob('Zg'), atob(btoa('h\xe9llo')) === 'h\xe9llo');
+            for (const f of [() => btoa('\u0100'), () => atob('Z'), () => atob('Zm9v!')]) {
+                try { f(); console.log('no error'); } catch (e) { console.log(e.name); }
+            }
+            "#,
+        );
+        assert_eq!(
+            rt.take_console(),
+            vec![
+                "[log]  Zg== Zm8= Zm9v /wA=",
+                "[log] foo fo f true",
+                "[log] InvalidCharacterError",
+                "[log] InvalidCharacterError",
+                "[log] InvalidCharacterError",
+            ]
+        );
+    }
+
+    #[test]
     fn dom_basics() {
         let (mut rt, out) = run(
             "<p id=a class='x y'>hi</p><ul></ul>",
