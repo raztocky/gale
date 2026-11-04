@@ -194,9 +194,10 @@ tracking-parameter stripping, HTTPS-only, the local-network block and the cookie
 third-party cookies) applied to each. Brickle sends Firefox's headers for images. Each image is
 fetched once per page, and a page gets at most 300 images and 64 MB of them.
 
-Only PNG, JPEG, GIF and WebP are shown (GIFs and WebPs only their first frame). SVG images are
-refused for now: an SVG is a document that can carry scripts. `data:` images are decoded
-without any request.
+PNG, JPEG, GIF, WebP and SVG are shown (GIFs and WebPs only their first frame). An SVG is drawn
+as a plain picture in the sandboxed renderer: only its shapes, gradients, clipping and filters.
+Its scripts, links and text are ignored, and it can't load anything, so images, fonts or files it
+points to are never fetched or read. `data:` images are decoded without any request.
 
 *Enforced by:* `images_follow_the_rules` in `tests/privacy.rs`, and the tests in
 `src/network.rs` and `src/filter.rs`.

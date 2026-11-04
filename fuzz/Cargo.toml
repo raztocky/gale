@@ -115,3 +115,9 @@ name = "certs"
 path = "fuzz_targets/certs.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "svg"
+path = "fuzz_targets/svg.rs"
+test = false
+doc = false

@@ -871,7 +871,8 @@ fn image_source(base: &str, e: &crate::dom::ElementData) -> Option<String> {
     Some(net::resolve(base, src))
 }
 
-/// The bytes of a `data:image/...;base64,` address (decoded here, no request).
+/// The bytes of a `data:image/...` address (decoded here, no request):
+/// base64, or for SVG also percent-encoded text.
 fn data_url(url: &str) -> Option<Result<Vec<u8>, String>> {
     let rest = url
         .get(..5)
@@ -879,13 +880,41 @@ fn data_url(url: &str) -> Option<Result<Vec<u8>, String>> {
         .map(|_| &url[5..])?;
     let (meta, payload) = rest.split_once(',')?;
     let meta = meta.to_ascii_lowercase();
-    if !meta.starts_with("image/") || meta.contains("svg") {
+    if !meta.starts_with("image/") {
         return Some(Err("not an image".into()));
     }
-    if !meta.ends_with(";base64") {
-        return Some(Err("only base64 image data is supported".into()));
+    if meta.ends_with(";base64") {
+        return Some(base64(payload).ok_or_else(|| "bad base64".to_string()));
     }
-    Some(base64(payload).ok_or_else(|| "bad base64".to_string()))
+    if meta.starts_with("image/svg+xml") {
+        return Some(Ok(percent_decode(payload)));
+    }
+    Some(Err("only base64 image data is supported".into()))
+}
+
+/// `%XX` escapes decoded; anything malformed is kept as it is.
+fn percent_decode(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        match (
+            b[i],
+            b.get(i + 1).copied().and_then(hex),
+            b.get(i + 2).copied().and_then(hex),
+        ) {
+            (b'%', Some(h), Some(l)) => {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+            }
+            (c, ..) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 fn base64(s: &str) -> Option<Vec<u8>> {
@@ -1321,11 +1350,13 @@ mod image_tests {
             s
         };
         let (page, asked) = load(&format!(
-            "<img id=a src='data:image/png;base64,{b64}'><img src='data:image/svg+xml,<svg/>'>\
+            "<img id=a src='data:image/png;base64,{b64}'>\
+             <img id=s src=\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='7' height='5'/%3E\">\
              <img src='data:text/html;base64,PGI+'>"
         ));
         assert!(asked.is_empty(), "{asked:?}");
         assert_eq!(size_of(&page, "a"), (3.0, 2.0));
+        assert_eq!(size_of(&page, "s"), (7.0, 5.0));
         assert_eq!(base64("aGk="), Some(b"hi".to_vec()));
         assert_eq!(base64("a!"), None);
     }

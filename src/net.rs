@@ -819,12 +819,11 @@ fn http_get_timeout(
         || ctype.contains("ecmascript")
         || ctype.contains("json")
         || ctype.is_empty();
-    // Images: any image type but SVG (which is a document, with scripts).
-    // What it really is gets decided from its bytes, in the renderer.
+    // Images, SVG included: what it really is gets decided from its bytes,
+    // in the renderer, which draws an SVG's shapes and ignores its scripts,
+    // links and everything else.
     let image = dest == Dest::Image
-        && (ctype.is_empty()
-            || (ctype.starts_with("image/") && !ctype.contains("svg"))
-            || ctype == "application/octet-stream");
+        && (ctype.is_empty() || ctype.starts_with("image/") || ctype == "application/octet-stream");
     if dest == Dest::Image && !image {
         return Err(NetError::Other(format!("not an image ({ctype})")));
     }

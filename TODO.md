@@ -3,9 +3,11 @@
 Planned work, roughly in priority order. Items marked *discuss* need a decision first.
 
 ## Features
-- [x] Images (PNG/JPEG/WebP/GIF), decoded inside the sandboxed renderer
+- [x] Images (PNG/JPEG/WebP/GIF/SVG), decoded inside the sandboxed renderer
+- [ ] SVG images: text (needs the bundled fonts wired into resvg), and drawing at the size shown
+      rather than the SVG's own size
 - [ ] Images: CSS `background-image`, `<picture>`/`srcset` choice by size, animation, lazy
-      loading, SVG (as a sandboxed document)
+      loading, inline `<svg>` in HTML
 - [ ] Floats and positioning (`float`, `position: absolute/fixed/relative`)
 - [ ] Real table layout
 - [x] Show `<noscript>` content

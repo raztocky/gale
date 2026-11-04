@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="16" height="16" viewBox="0 0 16 16">
+  <defs>
+    <linearGradient id="g" x1="0" x2="1"><stop offset="0" stop-color="#f97316"/><stop offset="1" stop-color="#1e293b" stop-opacity=".5"/></linearGradient>
+    <clipPath id="c"><circle cx="8" cy="8" r="7"/></clipPath>
+    <filter id="f"><feGaussianBlur stdDeviation=".5"/></filter>
+    <path id="p" d="M2 12 Q8 2 14 12 Z"/>
+  </defs>
+  <style>.s { stroke: #000; stroke-width: .5 }</style>
+  <rect width="16" height="16" fill="url(#g)" clip-path="url(#c)"/>
+  <use xlink:href="#p" class="s" fill="none" filter="url(#f)" transform="rotate(10 8 8)"/>
+  <polyline points="1,1 4,3 7,1" stroke="lime" fill="none" stroke-dasharray="1 1"/>
+</svg>

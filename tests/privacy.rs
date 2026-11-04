@@ -798,8 +798,9 @@ fn pages_answering_a_post_remember_their_form() {
 
 /// Images go through the same rules as everything else: your rules and
 /// `$image` filters, first-party-only cookies, Firefox's headers. Only real
-/// images are accepted (no SVG, no HTML posing as an image), and they are
-/// decoded in the sandboxed renderer.
+/// images are accepted (no HTML posing as an image; an SVG is drawn as a
+/// picture and its scripts never run), and they are decoded in the
+/// sandboxed renderer.
 #[test]
 fn images_follow_the_rules() {
     let home = temp_dir("images");

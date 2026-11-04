@@ -1,4 +1,5 @@
-//! Image decoding: PNG, JPEG, GIF (first frame) and WebP (first frame).
+//! Image decoding: PNG, JPEG, GIF (first frame), WebP (first frame) and
+//! SVG (shapes only: no text, no embedded images, nothing external).
 //!
 //! Images are only ever decoded in the sandboxed renderer: decoders are a
 //! classic place for memory-safety bugs, and image bytes come straight from
@@ -45,6 +46,7 @@ pub enum Format {
     Jpeg,
     Gif,
     WebP,
+    Svg,
 }
 
 /// Which format the bytes are, from their signature (not the server's
@@ -58,6 +60,8 @@ pub fn sniff(b: &[u8]) -> Option<Format> {
         Some(Format::Gif)
     } else if b.len() >= 12 && &b[0..4] == b"RIFF" && &b[8..12] == b"WEBP" {
         Some(Format::WebP)
+    } else if looks_like_svg(b) {
+        Some(Format::Svg)
     } else {
         None
     }
@@ -82,6 +86,8 @@ fn budget(w: u32, h: u32) -> usize {
 /// Decode an image.
 pub fn decode(bytes: &[u8]) -> Result<Decoded, String> {
     let bitmap = match sniff(bytes) {
+        // Drawn straight at the size it's kept at, so it stays sharp.
+        Some(Format::Svg) => return decode_svg(bytes),
         Some(Format::Png) => decode_png(bytes),
         Some(Format::Jpeg) => decode_jpeg(bytes),
         Some(Format::Gif) => decode_gif(bytes),
@@ -112,6 +118,169 @@ pub fn fit(w: u32, h: u32, max: u32) -> (u32, u32) {
         ((w as f64 * s).round() as u32).clamp(1, max),
         ((h as f64 * s).round() as u32).clamp(1, max),
     )
+}
+
+/// XML whose first element (after any declaration, comments and
+/// doctype) is `<svg`.
+fn looks_like_svg(b: &[u8]) -> bool {
+    let head = &b[..b.len().min(4096)];
+    let text = String::from_utf8_lossy(head);
+    let mut t = text.trim_start_matches('\u{feff}').trim_start();
+    loop {
+        if let Some(rest) = t.strip_prefix("<?") {
+            t = rest.split_once("?>").map_or("", |(_, r)| r).trim_start();
+        } else if let Some(rest) = t.strip_prefix("<!--") {
+            t = rest.split_once("-->").map_or("", |(_, r)| r).trim_start();
+        } else if t.starts_with("<!") {
+            t = t.split_once('>').map_or("", |(_, r)| r).trim_start();
+        } else {
+            break;
+        }
+    }
+    t.starts_with("<svg") && t[4..].starts_with(|c: char| c.is_whitespace() || c == '>' || c == '/')
+}
+
+/// Largest SVG file read.
+const MAX_SVG_BYTES: usize = 4 * 1024 * 1024;
+/// Most XML nodes in an SVG.
+const MAX_SVG_NODES: u32 = 200_000;
+/// Most elements an SVG may stand for once references (`<use>`,
+/// `url(#…)`) are followed: a few nested references can otherwise stand for
+/// billions.
+const MAX_SVG_EXPANDED: u64 = 250_000;
+
+/// How many elements `doc` stands for with every reference followed, or
+/// None if that's over the limit (or a reference loops).
+fn svg_expanded_size(doc: &roxmltree::Document) -> Option<u64> {
+    use std::collections::HashMap;
+    let ids: HashMap<&str, roxmltree::NodeId> = doc
+        .descendants()
+        .filter_map(|n| Some((n.attribute("id")?, n.id())))
+        .collect();
+    // The ids an element refers to: `href="#x"`, and `url(#x)` anywhere.
+    fn refs<'a>(n: roxmltree::Node<'a, '_>) -> Vec<&'a str> {
+        let mut out = vec![];
+        for a in n.attributes() {
+            let v = a.value();
+            if a.name() == "href" {
+                if let Some(id) = v.trim().strip_prefix('#') {
+                    out.push(id);
+                }
+            }
+            let mut rest = v;
+            while let Some(i) = rest.find("url(") {
+                rest = &rest[i + 4..];
+                let inner = rest
+                    .split(')')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .trim_matches(|c| c == '"' || c == '\'');
+                if let Some(id) = inner.strip_prefix('#') {
+                    out.push(id);
+                }
+            }
+        }
+        out
+    }
+    // cost(n) = 1 + its children's + what it refers to; None = too much.
+    // Iterative, so deep documents can't overflow the stack.
+    let mut cost: HashMap<roxmltree::NodeId, u64> = HashMap::new();
+    let mut visiting = std::collections::HashSet::new();
+    let mut stack = vec![(doc.root_element(), false)];
+    while let Some((n, expanded)) = stack.pop() {
+        if cost.contains_key(&n.id()) {
+            continue;
+        }
+        let deps: Vec<roxmltree::Node> = n
+            .children()
+            .filter(|c| c.is_element())
+            .chain(
+                refs(n)
+                    .into_iter()
+                    .filter_map(|id| ids.get(id).map(|&i| doc.get_node(i).unwrap())),
+            )
+            .collect();
+        if !expanded {
+            if !visiting.insert(n.id()) {
+                return None; // a reference loop
+            }
+            stack.push((n, true));
+            for d in deps {
+                if !cost.contains_key(&d.id()) {
+                    if visiting.contains(&d.id()) {
+                        return None;
+                    }
+                    stack.push((d, false));
+                }
+            }
+        } else {
+            visiting.remove(&n.id());
+            let mut total = 1u64;
+            for d in deps {
+                total = total.saturating_add(*cost.get(&d.id())?);
+            }
+            if total > MAX_SVG_EXPANDED {
+                return None;
+            }
+            cost.insert(n.id(), total);
+        }
+    }
+    cost.get(&doc.root_element().id()).copied()
+}
+
+fn decode_svg(bytes: &[u8]) -> Result<Decoded, String> {
+    if bytes.len() > MAX_SVG_BYTES {
+        return Err("SVG: file too large".into());
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| "SVG: not UTF-8")?;
+    let doc = roxmltree::Document::parse_with_options(
+        text,
+        roxmltree::ParsingOptions {
+            // Many SVGs have a doctype; roxmltree limits entity expansion.
+            allow_dtd: true,
+            nodes_limit: MAX_SVG_NODES,
+            // External entities are never loaded (no resolver).
+            ..Default::default()
+        },
+    )
+    .map_err(|e| format!("SVG: {e}"))?;
+    if doc.root_element().tag_name().name() != "svg" {
+        return Err("SVG: not an <svg> document".into());
+    }
+    svg_expanded_size(&doc).ok_or("SVG: too complex")?;
+    // Nothing outside the file is ever used: no linked or embedded images
+    // (and no nested SVGs), no files, no fonts (text isn't drawn at all).
+    let opt = usvg::Options {
+        image_href_resolver: usvg::ImageHrefResolver {
+            resolve_data: Box::new(|_, _, _| None),
+            resolve_string: Box::new(|_, _| None),
+        },
+        ..usvg::Options::default()
+    };
+    let tree = usvg::Tree::from_xmltree(&doc, &opt).map_err(|e| format!("SVG: {e}"))?;
+    let size = tree.size();
+    let natural = (
+        (size.width().ceil() as u32).clamp(1, MAX_SIDE),
+        (size.height().ceil() as u32).clamp(1, MAX_SIDE),
+    );
+    let (w, h) = fit(natural.0, natural.1, STORE_SIDE);
+    check_size(w, h)?;
+    let mut pixmap = tiny_skia::Pixmap::new(w, h).ok_or("SVG: can't make a canvas")?;
+    let transform = tiny_skia::Transform::from_scale(w as f32 / size.width(), h as f32 / size.height());
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    let rgba = pixmap
+        .pixels()
+        .iter()
+        .flat_map(|p| {
+            let c = p.demultiply();
+            [c.red(), c.green(), c.blue(), c.alpha()]
+        })
+        .collect();
+    Ok(Decoded {
+        natural,
+        bitmap: Arc::new(Bitmap { w, h, rgba }),
+    })
 }
 
 fn decode_png(bytes: &[u8]) -> Result<Bitmap, String> {
@@ -455,12 +624,92 @@ mod tests {
     #[test]
     fn rejects_garbage_and_truncation() {
         assert!(decode(b"").is_err());
-        assert!(decode(b"<svg></svg>").is_err());
+        assert!(decode(b"<svg").is_err());
+        assert!(decode(b"<html><svg></svg></html>").is_err());
         assert!(decode(&[0xFF, 0xD8, 0xFF, 0xE0, 0, 0x10]).is_err());
         assert!(decode(b"GIF89a\x02\x00").is_err());
         assert!(decode(b"RIFF\x10\x00\x00\x00WEBPVP8 ").is_err());
         let p = png_bytes(4, 4, png::ColorType::Rgb, &[7; 48]);
         assert!(decode(&p[..p.len() - 20]).is_err());
+    }
+
+    const NS: &str = "xmlns='http://www.w3.org/2000/svg' xmlns:xlink='http://www.w3.org/1999/xlink'";
+
+    #[test]
+    fn svg_shapes_are_drawn() {
+        let svg = format!(
+            "<?xml version='1.0'?><!-- logo --><!DOCTYPE svg><svg {NS} width='4' height='2'>\
+             <rect width='2' height='2' fill='red'/><rect x='2' width='2' height='2' fill='#00f' opacity='0.5'/></svg>"
+        );
+        assert_eq!(sniff(svg.as_bytes()), Some(Format::Svg));
+        let d = decode(svg.as_bytes()).unwrap();
+        assert_eq!(d.natural, (4, 2));
+        assert_eq!(&d.bitmap.rgba[0..4], &[255, 0, 0, 255]);
+        let blue = &d.bitmap.rgba[3 * 4..4 * 4];
+        assert_eq!((blue[0], blue[2]), (0, 255));
+        assert!((120..=135).contains(&blue[3]), "{blue:?}");
+        // Big drawings are drawn at the stored size, not enlarged later.
+        let big = format!(
+            "<svg {NS} viewBox='0 0 10 10' width='5000' height='2500'><circle cx='5' cy='5' r='5'/></svg>"
+        );
+        let d = decode(big.as_bytes()).unwrap();
+        assert_eq!(d.natural, (5000, 2500));
+        assert_eq!((d.bitmap.w, d.bitmap.h), (STORE_SIDE, STORE_SIDE / 2));
+    }
+
+    #[test]
+    fn svg_never_reaches_outside_the_file() {
+        // Linked and embedded images, nested SVGs and text are all left out;
+        // the rest is still drawn.
+        let svg = format!(
+            "<svg {NS} width='2' height='2'>\
+             <image href='file:///etc/passwd' width='2' height='2'/>\
+             <image xlink:href='https://tracker.example/x.png' width='2' height='2'/>\
+             <image href='data:image/svg+xml;base64,PHN2Zy8+' width='2' height='2'/>\
+             <text y='2' font-size='9'>hi</text>\
+             <script>alert(1)</script>\
+             <a href='https://example.com'><rect width='1' height='1' fill='lime'/></a></svg>"
+        );
+        let d = decode(svg.as_bytes()).unwrap();
+        assert_eq!(&d.bitmap.rgba[0..4], &[0, 255, 0, 255]);
+        assert_eq!(d.bitmap.rgba[3 * 4 + 3], 0, "nothing else drawn");
+    }
+
+    #[test]
+    fn svg_bombs_are_refused() {
+        // Ten levels of ten <use>s: 10^10 elements.
+        let mut s = format!("<svg {NS} width='10' height='10'><defs><rect id='l0' width='1' height='1'/>");
+        for i in 1..=10 {
+            s.push_str(&format!("<g id='l{i}'>"));
+            for _ in 0..10 {
+                s.push_str(&format!("<use href='#l{}'/>", i - 1));
+            }
+            s.push_str("</g>");
+        }
+        s.push_str("</defs><use href='#l10'/></svg>");
+        assert!(decode(s.as_bytes()).unwrap_err().contains("too complex"));
+        // Through fill references too.
+        let fill = format!(
+            "<svg {NS}><linearGradient id='a' href='#b'/><linearGradient id='b' href='#a'/>\
+             <rect width='1' height='1' fill='url(#a)'/></svg>"
+        );
+        assert!(decode(fill.as_bytes()).is_err(), "loop");
+        let me = format!("<svg {NS}><g id='a'><use href='#a'/></g></svg>");
+        assert!(decode(me.as_bytes()).is_err(), "self-reference");
+        // XML entity expansion.
+        let lol = format!(
+            "<?xml version='1.0'?><!DOCTYPE svg [<!ENTITY a 'aaaaaaaaaa'><!ENTITY b '&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;'>\
+             <!ENTITY c '&b;&b;&b;&b;&b;&b;&b;&b;&b;&b;'><!ENTITY d '&c;&c;&c;&c;&c;&c;&c;&c;&c;&c;'>\
+             <!ENTITY e '&d;&d;&d;&d;&d;&d;&d;&d;&d;&d;'><!ENTITY f '&e;&e;&e;&e;&e;&e;&e;&e;&e;&e;'>\
+             <!ENTITY g '&f;&f;&f;&f;&f;&f;&f;&f;&f;&f;'><!ENTITY h '&g;&g;&g;&g;&g;&g;&g;&g;&g;&g;'>]>\
+             <svg {NS}><desc>&h;</desc></svg>"
+        );
+        let start = std::time::Instant::now();
+        let _ = decode(lol.as_bytes());
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        // Too many nodes.
+        let many = format!("<svg {NS}>{}</svg>", "<g/>".repeat(MAX_SVG_NODES as usize));
+        assert!(decode(many.as_bytes()).is_err());
     }
 
     #[test]

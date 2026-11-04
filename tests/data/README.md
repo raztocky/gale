@@ -2,7 +2,8 @@
 `tests/privacy.rs` to check that certificate errors are refused. The private key is public on
 purpose; it protects nothing.
 
-`tiny*`: small images in each format Brickle decodes, for `src/image.rs`'s tests and as seeds
+`tiny*`: small images in each format Brickle decodes (`tiny.svg` uses gradients, clipping, a
+filter, `<use>` and CSS), for `src/image.rs`'s tests and as seeds
 for the `image` fuzz target.
 
 `example-com*.der`: example.com's public TLS certificate and its issuer (November 2026), for the
