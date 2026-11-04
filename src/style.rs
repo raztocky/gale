@@ -191,6 +191,9 @@ pub struct ComputedStyle {
     /// `background-image: url(...)`, as written (absolute if it came from
     /// an external stylesheet).
     pub background_image: Option<String>,
+    /// `background-image: linear-gradient(...)` and the like, drawn instead
+    /// of an image.
+    pub background_gradient: Option<Rc<crate::gradient::Gradient>>,
     /// Repeats across, and down.
     pub background_repeat: (bool, bool),
     pub background_size: BgSize,
@@ -266,6 +269,7 @@ impl ComputedStyle {
             color: Color::BLACK,
             background: Color::TRANSPARENT,
             background_image: None,
+            background_gradient: None,
             background_repeat: (true, true),
             background_size: BgSize::Auto,
             background_position: [Len::Percent(0.0); 2],
@@ -823,10 +827,15 @@ fn compute(
                 }
             }
             "background-image" => {
-                s.background_image = vals.iter().find_map(|v| match v {
-                    Value::Url(u) if !u.is_empty() => Some(u.clone()),
+                // The first image or gradient (more layers aren't supported).
+                let first = vals.iter().find_map(|v| match v {
+                    Value::Url(u) if !u.is_empty() => Some((Some(u.clone()), None)),
+                    Value::Keyword(k) if k.contains("gradient(") => {
+                        Some((None, crate::gradient::parse(k, s.font_size).map(Rc::new)))
+                    }
                     _ => None,
-                })
+                });
+                (s.background_image, s.background_gradient) = first.unwrap_or((None, None));
             }
             "background-repeat" => {
                 let kws: Vec<&str> = vals
@@ -1562,7 +1571,9 @@ fn expand(d: &Declaration, props: &mut HashMap<String, Vec<Value>>) {
             let url: Vec<Value> = d
                 .values
                 .iter()
-                .filter(|v| matches!(v, Value::Url(_)))
+                .filter(|v| {
+                    matches!(v, Value::Url(_)) || matches!(v, Value::Keyword(k) if k.contains("gradient("))
+                })
                 .take(1)
                 .cloned()
                 .collect();

@@ -263,6 +263,40 @@ pub type Backgrounds<'b> = dyn Fn(&str) -> Option<crate::image::Decoded> + 'b;
 /// stretched across instead.
 const MAX_TILES_PER_SIDE: f32 = 32.0;
 
+/// Most bitmap bytes a page's gradients may use; past that they're drawn
+/// as one colour.
+const MAX_GRADIENT_BYTES: usize = 24 * 1024 * 1024;
+
+/// A box's background gradient, filling its padding box.
+fn background_gradient(
+    list: &mut Vec<DrawOp>,
+    b: &LayoutBox,
+    g: &crate::gradient::Gradient,
+    used: &mut usize,
+) {
+    let area = b.dims.padding_box();
+    if area.is_empty() {
+        return;
+    }
+    let side = |v: f32| (v.ceil().max(1.0) as usize).min(crate::gradient::MAX_SIDE as usize);
+    let bytes = side(area.w) * side(area.h) * 4;
+    if *used + bytes > MAX_GRADIENT_BYTES {
+        list.push(DrawOp::Rect {
+            rect: area,
+            color: crate::gradient::average(g),
+        });
+        return;
+    }
+    if let Some(bmp) = crate::gradient::render(g, area.w, area.h) {
+        *used += bmp.rgba.len();
+        list.push(DrawOp::Image {
+            rect: area,
+            image: Arc::new(bmp),
+            clip: None,
+        });
+    }
+}
+
 /// A box's background image: sized, positioned and tiled in its padding
 /// box, and clipped to it.
 fn background_image(list: &mut Vec<DrawOp>, b: &LayoutBox, img: &crate::image::Decoded) {
@@ -422,6 +456,7 @@ pub fn build_layered(root: &LayoutBox, backgrounds: &Backgrounds) -> (Vec<DrawOp
     let mut list = Vec::new();
     let mut layers: Vec<LayerOps> = Vec::new();
     let mut open: Option<(usize, usize)> = None;
+    let mut gradient_bytes = 0;
     for b in crate::layout::paint_order(root) {
         let id = in_layer.get(&crate::layout::box_addr(b)).copied();
         if open.map(|(i, _)| i) != id {
@@ -431,7 +466,7 @@ pub fn build_layered(root: &LayoutBox, backgrounds: &Backgrounds) -> (Vec<DrawOp
             open = id.map(|i| (i, list.len()));
         }
         let start = list.len();
-        render_box(&mut list, b, backgrounds);
+        render_box(&mut list, b, backgrounds, &mut gradient_bytes);
         if let Some(&c) = clips.get(&crate::layout::box_addr(b)) {
             clip_ops(&mut list, start, c);
         }
@@ -461,7 +496,7 @@ fn clip_ops(list: &mut Vec<DrawOp>, start: usize, c: Rect) {
 }
 
 /// Paint one box (not its children).
-fn render_box(list: &mut Vec<DrawOp>, b: &LayoutBox, backgrounds: &Backgrounds) {
+fn render_box(list: &mut Vec<DrawOp>, b: &LayoutBox, backgrounds: &Backgrounds, gradient_bytes: &mut usize) {
     let s = b.style();
     if let BoxKind::Block(_) = b.kind {
         let bb = b.dims.border_box();
@@ -474,6 +509,8 @@ fn render_box(list: &mut Vec<DrawOp>, b: &LayoutBox, backgrounds: &Backgrounds) 
         // The image goes over the colour and under the borders.
         if let Some(img) = s.background_image.as_deref().and_then(backgrounds) {
             background_image(list, b, &img);
+        } else if let Some(g) = &s.background_gradient {
+            background_gradient(list, b, g, gradient_bytes);
         }
         let bw = s.border_width;
         let bc = s.border_color;

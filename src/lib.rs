@@ -7,6 +7,7 @@ pub mod dom;
 pub mod filter;
 pub mod font;
 pub mod forms;
+pub mod gradient;
 pub mod html;
 pub mod image;
 pub mod ipc;

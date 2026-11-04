@@ -1255,6 +1255,22 @@ mod image_tests {
     }
 
     #[test]
+    fn gradients_are_drawn_without_fetching() {
+        let (page, asked) = load(
+            "<body style='margin:0'><div style='width:100px;height:50px;padding:5px;\
+             background:linear-gradient(to right, red, blue)'></div>\
+             <div style='width:10px;height:10px;background-image:linear-gradient(nonsense)'></div>",
+        );
+        assert!(asked.iter().all(|u| !u.contains("gradient")), "{asked:?}");
+        let drawn = images_drawn(&page.render(800.0, 600.0));
+        assert_eq!(drawn.len(), 1, "the broken one draws nothing: {drawn:?}");
+        assert!(
+            (drawn[0].w - 110.0).abs() < 0.5 && (drawn[0].h - 60.0).abs() < 0.5,
+            "fills the padding box: {drawn:?}"
+        );
+    }
+
+    #[test]
     fn images_are_drawn_at_the_size_shown() {
         let (page, _) = load("<img src=/400x200.png width=100>");
         let r = page.render(800.0, 600.0);
