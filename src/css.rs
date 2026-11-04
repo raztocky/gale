@@ -23,6 +23,10 @@ pub enum Combinator {
     /// Relationship to the *next* (more leftward) compound selector.
     Descendant,
     Child,
+    /// `+`: the element right before.
+    Next,
+    /// `~`: any element before, with the same parent.
+    Subsequent,
     None,
 }
 
@@ -31,8 +35,62 @@ pub struct SimpleSelector {
     pub tag: Option<String>,
     pub id: Option<String>,
     pub classes: Vec<String>,
-    pub attrs: Vec<String>,
+    pub attrs: Vec<AttrSelector>,
     pub root: bool,
+    pub pseudo: Vec<Pseudo>,
+}
+
+/// `[name]`, or `[name op "value"]` (with `i`: ignoring ASCII case).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttrSelector {
+    pub name: String,
+    pub op: AttrOp,
+    pub value: String,
+    pub ignore_case: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AttrOp {
+    Exists,
+    /// `=`
+    Equals,
+    /// `~=`: one of its space-separated words.
+    Word,
+    /// `|=`: equal, or starting with it and a hyphen.
+    Lang,
+    /// `^=`, `$=`, `*=`
+    Prefix,
+    Suffix,
+    Contains,
+}
+
+/// Pseudo-classes Brickle evaluates.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pseudo {
+    /// `:nth-child(an+b)` and friends: the position (from 1) among the
+    /// element's siblings (of its type, from the end) is `a*n + b` for some
+    /// n >= 0. `:first-child` is (0, 1).
+    Nth {
+        a: i32,
+        b: i32,
+        of_type: bool,
+        from_end: bool,
+    },
+    /// `:only-child`, `:only-of-type`
+    Only { of_type: bool },
+    /// `:empty`: no element children and no text.
+    Empty,
+    /// None of these selectors match.
+    Not(Vec<Selector>),
+    /// `:is()` (`where_` false) or `:where()` (true, no specificity).
+    Is { list: Vec<Selector>, where_: bool },
+    /// Some element relative to this one matches one of these. Each is a
+    /// relative selector: its leftmost part's combinator says how that part
+    /// relates to this element.
+    Has(Vec<Selector>),
+    /// Interaction states (`:hover`, `:focus`, `:checked`, ...): a page
+    /// that's just been drawn has none of them.
+    Never,
 }
 
 pub type Specificity = (usize, usize, usize);
@@ -41,9 +99,25 @@ impl Selector {
     pub fn specificity(&self) -> Specificity {
         let mut s = (0, 0, 0);
         for (p, _) in &self.parts {
+            let add = |s: &mut Specificity, t: Specificity| {
+                s.0 += t.0;
+                s.1 += t.1;
+                s.2 += t.2;
+            };
             s.0 += p.id.iter().count();
             s.1 += p.classes.len() + p.attrs.len() + p.root as usize;
             s.2 += p.tag.iter().count();
+            for ps in &p.pseudo {
+                match ps {
+                    // The most specific selector in the list counts.
+                    Pseudo::Not(list) | Pseudo::Is { list, where_: false } | Pseudo::Has(list) => add(
+                        &mut s,
+                        list.iter().map(Selector::specificity).max().unwrap_or_default(),
+                    ),
+                    Pseudo::Is { where_: true, .. } => {}
+                    _ => s.1 += 1,
+                }
+            }
         }
         s
     }
@@ -157,6 +231,10 @@ impl Color {
 const MAX_NESTING: usize = 8;
 /// Longest selector (number of compound parts) we accept.
 const MAX_SELECTOR_PARTS: usize = 32;
+/// Deepest nesting of `:not()`, `:is()`, `:where()` and `:has()`.
+const MAX_SELECTOR_NESTING: usize = 8;
+/// Most selectors in one list (a rule's, or a `:is()`'s).
+const MAX_SELECTOR_LIST: usize = 256;
 /// Most rules kept from one stylesheet.
 pub const MAX_RULES: usize = 5_000;
 
@@ -292,7 +370,7 @@ impl Parser {
                     if self.peek() == Some('}') {
                         self.pos += 1;
                     }
-                    let selectors: Vec<Selector> = prelude.split(',').filter_map(parse_selector).collect();
+                    let selectors = parse_selector_list(&prelude);
                     if !selectors.is_empty() && !declarations.is_empty() && rules.len() < MAX_RULES {
                         rules.push(Rule {
                             selectors,
@@ -339,15 +417,59 @@ impl Parser {
     }
 }
 
+/// Split at commas outside brackets, parentheses and quotes.
+pub fn split_selector_list(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let (mut depth, mut start, mut quote) = (0i32, 0, None);
+    for (i, c) in text.char_indices() {
+        match (c, quote) {
+            ('"' | '\'', None) => quote = Some(c),
+            (q, Some(open)) if q == open => quote = None,
+            (_, Some(_)) => {}
+            ('[' | '(', None) => depth += 1,
+            (']' | ')', None) => depth -= 1,
+            (',', None) if depth == 0 => {
+                parts.push(&text[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&text[start..]);
+    parts
+}
+
+/// A rule's selectors: the ones Brickle understands (a rule whose other
+/// selectors it doesn't still applies through these).
+pub fn parse_selector_list(text: &str) -> Vec<Selector> {
+    split_selector_list(text)
+        .into_iter()
+        .take(MAX_SELECTOR_LIST)
+        .filter_map(parse_selector)
+        .collect()
+}
+
 pub fn parse_selector(text: &str) -> Option<Selector> {
+    parse_complex(text, false, 0)
+}
+
+/// Parse a complex selector; `relative` allows a leading combinator (for
+/// `:has()`), which becomes the leftmost part's combinator (descendant if
+/// none is written).
+fn parse_complex(text: &str, relative: bool, depth: usize) -> Option<Selector> {
     let text = text.trim();
-    if text.is_empty() {
+    if text.is_empty() || depth > MAX_SELECTOR_NESTING {
         return None;
     }
     let mut compounds: Vec<(SimpleSelector, Combinator)> = Vec::new();
     let chars: Vec<char> = text.chars().collect();
     let mut i = 0;
-    let mut pending = Combinator::None;
+    let mut pending = if relative {
+        Combinator::Descendant
+    } else {
+        Combinator::None
+    };
+    let mut leading_written = false;
     while i < chars.len() {
         let c = chars[i];
         if c.is_whitespace() {
@@ -357,93 +479,285 @@ pub fn parse_selector(text: &str) -> Option<Selector> {
             i += 1;
             continue;
         }
-        if c == '>' {
-            pending = Combinator::Child;
+        if matches!(c, '>' | '+' | '~') {
+            // A second explicit combinator in a row is an error.
+            let explicit = !matches!(pending, Combinator::None | Combinator::Descendant);
+            if explicit || (compounds.is_empty() && (!relative || leading_written)) {
+                return None;
+            }
+            leading_written |= compounds.is_empty();
+            pending = match c {
+                '>' => Combinator::Child,
+                '+' => Combinator::Next,
+                _ => Combinator::Subsequent,
+            };
             i += 1;
             continue;
         }
-        if c == '+' || c == '~' {
-            return None; // sibling combinators unsupported
-        }
-        // Parse one compound selector.
-        let mut s = SimpleSelector::default();
-        let mut any = false;
-        while i < chars.len() && !chars[i].is_whitespace() && chars[i] != '>' {
-            let c = chars[i];
-            let ident = |j: &mut usize| -> String {
-                let st = *j;
-                while *j < chars.len()
-                    && (chars[*j].is_alphanumeric() || chars[*j] == '-' || chars[*j] == '_')
-                {
-                    *j += 1;
-                }
-                chars[st..*j].iter().collect()
-            };
-            match c {
-                '*' => {
-                    i += 1;
-                }
-                '#' => {
-                    i += 1;
-                    s.id = Some(ident(&mut i));
-                }
-                '.' => {
-                    i += 1;
-                    s.classes.push(ident(&mut i));
-                }
-                '[' => {
-                    let st = i;
-                    while i < chars.len() && chars[i] != ']' {
-                        i += 1;
-                    }
-                    let inner: String = chars[st + 1..i.min(chars.len())].iter().collect();
-                    // Only presence selectors like [hidden]; anything fancier fails.
-                    if inner.contains('=') {
-                        return None;
-                    }
-                    s.attrs.push(inner.trim().to_ascii_lowercase());
-                    i += 1;
-                }
-                ':' => {
-                    i += 1;
-                    if i < chars.len() && chars[i] == ':' {
-                        return None; // pseudo-elements
-                    }
-                    let name = ident(&mut i).to_ascii_lowercase();
-                    match name.as_str() {
-                        "root" => s.root = true,
-                        "link" | "any-link" => s.attrs.push("href".into()),
-                        "visited" | "hover" | "active" | "focus" | "focus-visible" | "focus-within"
-                        | "checked" | "disabled" | "target" | "first-child" | "last-child" | "nth-child"
-                        | "not" | "is" | "where" | "has" | "first-of-type" | "last-of-type"
-                        | "nth-of-type" | "empty" => return None,
-                        _ => return None,
-                    }
-                }
-                c if c.is_alphanumeric() || c == '-' || c == '_' => {
-                    s.tag = Some(ident(&mut i).to_ascii_lowercase());
-                }
-                _ => return None,
-            }
-            any = true;
-        }
-        if !any {
-            return None;
-        }
+        let s = parse_compound(&chars, &mut i, depth)?;
         compounds.push((s, pending));
         pending = Combinator::None;
     }
-    if compounds.is_empty() || pending != Combinator::None || compounds.len() > MAX_SELECTOR_PARTS {
+    let trailing = !compounds.is_empty() && pending != Combinator::None;
+    if compounds.is_empty() || trailing || compounds.len() > MAX_SELECTOR_PARTS {
         return None;
     }
-    // Store right-to-left, with each combinator describing the link to the left.
+    // Store right-to-left, with each combinator describing the link to the
+    // left (for a relative selector, the leftmost one's link to the anchor).
     let n = compounds.len();
     let mut parts = Vec::with_capacity(n);
     for k in (0..n).rev() {
-        let comb = if k == 0 { Combinator::None } else { compounds[k].1 };
+        let comb = if k == 0 && !relative {
+            Combinator::None
+        } else {
+            compounds[k].1
+        };
         parts.push((compounds[k].0.clone(), comb));
     }
     Some(Selector { parts })
+}
+
+/// One compound selector (`a.b#c[d]:e`) starting at `chars[*i]`.
+fn parse_compound(chars: &[char], i: &mut usize, depth: usize) -> Option<SimpleSelector> {
+    let ident = |j: &mut usize| -> String {
+        let st = *j;
+        while *j < chars.len() && (chars[*j].is_alphanumeric() || chars[*j] == '-' || chars[*j] == '_') {
+            *j += 1;
+        }
+        chars[st..*j].iter().collect()
+    };
+    let mut s = SimpleSelector::default();
+    let mut any = false;
+    while *i < chars.len() && !chars[*i].is_whitespace() && !matches!(chars[*i], '>' | '+' | '~') {
+        let c = chars[*i];
+        match c {
+            '*' => *i += 1,
+            '#' => {
+                *i += 1;
+                s.id = Some(ident(i));
+            }
+            '.' => {
+                *i += 1;
+                s.classes.push(ident(i));
+            }
+            '[' => {
+                let st = *i + 1;
+                let mut quote = None;
+                while *i < chars.len() && (quote.is_some() || chars[*i] != ']') {
+                    match (chars[*i], quote) {
+                        ('"' | '\'', None) => quote = Some(chars[*i]),
+                        (q, Some(open)) if q == open => quote = None,
+                        _ => {}
+                    }
+                    *i += 1;
+                }
+                if *i >= chars.len() {
+                    return None;
+                }
+                let inner: String = chars[st..*i].iter().collect();
+                s.attrs.push(parse_attr(&inner)?);
+                *i += 1;
+            }
+            ':' => {
+                *i += 1;
+                if *i < chars.len() && chars[*i] == ':' {
+                    return None; // pseudo-elements
+                }
+                let name = ident(i).to_ascii_lowercase();
+                // A functional pseudo-class's argument, up to its `)`.
+                let arg = if *i < chars.len() && chars[*i] == '(' {
+                    let st = *i + 1;
+                    let mut d = 0;
+                    while *i < chars.len() {
+                        match chars[*i] {
+                            '(' => d += 1,
+                            ')' => {
+                                d -= 1;
+                                if d == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        *i += 1;
+                    }
+                    if *i >= chars.len() {
+                        return None;
+                    }
+                    *i += 1;
+                    Some(chars[st..*i - 1].iter().collect::<String>())
+                } else {
+                    None
+                };
+                let list = |a: &str, relative: bool| -> Option<Vec<Selector>> {
+                    let v: Vec<Selector> = split_selector_list(a)
+                        .into_iter()
+                        .take(MAX_SELECTOR_LIST)
+                        .filter_map(|t| parse_complex(t, relative, depth + 1))
+                        .collect();
+                    (!v.is_empty()).then_some(v)
+                };
+                let nth = |of_type: bool, from_end: bool| -> Option<Pseudo> {
+                    let (a, b) = parse_nth(arg.as_deref()?)?;
+                    Some(Pseudo::Nth {
+                        a,
+                        b,
+                        of_type,
+                        from_end,
+                    })
+                };
+                let first = |of_type, from_end| Pseudo::Nth {
+                    a: 0,
+                    b: 1,
+                    of_type,
+                    from_end,
+                };
+                match (name.as_str(), arg.as_deref()) {
+                    ("root", None) => s.root = true,
+                    ("link" | "any-link", None) => s.attrs.push(AttrSelector {
+                        name: "href".into(),
+                        op: AttrOp::Exists,
+                        value: String::new(),
+                        ignore_case: false,
+                    }),
+                    ("first-child", None) => s.pseudo.push(first(false, false)),
+                    ("last-child", None) => s.pseudo.push(first(false, true)),
+                    ("first-of-type", None) => s.pseudo.push(first(true, false)),
+                    ("last-of-type", None) => s.pseudo.push(first(true, true)),
+                    ("only-child", None) => s.pseudo.push(Pseudo::Only { of_type: false }),
+                    ("only-of-type", None) => s.pseudo.push(Pseudo::Only { of_type: true }),
+                    ("empty", None) => s.pseudo.push(Pseudo::Empty),
+                    ("nth-child", Some(_)) => s.pseudo.push(nth(false, false)?),
+                    ("nth-last-child", Some(_)) => s.pseudo.push(nth(false, true)?),
+                    ("nth-of-type", Some(_)) => s.pseudo.push(nth(true, false)?),
+                    ("nth-last-of-type", Some(_)) => s.pseudo.push(nth(true, true)?),
+                    // Unknown selectors inside :not() make it match nothing
+                    // rather than everything.
+                    ("not", Some(a)) => s.pseudo.push(Pseudo::Not(list(a, false)?)),
+                    ("is" | "matches" | "-webkit-any", Some(a)) => s.pseudo.push(Pseudo::Is {
+                        list: list(a, false)?,
+                        where_: false,
+                    }),
+                    ("where", Some(a)) => s.pseudo.push(Pseudo::Is {
+                        list: list(a, false)?,
+                        where_: true,
+                    }),
+                    ("has", Some(a)) => s.pseudo.push(Pseudo::Has(list(a, true)?)),
+                    (
+                        "hover" | "active" | "focus" | "focus-visible" | "focus-within" | "visited"
+                        | "checked" | "target" | "target-within" | "indeterminate" | "invalid"
+                        | "user-invalid" | "autofill" | "placeholder-shown" | "fullscreen" | "modal"
+                        | "popover-open" | "open",
+                        None,
+                    ) => s.pseudo.push(Pseudo::Never),
+                    // Form states we can tell from attributes.
+                    ("disabled", None) => s.attrs.push(AttrSelector {
+                        name: "disabled".into(),
+                        op: AttrOp::Exists,
+                        value: String::new(),
+                        ignore_case: false,
+                    }),
+                    ("enabled" | "valid" | "read-write" | "defined" | "scope", None) => {}
+                    _ => return None,
+                }
+            }
+            c if c.is_alphanumeric() || c == '-' || c == '_' => {
+                s.tag = Some(ident(i).to_ascii_lowercase());
+            }
+            _ => return None,
+        }
+        any = true;
+    }
+    any.then_some(s)
+}
+
+/// The inside of `[...]`.
+fn parse_attr(inner: &str) -> Option<AttrSelector> {
+    let inner = inner.trim();
+    // The first `=` ends the name (and operator); later ones are the value's.
+    let found = inner.find('=').map(|eq| {
+        let op = match inner[..eq].chars().last() {
+            Some('~') => AttrOp::Word,
+            Some('|') => AttrOp::Lang,
+            Some('^') => AttrOp::Prefix,
+            Some('$') => AttrOp::Suffix,
+            Some('*') => AttrOp::Contains,
+            _ => AttrOp::Equals,
+        };
+        let at = if op == AttrOp::Equals { eq } else { eq - 1 };
+        (at, eq + 1 - at, op)
+    });
+    let Some((at, len, op)) = found else {
+        let name = inner.to_ascii_lowercase();
+        let ok = !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_');
+        return ok.then_some(AttrSelector {
+            name,
+            op: AttrOp::Exists,
+            value: String::new(),
+            ignore_case: false,
+        });
+    };
+    let name = inner[..at].trim().to_ascii_lowercase();
+    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+        return None;
+    }
+    let mut rest = inner[at + len..].trim();
+    let mut ignore_case = false;
+    for flag in [" i", " I", " s", " S"] {
+        if let Some(r) = rest.strip_suffix(flag) {
+            ignore_case = flag.trim().eq_ignore_ascii_case("i");
+            rest = r.trim_end();
+        }
+    }
+    let value = match rest.chars().next() {
+        Some(q @ ('"' | '\'')) => rest.strip_prefix(q)?.strip_suffix(q)?.to_string(),
+        _ if rest.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') => rest.to_string(),
+        _ => return None,
+    };
+    Some(AttrSelector {
+        name,
+        op,
+        value,
+        ignore_case,
+    })
+}
+
+/// `an+b` as written in `:nth-child()`: `odd`, `even`, `3`, `2n+1`, `-n+3`...
+/// (`of S` isn't supported).
+fn parse_nth(arg: &str) -> Option<(i32, i32)> {
+    let t: String = arg
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    match t.as_str() {
+        "odd" => return Some((2, 1)),
+        "even" => return Some((2, 0)),
+        _ => {}
+    }
+    let num = |s: &str| -> Option<i32> {
+        let s = s.strip_prefix('+').unwrap_or(s);
+        if s.is_empty() || !s.trim_start_matches('-').chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        s.parse::<i32>().ok().filter(|n| n.abs() <= 1_000_000)
+    };
+    match t.find('n') {
+        None => Some((0, num(&t)?)),
+        Some(at) => {
+            let a = match &t[..at] {
+                "" | "+" => 1,
+                "-" => -1,
+                s => num(s)?,
+            };
+            let b = match &t[at + 1..] {
+                "" => 0,
+                s if s.starts_with('+') || s.starts_with('-') => num(s)?,
+                _ => return None,
+            };
+            Some((a, b))
+        }
+    }
 }
 
 pub fn parse_values(text: &str) -> Vec<Value> {
@@ -684,9 +998,13 @@ mod tests {
 
     #[test]
     fn drops_unsupported_selectors_only() {
-        let ss = parse("a:hover, b { color: red } @font-face { x: y } i { color: blue }");
+        let ss = parse("a::before, b { color: red } @font-face { x: y } i { color: blue }");
         assert_eq!(ss.rules.len(), 2);
         assert_eq!(ss.rules[0].selectors.len(), 1);
+        // States the page isn't in are kept (they just don't match), so
+        // `:not(:hover)` works.
+        let ss = parse("a:hover, b { color: red }");
+        assert_eq!(ss.rules[0].selectors.len(), 2);
     }
 
     #[test]

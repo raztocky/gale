@@ -72,6 +72,25 @@ struct ANode {
     data: NodeType,
 }
 
+/// Elements are real elements (not the document or a fragment, whose tags
+/// start with `#`).
+impl crate::selectors::Tree for Dom {
+    fn element(&self, id: u32) -> Option<&ElementData> {
+        Dom::element(self, id).filter(|e| !e.tag.starts_with('#'))
+    }
+    fn parent_node(&self, id: u32) -> Option<u32> {
+        self.nodes.get(id as usize)?.parent
+    }
+    fn children(&self, id: u32) -> &[u32] {
+        self.nodes.get(id as usize).map_or(&[], |n| &n.children)
+    }
+    fn has_text(&self, id: u32) -> bool {
+        self.nodes
+            .get(id as usize)
+            .is_some_and(|n| matches!(&n.data, NodeType::Text(t) if !t.is_empty()))
+    }
+}
+
 /// A mutable DOM. Node 0 is the document.
 #[derive(Debug, Default)]
 pub struct Dom {
@@ -343,33 +362,8 @@ impl Dom {
         }
     }
 
-    /// Ancestor elements of `id`, root first (the document excluded).
-    fn ancestors(&self, id: u32) -> Vec<&ElementData> {
-        let mut v = Vec::new();
-        let mut cur = self.nodes[id as usize].parent;
-        while let Some(p) = cur {
-            if p == DOCUMENT {
-                break;
-            }
-            if let Some(e) = self.element(p) {
-                if !e.tag.starts_with('#') {
-                    v.push(e);
-                }
-            }
-            cur = self.nodes[p as usize].parent;
-        }
-        v.reverse();
-        v
-    }
-
     fn matches(&self, id: u32, sels: &[css::Selector]) -> bool {
-        match self.element(id) {
-            Some(e) if !e.tag.starts_with('#') => {
-                let anc = self.ancestors(id);
-                sels.iter().any(|s| crate::style::matches(e, &anc, s))
-            }
-            _ => false,
-        }
+        sels.iter().any(|s| crate::selectors::matches(self, id, s))
     }
 
     /// Descendants of `root` in tree order.
@@ -509,25 +503,13 @@ fn opt_str(s: Option<String>) -> JsValue {
 }
 
 fn parse_selectors(text: &str) -> Option<Vec<css::Selector>> {
-    // Split on commas outside brackets and quotes.
-    let mut parts = Vec::new();
-    let (mut depth, mut start, mut quote) = (0i32, 0, None);
-    for (i, c) in text.char_indices() {
-        match (c, quote) {
-            ('"' | '\'', None) => quote = Some(c),
-            (q, Some(open)) if q == open => quote = None,
-            (_, Some(_)) => {}
-            ('[' | '(', None) => depth += 1,
-            (']' | ')', None) => depth -= 1,
-            (',', None) if depth == 0 => {
-                parts.push(&text[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    parts.push(&text[start..]);
-    parts.into_iter().map(css::parse_selector).collect()
+    // All or nothing: a script asking for a selector we can't match gets
+    // told, rather than a partial answer.
+    crate::selectors::reset_budget();
+    css::split_selector_list(text)
+        .into_iter()
+        .map(css::parse_selector)
+        .collect()
 }
 
 /// Selectors Brickle doesn't support yet return no matches, with a console

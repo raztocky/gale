@@ -1,7 +1,8 @@
 //! Selector matching, the cascade, inheritance and computed values.
 
-use crate::css::{self, Color, Combinator, Declaration, SimpleSelector, Stylesheet, Unit, Value};
+use crate::css::{self, Color, Declaration, Stylesheet, Unit, Value};
 use crate::dom::{ElementData, Node, NodeType};
+use crate::selectors::{self, Flat};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -217,6 +218,9 @@ pub struct ComputedStyle {
     pub border_color: [Color; 4],
     pub width: Len,
     pub height: Len,
+    /// `box-sizing: border-box`: `width`, `height` and their limits include
+    /// padding and border.
+    pub border_box: bool,
     pub min_height: Len,
     pub max_width: Len,
     pub visible: bool,
@@ -290,6 +294,7 @@ impl ComputedStyle {
             border_width: [0.0; 4],
             border_color: [Color::BLACK; 4],
             width: Len::Auto,
+            border_box: false,
             height: Len::Auto,
             min_height: Len::Auto,
             max_width: Len::Auto,
@@ -394,7 +399,19 @@ pub fn style_tree<'a>(root: &'a Node, ctx: &StyleContext) -> StyledNode<'a> {
     base.line_height *= k;
     let mut ancestors = Vec::new();
     let index = RuleIndex::new(&ctx.sheets);
-    style_node(root, &base, &mut ancestors, ctx, &index, true)
+    let flat = Flat::new(root);
+    selectors::reset_budget();
+    let mut next_id = 0;
+    style_node(
+        root,
+        &base,
+        &mut ancestors,
+        ctx,
+        &index,
+        &flat,
+        &mut next_id,
+        true,
+    )
 }
 
 /// Selectors bucketed by their subject's id, first class or tag, so each
@@ -460,28 +477,35 @@ impl<'s> RuleIndex<'s> {
     }
 }
 
+/// `id` is `node`'s id in `flat`; `next_id` counts nodes in tree order, as
+/// `Flat` numbers them.
+#[allow(clippy::too_many_arguments)]
 fn style_node<'a>(
     node: &'a Node,
     parent: &ComputedStyle,
     ancestors: &mut Vec<&'a ElementData>,
     ctx: &StyleContext,
     index: &RuleIndex,
+    flat: &Flat,
+    next_id: &mut u32,
     is_root: bool,
 ) -> StyledNode<'a> {
+    let id = *next_id;
+    *next_id += 1;
     let style = match &node.node_type {
         NodeType::Text(_) => {
             let mut s = parent.inherit();
             s.display = Display::Inline;
             s
         }
-        NodeType::Element(e) => compute(e, parent, ancestors, ctx, index, is_root),
+        NodeType::Element(e) => compute(e, parent, ancestors, ctx, index, (flat, id), is_root),
     };
     let style = Rc::new(style);
     let mut children = Vec::new();
     if let NodeType::Element(e) = &node.node_type {
         ancestors.push(e);
         for c in &node.children {
-            children.push(style_node(c, &style, ancestors, ctx, index, false));
+            children.push(style_node(c, &style, ancestors, ctx, index, flat, next_id, false));
         }
         ancestors.pop();
     }
@@ -492,51 +516,14 @@ fn style_node<'a>(
     }
 }
 
-fn matches_simple(e: &ElementData, s: &SimpleSelector, is_root: bool) -> bool {
-    if s.tag.as_ref().is_some_and(|t| *t != e.tag) {
-        return false;
-    }
-    if s.id.as_ref().is_some_and(|id| Some(id.as_str()) != e.id()) {
-        return false;
-    }
-    if s.root && !is_root {
-        return false;
-    }
-    s.classes.iter().all(|c| e.has_class(c)) && s.attrs.iter().all(|a| e.attrs.contains_key(a))
-}
-
-/// Match a right-to-left selector against an element and its ancestor chain.
-pub fn matches(e: &ElementData, ancestors: &[&ElementData], sel: &css::Selector) -> bool {
-    fn go(parts: &[(SimpleSelector, Combinator)], e: &ElementData, anc: &[&ElementData]) -> bool {
-        let (simple, comb) = &parts[0];
-        if !matches_simple(e, simple, anc.is_empty() && e.tag == "html") {
-            return false;
-        }
-        if parts.len() == 1 {
-            return true;
-        }
-        match comb {
-            Combinator::Child => anc.split_last().is_some_and(|(p, rest)| go(&parts[1..], p, rest)),
-            // With only descendant combinators left, matching the nearest
-            // qualifying ancestor is always optimal, so no backtracking is
-            // needed. This keeps crafted selectors like `a a a a a b` on deep
-            // trees from taking exponential time.
-            _ if parts[1..].iter().all(|(_, c)| *c != Combinator::Child) => (0..anc.len())
-                .rev()
-                .find(|&i| matches_simple(anc[i], &parts[1].0, i == 0 && anc[i].tag == "html"))
-                .is_some_and(|i| go(&parts[1..], anc[i], &anc[..i])),
-            _ => (0..anc.len()).rev().any(|i| go(&parts[1..], anc[i], &anc[..i])),
-        }
-    }
-    go(&sel.parts, e, ancestors)
-}
-
+/// `at` is the element in the document being matched against.
 fn compute(
     e: &ElementData,
     parent: &ComputedStyle,
     ancestors: &[&ElementData],
     ctx: &StyleContext,
     index: &RuleIndex,
+    at: (&Flat, u32),
     is_root: bool,
 ) -> ComputedStyle {
     let mut matched: Vec<MatchedRule> = Vec::new();
@@ -545,7 +532,7 @@ fn compute(
     let mut hits: std::collections::BTreeMap<usize, (u8, &css::Rule, css::Specificity)> = Default::default();
     for i in index.candidates(e) {
         let (rule_order, origin, rule, sel) = index.entries[i];
-        if matches(e, ancestors, sel) {
+        if selectors::matches(at.0, at.1, sel) {
             let spec = sel.specificity();
             hits.entry(rule_order)
                 .and_modify(|h| h.2 = h.2.max(spec))
@@ -955,6 +942,13 @@ fn compute(
                     Some(v) if absolute(v) => ctxv.length(v, fs).map_or(s.line_height, |px| px * scale),
                     Some(v) => ctxv.length(v, fs).unwrap_or(s.line_height),
                     None => s.line_height,
+                }
+            }
+            "box-sizing" => {
+                s.border_box = match kw {
+                    "border-box" => true,
+                    "content-box" => false,
+                    _ => s.border_box,
                 }
             }
             "text-align" => {

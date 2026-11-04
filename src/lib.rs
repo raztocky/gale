@@ -22,6 +22,7 @@ pub mod paint;
 pub mod renderer;
 pub mod sandbox;
 pub mod select;
+pub mod selectors;
 pub mod style;
 pub mod tab;
 pub mod urlclean;

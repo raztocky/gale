@@ -726,7 +726,12 @@ impl<'a> LayoutBox<'a> {
             matches!(s.display, Display::Table | Display::InlineTable).then(|| self.table_columns(cb_w));
         let d = &mut self.dims;
 
-        let mut width = s.width.resolve(cb_w);
+        // (A table's `width` is always its border box's, below.)
+        let mut width = if table.is_some() {
+            s.width.resolve(cb_w)
+        } else {
+            content_size(s.width, cb_w, &s, hz)
+        };
         if let Some(t) = &table {
             // A table is as wide as its columns want, within the space it has.
             // Its `width` is for the border box, and it never gets narrower
@@ -740,7 +745,7 @@ impl<'a> LayoutBox<'a> {
                 }
             });
         }
-        if let (Some(w), Some(max)) = (width, s.max_width.resolve(cb_w)) {
+        if let (Some(w), Some(max)) = (width, content_size(s.max_width, cb_w, &s, hz)) {
             width = Some(w.min(max));
         }
         let mut ml = s.margin[3].resolve(cb_w);
@@ -774,7 +779,7 @@ impl<'a> LayoutBox<'a> {
             }
         }
         let (mut w, mut l, mut r) = solve(width, ml, mr);
-        if let Some(max) = s.max_width.resolve(cb_w) {
+        if let Some(max) = content_size(s.max_width, cb_w, &s, hz) {
             if w > max {
                 (w, l, r) = solve(Some(max), ml, mr);
             }
@@ -800,10 +805,8 @@ impl<'a> LayoutBox<'a> {
         } else if let Some(t) = table {
             self.layout_table(t);
         } else if is_flex(s.display) {
-            let definite_h = match s.height {
-                Len::Px(h) => Some(h),
-                _ => None,
-            };
+            let vz = self.dims.border_box().h - self.dims.content.h;
+            let definite_h = content_height(s.height, &s, vz);
             self.layout_flex(definite_h);
         } else {
             self.layout_block_children(floats);
@@ -817,10 +820,11 @@ impl<'a> LayoutBox<'a> {
 
         let s = self.style().clone();
         let d = &mut self.dims;
-        if let Len::Px(h) = s.height {
+        let vz = d.padding.t + d.padding.b + d.border.t + d.border.b;
+        if let Some(h) = content_height(s.height, &s, vz) {
             d.content.h = h;
         }
-        if let Len::Px(h) = s.min_height {
+        if let Some(h) = content_height(s.min_height, &s, vz) {
             d.content.h = d.content.h.max(h);
         }
         // A positioned box is the containing block of the absolutely
@@ -879,7 +883,7 @@ impl<'a> LayoutBox<'a> {
         let pb = px(s.padding[1], cb.w) + px(s.padding[3], cb.w) + s.border_width[1] + s.border_width[3];
         let (ml, mr) = (s.margin[3].resolve(cb.w), s.margin[1].resolve(cb.w));
         let mh = ml.unwrap_or(0.0) + mr.unwrap_or(0.0);
-        let width = s.width.resolve(cb.w);
+        let width = content_size(s.width, cb.w, &s, pb);
         // Border-box width: as given, stretched between `left` and `right`,
         // or shrink-to-fit.
         let bw = match (width, l, r) {
@@ -891,7 +895,7 @@ impl<'a> LayoutBox<'a> {
                 max.min(avail).max(min) - mh
             }
         };
-        let bw = match s.max_width.resolve(cb.w) {
+        let bw = match content_size(s.max_width, cb.w, &s, pb) {
             Some(m) if width.is_some() => bw.min(m + pb),
             _ => bw,
         };
@@ -1011,10 +1015,17 @@ impl<'a> LayoutBox<'a> {
             // than a width that's set.
             let lo = lo.min(c.intrinsic_widths_of(avail, false).0);
             let outer_extra = c.outer_extra_w(avail);
-            base.push(match c.flex().basis.resolve(avail) {
-                Some(b) => b + outer_extra,
-                None => hi,
-            });
+            base.push(
+                match content_size(
+                    c.flex().basis,
+                    avail,
+                    c.style(),
+                    padding_border_w(c.style(), avail),
+                ) {
+                    Some(b) => b + outer_extra,
+                    None => hi,
+                },
+            );
             min.push(lo);
         }
         let hyp: Vec<f32> = base.iter().zip(&min).map(|(b, m)| b.max(*m)).collect();
@@ -1156,7 +1167,9 @@ impl<'a> LayoutBox<'a> {
                 .basis
                 .resolve(definite_h.unwrap_or(0.0))
                 .filter(|_| definite_h.is_some());
+            let vz = c.dims.border_box().h - c.dims.content.h;
             size.push(match basis {
+                Some(b) if c.style().border_box => (b - vz).max(0.0) + (h - c.dims.content.h),
                 Some(b) => b + (h - c.dims.content.h),
                 None => h,
             });
@@ -1321,7 +1334,7 @@ impl<'a> LayoutBox<'a> {
             // A cell with a fixed width still grows to fit its content.
             // Percentages are left to the table.
             if s.display != Display::TableCell && sized {
-                if let Some(w) = s.width.resolve(cb_w) {
+                if let Some(w) = content_size(s.width, cb_w, s, pb) {
                     return (w + hz, w + hz);
                 }
             }
@@ -1442,14 +1455,14 @@ impl<'a> LayoutBox<'a> {
             }
         };
         let (mut min, mut max) = (min + hz, max + hz);
-        if let (BoxKind::Block(_), Some(w), true) = (&self.kind, s.width.resolve(cb_w), sized) {
+        if let (BoxKind::Block(_), Some(w), true) = (&self.kind, content_size(s.width, cb_w, s, pb), sized) {
             // A fixed-width cell (percentages were skipped above).
             if matches!(s.width, Len::Px(_)) {
                 min = min.max(w + hz);
                 max = min;
             }
         }
-        if let Some(m) = s.max_width.resolve(cb_w) {
+        if let Some(m) = content_size(s.max_width, cb_w, s, pb) {
             min = min.min(m + hz);
             max = max.min(m + hz);
         }
@@ -2538,6 +2551,27 @@ fn spread(j: Justify, free: f32, n: usize) -> (f32, f32) {
     }
 }
 
+/// A `width`-like length as a content-box size. With `box-sizing:
+/// border-box` it includes `extra` (padding and border), which comes off.
+fn content_size(l: Len, cb_w: f32, s: &ComputedStyle, extra: f32) -> Option<f32> {
+    l.resolve(cb_w)
+        .map(|v| if s.border_box { (v - extra).max(0.0) } else { v })
+}
+
+/// The same for a fixed height (percentage heights aren't supported).
+fn content_height(l: Len, s: &ComputedStyle, extra: f32) -> Option<f32> {
+    match l {
+        Len::Px(h) if s.border_box => Some((h - extra).max(0.0)),
+        Len::Px(h) => Some(h),
+        _ => None,
+    }
+}
+
+/// Horizontal padding and border, from the style.
+fn padding_border_w(s: &ComputedStyle, cb_w: f32) -> f32 {
+    s.padding[1].or_zero(cb_w) + s.padding[3].or_zero(cb_w) + s.border_width[1] + s.border_width[3]
+}
+
 fn margins_h(b: &LayoutBox, cb_w: f32) -> f32 {
     let s = b.style();
     s.margin[1].or_zero(cb_w) + s.margin[3].or_zero(cb_w)
@@ -3501,5 +3535,107 @@ mod calc_var_tests {
         );
         assert!(start.elapsed().as_secs() < 2, "{:?}", start.elapsed());
         assert!(s.vars.values().all(|v| v.len() <= 1024));
+    }
+}
+
+#[cfg(test)]
+mod box_sizing_tests {
+    use super::table_tests::{boxes, close};
+
+    const BB: &str = "box-sizing:border-box;padding:10px;border:5px solid";
+
+    #[test]
+    fn border_box_widths_include_padding_and_border() {
+        let b = boxes(&format!("<div style='width:200px;{BB}'>x</div>"), 800.0, "div");
+        assert!(close(b[0].w, 200.0), "{:?}", b[0]);
+        let b = boxes(
+            "<div style='width:200px;padding:10px;border:5px solid'>x</div>",
+            800.0,
+            "div",
+        );
+        assert!(close(b[0].w, 230.0), "content-box by default: {:?}", b[0]);
+        // Percentages and max-width too.
+        let b = boxes(&format!("<div style='width:50%;{BB}'>x</div>"), 800.0, "div");
+        assert!(close(b[0].w, 400.0), "{:?}", b[0]);
+        let b = boxes(
+            &format!("<div style='max-width:300px;{BB}'>x</div>"),
+            800.0,
+            "div",
+        );
+        assert!(close(b[0].w, 300.0), "{:?}", b[0]);
+        // Padding bigger than the width: the content is just empty.
+        let b = boxes(&format!("<div style='width:10px;{BB}'>x</div>"), 800.0, "div");
+        assert!(close(b[0].w, 30.0), "{:?}", b[0]);
+    }
+
+    #[test]
+    fn border_box_heights() {
+        let b = boxes(&format!("<div style='height:100px;{BB}'>x</div>"), 800.0, "div");
+        assert!(close(b[0].h, 100.0), "{:?}", b[0]);
+        let b = boxes(
+            &format!("<div style='min-height:100px;{BB}'>x</div>"),
+            800.0,
+            "div",
+        );
+        assert!(close(b[0].h, 100.0), "{:?}", b[0]);
+    }
+
+    #[test]
+    fn border_box_in_flex_inline_blocks_and_positioning() {
+        // Three border-box thirds fit on one line.
+        let b = boxes(
+            &format!(
+                "<div style='display:flex'><p style='margin:0;width:33.33%;{BB}'>a</p>\
+                 <p style='margin:0;width:33.33%;{BB}'>b</p><p style='margin:0;width:33.33%;{BB}'>c</p></div>"
+            ),
+            900.0,
+            "p",
+        );
+        assert!(b.iter().all(|r| close(r.y, b[0].y) && close(r.w, 300.0)), "{b:?}");
+        let b = boxes(
+            &format!("<div style='display:flex'><p style='margin:0;flex:0 0 200px;{BB}'>a</p></div>"),
+            900.0,
+            "p",
+        );
+        assert!(close(b[0].w, 200.0), "flex-basis: {:?}", b[0]);
+        let b = boxes(
+            &format!("<span style='display:inline-block;width:120px;{BB}'>x</span>"),
+            800.0,
+            "span",
+        );
+        assert!(close(b[0].w, 120.0), "inline-block: {:?}", b[0]);
+        let b = boxes(
+            &format!(
+                "<div style='position:relative'><i style='position:absolute;width:80px;{BB}'>x</i></div>"
+            ),
+            800.0,
+            "i",
+        );
+        assert!(close(b[0].w, 80.0), "absolute: {:?}", b[0]);
+    }
+
+    #[test]
+    fn the_common_reset() {
+        // `*, *::before, *::after { box-sizing: border-box }`: the
+        // pseudo-elements are dropped, the rest of the rule applies.
+        use crate::{css, html, layout::layout_tree, style};
+        let dom = html::parse("<body style='margin:0'><div style='width:200px;padding:20px'>x</div>");
+        let (ua, reset) = (
+            css::parse(style::UA_CSS),
+            css::parse("*, *::before, *::after { box-sizing: border-box }"),
+        );
+        let ctx = style::StyleContext {
+            text_scale: 1.0,
+            sheets: vec![(0, &ua), (1, &reset)],
+            viewport: (800.0, 600.0),
+        };
+        let styled = style::style_tree(&dom, &ctx);
+        let root = layout_tree(&styled, 800.0);
+        let div = &root.children[0].children[0];
+        assert!(
+            close(div.dims.border_box().w, 200.0),
+            "{:?}",
+            div.dims.border_box()
+        );
     }
 }

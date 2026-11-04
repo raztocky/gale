@@ -174,4 +174,4 @@ On non-Linux systems the sandbox isn't implemented yet, so you have to run with 
 
 ## Not yet
 
-JavaScript modules, CORS preflight, file uploads, conic gradients and multiple background layers, SVG, animated images, choosing between conflicting collapsed table borders (cells' borders are drawn over the table's), `position: sticky` with `bottom`/`left`/`right` (only `top` sticks), relative offsets and vertical padding on inline elements, borders drawn around inline elements, web fonts, and selecting text inside form fields.
+JavaScript modules, CORS preflight, file uploads, `::before`/`::after` generated content, `:nth-child(… of S)`, conic gradients and multiple background layers, SVG, animated images, choosing between conflicting collapsed table borders (cells' borders are drawn over the table's), `position: sticky` with `bottom`/`left`/`right` (only `top` sticks), relative offsets and vertical padding on inline elements, borders drawn around inline elements, web fonts, and selecting text inside form fields.
