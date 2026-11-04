@@ -137,6 +137,10 @@ const CURRENT_MATCH: Color = Color {
     a: 0xb0,
 };
 const FIND_W: f32 = 340.0;
+/// Pixels a mouse wheel notch scrolls, at 100% text.
+const WHEEL_STEP: f32 = 48.0;
+/// The scrollbar's width, at the page's right edge, in interface units.
+const SCROLLBAR_W: f32 = 12.0;
 const FIND_H: f32 = 30.0;
 /// Drawn over selected text.
 const SELECTION: Color = Color {
@@ -569,6 +573,8 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
     let mut ix = PageIndex::new(&rendered);
     let mut find: Option<Find> = None;
     let mut press: Option<(f32, f32)> = None;
+    // Dragging the scrollbar: where on the thumb you grabbed it.
+    let mut scroll_drag: Option<f32> = None;
     let mut dragged = false;
     let mut word_press = false;
     let mut last_press: Option<(Instant, f32, f32)> = None;
@@ -1090,8 +1096,8 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             }
             let before = scroll;
             match key {
-                Key::Down => scroll += 40.0,
-                Key::Up => scroll -= 40.0,
+                Key::Down => scroll += 40.0 * ui.text_scale,
+                Key::Up => scroll -= 40.0 * ui.text_scale,
                 Key::PageDown | Key::Space => scroll += view_h * 0.9,
                 Key::PageUp => scroll -= view_h * 0.9,
                 Key::Home => scroll = 0.0,
@@ -1165,10 +1171,12 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         let mouse = window.get_mouse_pos(MouseMode::Discard);
         let over_panel = ui.panel && mouse.is_some_and(|(mx, my)| mx >= page_w && my > bar);
         if let Some((_, dy)) = window.get_scroll_wheel() {
+            // About three lines a notch (X11 reports 1 per notch), more
+            // with bigger text.
             if over_panel {
-                ui.panel_scroll = (ui.panel_scroll - dy * 3.0).max(0.0);
+                ui.panel_scroll = (ui.panel_scroll - dy * WHEEL_STEP).max(0.0);
             } else {
-                scroll -= dy * 3.0;
+                scroll -= dy * WHEEL_STEP * ui.text_scale;
             }
             dirty = true;
         }
@@ -1353,6 +1361,15 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                         Err(_) => "Wait for the page to finish loading".into(),
                     });
                 } else if over_panel {
+                } else if let Some((y, h)) = scrollbar_thumb(scroll, max_scroll, view_h, k)
+                    .filter(|_| my > bar && mx >= page_w - SCROLLBAR_W * k && mx < page_w)
+                {
+                    // On the scrollbar: drag the thumb from where you
+                    // grabbed it; off it, the thumb jumps there first.
+                    let at = my - bar;
+                    let grab = if (y..y + h).contains(&at) { at - y } else { h / 2.0 };
+                    scroll_drag = Some(grab);
+                    scroll = scroll_for_thumb(at - grab, max_scroll, view_h, h);
                 } else if my > bar {
                     // The page gets the click when you let go (below), so
                     // that dragging can select text instead.
@@ -1381,6 +1398,19 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     ui.address.set(&info.url);
                 }
                 dirty = true;
+            }
+        }
+        if let Some(grab) = scroll_drag {
+            match (down, mouse, scrollbar_thumb(scroll, max_scroll, view_h, k)) {
+                (true, Some((_, my)), Some((_, h))) => {
+                    let to = scroll_for_thumb(my - bar - grab, max_scroll, view_h, h);
+                    if to != scroll {
+                        scroll = to;
+                        dirty = true;
+                    }
+                }
+                (true, None, _) => {}
+                _ => scroll_drag = None,
             }
         }
         // A press on the page: dragging selects text, letting go without
@@ -1885,6 +1915,27 @@ fn draw_tabs(c: &mut Canvas, titles: &[(String, bool)], cache: &mut GlyphCache) 
     text(c, plus.x + 7.0, plus.y + 16.0, "+", BOLD, 16.0, GRAY, cache, 0.0);
 }
 
+/// The scrollbar thumb's top (from the top of the page area) and height,
+/// in window pixels, if the page scrolls. `k` is the interface size.
+fn scrollbar_thumb(scroll: f32, max_scroll: f32, view_h: f32, k: f32) -> Option<(f32, f32)> {
+    if !(max_scroll > 0.0 && view_h > 0.0) {
+        return None;
+    }
+    let h = (view_h / (view_h + max_scroll) * view_h)
+        .max(24.0 * k)
+        .min(view_h);
+    Some(((scroll / max_scroll).clamp(0.0, 1.0) * (view_h - h), h))
+}
+
+/// The scroll position that puts the thumb's top at `top`.
+fn scroll_for_thumb(top: f32, max_scroll: f32, view_h: f32, thumb_h: f32) -> f32 {
+    let track = view_h - thumb_h;
+    if track <= 0.0 {
+        return 0.0;
+    }
+    (top / track * max_scroll).clamp(0.0, max_scroll)
+}
+
 /// The next size in `steps` up (`dir` 1) or down (-1) from `cur`.
 fn step_scale(steps: &[f32], cur: f32, dir: i32) -> f32 {
     if dir > 0 {
@@ -2312,14 +2363,13 @@ fn draw_chrome(
         text(c, x, base, &rest, SANS, 14.0, GRAY, cache, 0.0);
     }
 
-    if max_scroll > 0.0 {
-        let thumb = (view_h / (view_h + max_scroll) * view_h).max(24.0);
-        let y = BAR_H + scroll / max_scroll * (view_h - thumb);
+    // `view_h` is in interface units here, `scroll` in pixels.
+    if let Some((y, thumb)) = scrollbar_thumb(scroll, max_scroll, view_h * c.scale, c.scale) {
         let bar = Rect {
-            x: page_w - 8.0,
-            y,
-            w: 6.0,
-            h: thumb,
+            x: page_w - SCROLLBAR_W + 2.0,
+            y: BAR_H + y / c.scale,
+            w: SCROLLBAR_W - 4.0,
+            h: thumb / c.scale,
         };
         c.fill(
             bar,
@@ -2727,6 +2777,22 @@ mod menu_tests {
         assert_eq!(step(1.3, 1), 1.5);
         assert_eq!(step(1.3, -1), 1.25);
         assert_eq!(step_scale(&UI_SCALES, 1.0, 1), 1.25);
+    }
+
+    #[test]
+    fn scrollbar_maps_both_ways() {
+        assert_eq!(scrollbar_thumb(0.0, 0.0, 500.0, 1.0), None, "nothing to scroll");
+        // A page twice the window: the thumb is half the track.
+        let (y, h) = scrollbar_thumb(0.0, 500.0, 500.0, 1.0).unwrap();
+        assert_eq!((y, h), (0.0, 250.0));
+        let (y, _) = scrollbar_thumb(500.0, 500.0, 500.0, 1.0).unwrap();
+        assert_eq!(y, 250.0, "at the bottom");
+        assert_eq!(scroll_for_thumb(125.0, 500.0, 500.0, 250.0), 250.0);
+        assert_eq!(scroll_for_thumb(-50.0, 500.0, 500.0, 250.0), 0.0);
+        assert_eq!(scroll_for_thumb(9e9, 500.0, 500.0, 250.0), 500.0);
+        // A huge page still gets a thumb you can grab.
+        let (_, h) = scrollbar_thumb(0.0, 1e7, 500.0, 2.0).unwrap();
+        assert_eq!(h, 48.0);
     }
 
     #[test]
