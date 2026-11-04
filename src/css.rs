@@ -1,5 +1,7 @@
-//! CSS parser: stylesheets, selectors (type/class/id/universal, descendant
-//! and child combinators) and declarations with a handful of value types.
+//! CSS parser: stylesheets, selectors (with combinators, attributes,
+//! pseudo-classes and escaped names), `@media` queries (kept on each rule
+//! and checked against the viewport when styling) and declarations with a
+//! handful of value types.
 
 #[derive(Debug, Clone, Default)]
 pub struct Stylesheet {

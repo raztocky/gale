@@ -6,13 +6,15 @@ Planned work, roughly in priority order. Items marked *discuss* need a decision 
 - [x] Images (PNG/JPEG/WebP/GIF/SVG), decoded inside the sandboxed renderer
 - [x] SVG images: text, in the bundled fonts
 - [ ] SVG images: drawing at the size shown rather than the SVG's own size
-- [ ] Images: CSS `background-image`, `<picture>`/`srcset` choice by size, animation, lazy
-      loading, inline `<svg>` in HTML
-- [ ] Floats and positioning (`float`, `position: absolute/fixed/relative`)
-- [ ] Real table layout
-- [x] Show `<noscript>` content
+- [x] Images: CSS `background-image`
+- [ ] Images: `<picture>`/`srcset` choice by size, animation, lazy loading, inline `<svg>` in HTML
+- [x] Floats and positioning (`float`, `position: absolute/fixed/relative`)
+- [x] Real table layout
+- [x] Flexbox, CSS grid columns, `@media` queries, `aspect-ratio`, percentage heights
+- [ ] Grid rows (`grid-template-rows`, `grid-row`, named areas), `::before`/`::after` content
+- [x] Show `<noscript>` content, and follow `<meta http-equiv=refresh>` redirects
 - [x] Cookies: session-only, first-party only, per-site keep list
-- [ ] JavaScript (*discuss*: big project; would require same-origin policy and CSP first)
+- [x] JavaScript: Boa in the sandboxed renderer, off unless you allow a site (see below)
 
 ## Text
 - [ ] Text shaping with **HarfRust** (the HarfBuzz project's safe-Rust port), in the renderer:
@@ -35,13 +37,16 @@ Planned work, roughly in priority order. Items marked *discuss* need a decision 
 
 ## Project
 - [ ] Choose a license
-- [ ] App icon and home-page art of Brickle the cat; `.desktop` file for the Linux menu
-- [ ] Bump `FIREFOX_VERSION` in `src/net.rs` with Firefox releases
+- [x] App icon of Brickle the cat (`assets/brickle.svg`)
+- [ ] Home-page art; `.desktop` file for the Linux menu
+- [ ] Bump `FIREFOX_VERSION` and `FIREFOX_RELEASED` in `src/net.rs` now and then: Brickle
+      assumes up to six releases have come out since (about three months), then asks to be updated
 
 ## JavaScript
 
 Done: Boa in the sandboxed renderer, off by default, allowed per site, DOM, events, timers,
-clicks, no network for scripts. Rules that still apply to what's next:
+clicks, and network requests only through the browser's checks. Rules that still apply to
+what's next:
 - Cookie selection and network authorization stay in the browser process, using the browser's
   own record of the page's origin, never what the renderer claims.
 - [x] `fetch`/XHR through the browser, with same-origin policy, CORS and credentials rules.
@@ -49,8 +54,8 @@ clicks, no network for scripts. Rules that still apply to what's next:
 - [x] Scripts can't send to other sites (requests, or files they put on the page) unless you allow it.
 - [x] `document.cookie` for non-HttpOnly cookies, answered by the browser.
 - [ ] JavaScript modules (`type=module`, `import`).
-- [ ] Keyboard input and form controls (typing into fields, submitting forms).
-- [ ] More selectors for `querySelector` (sibling combinators, `:not()`, attribute values),
+- [x] Keyboard input and form controls (typing into fields, submitting forms).
+- [x] More selectors for `querySelector` (sibling combinators, `:not()`, attribute values),
   shared with CSS.
 - [ ] `MutationObserver` callbacks; `getComputedStyle` beyond inline styles.
 - [ ] Faster startup for the JS fuzzer (snapshot the prelude).

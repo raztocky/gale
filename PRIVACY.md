@@ -16,6 +16,12 @@ link, reloading, going back or forward) and for that page's own resources, or wh
 `brickle filters update` (filter lists, and the certificate revocation data described in rule 5). It doesn't prefetch or preconnect, it doesn't update anything in the
 background, and it makes no requests at startup.
 
+A page can send you on to another address with `<meta http-equiv="refresh">` (DuckDuckGo does,
+to its no-JavaScript version, when scripts are off). Brickle treats that like a server's
+redirect: it goes there right away, through the same checks as a link, and at most five times
+in a row. A refresh without an address, which would only reload the page over and over, is
+ignored.
+
 Looking up a site's address (DNS) is part of loading it. Brickle does it with **DNS over
 HTTPS**, so your network and ISP can't see or change which sites you look up: by default it asks
 Cloudflare (Firefox's default resolver), reached at a fixed address so finding it needs no plain

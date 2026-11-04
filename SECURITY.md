@@ -57,10 +57,15 @@ Scripts run only in the sandboxed renderer, in Boa (an interpreter, no JIT: the 
 executable memory anyway). What a script can reach is the page's own DOM through a small set of
 native functions in `src/js.rs`, which validate every node id and string. Scripts' network
 requests and cookie changes are queued and answered by the browser process, which applies the
-network policy and CORS using its own record of the page's origin (`Network::script_request`). Loop-iteration and recursion limits can't be caught by scripts, work
+network policy, CORS (with preflights) and the rule that scripts only send to their own site,
+using its own record of the page's origin (`Network::script_request`). Which images, stylesheets
+and scripts a script added to the page is reported by the renderer, so a compromised renderer
+could pass one off as part of the page; it still can't reach anything the sandbox forbids, or a
+request the other rules block. Loop-iteration and recursion limits can't be caught by scripts, work
 runs in time-boxed batches, and a renderer that still hangs is killed and the page reloaded
 without JavaScript. The `js` fuzz target drives random DOM operations through the whole
-pipeline. The `image` fuzz target feeds arbitrary bytes to the image decoders and resizer.
+pipeline. The `image` fuzz target feeds arbitrary bytes to the image decoders and resizer, and
+`svg` does the same for SVG drawings, text included.
 
 ## Supported versions
 

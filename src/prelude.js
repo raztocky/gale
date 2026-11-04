@@ -1200,8 +1200,8 @@
     queueMicrotask: (fn) => { Promise.resolve().then(fn); },
     fetch, Headers, Request, Response, AbortController, AbortSignal, FormData, TextEncoder, TextDecoder,
     btoa, atob,
-    // Images aren't loaded (Brickle doesn't show images yet), so these are
-    // plain elements: setting src requests nothing.
+    // Plain elements: setting src requests nothing until the image is put
+    // on the page (a hidden `new Image()` is the usual tracking pixel).
     Image: function Image(w, h) {
       const img = document.createElement('img');
       if (w !== undefined) img.setAttribute('width', w);

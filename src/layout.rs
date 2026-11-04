@@ -2,9 +2,10 @@
 //!
 //! Supports normal flow (block + inline formatting contexts), the CSS box
 //! model, auto margins, max-width, sibling margin collapsing, text wrapping
-//! and alignment, list markers, inline-blocks, a simple flexbox, floats,
-//! positioning and tables (the CSS 2.1 automatic table layout, in the
-//! separated-borders model).
+//! and alignment, list markers, inline-blocks, flexbox, a grid (columns
+//! from `grid-template-columns`, automatic rows), floats, positioning,
+//! `aspect-ratio`, percentage heights and tables (the CSS 2.1 automatic
+//! table layout, in the separated-borders model).
 
 use crate::css::Color;
 use crate::dom::NodeType;
