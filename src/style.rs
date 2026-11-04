@@ -398,7 +398,7 @@ pub fn style_tree<'a>(root: &'a Node, ctx: &StyleContext) -> StyledNode<'a> {
     base.font_size *= k;
     base.line_height *= k;
     let mut ancestors = Vec::new();
-    let index = RuleIndex::new(&ctx.sheets);
+    let index = RuleIndex::new(&ctx.sheets, ctx.viewport);
     let flat = Flat::new(root);
     selectors::reset_budget();
     let mut next_id = 0;
@@ -427,7 +427,8 @@ struct RuleIndex<'s> {
 }
 
 impl<'s> RuleIndex<'s> {
-    fn new(sheets: &[(u8, &'s Stylesheet)]) -> Self {
+    /// Rules whose `@media` doesn't match `viewport` are left out.
+    fn new(sheets: &[(u8, &'s Stylesheet)], viewport: (f32, f32)) -> Self {
         let mut ix = RuleIndex {
             entries: Vec::new(),
             by_id: HashMap::new(),
@@ -438,6 +439,10 @@ impl<'s> RuleIndex<'s> {
         let mut order = 0;
         for (origin, sheet) in sheets {
             for rule in &sheet.rules {
+                if !rule.applies(viewport) {
+                    order += 1;
+                    continue;
+                }
                 for sel in &rule.selectors {
                     let i = ix.entries.len();
                     ix.entries.push((order, *origin, rule, sel));

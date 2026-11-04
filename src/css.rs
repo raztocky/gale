@@ -10,6 +10,315 @@ pub struct Stylesheet {
 pub struct Rule {
     pub selectors: Vec<Selector>,
     pub declarations: Vec<Declaration>,
+    /// The `@media` blocks it's inside: it applies while all of them match.
+    pub media: Vec<std::sync::Arc<Media>>,
+}
+
+impl Rule {
+    /// Does the rule apply in a viewport of this size?
+    pub fn applies(&self, viewport: (f32, f32)) -> bool {
+        self.media.iter().all(|m| m.matches(viewport))
+    }
+}
+
+/// An `@media` query list: it matches while any of its queries does.
+/// Brickle is a screen with a mouse, light colours, no motion preference
+/// and 1 pixel per CSS pixel; features it doesn't know never match.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Media(Vec<Query>);
+
+#[derive(Debug, Clone, PartialEq)]
+struct Query {
+    negated: bool,
+    conds: Vec<Cond>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Cond {
+    Always,
+    Never,
+    Width(Cmp, f32),
+    Height(Cmp, f32),
+    /// Width / height.
+    Aspect(Cmp, f32),
+    Landscape(bool),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Cmp {
+    AtLeast,
+    AtMost,
+    Above,
+    Below,
+    Equal,
+}
+
+impl Cmp {
+    fn test(self, v: f32, limit: f32) -> bool {
+        match self {
+            Cmp::AtLeast => v >= limit,
+            Cmp::AtMost => v <= limit,
+            Cmp::Above => v > limit,
+            Cmp::Below => v < limit,
+            Cmp::Equal => v == limit,
+        }
+    }
+
+    /// `limit OP feature` read as `feature OP' limit`.
+    fn flip(self) -> Cmp {
+        match self {
+            Cmp::AtLeast => Cmp::AtMost,
+            Cmp::AtMost => Cmp::AtLeast,
+            Cmp::Above => Cmp::Below,
+            Cmp::Below => Cmp::Above,
+            Cmp::Equal => Cmp::Equal,
+        }
+    }
+}
+
+/// Most queries in one list, and conditions in one query.
+const MAX_MEDIA_PARTS: usize = 32;
+
+impl Media {
+    /// Parse the part after `@media`.
+    pub fn parse(text: &str) -> Media {
+        // `(a)and (b)` is common in minified CSS.
+        let text = text.to_ascii_lowercase().replace('(', " (").replace(')', ") ");
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let queries = split_top(&text, |rest| {
+            if rest.starts_with(',') {
+                Some(1)
+            } else if rest.starts_with(" or ") {
+                Some(4)
+            } else {
+                None
+            }
+        });
+        Media(
+            queries
+                .into_iter()
+                .take(MAX_MEDIA_PARTS)
+                .map(Query::parse)
+                .collect(),
+        )
+    }
+
+    pub fn matches(&self, (w, h): (f32, f32)) -> bool {
+        self.0.iter().any(|q| {
+            let all = q.conds.iter().all(|c| match *c {
+                Cond::Always => true,
+                Cond::Never => false,
+                Cond::Width(op, v) => op.test(w, v),
+                Cond::Height(op, v) => op.test(h, v),
+                Cond::Aspect(op, v) => h > 0.0 && op.test(w / h, v),
+                Cond::Landscape(l) => (w >= h) == l,
+            });
+            all != q.negated
+        })
+    }
+
+    /// Never matches, whatever the viewport (`print`, `speech`...).
+    fn never(&self) -> bool {
+        self.0
+            .iter()
+            .all(|q| !q.negated && q.conds.contains(&Cond::Never))
+    }
+}
+
+/// Split at depth-0 separators; `sep` says how long the one at the start
+/// of `rest` is.
+fn split_top(text: &str, sep: impl Fn(&str) -> Option<usize>) -> Vec<&str> {
+    let (mut out, mut depth, mut start, mut i) = (Vec::new(), 0i32, 0, 0);
+    while i < text.len() {
+        let c = text.as_bytes()[i];
+        if c == b'(' {
+            depth += 1;
+        } else if c == b')' {
+            depth -= 1;
+        } else if depth == 0 && text.is_char_boundary(i) {
+            if let Some(n) = sep(&text[i..]) {
+                out.push(text[start..i].trim());
+                i += n;
+                start = i;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.push(text[start..].trim());
+    out
+}
+
+impl Query {
+    fn parse(text: &str) -> Query {
+        let mut text = text.trim();
+        let mut negated = false;
+        if let Some(r) = text.strip_prefix("only ") {
+            text = r.trim_start();
+        } else if let Some(r) = text.strip_prefix("not ") {
+            negated = true;
+            text = r.trim_start();
+        }
+        let parts = split_top(text, |rest| rest.starts_with(" and ").then_some(5));
+        let conds = parts
+            .into_iter()
+            .take(MAX_MEDIA_PARTS)
+            .flat_map(|p| {
+                let p = p.trim();
+                match p.strip_prefix('(').and_then(|p| p.strip_suffix(')')) {
+                    Some(inner) => feature(inner.trim()),
+                    None => match p {
+                        "screen" | "all" | "" => vec![Cond::Always],
+                        _ => vec![Cond::Never],
+                    },
+                }
+            })
+            .collect();
+        Query { negated, conds }
+    }
+}
+
+/// One `(feature: value)` or `(feature < value)` test (two conditions for
+/// `(400px <= width < 900px)`).
+fn feature(text: &str) -> Vec<Cond> {
+    if let Some((name, value)) = text.split_once(':') {
+        let (name, value) = (name.trim(), value.trim());
+        let (op, name) = match (name.strip_prefix("min-"), name.strip_prefix("max-")) {
+            (Some(n), _) => (Cmp::AtLeast, n),
+            (_, Some(n)) => (Cmp::AtMost, n),
+            _ => (Cmp::Equal, name),
+        };
+        return vec![named(name, op, value)];
+    }
+    // Range syntax: `width >= 600px`, `400px <= width < 900px`.
+    let ops: [(&str, Cmp); 5] = [
+        (">=", Cmp::AtLeast),
+        ("<=", Cmp::AtMost),
+        (">", Cmp::Above),
+        ("<", Cmp::Below),
+        ("=", Cmp::Equal),
+    ];
+    let mut pieces = Vec::new();
+    let mut rest = text;
+    'outer: loop {
+        for (i, _) in rest.char_indices() {
+            for (sym, op) in ops {
+                if rest[i..].starts_with(sym) {
+                    pieces.push((rest[..i].trim(), Some(op)));
+                    rest = &rest[i + sym.len()..];
+                    continue 'outer;
+                }
+            }
+        }
+        pieces.push((rest.trim(), None));
+        break;
+    }
+    match pieces.as_slice() {
+        [(name, None)] => vec![named(name, Cmp::Equal, "")],
+        [(a, Some(op)), (b, None)] => {
+            if is_range_feature(a) {
+                vec![named(a, *op, b)]
+            } else {
+                vec![named(b, op.flip(), a)]
+            }
+        }
+        [(lo, Some(op1)), (name, Some(op2)), (hi, None)] => {
+            vec![named(name, op1.flip(), lo), named(name, *op2, hi)]
+        }
+        _ => vec![Cond::Never],
+    }
+}
+
+fn is_range_feature(name: &str) -> bool {
+    matches!(name, "width" | "height" | "aspect-ratio" | "resolution")
+}
+
+/// A named feature compared with a value (`""` for a bare `(hover)`).
+fn named(name: &str, op: Cmp, value: &str) -> Cond {
+    let px = || -> Option<f32> {
+        let v = value.trim();
+        let num_end = v
+            .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == '+'))
+            .unwrap_or(v.len());
+        let n: f32 = v[..num_end].parse().ok()?;
+        let n = match v[num_end..].trim() {
+            "px" | "" => n,
+            "em" | "rem" => n * 16.0,
+            "pt" => n * 4.0 / 3.0,
+            _ => return None,
+        };
+        n.is_finite().then_some(n)
+    };
+    let is = |yes: &[&str]| {
+        if yes.contains(&value) {
+            Cond::Always
+        } else {
+            Cond::Never
+        }
+    };
+    match name {
+        "width" | "device-width" => px().map_or(Cond::Never, |v| Cond::Width(op, v)),
+        "height" | "device-height" => px().map_or(Cond::Never, |v| Cond::Height(op, v)),
+        "aspect-ratio" | "device-aspect-ratio" => {
+            let ratio = match value.split_once('/') {
+                Some((a, b)) => a
+                    .trim()
+                    .parse::<f32>()
+                    .ok()
+                    .zip(b.trim().parse::<f32>().ok())
+                    .map(|(a, b)| a / b),
+                None => value.trim().parse().ok(),
+            };
+            ratio
+                .filter(|r| r.is_finite())
+                .map_or(Cond::Never, |r| Cond::Aspect(op, r))
+        }
+        "orientation" => match value {
+            "landscape" => Cond::Landscape(true),
+            "portrait" => Cond::Landscape(false),
+            _ => Cond::Never,
+        },
+        // One pixel per CSS pixel.
+        "resolution" | "-webkit-device-pixel-ratio" | "device-pixel-ratio" => {
+            let v = value.trim();
+            let n = v
+                .strip_suffix("dppx")
+                .or_else(|| v.strip_suffix('x'))
+                .map(|n| n.trim().parse::<f32>().ok())
+                .unwrap_or_else(|| {
+                    v.strip_suffix("dpi")
+                        .and_then(|n| n.trim().parse::<f32>().ok())
+                        .map(|d| d / 96.0)
+                        .or_else(|| v.parse().ok())
+                });
+            match n {
+                Some(n) if op.test(1.0, n) => Cond::Always,
+                _ => Cond::Never,
+            }
+        }
+        "-webkit-min-device-pixel-ratio" => named("resolution", Cmp::AtLeast, value),
+        "-webkit-max-device-pixel-ratio" => named("resolution", Cmp::AtMost, value),
+        "hover" | "any-hover" => is(&["", "hover"]),
+        "pointer" | "any-pointer" => is(&["", "fine"]),
+        "color" => {
+            if value.is_empty() || op != Cmp::Equal {
+                Cond::Always
+            } else {
+                Cond::Never
+            }
+        }
+        "prefers-color-scheme" => is(&["light"]),
+        "prefers-reduced-motion"
+        | "prefers-reduced-transparency"
+        | "prefers-reduced-data"
+        | "prefers-contrast" => is(&["no-preference"]),
+        "forced-colors" | "inverted-colors" => is(&["none"]),
+        "display-mode" => is(&["browser"]),
+        "update" => is(&["", "fast"]),
+        "scan" => is(&["progressive"]),
+        "dynamic-range" | "video-dynamic-range" => is(&["standard"]),
+        _ => Cond::Never,
+    }
 }
 
 /// A complex selector, stored right-to-left: `parts[0]` is the subject.
@@ -257,7 +566,9 @@ pub fn parse(source: &str) -> Stylesheet {
         chars: src.chars().collect(),
         pos: 0,
     };
-    Stylesheet { rules: p.rules(0) }
+    Stylesheet {
+        rules: p.rules(0, &[]),
+    }
 }
 
 /// Parse the contents of a `style="..."` attribute.
@@ -341,7 +652,7 @@ impl Parser {
         }
     }
 
-    fn rules(&mut self, depth: usize) -> Vec<Rule> {
+    fn rules(&mut self, depth: usize, media: &[std::sync::Arc<Media>]) -> Vec<Rule> {
         let mut rules = Vec::new();
         loop {
             self.skip_ws();
@@ -358,18 +669,26 @@ impl Parser {
                         continue;
                     }
                     let lower = prelude.to_ascii_lowercase();
-                    // We render to a "screen"; honour simple @media screen /
-                    // min-width queries generously, skip everything else.
-                    let usable = (lower.starts_with("@media")
-                        && !lower.contains("print")
-                        && !lower.contains("max-width"))
-                        || lower.starts_with("@supports")
-                        || lower.starts_with("@layer");
-                    if usable && depth < MAX_NESTING {
-                        self.pos += 1;
-                        rules.extend(self.rules(depth + 1));
+                    // `@media` rules keep their query, checked against the
+                    // viewport when styling (see `Rule::applies`).
+                    let inner = if let Some(q) = lower.strip_prefix("@media") {
+                        let m = Media::parse(q);
+                        (!m.never()).then(|| {
+                            let mut v = media.to_vec();
+                            v.push(std::sync::Arc::new(m));
+                            v
+                        })
+                    } else if lower.starts_with("@supports") || lower.starts_with("@layer") {
+                        Some(media.to_vec())
                     } else {
-                        self.skip_block();
+                        None
+                    };
+                    match inner {
+                        Some(inner) if depth < MAX_NESTING => {
+                            self.pos += 1;
+                            rules.extend(self.rules(depth + 1, &inner));
+                        }
+                        _ => self.skip_block(),
                     }
                 }
                 Some(_) => {
@@ -388,6 +707,7 @@ impl Parser {
                         rules.push(Rule {
                             selectors,
                             declarations,
+                            media: media.to_vec(),
                         });
                     }
                 }
@@ -417,10 +737,20 @@ impl Parser {
                     important = true;
                     value = value[..i].trim();
                 }
+                // `background: center/100% url(x)`: the size after the
+                // slash becomes its own declaration (values drop slashes).
+                let size = (name == "background").then(|| background_size(value)).flatten();
                 if !name.is_empty() {
                     decls.push(Declaration {
                         name,
-                        values: parse_values(value),
+                        values: parse_values(size.as_ref().map_or(value, |(rest, _)| rest)),
+                        important,
+                    });
+                }
+                if let Some((_, size)) = size {
+                    decls.push(Declaration {
+                        name: "background-size".into(),
+                        values: parse_values(&size),
                         important,
                     });
                 }
@@ -428,6 +758,45 @@ impl Parser {
         }
         decls
     }
+}
+
+/// The `/size` in a `background` shorthand's first layer: the value without
+/// it, and the size (one or two of lengths, percentages, `auto`, `cover`,
+/// `contain`).
+fn background_size(value: &str) -> Option<(String, String)> {
+    let (mut depth, mut quote) = (0i32, None);
+    for (i, c) in value.char_indices() {
+        match (c, quote) {
+            ('"' | '\'', None) => quote = Some(c),
+            (q, Some(open)) if q == open => quote = None,
+            (_, Some(_)) => {}
+            ('(', _) => depth += 1,
+            (')', _) => depth -= 1,
+            (',', _) if depth == 0 => return None,
+            ('/', _) if depth == 0 => {
+                let after = &value[i + 1..];
+                let is_size = |t: &str| {
+                    matches!(t, "auto" | "cover" | "contain")
+                        || t.starts_with(|c: char| c.is_ascii_digit() || c == '.')
+                };
+                let toks: Vec<&str> = after
+                    .split_whitespace()
+                    .take(2)
+                    .take_while(|t| is_size(t))
+                    .collect();
+                let first = *toks.first()?;
+                let mut end = after.find(first)? + first.len();
+                let mut size = first.to_string();
+                if let Some(second) = toks.get(1).filter(|_| !matches!(first, "cover" | "contain")) {
+                    end += after[end..].find(second)? + second.len();
+                    size = format!("{size} {second}");
+                }
+                return Some((format!("{} {}", &value[..i], &after[end..]), size));
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Split at commas outside brackets, parentheses and quotes.
@@ -977,6 +1346,67 @@ fn named_color(name: &str) -> Option<Color> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_shorthand_size() {
+        let d =
+            parse_inline("background: no-repeat center/100% url(\"/logo.svg\"), linear-gradient(red, blue)");
+        assert_eq!(d.len(), 2);
+        assert_eq!(d[0].name, "background");
+        assert!(d[0].values.contains(&Value::Url("/logo.svg".into())));
+        assert!(!d[0].values.contains(&Value::Percent(100.0)), "{:?}", d[0].values);
+        assert_eq!(
+            (d[1].name.as_str(), d[1].values.clone()),
+            ("background-size", vec![Value::Percent(100.0)])
+        );
+        let d = parse_inline("background: url(a.png) 0 0 / 20px 10px repeat-x");
+        assert_eq!(
+            d[1].values,
+            vec![Value::Length(20.0, Unit::Px), Value::Length(10.0, Unit::Px)]
+        );
+        assert!(d[0].values.contains(&Value::Keyword("repeat-x".into())));
+        let d = parse_inline("background: url(a.png) center / cover");
+        assert_eq!(d[1].values, vec![Value::Keyword("cover".into())]);
+        // No slash, or one only in a later layer or inside url(): unchanged.
+        assert_eq!(parse_inline("background: red url(a/b.png)").len(), 1);
+        assert_eq!(parse_inline("background: red, url(a.png) 0 0/10px").len(), 1);
+    }
+
+    #[test]
+    fn media_queries_follow_the_viewport() {
+        let m = |q: &str, w: f32, h: f32| Media::parse(q).matches((w, h));
+        // DuckDuckGo's, minified: only for very short, wide windows.
+        let ddg = "only screen and (max-height: 361.25px)and (min-width: 864px)";
+        assert!(!m(ddg, 1024.0, 768.0));
+        assert!(m(ddg, 1024.0, 300.0));
+        assert!(m("(max-width: 600px)", 500.0, 800.0));
+        assert!(!m("(max-width: 600px)", 1200.0, 800.0));
+        assert!(m("screen and (min-width:40em)", 700.0, 800.0));
+        assert!(!m("print", 1000.0, 800.0));
+        assert!(m("print, (min-width: 100px)", 1000.0, 800.0));
+        assert!(m("not print", 1000.0, 800.0));
+        assert!(!m("not all and (min-width: 100px)", 1000.0, 800.0));
+        assert!(m("(width >= 600px)", 600.0, 1.0));
+        assert!(m("(400px <= width < 900px)", 500.0, 1.0));
+        assert!(!m("(400px <= width < 900px)", 900.0, 1.0));
+        assert!(m("(orientation: landscape)", 1000.0, 800.0));
+        assert!(!m("(prefers-color-scheme: dark)", 1000.0, 800.0));
+        assert!(m("(prefers-reduced-motion: no-preference)", 1000.0, 800.0));
+        assert!(m("(hover: hover) and (pointer: fine)", 1000.0, 800.0));
+        assert!(!m(
+            "(-webkit-min-device-pixel-ratio: 2), (min-resolution: 192dpi)",
+            1000.0,
+            800.0
+        ));
+        assert!(!m("(some-future-thing: yes)", 1000.0, 800.0));
+        assert!(m("(max-width: 500px) or (min-width: 900px)", 1000.0, 800.0));
+
+        let sheet = parse("@media (max-width: 600px) { p { color: red } } @media print { p { color: blue } } a { color: green }");
+        assert_eq!(sheet.rules.len(), 2, "print rules are dropped");
+        assert!(sheet.rules[0].applies((500.0, 800.0)));
+        assert!(!sheet.rules[0].applies((1000.0, 800.0)));
+        assert!(sheet.rules[1].applies((1000.0, 800.0)));
+    }
 
     #[test]
     fn urls_keep_their_case_and_resolve_against_the_sheet() {

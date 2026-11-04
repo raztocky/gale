@@ -539,7 +539,8 @@ pub fn decorate(n: &mut Node, focus: Option<u32>) {
             add_class(n, "-brickle-button");
             let label = match kind {
                 Control::File => "Browse… (not supported)".to_string(),
-                _ if !val.is_empty() => val,
+                // `value=""` is an empty label (often an icon button).
+                _ if !val.is_empty() || e.attrs.contains_key("value") => val,
                 Control::Submit => e.attrs.get("alt").cloned().unwrap_or_else(|| "Submit".into()),
                 Control::Reset => "Reset".into(),
                 _ => String::new(),
@@ -569,6 +570,22 @@ mod tests {
 
     fn find(d: &Dom, id: &str) -> u32 {
         by_id(d, id).unwrap_or_else(|| panic!("no #{id}"))
+    }
+
+    #[test]
+    fn button_labels() {
+        let label = |html: &str| {
+            let mut n = crate::html::parse(html);
+            decorate(&mut n, None);
+            let mut b = Vec::new();
+            n.walk(&mut b, &|c| c.tag() == Some("input"));
+            b[0].text_content()
+        };
+        assert_eq!(label("<input type=submit>"), "Submit");
+        assert_eq!(label("<input type=submit value=Go>"), "Go");
+        // DuckDuckGo's icon button: empty, not its `alt`.
+        assert_eq!(label("<input type=submit value='' alt=Search>"), "");
+        assert_eq!(label("<input type=reset>"), "Reset");
     }
 
     #[test]
