@@ -9,6 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+url = "2"
 
 [dependencies.brickle]
 path = ".."
@@ -78,5 +79,23 @@ doc = false
 [[bin]]
 name = "lineedit"
 path = "fuzz_targets/lineedit.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "cookies"
+path = "fuzz_targets/cookies.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "urls"
+path = "fuzz_targets/urls.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "response"
+path = "fuzz_targets/response.rs"
 test = false
 doc = false

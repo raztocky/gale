@@ -1041,7 +1041,10 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 let end = a.text.chars().count();
                 match key {
                     Key::Enter | Key::NumPadEnter => {
-                        navigate = Some((net::address_or_search(&a.text), None));
+                        let to = net::address_or_search(&a.text);
+                        if !to.is_empty() {
+                            navigate = Some((to, None));
+                        }
                         ui.editing = false;
                     }
                     Key::Escape => {

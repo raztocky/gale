@@ -847,14 +847,26 @@ pub fn display_parts(input: &str) -> (String, String) {
 pub const SEARCH_URL: &str = "https://html.duckduckgo.com/html/";
 
 /// What the address bar does with what you typed: go to it if it looks like
-/// an address or a file, else search for it.
+/// an address or a file, else search for it. Nothing ("") for nothing typed.
 pub fn address_or_search(input: &str) -> String {
-    if looks_like_search(input) {
+    let search = || {
         url::Url::parse_with_params(SEARCH_URL, [("q", input.trim())])
             .map(String::from)
             .unwrap_or_else(|_| SEARCH_URL.to_string())
+    };
+    if input.trim().is_empty() {
+        return String::new();
+    }
+    if looks_like_search(input) {
+        return search();
+    }
+    // Something that looked like an address but isn't a valid one is
+    // searched for rather than loaded as a broken URL.
+    let url = normalize(input);
+    if url.starts_with("about:") || url::Url::parse(&url).is_ok() {
+        url
     } else {
-        normalize(input)
+        search()
     }
 }
 
@@ -940,6 +952,12 @@ mod tests {
             assert!(!address_or_search(url).starts_with(SEARCH_URL), "{url}");
         }
         assert_eq!(address_or_search("example.com"), "https://example.com/");
+        // Found by fuzzing: nothing typed went to "https://".
+        assert_eq!(address_or_search("  "), "");
+        assert!(
+            address_or_search("exa%mple.com").starts_with(SEARCH_URL),
+            "not a valid host"
+        );
     }
 
     #[test]
