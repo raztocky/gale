@@ -111,6 +111,20 @@ pub enum InlineItem {
     /// Index into the anonymous box's `children` (an absolutely positioned
     /// box). It takes no space; where it appears is its static position.
     OutOfFlow(usize),
+    /// The start or end of an inline element with horizontal margin, border
+    /// or padding: space on the line, with the border and padding part in
+    /// the element's background.
+    Edge {
+        margin: Len,
+        /// Border plus padding.
+        inner: Len,
+        border: f32,
+        style: Rc<ComputedStyle>,
+        bg: Color,
+        link: Option<String>,
+        uid: u32,
+        start: bool,
+    },
 }
 
 pub enum BoxKind<'a> {
@@ -402,6 +416,25 @@ fn flatten_inline<'a>(node: &'a StyledNode<'a>, anon: &mut LayoutBox<'a>, bg: Co
             } else {
                 bg
             };
+            let st = &node.style;
+            let edge = |side: usize, start: bool| {
+                let (margin, inner, border) = (st.margin[side], st.padding[side], st.border_width[side]);
+                let zero = |l: Len| matches!(l, Len::Px(v) if v == 0.0) || matches!(l, Len::Auto);
+                (!(zero(margin) && zero(inner) && border == 0.0)).then(|| InlineItem::Edge {
+                    margin,
+                    inner,
+                    border,
+                    style: st.clone(),
+                    bg,
+                    link: link.clone(),
+                    uid: node.node.uid,
+                    start,
+                })
+            };
+            if let Some(e) = edge(3, true) {
+                push(anon, e);
+            }
+            let end = edge(1, false);
             for c in &node.children {
                 let l = child_link(c, &link);
                 match c.display() {
@@ -423,6 +456,9 @@ fn flatten_inline<'a>(node: &'a StyledNode<'a>, anon: &mut LayoutBox<'a>, bg: Co
                     }
                     _ => flatten_inline(c, anon, bg, l),
                 }
+            }
+            if let Some(e) = end {
+                push(anon, e);
             }
         }
     }
@@ -1172,7 +1208,7 @@ impl<'a> LayoutBox<'a> {
             BoxKind::Anonymous { items, .. } => items.iter().any(|i| match i {
                 InlineItem::Text { text, style, .. } => style.pre || !is_collapsible_ws(text),
                 InlineItem::Atomic(_) | InlineItem::Float(_) => true,
-                InlineItem::Break(_) | InlineItem::OutOfFlow(_) => false,
+                InlineItem::Break(_) | InlineItem::OutOfFlow(_) | InlineItem::Edge { .. } => false,
             }),
         }
     }
@@ -1360,6 +1396,17 @@ impl<'a> LayoutBox<'a> {
                             run = 0.0;
                         }
                         InlineItem::OutOfFlow(_) => {}
+                        InlineItem::Edge {
+                            margin,
+                            inner,
+                            border,
+                            ..
+                        } => {
+                            let w = margin.or_zero(cb_w) + inner.or_zero(cb_w) + border;
+                            line += w;
+                            run += w;
+                            min = min.max(run);
+                        }
                         InlineItem::Atomic(i) | InlineItem::Float(i) => {
                             let (cmin, cmax) = self.children[*i].intrinsic_widths(cb_w);
                             line += cmax;
@@ -1469,8 +1516,43 @@ impl<'a> LayoutBox<'a> {
         // Last character of the previous word, if nothing (no space, break
         // or inline-block) separates it from the next one.
         let mut prev_tail: Option<char> = None;
+        // The next word stays on the line with the inline element start
+        // just before it.
+        let mut stick = false;
         for item in &items {
             match item {
+                InlineItem::Edge {
+                    margin,
+                    inner,
+                    border,
+                    style,
+                    bg,
+                    link,
+                    uid,
+                    start,
+                } => {
+                    let space = |w: f32, bg: Color, glue: bool| Piece::Word {
+                        text: String::new(),
+                        style: style.clone(),
+                        bg,
+                        link: link.clone(),
+                        uid: *uid,
+                        w: w.max(0.0),
+                        glue,
+                    };
+                    let (m, i) = (margin.or_zero(avail), inner.or_zero(avail) + border);
+                    // A start can't separate a word from the text right
+                    // before it; an end always stays with what it closes.
+                    let glue = !start || prev_tail.is_some() || stick;
+                    if *start {
+                        pieces.push(space(m, Color::TRANSPARENT, glue));
+                        pieces.push(space(i, *bg, true));
+                        stick = true;
+                    } else {
+                        pieces.push(space(i, *bg, true));
+                        pieces.push(space(m, Color::TRANSPARENT, true));
+                    }
+                }
                 InlineItem::Text {
                     text,
                     style,
@@ -1505,6 +1587,7 @@ impl<'a> LayoutBox<'a> {
                         }
                         last_space = false;
                         prev_tail = None;
+                        stick = false;
                         continue;
                     }
                     if style.nowrap {
@@ -1517,14 +1600,19 @@ impl<'a> LayoutBox<'a> {
                             last_space = text.ends_with(|c: char| c.is_ascii_whitespace());
                         }
                         prev_tail = None;
+                        stick = false;
                         continue;
                     }
                     // A run of non-space text is split further wherever the
                     // Unicode line-breaking rules (UAX #14) allow: between
                     // CJK characters, after hyphens and slashes, and so on.
-                    let push_word = |word: &str, pieces: &mut Vec<Piece>, prev_tail: &mut Option<char>| {
+                    let push_word = |word: &str,
+                                     pieces: &mut Vec<Piece>,
+                                     prev_tail: &mut Option<char>,
+                                     stick: &mut bool| {
                         let first = word.chars().next().unwrap_or(' ');
-                        let mut glue = prev_tail.is_some_and(|a| !break_between(a, first));
+                        let mut glue =
+                            std::mem::take(stick) || prev_tail.is_some_and(|a| !break_between(a, first));
                         let mut start = 0;
                         for (i, _) in unicode_linebreak::linebreaks(word) {
                             if i > start && i < word.len() {
@@ -1540,7 +1628,7 @@ impl<'a> LayoutBox<'a> {
                     for c in text.chars() {
                         if c.is_ascii_whitespace() {
                             if !word.is_empty() {
-                                push_word(&word, &mut pieces, &mut prev_tail);
+                                push_word(&word, &mut pieces, &mut prev_tail, &mut stick);
                                 word.clear();
                             }
                             prev_tail = None;
@@ -1560,7 +1648,7 @@ impl<'a> LayoutBox<'a> {
                         }
                     }
                     if !word.is_empty() {
-                        push_word(&word, &mut pieces, &mut prev_tail);
+                        push_word(&word, &mut pieces, &mut prev_tail, &mut stick);
                     }
                 }
                 InlineItem::Break(s) => {
@@ -2569,6 +2657,116 @@ mod line_break_tests {
             l.iter().any(|line| line.ends_with('-')),
             "breaks after hyphens: {l:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod inline_edge_tests {
+    use crate::css;
+    use crate::html;
+    use crate::layout::{layout_tree, BoxKind, LayoutBox, TextFrag};
+    use crate::style::{self, StyleContext};
+
+    /// Every text fragment of `body` laid out at `width`, in line order.
+    fn frags(body: &str, width: f32) -> Vec<TextFrag> {
+        let dom = html::parse(&format!(
+            "<body style='margin:0;font-family:sans-serif;font-size:16px'>{body}"
+        ));
+        let ua = css::parse(style::UA_CSS);
+        let ctx = StyleContext {
+            sheets: vec![(0, &ua)],
+            viewport: (width, 600.0),
+        };
+        let styled = style::style_tree(&dom, &ctx);
+        let root = layout_tree(&styled, width);
+        fn walk(b: &LayoutBox, out: &mut Vec<TextFrag>) {
+            if let BoxKind::Anonymous { frags, .. } = &b.kind {
+                out.extend(frags.iter().cloned());
+            }
+            for c in &b.children {
+                walk(c, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(&root, &mut out);
+        out.sort_by(|a, b| a.baseline.total_cmp(&b.baseline).then(a.x.total_cmp(&b.x)));
+        out
+    }
+
+    fn word<'f>(f: &'f [TextFrag], text: &str) -> &'f TextFrag {
+        f.iter()
+            .find(|f| f.text == text)
+            .unwrap_or_else(|| panic!("no {text:?}"))
+    }
+
+    #[test]
+    fn margins_separate_inline_elements() {
+        let f = frags(
+            "<a href=/ style='margin-right:20px'>Home</a><a href=/d style='margin-right:20px'>Docs</a>",
+            800.0,
+        );
+        let (home, docs) = (word(&f, "Home"), word(&f, "Docs"));
+        assert!(
+            (docs.x - (home.x + home.w) - 20.0).abs() < 0.5,
+            "{} {}",
+            home.x + home.w,
+            docs.x
+        );
+    }
+
+    #[test]
+    fn padding_takes_space_and_gets_the_background() {
+        let f = frags(
+            "a<span style='padding:0 10px;margin-left:5px;background:#f00;border-left:2px solid'>b</span>c",
+            800.0,
+        );
+        let (a, b, c) = (word(&f, "a"), word(&f, "b"), word(&f, "c"));
+        assert!(
+            (b.x - (a.x + a.w) - 17.0).abs() < 0.5,
+            "margin + border + padding before"
+        );
+        assert!((c.x - (b.x + b.w) - 10.0).abs() < 0.5, "padding after");
+        // The padding (and border) is painted in the span's background; the
+        // margin isn't.
+        let red: f32 = f
+            .iter()
+            .filter(|f| f.text.is_empty() && f.bg.r == 255)
+            .map(|f| f.w)
+            .sum();
+        assert!((red - 22.0).abs() < 0.5, "{red}");
+        let clear: f32 = f
+            .iter()
+            .filter(|f| f.text.is_empty() && f.bg.a == 0)
+            .map(|f| f.w)
+            .sum();
+        assert!((clear - 5.0).abs() < 0.5, "{clear}");
+    }
+
+    #[test]
+    fn edges_stay_with_their_words() {
+        // Wrapping never leaves an element's padding alone at a line's end
+        // or start, or splits "foo" from the span right after it.
+        let f = frags(
+            "aaaa aaaa aaaa foo<span style='padding-left:30px'>bar</span> <span style='padding:0 30px'>baz</span>",
+            110.0,
+        );
+        let line = |t: &str| word(&f, t).baseline;
+        assert_eq!(line("foo"), line("bar"));
+        let baz = word(&f, "baz");
+        let before: Vec<_> = f
+            .iter()
+            .filter(|g| g.baseline == baz.baseline && g.x < baz.x)
+            .collect();
+        assert!(
+            before.iter().any(|g| g.text.is_empty() && g.w == 30.0),
+            "padding before baz on its line"
+        );
+    }
+
+    #[test]
+    fn percent_margins_use_the_line_width() {
+        let f = frags("<span style='margin-left:10%'>x</span>", 500.0);
+        assert!((word(&f, "x").x - 50.0).abs() < 0.5);
     }
 }
 

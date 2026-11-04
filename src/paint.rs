@@ -554,7 +554,7 @@ fn render_box(list: &mut Vec<DrawOp>, b: &LayoutBox, backgrounds: &Backgrounds) 
                     color: t.bg,
                 });
             }
-            if t.text != " " {
+            if t.text != " " && !t.text.is_empty() {
                 list.push(DrawOp::Text {
                     x: t.x,
                     baseline: t.baseline,
