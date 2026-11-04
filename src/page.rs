@@ -44,6 +44,9 @@ pub struct Page {
     image_bytes: usize,
     /// Your text size (see `StyleContext::text_scale`).
     pub text_scale: f32,
+    /// Size of the tab bar's text in px: [`Rendered::title`] is drawn at
+    /// it (0 = not wanted).
+    pub title_px: f32,
 }
 
 /// Decoded image pixels a page may keep (the renderer has 4 GB in all).
@@ -92,6 +95,8 @@ pub struct Rendered {
     /// Fixed and sticky boxes: ranges of `list` the browser paints on top,
     /// moved for scrolling.
     pub layers: Vec<paint::Layer>,
+    /// The page's title, drawn for the tab bar (see [`paint::text_mask`]).
+    pub title: Option<paint::GlyphBitmap>,
 }
 
 /// Fetches a subresource (absolute URL) for the page. In the sandboxed
@@ -257,6 +262,7 @@ impl Page {
             images: HashMap::new(),
             image_bytes: 0,
             text_scale: 1.0,
+            title_px: 0.0,
         }
     }
 
@@ -663,6 +669,9 @@ impl Page {
             links,
             texts,
             layers,
+            title: (self.title_px > 0.0)
+                .then(|| paint::text_mask(&self.title, 0, self.title_px, paint::MAX_TITLE_W))
+                .flatten(),
         }
     }
 }
@@ -1330,6 +1339,33 @@ mod text_tests {
     fn render(html: &str) -> Rendered {
         let page = Page::parse("https://example.com/", html, "", &mut |_, _| Err("none".into()));
         page.render(800.0, 600.0)
+    }
+
+    /// The renderer draws the page's title for the tab bar, at the size
+    /// asked for, so the browser never rasterizes text a page chose.
+    #[test]
+    fn title_is_drawn_for_the_tab_bar() {
+        let html = "<title>Hello — wörld</title><p>x";
+        let mut page = Page::parse("https://example.com/", html, "", &mut |_, _| Err("none".into()));
+        assert!(page.render(800.0, 600.0).title.is_none(), "not asked for");
+        page.title_px = 18.0;
+        let t = page.render(800.0, 600.0).title.unwrap();
+        let (a, d) = crate::font::vmetrics(0, 18.0);
+        assert_eq!(t.h as usize, (a + d).ceil() as usize);
+        assert_eq!(t.data.len(), t.w as usize * t.h as usize);
+        assert!(t.w > 60 && t.data.iter().any(|&c| c > 200));
+        // Long titles are cut, not sent whole.
+        let long = format!("<title>{}</title>", "W".repeat(5000));
+        let mut page = Page::parse("https://example.com/", &long, "", &mut |_, _| Err("none".into()));
+        page.title_px = 48.0;
+        assert_eq!(
+            page.render(800.0, 600.0).title.unwrap().w,
+            crate::paint::MAX_TITLE_W
+        );
+        // No title, nothing to draw.
+        let mut page = Page::parse("https://example.com/", "<p>x", "", &mut |_, _| Err("none".into()));
+        page.title_px = 18.0;
+        assert!(page.render(800.0, 600.0).title.is_none());
     }
 
     #[test]

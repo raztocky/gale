@@ -87,6 +87,9 @@ pub struct Tab {
     pub script_navigate: Option<String>,
     /// Your text size, used when rendering.
     pub text_scale: f32,
+    /// Size of the tab bar's text in px, so the renderer can draw the
+    /// title for it (0 = no title wanted).
+    pub title_px: f32,
     /// The form submission this page answers, if loading it again means
     /// sending the form again (a POST that wasn't redirected).
     pub resubmit: Option<Submission>,
@@ -184,6 +187,7 @@ impl Tab {
                     script_navigate: None,
                     backend: Backend::InProcess(Box::new(page)),
                     text_scale: 1.0,
+                    title_px: 0.0,
                     resubmit: None,
                 }
             }
@@ -217,6 +221,7 @@ impl Tab {
             script_navigate: None,
             backend: Backend::Failed(String::new()),
             text_scale: 1.0,
+            title_px: 0.0,
             resubmit: None,
         };
         let blocker_css = net.cosmetic_css(url);
@@ -334,6 +339,7 @@ impl Tab {
         let result = match &mut self.backend {
             Backend::InProcess(p) => {
                 p.text_scale = self.text_scale;
+                p.title_px = self.title_px;
                 return p.render(width, height);
             }
             Backend::Failed(e) => Err(e.clone()),
@@ -342,6 +348,7 @@ impl Tab {
                     width,
                     height,
                     text_scale: self.text_scale,
+                    title_px: self.title_px,
                 })
                 .and_then(
                     |_| match r.recv(Instant::now() + RENDERER_TIMEOUT, &mut { MAX_FRAME })? {
@@ -787,6 +794,7 @@ except BrokenPipeError:
                 width: 100.0,
                 height: 100.0,
                 text_scale: 1.0,
+                title_px: 0.0,
             })
             .unwrap_err();
         assert!(err.contains("nobody asked"), "{err}");

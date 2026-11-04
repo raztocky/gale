@@ -122,7 +122,8 @@ described in [PRIVACY.md](PRIVACY.md). Security measures:
   The browser only ever receives rectangles and finished glyph bitmaps from a renderer, and checks
   them (sizes, counts, references, and a per-region paint budget so it can't make every repaint
   crawl) before painting. It never runs the font rasterizer on anything
-  a page controls. It kills a renderer that hangs for 20 s or sends a malformed message, then
+  a page controls: even a page's title reaches the tab bar as a bitmap its renderer drew (until it
+  has one, the tab shows the site's host). It kills a renderer that hangs for 20 s or sends a malformed message, then
   shows an error page. Run `brickle sandbox-test` to see it block file reads, network and exec on your
   machine.
 - **DNS over HTTPS.** Site lookups go to an encrypted resolver (Cloudflare by default, as in

@@ -9,7 +9,7 @@ use brickle::lineedit::LineEdit;
 use brickle::net;
 use brickle::network::{Action, LogEntry, Network, Outcome};
 use brickle::page::{Key as PageKey, Rendered};
-use brickle::paint::{Canvas, DisplayList, GlyphCache, Layer, TileCache, TilePainter};
+use brickle::paint::{self, Canvas, DisplayList, GlyphBitmap, GlyphCache, Layer, TileCache, TilePainter};
 use brickle::select::{self, Bands, FindText, Pos};
 use brickle::tab::{Input, Tab};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
@@ -462,6 +462,7 @@ fn spawn_loader(net: Arc<Mutex<Network>>, sandboxed: bool, scale: Arc<AtomicU32>
                             }
                         };
                         tab.text_scale = text_scale;
+                        tab.title_px = tab_title_px();
                         let rendered = Some(tab.render(w, h));
                         Done {
                             tab,
@@ -472,6 +473,7 @@ fn spawn_loader(net: Arc<Mutex<Network>>, sandboxed: bool, scale: Arc<AtomicU32>
                     }
                     Job::Render { mut tab, w, h } => {
                         tab.text_scale = text_scale;
+                        tab.title_px = tab_title_px();
                         let rendered = Some(tab.render(w, h));
                         Done {
                             tab: *tab,
@@ -492,6 +494,7 @@ fn spawn_loader(net: Arc<Mutex<Network>>, sandboxed: bool, scale: Arc<AtomicU32>
                             tab.interact(&mut n, input)
                         };
                         tab.text_scale = text_scale;
+                        tab.title_px = tab_title_px();
                         let rendered = click.changed.then(|| tab.render(w, h));
                         Done {
                             tab: *tab,
@@ -561,6 +564,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         links: vec![],
         texts: vec![],
         layers: vec![],
+        title: None,
     };
     // In flight: the URL being loaded (None for a re-layout).
     let mut busy: Option<Option<String>>;
@@ -1824,19 +1828,17 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 page_w / k,
                 &mut cache,
             );
-            let titles: Vec<(String, bool)> = order
+            let titles: Vec<(TabLabel, bool)> = order
                 .iter()
                 .map(|&id| {
                     if id == cur_id {
-                        let t = if info.title.is_empty() {
-                            &info.url
-                        } else {
-                            &info.title
-                        };
-                        (t.clone(), true)
+                        (TabLabel::of(&info, &rendered), true)
                     } else {
-                        let t = parked.iter().find(|p| p.id == id).map(|p| p.title().to_string());
-                        (t.unwrap_or_default(), false)
+                        let p = parked.iter().find(|p| p.id == id);
+                        (
+                            p.map(|p| TabLabel::of(&p.info, &p.rendered)).unwrap_or_default(),
+                            false,
+                        )
                     }
                 })
                 .collect();
@@ -2020,14 +2022,6 @@ impl Parked {
         }
         self.tab = Some(done.tab);
     }
-
-    fn title(&self) -> &str {
-        if self.info.title.is_empty() {
-            &self.info.url
-        } else {
-            &self.info.title
-        }
-    }
 }
 
 fn blank_rendered() -> Rendered {
@@ -2039,6 +2033,7 @@ fn blank_rendered() -> Rendered {
         links: vec![],
         texts: vec![],
         layers: vec![],
+        title: None,
     }
 }
 
@@ -2079,28 +2074,91 @@ fn tab_rects(n: usize, w: f32) -> (Vec<(Rect, Rect)>, Rect) {
     (v, plus)
 }
 
-fn draw_tabs(c: &mut Canvas, titles: &[(String, bool)], cache: &mut GlyphCache) {
+/// Size of the tab bar's text.
+const TAB_TEXT: f32 = 12.0;
+
+/// The tab bar's text size in window pixels, which renderers draw page
+/// titles at.
+fn tab_title_px() -> f32 {
+    TAB_TEXT * ui_scale()
+}
+
+/// What a tab shows: its page's title as the renderer drew it (the browser
+/// never runs the font code on text a page chose), or, until there is one
+/// at the current size, the site's host from the address.
+#[derive(Default)]
+struct TabLabel<'a> {
+    title: Option<&'a GlyphBitmap>,
+    fallback: String,
+}
+
+impl<'a> TabLabel<'a> {
+    fn of(info: &Info, rendered: &'a Rendered) -> TabLabel<'a> {
+        let px = tab_title_px();
+        let (ascent, descent) = font::vmetrics(SANS, px);
+        let fits = |t: &&GlyphBitmap| t.h as usize == ((ascent + descent).ceil() as usize);
+        let (host, _) = net::display_parts(&info.url);
+        TabLabel {
+            title: rendered.title.as_ref().filter(fits),
+            fallback: if host.is_empty() { info.url.clone() } else { host },
+        }
+    }
+}
+
+/// `t` cut to `max_w` pixels, fading out over its last few if it was cut.
+fn faded(t: &GlyphBitmap, max_w: usize) -> GlyphBitmap {
+    let (w, h) = (t.w as usize, t.h as usize);
+    let cut = w.min(max_w);
+    let fade = if w > max_w { (cut / 4).min(24) } else { 0 };
+    let mut data = Vec::with_capacity(cut * h);
+    for row in 0..h {
+        for x in 0..cut {
+            let a = t.data[row * w + x] as usize;
+            let left = cut - x;
+            data.push(if left <= fade {
+                (a * left / (fade + 1)) as u8
+            } else {
+                a as u8
+            });
+        }
+    }
+    GlyphBitmap {
+        w: cut as u16,
+        h: h as u16,
+        data,
+    }
+}
+
+fn draw_tabs(c: &mut Canvas, titles: &[(TabLabel, bool)], cache: &mut GlyphCache) {
     let w = c.size().0;
     let (rects, plus) = tab_rects(titles.len(), w);
-    for ((title, current), (r, close)) in titles.iter().zip(&rects) {
+    for ((label, current), (r, close)) in titles.iter().zip(&rects) {
         let bg = if *current {
             Color::WHITE
         } else {
             Color::rgb(0xdd, 0xe0, 0xe5)
         };
         c.fill(*r, bg, 0.0);
-        let shown = fit(title, r.w - 34.0, SANS, 12.0);
-        text(
-            c,
-            r.x + 8.0,
-            r.y + 17.0,
-            &shown,
-            if *current { BOLD } else { SANS },
-            12.0,
-            DARK,
-            cache,
-            0.0,
-        );
+        let room = r.w - 34.0;
+        match label.title {
+            Some(t) if t.data.len() == t.w as usize * t.h as usize => {
+                // Placed as `text` would place it: the baseline 17px down.
+                let k = c.scale;
+                let (ascent, _) = font::vmetrics(SANS, TAB_TEXT * k);
+                let color = if c.dark { paint::dark_variant(DARK) } else { DARK };
+                c.blit(
+                    ((r.x + 8.0) * k).round(),
+                    ((r.y + 17.0) * k - ascent).round(),
+                    &faded(t, (room * k).max(0.0) as usize),
+                    color,
+                    0.0,
+                );
+            }
+            _ => {
+                let shown = fit(&label.fallback, room, SANS, TAB_TEXT);
+                text(c, r.x + 8.0, r.y + 17.0, &shown, SANS, TAB_TEXT, DARK, cache, 0.0);
+            }
+        }
         text(
             c,
             close.x + 4.0,
@@ -3199,9 +3257,28 @@ mod menu_tests {
         ui.address.set("https://example.com/");
         let w = c.size().0;
         draw_chrome(&mut c, &ui, &[], 0.0, 0.0, 160.0, w, &mut cache);
+        // As renderers draw titles: the first fits, the second is cut.
+        let px = TAB_TEXT;
+        let a = paint::text_mask("Example Domain", SANS, px * k, paint::MAX_TITLE_W);
+        let b = paint::text_mask(
+            "A very long page title that won't fit in its tab at all",
+            SANS,
+            px * k,
+            paint::MAX_TITLE_W,
+        );
+        fn label<'a>(title: Option<&'a GlyphBitmap>, fallback: &str) -> TabLabel<'a> {
+            TabLabel {
+                title,
+                fallback: fallback.into(),
+            }
+        }
         draw_tabs(
             &mut c,
-            &[("Example Domain".into(), true), ("Docs".into(), false)],
+            &[
+                (label(a.as_ref(), ""), true),
+                (label(b.as_ref(), ""), false),
+                (label(None, "loading.example"), false),
+            ],
             &mut cache,
         );
         draw_menu_bar(&mut c, &ui, &mut cache);

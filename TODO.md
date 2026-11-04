@@ -20,7 +20,8 @@ Planned work, roughly in priority order. Items marked *discuss* need a decision 
 - [ ] Bidirectional text (Arabic, Hebrew) with `unicode-bidi`
 - [x] Unicode line breaking (UAX #14) with `unicode-linebreak`
 - [ ] Thai/Lao/Khmer word breaking (needs a dictionary)
-- [ ] Draw the browser's own UI text in a sandboxed helper too
+- [x] Page titles in the tab bar are drawn by the page's own sandboxed renderer; the browser only
+      rasterizes its own text and checked URLs
 
 - [x] Replace fontdue: it depends on `ttf-parser`, which is now unmaintained (RUSTSEC-2026-0192).
       A rasterizer on Google's maintained fontations stack (`skrifa` outlines) would also line up

@@ -78,6 +78,54 @@ pub type DisplayList = Vec<DisplayCommand>;
 
 /// Largest glyph bitmap side (a 256px glyph plus italic skew fits easily).
 pub const MAX_GLYPH_SIDE: u16 = 1024;
+/// Largest page-title bitmap a renderer may send for the tab bar.
+pub const MAX_TITLE_W: u16 = MAX_GLYPH_SIDE;
+pub const MAX_TITLE_H: u16 = 128;
+
+/// `text` drawn as one coverage bitmap `size` px tall (ascent plus
+/// descent), cut off at `max_w` px. The renderer draws page titles this way
+/// so the browser never runs the font code on text a page chose.
+pub fn text_mask(text: &str, font_idx: usize, size: f32, max_w: u16) -> Option<GlyphBitmap> {
+    if !(MIN_TEXT_SIZE..=64.0).contains(&size) || font_idx >= font::COUNT {
+        return None;
+    }
+    let (ascent, descent) = font::vmetrics(font_idx, size);
+    let h = ((ascent + descent).ceil() as usize).min(MAX_TITLE_H as usize);
+    let w = (font::measure(font_idx, size, text).ceil() as usize).min(max_w.min(MAX_TITLE_W) as usize);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let mut data = vec![0u8; w * h];
+    let mut pen = 0.0f32;
+    for ch in text.chars() {
+        if pen >= w as f32 {
+            break;
+        }
+        let fi = font::resolve(font_idx, ch);
+        let (m, bitmap) = font::rasterize(fi, ch, size);
+        let gx = (pen + m.xmin as f32).round() as i64;
+        let gy = (ascent - (m.height as i32 + m.ymin) as f32).round() as i64;
+        for row in 0..m.height {
+            let y = gy + row as i64;
+            if !(0..h as i64).contains(&y) {
+                continue;
+            }
+            for col in 0..m.width {
+                let x = gx + col as i64;
+                if (0..w as i64).contains(&x) {
+                    let d = &mut data[y as usize * w + x as usize];
+                    *d = (*d).max(bitmap[row * m.width + col]);
+                }
+            }
+        }
+        pen += m.advance_width;
+    }
+    Some(GlyphBitmap {
+        w: w as u16,
+        h: h as u16,
+        data,
+    })
+}
 /// Stop adding glyphs to a page's atlas beyond this many bytes.
 pub const MAX_ATLAS_BYTES: usize = 24 * 1024 * 1024;
 

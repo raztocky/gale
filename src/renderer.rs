@@ -156,9 +156,15 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                 width,
                 height,
                 text_scale,
+                title_px,
             } => {
                 let p = page.as_mut().ok_or("render before load")?;
                 p.text_scale = text_scale;
+                p.title_px = if title_px.is_finite() {
+                    title_px.clamp(0.0, 64.0)
+                } else {
+                    0.0
+                };
                 let width = width.clamp(1.0, 16_000.0);
                 let rendered = p.render(width, height.clamp(1.0, 16_000.0));
                 if let Some(rt) = rt.as_mut() {

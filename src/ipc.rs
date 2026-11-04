@@ -16,7 +16,7 @@ use crate::page::Key;
 use crate::page::{Rendered, MAX_LINKS, MAX_TEXT_CHARS, MAX_TEXT_RUNS};
 use crate::paint::{
     DisplayCommand, GlyphBitmap, Layer, LayerKind, PlacedGlyph, MAX_ATLAS_BYTES, MAX_FRAME_IMAGE_BYTES,
-    MAX_GLYPH_SIDE, MAX_LAYERS,
+    MAX_GLYPH_SIDE, MAX_LAYERS, MAX_TITLE_H, MAX_TITLE_W,
 };
 use crate::select::TextRun;
 use std::io::{self, Read, Write};
@@ -73,6 +73,8 @@ pub enum ToRenderer {
         height: f32,
         /// Your text size.
         text_scale: f32,
+        /// Size to draw the page's title at, for the tab bar (0 = none).
+        title_px: f32,
     },
     Dom,
 }
@@ -426,11 +428,13 @@ impl ToRenderer {
                 width,
                 height,
                 text_scale,
+                title_px,
             } => {
                 e.u8(3);
                 e.f32(*width);
                 e.f32(*height);
                 e.f32(*text_scale);
+                e.f32(*title_px);
             }
             ToRenderer::Dom => e.u8(4),
             ToRenderer::ImageReply(r) => {
@@ -497,6 +501,7 @@ impl ToRenderer {
                 width: d.f32()?,
                 height: d.f32()?,
                 text_scale: d.f32()?,
+                title_px: d.f32()?,
             },
             4 => ToRenderer::Dom,
             10 => match d.u8()? {
@@ -652,12 +657,14 @@ impl FromRenderer {
                     e.u32(l.start as u32);
                     e.u32(l.end as u32);
                 }
-                e.u32(r.atlas.len() as u32);
-                for g in &r.atlas {
+                // The title bitmap, if any, goes last, flagged after.
+                e.u32((r.atlas.len() + r.title.is_some() as usize) as u32);
+                for g in r.atlas.iter().chain(&r.title) {
                     e.0.extend_from_slice(&g.w.to_le_bytes());
                     e.0.extend_from_slice(&g.h.to_le_bytes());
                     e.0.extend_from_slice(&g.data);
                 }
+                e.u8(r.title.is_some() as u8);
             }
             FromRenderer::Dom(s) => {
                 e.u8(4);
@@ -867,6 +874,15 @@ impl FromRenderer {
                         data: d.take(len)?.to_vec(),
                     });
                 }
+                let title = match d.u8()? {
+                    0 => None,
+                    1 => match atlas.pop() {
+                        Some(t) if t.w <= MAX_TITLE_W && t.h <= MAX_TITLE_H => Some(t),
+                        Some(t) => return Err(format!("title bitmap too large: {}x{}", t.w, t.h)),
+                        None => return Err("title flag without a title bitmap".into()),
+                    },
+                    f => return Err(format!("invalid title flag {f}")),
+                };
                 // Every placed glyph must refer to a bitmap that exists.
                 for cmd in &list {
                     if let DisplayCommand::Glyphs { glyphs, .. } = cmd {
@@ -884,6 +900,7 @@ impl FromRenderer {
                     links,
                     texts,
                     layers,
+                    title,
                 })
             }
             4 => FromRenderer::Dom(d.str()?),
@@ -974,6 +991,11 @@ mod tests {
                 start: 0,
                 end: 1,
             }],
+            title: Some(GlyphBitmap {
+                w: 3,
+                h: 1,
+                data: vec![9, 8, 7],
+            }),
         }
     }
 
@@ -1069,12 +1091,44 @@ mod tests {
                 width: 800.0,
                 height: 600.0,
                 text_scale: 1.25,
+                title_px: 15.0,
             },
             ToRenderer::Dom,
         ];
         for m in msgs {
             assert_eq!(ToRenderer::decode(&m.encode()).unwrap(), m);
         }
+    }
+
+    /// The page title's bitmap travels after the glyph atlas, and is
+    /// checked like a glyph (and against the tab bar's limits).
+    #[test]
+    fn title_bitmaps() {
+        let mut r = sample();
+        r.title = None;
+        let m = FromRenderer::Rendered(r);
+        assert_eq!(FromRenderer::decode(&m.encode()).unwrap(), m);
+        let mut r = sample();
+        r.title = Some(GlyphBitmap {
+            w: 10,
+            h: MAX_TITLE_H + 1,
+            data: vec![0; 10 * (MAX_TITLE_H as usize + 1)],
+        });
+        assert!(FromRenderer::decode(&FromRenderer::Rendered(r).encode()).is_err());
+        // A glyph may not point at the title's bitmap.
+        let mut r = sample();
+        if let DisplayCommand::Glyphs { glyphs, .. } = &mut r.list[1] {
+            glyphs[0].id = 2;
+        }
+        assert!(FromRenderer::decode(&FromRenderer::Rendered(r).encode()).is_err());
+        // A title flag with nothing to flag.
+        let mut r = sample();
+        r.title = None;
+        r.atlas.clear();
+        r.list.truncate(1);
+        let mut bytes = FromRenderer::Rendered(r).encode();
+        *bytes.last_mut().unwrap() = 1;
+        assert!(FromRenderer::decode(&bytes).is_err());
     }
 
     #[test]
