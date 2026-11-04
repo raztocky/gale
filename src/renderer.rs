@@ -145,7 +145,7 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                     output,
                     FromRenderer::Loaded {
                         title: p.title.clone(),
-                        navigate: out.navigate,
+                        navigate: out.navigate.or_else(|| p.redirect.clone()),
                         console: out.console,
                     },
                 )?;

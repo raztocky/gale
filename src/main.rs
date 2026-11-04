@@ -451,7 +451,16 @@ fn render(args: &[String], sandboxed: bool, filters: bool) -> Result<(), String>
             u => url = Some(u.to_string()),
         }
     }
-    let mut tab = open_tab(&mut network(filters), &url.ok_or(USAGE)?, sandboxed);
+    let mut net = network(filters);
+    let mut tab = open_tab(&mut net, &url.ok_or(USAGE)?, sandboxed);
+    // Follow the page's own redirects (scripts, `<meta http-equiv=refresh>`)
+    // as the window does.
+    for _ in 0..5 {
+        let Some(to) = tab.script_navigate.take() else {
+            break;
+        };
+        tab = Tab::open(&mut net, &to, Some(&tab.url), sandboxed);
+    }
     let r = tab.render(width, 768.0);
     let height = (r.height.ceil() as usize).clamp(1, 20_000);
     let mut canvas = paint::Canvas::new(width as usize, height, r.background);

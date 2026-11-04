@@ -47,6 +47,10 @@ pub struct Page {
     /// Size of the tab bar's text in px: [`Rendered::title`] is drawn at
     /// it (0 = not wanted).
     pub title_px: f32,
+    /// Where the page's `<meta http-equiv="refresh">` sends you, as an
+    /// absolute URL (the browser applies its checks, like a script's
+    /// navigation).
+    pub redirect: Option<String>,
 }
 
 /// Decoded image pixels a page may keep (the renderer has 4 GB in all).
@@ -263,6 +267,7 @@ impl Page {
             image_bytes: 0,
             text_scale: 1.0,
             title_px: 0.0,
+            redirect: None,
         }
     }
 
@@ -390,6 +395,9 @@ impl Page {
             .first()
             .map(|t| t.text_content().split_whitespace().collect::<Vec<_>>().join(" "))
             .unwrap_or_default();
+        self.redirect = meta_refresh(&dom, scripting)
+            .and_then(|c| refresh_url(&c))
+            .map(|to| net::resolve(&self.url, &to));
         self.sheets = sheets;
         self.dom = dom;
     }
@@ -956,6 +964,47 @@ fn collect_style_elements<'a>(n: &'a Node, scripting: bool, out: &mut Vec<&'a No
     }
 }
 
+/// The `content` of the first `<meta http-equiv="refresh">`; inside
+/// `<noscript>` only when scripts are off.
+fn meta_refresh(n: &Node, scripting: bool) -> Option<String> {
+    let e = n.element()?;
+    match e.tag.as_str() {
+        "meta"
+            if e.attrs
+                .get("http-equiv")
+                .is_some_and(|h| h.trim().eq_ignore_ascii_case("refresh")) =>
+        {
+            e.attrs.get("content").cloned()
+        }
+        "noscript" if scripting => None,
+        _ => n.children.iter().find_map(|c| meta_refresh(c, scripting)),
+    }
+}
+
+/// The URL in a refresh's `content` (`"5; url='/next'"`). The delay is
+/// ignored: the page is left right away. One without a URL would only
+/// reload the page over and over, so it gives `None`.
+fn refresh_url(content: &str) -> Option<String> {
+    let (delay, rest) = content.trim().split_once([';', ','])?;
+    if delay.trim().is_empty() || !delay.trim().bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return None;
+    }
+    let rest = rest.trim_start();
+    let rest = match rest.get(..3) {
+        Some(u) if u.eq_ignore_ascii_case("url") => match rest[3..].trim_start().strip_prefix('=') {
+            Some(r) => r.trim_start(),
+            None => rest,
+        },
+        _ => rest,
+    };
+    let url = match rest.chars().next() {
+        Some(q @ ('"' | '\'')) => rest[1..].split(q).next().unwrap_or_default(),
+        _ => rest,
+    };
+    let url = url.trim();
+    (!url.is_empty()).then(|| url.to_string())
+}
+
 /// Runs scripts while a page loads, fetching external ones from the browser.
 struct ScriptLoader {
     fetched: usize,
@@ -1374,6 +1423,38 @@ mod text_tests {
 
     /// The renderer draws the page's title for the tab bar, at the size
     /// asked for, so the browser never rasterizes text a page chose.
+    #[test]
+    fn meta_refresh_redirects() {
+        let parse = |src: &str| Page::parse("https://a.test/x/", src, "", &mut |_, _| Err("no".into()));
+        // DuckDuckGo's fallback for browsers without scripts.
+        let ddg = r#"<noscript><meta http-equiv="refresh" content="0; url=&quot;https://html.duckduckgo.com/html&quot;"/><style>body { display: none }</style></noscript>"#;
+        assert_eq!(
+            parse(ddg).redirect.as_deref(),
+            Some("https://html.duckduckgo.com/html")
+        );
+        let p = parse(r#"<meta http-equiv="Refresh" content="5;URL='next'">"#);
+        assert_eq!(p.redirect.as_deref(), Some("https://a.test/x/next"));
+        assert_eq!(
+            parse(r#"<meta http-equiv=refresh content="0, /b">"#)
+                .redirect
+                .as_deref(),
+            Some("https://a.test/b")
+        );
+        // Reloading without a URL, broken delays, other metas: stay.
+        for src in [
+            r#"<meta http-equiv="refresh" content="30">"#,
+            r#"<meta http-equiv="refresh" content="soon; url=/b">"#,
+            r#"<meta http-equiv="refresh" content="0; url=">"#,
+            r#"<meta name="refresh" content="0; url=/b">"#,
+        ] {
+            assert_eq!(parse(src).redirect, None, "{src}");
+        }
+        // With scripts on, `<noscript>` is skipped.
+        let mut p = Page::empty("https://a.test/", "", true);
+        p.set_tree(html::parse(ddg), &mut |_, _| Err("no".into()));
+        assert_eq!(p.redirect, None);
+    }
+
     #[test]
     fn title_is_drawn_for_the_tab_bar() {
         let html = "<title>Hello — wörld</title><p>x";
