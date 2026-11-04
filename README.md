@@ -145,8 +145,10 @@ described in [PRIVACY.md](PRIVACY.md). Security measures:
 - **No `unsafe` code** in Brickle itself (`#![forbid(unsafe_code)]`).
 - **Fuzzed.** `fuzz/` has [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets for the
   HTML parser, the CSS parser, the whole render pipeline, the IPC decoder, the filter engine,
-  JavaScript and the image decoders. CI fuzzes each one on every push. To run them locally:
-  `cargo +nightly fuzz run html` (or `css`, `render`, `ipc`, `filter`, `js`, `image`).
+  JavaScript, the image decoders, text selection and find-in-page (on hostile text runs), CSS
+  gradients and the address bar's text editing. CI fuzzes each one on every push. To run them
+  locally: `cargo +nightly fuzz run html` (or `css`, `render`, `ipc`, `filter`, `js`, `image`,
+  `select`, `gradient`, `lineedit`).
 - **Dependency auditing.** [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) checks
   RustSec advisories, licenses and sources, and bans AI crates, in CI on every push and weekly
   (config in `deny.toml`). CI actions are pinned to commit hashes. Dependabot proposes updates,

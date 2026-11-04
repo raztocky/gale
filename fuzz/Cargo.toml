@@ -62,3 +62,21 @@ name = "image"
 path = "fuzz_targets/image.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "select"
+path = "fuzz_targets/select.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "gradient"
+path = "fuzz_targets/gradient.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "lineedit"
+path = "fuzz_targets/lineedit.rs"
+test = false
+doc = false

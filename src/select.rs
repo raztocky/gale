@@ -3,7 +3,7 @@
 //! renderer sent (and `ipc` checked).
 
 use crate::layout::Rect;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 /// A piece of text as painted, in page coordinates. `offsets` holds the x
 /// of each character boundary relative to `rect.x`: one more than the
@@ -31,14 +31,14 @@ impl TextRun {
 pub type Pos = (usize, usize);
 
 /// Rectangles indexed by 64px horizontal band, so looking up what's at a
-/// point checks a few of them instead of every one on the page.
+/// point checks a few of them instead of every one on the page. Only bands
+/// with something in them are visited, however far apart they are (a
+/// hostile renderer can put text anywhere).
 #[derive(Debug, Default)]
 pub struct Bands {
-    map: HashMap<i64, Vec<usize>>,
+    map: BTreeMap<i64, Vec<usize>>,
     /// Rectangles too tall to list in every band they cross.
     tall: Vec<usize>,
-    /// The first and last bands with anything in them.
-    range: Option<(i64, i64)>,
 }
 
 const BAND_H: f32 = 64.0;
@@ -48,7 +48,9 @@ const MAX_SPAN: i64 = 64;
 const MAX_TALL: usize = 4096;
 
 fn band(y: f32) -> i64 {
-    (y / BAND_H).floor() as i64
+    // Far enough out that sums and differences of bands can't overflow
+    // (NaN goes to 0).
+    (y / BAND_H).floor().clamp(-1e15, 1e15) as i64
 }
 
 impl Bands {
@@ -57,19 +59,14 @@ impl Bands {
         for (i, r) in rects.into_iter().enumerate() {
             let (top, bottom) = (band(r.y), band(r.y + r.h));
             if bottom - top > MAX_SPAN {
-                if b.tall.len() >= MAX_TALL {
-                    continue;
+                if b.tall.len() < MAX_TALL {
+                    b.tall.push(i);
                 }
-                b.tall.push(i);
             } else {
                 for k in top..=bottom {
                     b.map.entry(k).or_default().push(i);
                 }
             }
-            b.range = Some(
-                b.range
-                    .map_or((top, bottom), |(lo, hi)| (lo.min(top), hi.max(bottom))),
-            );
         }
         b
     }
@@ -81,12 +78,10 @@ impl Bands {
 
     /// The rectangles that may reach heights `y0..=y1`, in order.
     pub fn between(&self, y0: f32, y1: f32) -> Vec<usize> {
-        let Some((lo, hi)) = self.range else {
-            return Vec::new();
-        };
+        let (b0, b1) = (band(y0), band(y1));
         let mut v = self.tall.clone();
-        for k in band(y0).max(lo)..=band(y1).min(hi) {
-            if let Some(ix) = self.map.get(&k) {
+        if b0 <= b1 {
+            for ix in self.map.range(b0..=b1).map(|(_, ix)| ix) {
                 v.extend(ix);
             }
         }
@@ -109,8 +104,9 @@ pub fn hit(runs: &[TextRun], bands: &Bands, x: f32, y: f32) -> Option<Pos> {
         }
     };
     let dist = |r: &Rect| (gap(y, r.y, r.y + r.h), gap(x, r.x, r.x + r.w));
-    // The nearest run, ties going to the earliest, looking outwards band by
-    // band from `y` until no further band could hold a nearer one.
+    // The nearest run, ties going to the earliest, looking outwards from `y`
+    // through the bands with runs in them until no further band could hold
+    // a nearer one.
     let mut best: Option<((f32, f32), usize)> = None;
     let consider = |best: &mut Option<((f32, f32), usize)>, i: usize| {
         if let Some(r) = runs.get(i) {
@@ -121,20 +117,31 @@ pub fn hit(runs: &[TextRun], bands: &Bands, x: f32, y: f32) -> Option<Pos> {
         }
     };
     bands.tall.iter().for_each(|&i| consider(&mut best, i));
-    let (lo, hi) = bands.range?;
     let b0 = band(y);
-    let mut k = 0i64;
+    let mut up = bands.map.range(..b0).rev().peekable();
+    let mut down = bands.map.range(b0..).peekable();
     loop {
-        for kb in [b0 - k, b0 + k].into_iter().take(if k == 0 { 1 } else { 2 }) {
-            if let Some(ix) = bands.map.get(&kb) {
-                ix.iter().for_each(|&i| consider(&mut best, i));
+        // Whichever side's next band is closer.
+        let next = match (up.peek(), down.peek()) {
+            (None, None) => break,
+            (Some((&ku, _)), Some((&kd, _))) => {
+                if b0 - ku < kd - b0 {
+                    up.next()
+                } else {
+                    down.next()
+                }
             }
-        }
-        // Runs listed further out are at least `k` bands away.
-        if best.is_some_and(|((dy, _), _)| dy <= k as f32 * BAND_H) || (b0 - k <= lo && b0 + k >= hi) {
+            (Some(_), None) => up.next(),
+            (None, Some(_)) => down.next(),
+        };
+        let Some((&kb, ix)) = next else { break };
+        // Runs listed in this band or further out are at least this many
+        // bands away (less one, for where in its band `y` is).
+        let k = (kb - b0).abs() - 1;
+        if best.is_some_and(|((dy, _), _)| dy <= k as f32 * BAND_H) {
             break;
         }
-        k += 1;
+        ix.iter().for_each(|&i| consider(&mut best, i));
     }
     let (_, i) = best?;
     let run = &runs[i];
@@ -446,7 +453,6 @@ mod tests {
         let b = bands(&r);
         let all = Bands {
             tall: (0..r.len()).collect(),
-            range: Some((0, 0)),
             ..Bands::default()
         };
         for y in (-200..120_000).step_by(37) {
@@ -470,6 +476,35 @@ mod tests {
         assert!(f.find(&r, "").is_empty() && f.find(&r, "missing").is_empty());
         let many = runs(&[(&"ab".repeat(5000), 0.0, 0)]);
         assert_eq!(FindText::new(&many).find(&many, "a").len(), MAX_MATCHES);
+    }
+
+    #[test]
+    fn runs_far_apart_dont_hang() {
+        // Found by fuzzing: bands were walked one by one between the
+        // furthest runs, which a hostile renderer can put 10^30 px apart.
+        let run = |y: f32, h: f32| TextRun {
+            rect: Rect {
+                x: 0.0,
+                y,
+                w: 10.0,
+                h,
+            },
+            text: "a".into(),
+            offsets: vec![0.0, 10.0],
+        };
+        let r = vec![
+            run(-1e30, 10.0),
+            run(1e30, 10.0),
+            run(0.0, f32::INFINITY),
+            run(f32::NAN, 1.0),
+        ];
+        let b = bands(&r);
+        for y in [0.0, -1e30, 1e30, 5e29, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let _ = hit(&r, &b, 5.0, y);
+        }
+        assert_eq!(hit(&r, &b, 2.0, 1e30 + 1.0), Some((1, 0)));
+        let _ = highlights(&r, &b, (0, 0), (3, 1), f32::NEG_INFINITY, f32::INFINITY);
+        assert!(b.between(f32::NEG_INFINITY, f32::INFINITY).len() >= 2);
     }
 
     #[test]
