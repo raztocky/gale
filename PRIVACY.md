@@ -235,19 +235,24 @@ images, fonts or files it points to are never fetched or read. `data:` images ar
 
 Brickle reads the clipboard only when you press `Ctrl+V` or `Shift+Insert`, and only to type what's
 on it into the address bar or the form field you're in, as if you'd typed it yourself. It writes
-the clipboard only when you press `Ctrl+C` (to copy the address). Only the browser process can
-reach the clipboard; sandboxed pages can't, and scripts have no clipboard API
-(`navigator.clipboard` is missing and `document.execCommand` does nothing).
+the clipboard only when you press `Ctrl+C` or `Ctrl+X` (to copy the address, your selection, or
+what you selected in a form field). Only the browser process can reach the clipboard; sandboxed
+pages can't, and scripts have no clipboard API (`navigator.clipboard` is missing and
+`document.execCommand` does nothing). Text from a form field comes from the page's renderer, so
+the browser takes it only in answer to `Ctrl+C` or `Ctrl+X`, at most 1 MiB, and never from a
+password field.
 
 What you copy from a page is what you saw. Text a page hides from you isn't selectable: text
 that's transparent or the colour of what's behind it, smaller than 4px, pushed off the page, clipped
 away by an `overflow` box, or covered by something opaque painted over it. Copied text also loses
 invisible characters that change what it means or how it shows: control characters, direction
 overrides, zero-width spaces, soft hyphens and Unicode tag characters. So a command you copy
-can't carry a hidden `; curl … | sh`.
+can't carry a hidden `; curl … | sh`. The same characters are taken out of text copied from a form
+field.
 
-*Enforced by:* `hidden_text_is_not_copied` in `src/page.rs` and `invisible_characters_are_not_copied`
-in `src/select.rs`.
+*Enforced by:* `hidden_text_is_not_copied` and `select_drop_down_and_field_keys` in `src/page.rs`,
+`invisible_characters_are_not_copied` and `field_text_is_cleaned_too` in `src/select.rs`, and
+`renderers_reach_the_clipboard_only_when_asked` in `src/tab.rs`.
 
 ## What Brickle does store
 
@@ -259,4 +264,5 @@ in `src/select.rs`.
 - `~/.config/brickle/text-size`, `interface-size` and `interface-theme`: your text and interface
   sizes and whether the interface is light or dark, the same for every site.
 
-There is no history file. Back/forward history exists only in memory while the window is open.
+There is no history file. Back/forward history, and the closed tabs `Ctrl+Shift+T` can reopen,
+exist only in memory while the window is open.

@@ -10,8 +10,10 @@ Planned work, roughly in priority order. Items marked *discuss* need a decision 
 - [ ] Images: `<picture>`/`srcset` choice by size, animation, lazy loading, inline `<svg>` in HTML
 - [x] Floats and positioning (`float`, `position: absolute/fixed/relative`)
 - [x] Real table layout
-- [x] Flexbox, CSS grid columns, `@media` queries, `aspect-ratio`, percentage heights
-- [ ] Grid rows (`grid-template-rows`, `grid-row`, named areas), `::before`/`::after` content
+- [x] Flexbox, CSS grid, `@media` queries, `aspect-ratio`, percentage heights
+- [x] Grid rows (`grid-template-rows`, `grid-auto-rows`, `grid-row`, `grid-area`, named areas)
+- [x] `::before`/`::after` content (strings, `attr()`, quotes), and `<details>` that open on a click
+- [ ] CSS counters (`counter()`/`counters()` in `content`), `grid-template`/`grid` shorthands
 - [x] Show `<noscript>` content, and follow `<meta http-equiv=refresh>` redirects
 - [x] Cookies: session-only, first-party only, per-site keep list
 - [x] JavaScript: Boa in the sandboxed renderer, off unless you allow a site (see below)
@@ -62,11 +64,12 @@ what's next:
 
 ## Forms
 
-Done: text fields, passwords, textareas, checkboxes, radio buttons, selects, buttons, labels,
-Tab between fields, Enter to submit, GET/POST (url-encoded, multipart, text/plain), and the
+Done: text fields (with a caret and selection), passwords, textareas, checkboxes, radio buttons,
+selects (with a drop-down), buttons, labels, Tab between fields, Enter to submit, GET/POST (url-encoded, multipart, text/plain), and the
 `input`/`change`/`submit` events for scripts.
-- [ ] A real drop-down for `<select>` (clicks cycle through the options for now).
-- [ ] Moving the caret, selecting text, copy and paste.
+- [x] A real drop-down for `<select>`, and `↑`/`↓` to change it.
+- [x] Moving the caret, selecting text in a field, copy, cut and paste.
+- [ ] Placing the caret and selecting in a field with the mouse.
 - [ ] File uploads (`<input type=file>`).
 - [ ] Form validation (`required`, `pattern`), `<input type=number>` steppers, date pickers.
 - [x] Ask before re-sending a POST on reload, back or forward (a page reached by a redirect after the POST reloads freely, as in Firefox).
@@ -75,5 +78,6 @@ Tab between fields, Enter to submit, GET/POST (url-encoded, multipart, text/plai
 
 Done: tab strip, new/close/switch (keyboard and mouse), links in background tabs, each tab with
 its own renderer, history, scroll and form focus.
-- [ ] Reopen closed tab (`Ctrl+Shift+T`), drag to reorder.
+- [x] Reopen closed tab (`Ctrl+Shift+T`), with its history (kept in memory only).
+- [ ] Drag tabs to reorder.
 - [x] Discard the renderers of tabs left in the background for a long time (10 minutes, or past 6 live background tabs; they reload when shown).

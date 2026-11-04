@@ -40,6 +40,8 @@ browser treats everything it sends as hostile (`src/tab.rs`, `src/ipc.rs`):
 - all of a page's loading (document, redirects, stylesheets) shares one deadline;
 - the renderer can only *ask* for subresources; the browser applies every policy to each request
   and holds the cookies;
+- the renderer can hand the browser clipboard text (what you selected in a form field) only in
+  reply to your `Ctrl+C` or `Ctrl+X`, capped in size and cleaned of invisible characters;
 - images are decoded only in the renderer (`src/image.rs`): image decoders are a classic source
   of memory-safety bugs, so the browser never runs one on a website's bytes. It only receives
   finished RGBA pixels, which it checks (sizes, references, total pixels, painting cost) before

@@ -47,17 +47,17 @@ size, and clicking the percentage between them goes back to the normal size.
 | Scroll | mouse wheel, arrow keys, `Space`, `PgUp`/`PgDn` |
 | Back / forward | the ← → buttons, `Backspace` or `Alt+←` / `Alt+→` |
 | Reload / stop | the ↻ button (✕ while loading), `Ctrl+R` or `F5` / `Esc` |
-| New tab / close tab | `Ctrl+T` or `+` / `Ctrl+W` or `×` |
+| New tab / close tab / reopen closed tab | `Ctrl+T` or `+` / `Ctrl+W` or `×` / `Ctrl+Shift+T` |
 | Switch tabs | `Ctrl+Tab`, `Ctrl+Shift+Tab`, `Ctrl+PgDn`/`PgUp`, `Ctrl+1`…`Ctrl+9` |
 | Open a link in a new tab | middle-click, or `Ctrl`+click |
-| Forms | click a field to type; `Tab` next field, `Enter` submit, `Esc` leave the field |
+| Forms | click a field to type; `Tab` next field, `Enter` submit, `Esc` leave the field. In a field: arrows, `Home`/`End` move the caret (`Ctrl`: by words), `Shift` selects, `Ctrl+A` selects all. Click a drop-down to see its options; `↑`/`↓` change it |
 | Find in page | `Ctrl+F`, then `Enter`/`Shift+Enter` (or `F3`, `Ctrl+G`) for the next/previous match, `Esc` to close |
 | Select text | drag, double-click a word, `Ctrl+A` for the page, `Esc` to clear |
 | Text size | `Ctrl+=` bigger, `Ctrl+-` smaller, `Ctrl+0` normal (125%, remembered between runs) |
 | Interface size (menus, tabs, address bar, panels) | `Ctrl+Alt+=` bigger, `Ctrl+Alt+-` smaller, `Ctrl+Alt+0` normal, also in the View menu (remembered) |
 | Light / dark interface (dark by default; pages keep their own colours) | `Ctrl+Shift+D`, or View menu (remembered) |
 | Quit | `Ctrl+Q` |
-| Copy / paste | `Ctrl+C` copies the selection (or the address); `Ctrl+V` or `Shift+Insert` pastes into the address bar or a form field |
+| Copy / paste | `Ctrl+C` copies the selection (or the address, or what's selected in a form field; `Ctrl+X` cuts it); `Ctrl+V` or `Shift+Insert` pastes into the address bar or a form field |
 
 ## Architecture
 
@@ -78,9 +78,9 @@ browser validates before painting.
 | Module | What it does |
 |---|---|
 | `html.rs` | Tokenizer and tree builder. Handles implied end tags (`<p>`, `<li>`, `<td>`…), void elements, raw text (`<script>`/`<style>`), entities, and `<html>/<head>/<body>` normalization |
-| `css.rs` | Rules, selectors (type, `.class`, `#id`, `*`, `[attr]`, `:root`, `:link`, descendant and `>` combinators, escaped names like Tailwind's `.md\:flex`), `@media` queries checked against the window (width, height, orientation, ranges, `not`/`or`), `!important`, colors, units, custom properties (`--name`, `var()`) and `calc()`/`min()`/`max()`/`clamp()` |
-| `style.rs` | Selector matching, specificity, the cascade (UA < author < inline), inheritance, shorthand expansion and computed values. The UA sheet is `ua.css` |
-| `layout.rs` | Block and inline formatting contexts, box model, auto margins, `max-width`, margin collapsing between siblings, Unicode line breaking (UAX #14), `text-align`, `<pre>`, list markers, inline-blocks (baseline-aligned), flexbox (grow/shrink/basis, wrapping, `justify-content`, `align-items`/`align-self`/`align-content`, columns, `order`, gaps, `inline-flex`, auto margins), CSS grid (`grid-template-columns` with px/%/`fr`/`auto`/`minmax()`/`repeat()` including `auto-fill`/`auto-fit`, `grid-column` lines and spans, gaps; rows are automatic), `aspect-ratio`, percentage heights, floats (`float`, `clear`, `<br clear>`, `align=left/right`, with `overflow`/`flow-root` containing them), positioning (`relative`, `absolute`, `fixed`, insets, `z-index` stacking order), and tables (automatic column widths, `colspan`/`rowspan`, `border-spacing`, `vertical-align`, captions, CSS `display: table-*`) |
+| `css.rs` | Rules, selectors (type, `.class`, `#id`, `*`, `[attr]`, `:root`, `:link`, descendant and `>` combinators, escaped names like Tailwind's `.md\:flex`), `@media` queries checked against the window (width, height, orientation, ranges, `not`/`or`), `::before`/`::after`, `!important`, colors, units, string escapes, custom properties (`--name`, `var()`) and `calc()`/`min()`/`max()`/`clamp()` |
+| `style.rs` | Selector matching, specificity, the cascade (UA < author < inline), inheritance, shorthand expansion and computed values, and `::before`/`::after` boxes (`content` strings, `attr()`, quotes). The UA sheet is `ua.css` |
+| `layout.rs` | Block and inline formatting contexts, box model, auto margins, `max-width`, margin collapsing between siblings, Unicode line breaking (UAX #14), `text-align`, `<pre>`, list markers, inline-blocks (baseline-aligned), flexbox (grow/shrink/basis, wrapping, `justify-content`, `align-items`/`align-self`/`align-content`, columns, `order`, gaps, `inline-flex`, auto margins), CSS grid (`grid-template-columns` with px/%/`fr`/`auto`/`minmax()`/`repeat()` including `auto-fill`/`auto-fit`, `grid-template-rows` and `grid-auto-rows` (`fr` rows when the grid has a height), `grid-column`/`grid-row`/`grid-area` lines and spans, `grid-template-areas`, gaps), `aspect-ratio`, percentage heights, floats (`float`, `clear`, `<br clear>`, `align=left/right`, with `overflow`/`flow-root` containing them), positioning (`relative`, `absolute`, `fixed`, insets, `z-index` stacking order), and tables (automatic column widths, `colspan`/`rowspan`, `border-spacing`, `vertical-align`, captions, CSS `display: table-*`) |
 | `font.rs` | Bundled fonts, per-character fallback, lazy loading |
 | `image.rs` | PNG, JPEG, GIF, WebP and SVG decoding (in the renderer only), with size checks before decoding, and resizing |
 | `paint.rs` | Draw ops in CSS stacking order, clipped to `overflow` boxes (rectangles and images exactly, text by glyph), glyph-atlas rasterization (in the renderer: skrifa outlines, filled by `font.rs`), and the browser's software painter: alpha-blended rects and glyph bitmaps, cached in 512px tiles, painted on their own threads, so scrolling just copies pixels |
@@ -153,6 +153,8 @@ described in [PRIVACY.md](PRIVACY.md). Security measures:
   - Element nesting depth 256 and 100,000 nodes per page.
   - Selectors up to 32 parts and 8 levels of `:not()`/`:is()`/`:has()`, and matching has a
     step budget per page, so crafted selectors can't stall it.
+  - Grid placement checks at most 4 million cells per grid, and generated `content` is at most
+    1,000 characters per box.
   - Fonts capped at 256 px, and the glyph cache is bounded.
 - **A slow or hostile page can't freeze the window.** Loading and layout run on a background
   thread and page tiles are painted on their own threads; `Esc` stops a load.
@@ -187,4 +189,4 @@ On non-Linux systems the sandbox isn't implemented yet, so you have to run with 
 
 ## Not yet
 
-JavaScript modules, `grid-template-rows`/`grid-row`/named areas, scrolling inside boxes (boxes with `overflow: auto` grow to fit instead), file uploads, `::before`/`::after` generated content, `:nth-child(… of S)`, conic gradients and multiple background layers, inline `<svg>` in HTML, animated images, choosing between conflicting collapsed table borders (cells' borders are drawn over the table's), `position: sticky` with `bottom`/`left`/`right` (only `top` sticks), relative offsets and vertical padding on inline elements, borders drawn around inline elements, web fonts, and selecting text inside form fields.
+JavaScript modules, the `grid-template`/`grid` shorthands, `grid-auto-flow` and named grid lines, CSS counters (`counter()` in `content` gives nothing), other pseudo-elements (`::marker`, `::first-line`…), scrolling inside boxes (boxes with `overflow: auto` grow to fit instead), file uploads, `:nth-child(… of S)`, conic gradients and multiple background layers, inline `<svg>` in HTML, animated images, choosing between conflicting collapsed table borders (cells' borders are drawn over the table's), `position: sticky` with `bottom`/`left`/`right` (only `top` sticks), relative offsets and vertical padding on inline elements, borders drawn around inline elements, web fonts (so icon-font characters in `content` are left out), placing the caret or selecting in a form field with the mouse (clicking puts the caret at the end), and drop-down lists that reach outside a box that clips them.
