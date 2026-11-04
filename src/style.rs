@@ -254,8 +254,17 @@ pub struct ComputedStyle {
     /// (its items are built like a flex container's, so `display` is `Flex`).
     pub is_grid: bool,
     pub grid_columns: Option<Rc<GridTemplate>>,
-    /// A grid item's `grid-column` start and end.
+    /// `grid-template-rows`, and `grid-auto-rows` for the rows after them.
+    pub grid_rows: Option<Rc<GridTemplate>>,
+    pub grid_auto_rows: Option<Rc<GridTemplate>>,
+    /// `grid-template-areas`.
+    pub grid_areas: Option<Rc<GridAreas>>,
+    /// A grid item's `grid-column` and `grid-row` start and end.
     pub grid_column: [GridLine; 2],
+    pub grid_row: [GridLine; 2],
+    /// `grid-area: name`: the item fills that area of the container's
+    /// `grid-template-areas`.
+    pub grid_area: Option<Rc<str>>,
     /// `column-gap`: between items in a row, or between columns.
     pub gap: f32,
     pub row_gap: f32,
@@ -337,7 +346,12 @@ impl ComputedStyle {
             aspect_ratio: None,
             is_grid: false,
             grid_columns: None,
+            grid_rows: None,
+            grid_auto_rows: None,
+            grid_areas: None,
             grid_column: [GridLine::Auto; 2],
+            grid_row: [GridLine::Auto; 2],
+            grid_area: None,
             gap: 0.0,
             row_gap: 0.0,
             border_spacing: [0.0; 2],
@@ -543,7 +557,59 @@ fn track_size(tok: &str, font_size: f32, rem: f32) -> Option<TrackSize> {
     })
 }
 
-/// A `grid-column` start or end.
+/// `grid-template-areas`: named rectangles of cells.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GridAreas {
+    pub rows: usize,
+    pub cols: usize,
+    /// Each name's first row and column, and the row and column past its
+    /// end (0-based).
+    pub areas: HashMap<String, [usize; 4]>,
+}
+
+impl GridAreas {
+    /// The rows as strings (`"head head" "nav main"`); `.` is an empty cell.
+    /// Rows of different lengths or areas that aren't rectangles make the
+    /// whole value invalid, as in CSS.
+    fn parse(vals: &[Value]) -> Option<GridAreas> {
+        let rows: Vec<Vec<&str>> = vals
+            .iter()
+            .map(|v| match v {
+                Value::Str(r) => Some(r.split_whitespace().collect()),
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        let cols = rows.first()?.len();
+        if cols == 0 || rows.iter().any(|r| r.len() != cols) || rows.len() * cols > MAX_GRID_TRACKS {
+            return None;
+        }
+        let mut areas: HashMap<String, [usize; 4]> = HashMap::new();
+        for (r, row) in rows.iter().enumerate() {
+            for (c, name) in row.iter().enumerate() {
+                if name.chars().all(|ch| ch == '.') {
+                    continue;
+                }
+                // Names are matched ignoring case: `grid-area` values
+                // arrive lower-cased.
+                let a = areas.entry(name.to_lowercase()).or_insert([r, c, r + 1, c + 1]);
+                *a = [a[0].min(r), a[1].min(c), a[2].max(r + 1), a[3].max(c + 1)];
+            }
+        }
+        // Every cell inside each area's bounds must be that area's.
+        for (name, [r0, c0, r1, c1]) in &areas {
+            if (*r0..*r1).any(|r| (*c0..*c1).any(|c| rows[r][c].to_lowercase() != *name)) {
+                return None;
+            }
+        }
+        Some(GridAreas {
+            rows: rows.len(),
+            cols,
+            areas,
+        })
+    }
+}
+
+/// A `grid-column` or `grid-row` start or end.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GridLine {
     Auto,
@@ -1472,18 +1538,49 @@ fn compute(
                 let text: Vec<String> = vals.iter().map(|v| v.to_css()).collect();
                 s.grid_columns = GridTemplate::parse(&text.join(" "), fs, ctxv.rem).map(Rc::new);
             }
-            "grid-column" | "grid-column-start" | "grid-column-end" => {
+            "grid-template-rows" | "grid-auto-rows" => {
+                let text: Vec<String> = vals.iter().map(|v| v.to_css()).collect();
+                let t = GridTemplate::parse(&text.join(" "), fs, ctxv.rem).map(Rc::new);
+                if name == "grid-template-rows" {
+                    s.grid_rows = t;
+                } else {
+                    s.grid_auto_rows = t;
+                }
+            }
+            "grid-template-areas" => s.grid_areas = GridAreas::parse(vals).map(Rc::new),
+            "grid-column" | "grid-column-start" | "grid-column-end" | "grid-row" | "grid-row-start"
+            | "grid-row-end" => {
                 let lines = GridLine::parse(vals);
+                let first = lines.first().copied().unwrap_or(GridLine::Auto);
+                let target = if name.starts_with("grid-row") {
+                    &mut s.grid_row
+                } else {
+                    &mut s.grid_column
+                };
                 match name.as_str() {
-                    "grid-column" => {
+                    "grid-column" | "grid-row" => {
                         // `a / b`; `a` alone is `a / auto`, but a span stays one.
                         let at = |i: usize| lines.get(i).copied().unwrap_or(GridLine::Auto);
-                        s.grid_column = [at(0), at(1)];
+                        *target = [at(0), at(1)];
                     }
-                    "grid-column-start" => {
-                        s.grid_column[0] = lines.first().copied().unwrap_or(GridLine::Auto)
+                    n if n.ends_with("-start") => target[0] = first,
+                    _ => target[1] = first,
+                }
+            }
+            "grid-area" => {
+                // A name, or up to four lines: row start / column start /
+                // row end / column end.
+                s.grid_area = None;
+                match vals.as_slice() {
+                    [Value::Keyword(k)] if k != "auto" && !k.contains('(') => {
+                        s.grid_area = Some(k.as_str().into())
                     }
-                    _ => s.grid_column[1] = lines.first().copied().unwrap_or(GridLine::Auto),
+                    _ => {
+                        let l = GridLine::parse(vals);
+                        let at = |i: usize| l.get(i).copied().unwrap_or(GridLine::Auto);
+                        s.grid_row = [at(0), at(2)];
+                        s.grid_column = [at(1), at(3)];
+                    }
                 }
             }
             "column-gap" => {

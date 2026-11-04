@@ -2,8 +2,8 @@
 //!
 //! Supports normal flow (block + inline formatting contexts), the CSS box
 //! model, auto margins, max-width, sibling margin collapsing, text wrapping
-//! and alignment, list markers, inline-blocks, flexbox, a grid (columns
-//! from `grid-template-columns`, automatic rows), floats, positioning,
+//! and alignment, list markers, inline-blocks, flexbox, a grid (column and
+//! row templates, line and area placement), floats, positioning,
 //! `aspect-ratio`, percentage heights and tables (the CSS 2.1 automatic
 //! table layout, in the separated-borders model).
 
@@ -569,6 +569,9 @@ fn build_cell<'a>(
 // Layout
 // ---------------------------------------------------------------------------
 
+/// Most grid cells placing a grid's items may check or mark.
+const GRID_PLACEMENT_WORK: usize = 4_000_000;
+
 /// Lay out for a viewport `viewport_w` wide. Absolutely positioned boxes
 /// with no positioned ancestor use the page's own height as the viewport's.
 pub fn layout_tree<'a>(root: &'a StyledNode<'a>, viewport_w: f32) -> LayoutBox<'a> {
@@ -1016,7 +1019,7 @@ impl<'a> LayoutBox<'a> {
         let mut items = items;
         items.sort_by_key(|&i| self.children[i].flex().order);
         if s.is_grid {
-            self.layout_grid(items, &s);
+            self.layout_grid(items, &s, definite_h);
         } else if s.flex_row {
             self.layout_flex_row(items, &s, definite_h);
         } else {
@@ -1240,10 +1243,11 @@ impl<'a> LayoutBox<'a> {
     }
 
     /// Lay out `items` as a CSS grid: columns from `grid-template-columns`,
-    /// items placed row by row in order (`grid-column` can pick a column or
-    /// a span), each row as tall as its tallest item. Rows aren't templated:
-    /// `grid-template-rows` and `grid-row` are ignored.
-    fn layout_grid(&mut self, items: Vec<usize>, s: &ComputedStyle) {
+    /// rows from `grid-template-rows` then `grid-auto-rows` (else as tall as
+    /// their content), named areas from `grid-template-areas`. Items go
+    /// where `grid-row`, `grid-column` or `grid-area` put them, the rest
+    /// row by row in order. `fr` rows need the grid's height to be set.
+    fn layout_grid(&mut self, items: Vec<usize>, s: &ComputedStyle, definite_h: Option<f32>) {
         let content = self.dims.content;
         let (cgap, rgap) = (s.gap, s.row_gap);
         let auto = Track {
@@ -1284,69 +1288,137 @@ impl<'a> LayoutBox<'a> {
             repeated = at..at + ins.len();
             tracks.splice(at..at, ins);
         }
+        let areas = s.grid_areas.clone();
+        if let Some(a) = &areas {
+            while tracks.len() < a.cols.min(MAX_GRID_TRACKS) {
+                tracks.push(auto);
+            }
+        }
         if tracks.is_empty() {
             tracks.push(auto);
         }
         let ncols = tracks.len();
+        let row_tpl: Vec<Track> = s.grid_rows.as_ref().map_or_else(Vec::new, |t| {
+            let mut v = t.tracks.clone();
+            // A repeat that depends on the height: once.
+            if let Some(r) = &t.repeat {
+                let at = r.at.min(v.len());
+                v.splice(at..at, r.tracks.iter().copied());
+            }
+            v
+        });
+        let explicit_rows = row_tpl.len().max(areas.as_ref().map_or(0, |a| a.rows));
 
-        // Placement: (item, column, span, row).
-        let mut placed: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(items.len());
-        let mut occupied: Vec<Vec<bool>> = Vec::new();
-        let (mut cur_r, mut cur_c) = (0usize, 0usize);
-        for &i in &items {
-            let [a, b] = self.children[i].style().grid_column;
-            // 0-based line index; negative counts from the end.
+        // Where each item wants to go along one axis: its first track (or
+        // `None` for automatic) and how many it spans. `n` is the number of
+        // explicit tracks, which negative lines count back from.
+        fn axis([a, b]: [GridLine; 2], n: usize) -> (Option<usize>, usize) {
             let line = |l: i32| -> usize {
                 if l > 0 {
                     (l - 1) as usize
                 } else {
-                    (ncols as i32 + 1 + l).max(0) as usize
+                    (n as i32 + 1 + l).max(0) as usize
                 }
             };
-            let (start, span) = match (a, b) {
+            match (a, b) {
                 (GridLine::Line(x), GridLine::Line(y)) => {
                     let (x, y) = (line(x), line(y));
                     (Some(x.min(y)), x.abs_diff(y).max(1))
                 }
-                (GridLine::Line(x), GridLine::Span(n)) => (Some(line(x)), n as usize),
-                (GridLine::Span(n), GridLine::Line(y)) => {
-                    (Some(line(y).saturating_sub(n as usize)), n as usize)
+                (GridLine::Line(x), GridLine::Span(k)) => (Some(line(x)), k as usize),
+                (GridLine::Span(k), GridLine::Line(y)) => {
+                    (Some(line(y).saturating_sub(k as usize)), k as usize)
                 }
                 (GridLine::Line(x), GridLine::Auto) => (Some(line(x)), 1),
                 (GridLine::Auto, GridLine::Line(y)) => (Some(line(y).saturating_sub(1)), 1),
-                (GridLine::Span(n), _) | (GridLine::Auto, GridLine::Span(n)) => (None, n as usize),
+                (GridLine::Span(k), _) | (GridLine::Auto, GridLine::Span(k)) => (None, k as usize),
                 (GridLine::Auto, GridLine::Auto) => (None, 1),
-            };
-            let span = span.clamp(1, ncols);
-            let free = |occ: &Vec<Vec<bool>>, r: usize, c: usize| {
-                (c..c + span).all(|k| !occ.get(r).is_some_and(|row| row[k]))
-            };
-            let (r, c) = match start {
+            }
+        }
+        // (item, row, column) wanted.
+        type Want = (usize, (Option<usize>, usize), (Option<usize>, usize));
+        let wants: Vec<Want> = items
+            .iter()
+            .map(|&i| {
+                let st = self.children[i].style();
+                let mut col = axis(st.grid_column, ncols);
+                let mut row = axis(st.grid_row, explicit_rows);
+                if let (Some(name), Some(a)) = (&st.grid_area, &areas) {
+                    if let Some(&[r0, c0, r1, c1]) = a.areas.get(&**name) {
+                        row = (Some(r0), r1 - r0);
+                        col = (Some(c0), c1 - c0);
+                    }
+                }
+                col.1 = col.1.clamp(1, ncols);
+                col.0 = col.0.map(|c| c.min(ncols - col.1));
+                row.1 = row.1.clamp(1, MAX_GRID_TRACKS);
+                row.0 = row.0.map(|r| r.min(MAX_GRID_TRACKS));
+                (i, row, col)
+            })
+            .collect();
+
+        // Placement, as CSS does it: items with a row first, then the rest
+        // in order with a cursor. (item, column, span, row, row span).
+        let mut placed: Vec<(usize, usize, usize, usize, usize)> = Vec::with_capacity(items.len());
+        let mut occupied: Vec<Vec<bool>> = Vec::new();
+        // Cells checked or marked. Past the budget, items just go where the
+        // cursor is (overlapping), so crafted spans can't take long.
+        let work = std::cell::Cell::new(0usize);
+        let spend = |n: usize| {
+            work.set(work.get().saturating_add(n));
+            work.get() <= GRID_PLACEMENT_WORK
+        };
+        let free = |occ: &Vec<Vec<bool>>, r: usize, rs: usize, c: usize, cs: usize| {
+            !spend(rs * cs) || (r..r + rs).all(|r| (c..c + cs).all(|k| !occ.get(r).is_some_and(|row| row[k])))
+        };
+        let mark = |occ: &mut Vec<Vec<bool>>, r: usize, rs: usize, c: usize, cs: usize| {
+            if !spend(rs * cs) {
+                return;
+            }
+            while occ.len() < r + rs {
+                occ.push(vec![false; ncols]);
+            }
+            for row in &mut occ[r..r + rs] {
+                row[c..c + cs].iter_mut().for_each(|o| *o = true);
+            }
+        };
+        for &(i, (r, rs), (c, cs)) in &wants {
+            let Some(r) = r else { continue };
+            let c = c.unwrap_or_else(|| {
+                (0..=ncols - cs)
+                    .find(|&c| free(&occupied, r, rs, c, cs))
+                    .unwrap_or(0)
+            });
+            mark(&mut occupied, r, rs, c, cs);
+            placed.push((i, c, cs, r, rs));
+        }
+        let (mut cur_r, mut cur_c) = (0usize, 0usize);
+        for &(i, (r, rs), (c, cs)) in &wants {
+            if r.is_some() {
+                continue;
+            }
+            let (r, c) = match c {
                 Some(c) => {
-                    let c = c.min(ncols - span);
                     let mut r = cur_r + usize::from(c < cur_c);
-                    while !free(&occupied, r, c) {
+                    while !free(&occupied, r, rs, c, cs) {
                         r += 1;
                     }
                     (r, c)
                 }
                 None => loop {
-                    if cur_c + span > ncols {
+                    if cur_c + cs > ncols {
                         cur_r += 1;
                         cur_c = 0;
-                    } else if free(&occupied, cur_r, cur_c) {
+                    } else if free(&occupied, cur_r, rs, cur_c, cs) {
                         break (cur_r, cur_c);
                     } else {
                         cur_c += 1;
                     }
                 },
             };
-            (cur_r, cur_c) = (r, c + span);
-            while occupied.len() <= r {
-                occupied.push(vec![false; ncols]);
-            }
-            occupied[r][c..c + span].iter_mut().for_each(|o| *o = true);
-            placed.push((i, c, span, r));
+            (cur_r, cur_c) = (r, c + cs);
+            mark(&mut occupied, r, rs, c, cs);
+            placed.push((i, c, cs, r, rs));
         }
 
         // Column widths.
@@ -1359,13 +1431,13 @@ impl<'a> LayoutBox<'a> {
             for c in repeated {
                 collapsed[c] = !placed
                     .iter()
-                    .any(|&(_, pc, span, _)| (pc..pc + span).contains(&c));
+                    .any(|&(_, pc, span, ..)| (pc..pc + span).contains(&c));
             }
         }
         let shown = collapsed.iter().filter(|c| !**c).count();
         let avail = (content.w - cgap * shown.saturating_sub(1) as f32).max(0.0);
         let (mut cmin, mut cmax) = (vec![0.0f32; ncols], vec![0.0f32; ncols]);
-        for &(i, c, span, _) in &placed {
+        for &(i, c, span, ..) in &placed {
             if span == 1 {
                 // Percentages are of the column being sized: for its
                 // minimum they count as `auto`.
@@ -1443,14 +1515,85 @@ impl<'a> LayoutBox<'a> {
         }
 
         // Rows: lay items out in their columns, then size and place.
-        let nrows = occupied.len();
-        let mut row_h = vec![0.0f32; nrows];
-        for &(i, c, span, r) in &placed {
+        let nrows = occupied.len().max(explicit_rows);
+        let row_track = |r: usize| -> Track {
+            if let Some(t) = row_tpl.get(r) {
+                return *t;
+            }
+            match s.grid_auto_rows.as_ref().map(|t| &t.tracks) {
+                Some(t) if !t.is_empty() => t[(r - row_tpl.len().min(r)) % t.len()],
+                _ => auto,
+            }
+        };
+        let fixed = |t: TrackSize| match t {
+            TrackSize::Px(v) => Some(v),
+            TrackSize::Percent(p) => definite_h.map(|h| h * p / 100.0),
+            TrackSize::Auto | TrackSize::Fr(_) => None,
+        };
+        let mut content_h = vec![0.0f32; nrows];
+        for &(i, c, span, r, rs) in &placed {
             let last = c + span - 1;
             let area_w = (col_x[last] + w[last] - col_x[c]).max(0.0);
             let item = &mut self.children[i];
             item.layout_outer(col_x[c], content.y, area_w, area_w);
-            row_h[r] = row_h[r].max(item.dims.margin_box().h);
+            if rs == 1 {
+                content_h[r] = content_h[r].max(item.dims.margin_box().h);
+            }
+        }
+        let mut row_h: Vec<f32> = (0..nrows)
+            .map(|r| {
+                let t = row_track(r);
+                let content = content_h[r];
+                match (fixed(t.min), fixed(t.max)) {
+                    (Some(lo), Some(hi)) => content.clamp(lo, hi.max(lo)),
+                    (Some(lo), None) => content.max(lo),
+                    (None, Some(hi)) => content.min(hi),
+                    (None, None) => content,
+                }
+            })
+            .collect();
+        // Items spanning rows: grow the content-sized rows they cross.
+        for &(i, _, _, r, rs) in &placed {
+            if rs < 2 {
+                continue;
+            }
+            let need = self.children[i].dims.margin_box().h;
+            let have: f32 = row_h[r..r + rs].iter().sum::<f32>() + rgap * (rs - 1) as f32;
+            if need > have {
+                let grow: Vec<usize> = (r..r + rs)
+                    .filter(|&k| fixed(row_track(k).max).is_none())
+                    .collect();
+                let grow = if grow.is_empty() { vec![r + rs - 1] } else { grow };
+                let each = (need - have) / grow.len() as f32;
+                grow.iter().for_each(|&k| row_h[k] += each);
+            }
+        }
+        // `fr` rows share the height left, if the grid has one.
+        if let Some(total) = definite_h {
+            let fr = |r: usize| match row_track(r).max {
+                TrackSize::Fr(f) => f.max(0.0),
+                _ => 0.0,
+            };
+            let mut flex: Vec<usize> = (0..nrows).filter(|&r| fr(r) > 0.0).collect();
+            let avail = total - rgap * nrows.saturating_sub(1) as f32;
+            for _ in 0..nrows {
+                if flex.is_empty() {
+                    break;
+                }
+                let others: f32 = (0..nrows).filter(|r| !flex.contains(r)).map(|r| row_h[r]).sum();
+                let total_fr: f32 = flex.iter().map(|&r| fr(r)).sum::<f32>().max(1.0);
+                let unit = ((avail - others) / total_fr).max(0.0);
+                let big: Vec<usize> = flex
+                    .iter()
+                    .copied()
+                    .filter(|&r| row_h[r] > unit * fr(r))
+                    .collect();
+                if big.is_empty() {
+                    flex.iter().for_each(|&r| row_h[r] = unit * fr(r));
+                    break;
+                }
+                flex.retain(|r| !big.contains(r));
+            }
         }
         let mut row_y = vec![content.y; nrows];
         let mut y = content.y;
@@ -1458,20 +1601,21 @@ impl<'a> LayoutBox<'a> {
             row_y[r] = y;
             y += row_h[r] + rgap;
         }
-        for &(i, c, _, r) in &placed {
+        for &(i, c, _, r, rs) in &placed {
+            let area_h = row_h[r..r + rs].iter().sum::<f32>() + rgap * (rs - 1) as f32;
             let align = cross_align(&self.children[i], s, false);
             let item = &mut self.children[i];
             let mb = item.dims.margin_box();
             let dy = match align {
                 Align::Stretch => {
                     if item.flex().auto_height {
-                        item.dims.content.h += (row_h[r] - mb.h).max(0.0);
+                        item.dims.content.h += (area_h - mb.h).max(0.0);
                     }
                     0.0
                 }
                 Align::Start => 0.0,
-                Align::End => row_h[r] - mb.h,
-                Align::Center => (row_h[r] - mb.h) / 2.0,
+                Align::End => area_h - mb.h,
+                Align::Center => (area_h - mb.h) / 2.0,
             };
             item.translate(col_x[c] - mb.x, row_y[r] + dy - mb.y);
         }
@@ -4169,6 +4313,92 @@ mod modern_layout_tests {
         );
         let line = boxes("", "<div style='float:left'>x</div>", WIN, "div")[0].h;
         assert!(close(one[0].h, line), "wrapped: {:?}", one[0]);
+    }
+
+    #[test]
+    fn grid_rows_and_areas() {
+        // Row templates, `grid-auto-rows` after them, and a row span.
+        let b = boxes(
+            "p{margin:0}",
+            "<div style='display:grid;grid-template-columns:100px 100px;grid-template-rows:50px auto;\
+                 grid-auto-rows:minmax(30px,auto);row-gap:10px'>\
+                 <p style='grid-row:span 2'>a</p><p>b</p><p>c</p><p>d</p><p>e</p></div>",
+            WIN,
+            "p",
+        );
+        let line = b[2].h;
+        assert!(
+            close(b[0].h, 60.0 + line) && close(b[0].x, 0.0),
+            "a spans two rows: {b:?}"
+        );
+        assert!(close(b[1].x, 100.0) && close(b[1].h, 50.0), "b: {b:?}");
+        assert!(close(b[2].x, 100.0) && close(b[2].y, 60.0), "c: {b:?}");
+        assert!(
+            close(b[3].y, 70.0 + line) && close(b[3].h, line.max(30.0)),
+            "d: {b:?}"
+        );
+        assert!(close(b[4].x, 100.0) && close(b[4].y, b[3].y), "e: {b:?}");
+        // Named areas, placed out of document order.
+        let b = boxes(
+            ".g{display:grid;grid-template-columns:150px 1fr;grid-template-rows:40px 200px 30px;width:600px;\
+               grid-template-areas:'head head' 'nav main' 'foot foot'}\
+             header{grid-area:head} nav{grid-area:nav} main{grid-area:main} footer{grid-area:Foot}",
+            "<div class=g><footer>f</footer><main>m</main><nav>n</nav><header>h</header></div>",
+            WIN,
+            "footer",
+        );
+        assert!(
+            close(b[0].y, 240.0) && close(b[0].w, 600.0) && close(b[0].h, 30.0),
+            "footer: {b:?}"
+        );
+        let main = boxes(
+            ".g{display:grid;grid-template-columns:150px 1fr;width:600px;grid-template-areas:'head head' 'nav main'}\
+             header{grid-area:head;height:40px} main{grid-area:main}",
+            "<div class=g><main>m</main><header>h</header></div>",
+            WIN,
+            "main",
+        );
+        assert!(
+            close(main[0].x, 150.0) && close(main[0].y, 40.0) && close(main[0].w, 450.0),
+            "{main:?}"
+        );
+        // Explicit lines, negative ones from the explicit grid's end, and
+        // `fr` rows sharing a set height.
+        let b = boxes(
+            "p{margin:0}",
+            "<div style='display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 3fr;height:400px;width:200px'>\
+                 <p style='grid-row:-2;grid-column:2'>a</p><p style='grid-area:1 / 1 / 3 / 2'>b</p></div>",
+            WIN,
+            "p",
+        );
+        assert!(
+            close(b[0].x, 100.0) && close(b[0].y, 100.0) && close(b[0].h, 300.0),
+            "a: {b:?}"
+        );
+        assert!(
+            close(b[1].x, 0.0) && close(b[1].y, 0.0) && close(b[1].h, 400.0),
+            "b: {b:?}"
+        );
+        // Areas that aren't rectangles are ignored.
+        let b = boxes(
+            "p{margin:0;grid-area:x}",
+            "<div style=\"display:grid;grid-template-areas:'x x' 'x .'\"><p>a</p><p>b</p></div>",
+            WIN,
+            "p",
+        );
+        assert!(b[1].y > b[0].y, "{b:?}");
+    }
+
+    #[test]
+    fn crafted_grid_placement_stays_fast() {
+        let items = "<p style='grid-row:1000 / span 1000;grid-column:1 / -1'>x</p>".repeat(2000);
+        let doc = format!(
+            "<div style='display:grid;grid-template-columns:repeat(1000,1px);grid-auto-rows:0'>{items}{}</div>",
+            "<p>y</p>".repeat(2000)
+        );
+        let t = std::time::Instant::now();
+        boxes("", &doc, WIN, "div");
+        assert!(t.elapsed().as_secs() < 5, "{:?}", t.elapsed());
     }
 
     /// The page's text, in order, laid out with `sheet`.
