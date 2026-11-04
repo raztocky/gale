@@ -26,6 +26,9 @@ const BAR_H: f32 = MENU_H + TABS_H + ADDR_H;
 /// Where the tab strip starts.
 const TABS_Y: f32 = MENU_H;
 const MENU_ITEM_H: f32 = 26.0;
+/// Back, forward and reload buttons, then the address field.
+const NAV_W: f32 = 32.0;
+const FIELD_X: f32 = 8.0 + 3.0 * (NAV_W + 2.0) + 6.0;
 const MENU_W: f32 = 250.0;
 
 /// Your interface size: the menu bar, tabs, address bar, panels and status
@@ -328,6 +331,10 @@ struct Ui {
     menu: Option<usize>,
     /// Your text size (see `StyleContext::text_scale`).
     text_scale: f32,
+    /// For the back, forward and reload/stop buttons.
+    can_back: bool,
+    can_forward: bool,
+    loading: bool,
 }
 
 /// What the window knows about the current page. The `Tab` itself may be
@@ -555,6 +562,9 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         flash: None,
         menu: None,
         text_scale: load_scale("text-size", &TEXT_SCALES, DEFAULT_TEXT_SCALE),
+        can_back: false,
+        can_forward: false,
+        loading: false,
     };
     shared_scale.store(ui.text_scale.to_bits(), Ordering::Relaxed);
     UI_SCALE.store(
@@ -1225,6 +1235,16 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     }
                     .into(),
                 )
+            } else if let Some(i) = nav_button_at(lx, ly) {
+                Some(
+                    match i {
+                        0 => "Back (Alt+Left)",
+                        1 => "Forward (Alt+Right)",
+                        _ if matches!(busy, Some(Some(_))) => "Stop loading (Esc)",
+                        _ => "Reload (Ctrl+R)",
+                    }
+                    .into(),
+                )
             } else if badge.contains(lx, ly) {
                 Some("Show every request this page made (F12)".into())
             } else if my > bar && mx < page_w {
@@ -1306,12 +1326,21 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                             TabAction::Switch(i)
                         });
                     }
+                } else if let Some(i) = nav_button_at(lx, ly) {
+                    match i {
+                        0 => hist = -1,
+                        1 => hist = 1,
+                        _ if matches!(busy, Some(Some(_))) => {
+                            menu_press = Some((Key::Escape, false, false, false));
+                        }
+                        _ => reload = true,
+                    }
                 } else if badge.contains(lx, ly) {
                     ui.panel = !ui.panel;
                 } else if my < bar {
                     if ui.editing {
                         // Already typing: put the cursor where you clicked.
-                        let at = address_index(&ui.address, badge.x - 40.0, lx - 20.0);
+                        let at = address_index(&ui.address, badge.x - FIELD_X - 30.0, lx - FIELD_X - 10.0);
                         ui.address.move_to(at, shift);
                     } else {
                         ui.editing = true;
@@ -1594,6 +1623,9 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         }
 
         let loading = matches!(busy, Some(Some(_))) || queued.is_some();
+        ui.can_back = !history.is_empty();
+        ui.can_forward = !forward.is_empty();
+        ui.loading = loading;
         if dirty || loading {
             canvas = Canvas::new(w, h, rendered.background);
             if tiles.as_ref().is_some_and(|t| t.width() != page_w as usize) {
@@ -1967,6 +1999,20 @@ fn save_scale(name: &str, scale: f32) {
     }
 }
 
+/// The back, forward and reload/stop buttons, left of the address field.
+fn nav_buttons() -> [Rect; 3] {
+    std::array::from_fn(|i| Rect {
+        x: 8.0 + i as f32 * (NAV_W + 2.0),
+        y: TABS_Y + TABS_H + 6.0,
+        w: NAV_W,
+        h: ADDR_H - 12.0,
+    })
+}
+
+fn nav_button_at(x: f32, y: f32) -> Option<usize> {
+    nav_buttons().iter().position(|r| r.contains(x, y))
+}
+
 /// Where each menu's title is in the menu bar.
 fn menu_titles() -> Vec<Rect> {
     let mut x = 6.0;
@@ -2264,10 +2310,30 @@ fn draw_chrome(
         0.0,
     );
 
+    let enabled = [ui.can_back, ui.can_forward, true];
+    let labels = ["←", "→", if ui.loading { "✕" } else { "↻" }];
+    for ((r, label), on) in nav_buttons().iter().zip(labels).zip(enabled) {
+        if on {
+            c.fill(*r, Color::rgb(0xf7, 0xf8, 0xfa), 0.0);
+        }
+        let lw = font::measure(SANS, 18.0, label);
+        let color = if on { DARK } else { LINE };
+        text(
+            c,
+            r.x + (r.w - lw) / 2.0,
+            r.y + 19.0,
+            label,
+            SANS,
+            18.0,
+            color,
+            cache,
+            0.0,
+        );
+    }
     let field = Rect {
-        x: 10.0,
+        x: FIELD_X,
         y: TABS_Y + TABS_H + 6.0,
-        w: badge.x - 20.0,
+        w: badge.x - FIELD_X - 10.0,
         h: ADDR_H - 12.0,
     };
     let border = if ui.editing {
@@ -2815,6 +2881,10 @@ mod menu_tests {
         assert!(right < minus.x && minus.x + minus.w <= label.x && label.x + label.w <= plus.x);
         assert_eq!(text_size_control_at(1100.0, plus.x + 3.0, 10.0), Some(1));
         assert_eq!(text_size_control_at(1100.0, label.x + 3.0, 10.0), Some(0));
+        // The buttons come before the address field, in the address row.
+        let nav = nav_buttons();
+        assert!(nav[2].x + nav[2].w < FIELD_X && nav.iter().all(|r| r.y > TABS_Y + TABS_H));
+        assert_eq!(nav_button_at(nav[0].x + 3.0, nav[0].y + 3.0), Some(0));
         // The tab strip is below the menu bar.
         let (tabs, plus_tab) = tab_rects(3, 1100.0);
         assert!(tabs.iter().all(|(r, _)| r.y >= MENU_H) && plus_tab.y >= MENU_H);
@@ -2839,8 +2909,11 @@ mod menu_tests {
             panel: false,
             panel_scroll: 0.0,
             flash: None,
-            menu: Some(2),
+            menu: std::env::var("MENU_CLOSED").is_err().then_some(2),
             text_scale: DEFAULT_TEXT_SCALE,
+            can_back: true,
+            can_forward: false,
+            loading: false,
         };
         ui.address.set("https://example.com/");
         let w = c.size().0;
@@ -2851,13 +2924,15 @@ mod menu_tests {
             &mut cache,
         );
         draw_menu_bar(&mut c, &ui, &mut cache);
-        let (_, items) = menu_rects(2);
-        draw_menu(
-            &mut c,
-            2,
-            Some((items[0].x + 20.0, items[0].y + 10.0)),
-            &mut cache,
-        );
+        if let Some(m) = ui.menu {
+            let (_, items) = menu_rects(m);
+            draw_menu(
+                &mut c,
+                m,
+                Some((items[0].x + 20.0, items[0].y + 10.0)),
+                &mut cache,
+            );
+        }
         c.write_png(&std::env::var("MENU_PNG").unwrap_or("menu.png".into()))
             .unwrap();
     }

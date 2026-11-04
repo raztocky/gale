@@ -45,8 +45,8 @@ size, and clicking the percentage between them goes back to the normal size.
 | Type a URL, or search DuckDuckGo | `Ctrl+L` or click the address bar, then `Enter` |
 | Request panel | `F12`, `Ctrl+Shift+E`, or click "N blocked · M requests" |
 | Scroll | mouse wheel, arrow keys, `Space`, `PgUp`/`PgDn` |
-| Back / forward | `Backspace` or `Alt+←` / `Alt+→` |
-| Reload / stop | `Ctrl+R` or `F5` / `Esc` |
+| Back / forward | the ← → buttons, `Backspace` or `Alt+←` / `Alt+→` |
+| Reload / stop | the ↻ button (✕ while loading), `Ctrl+R` or `F5` / `Esc` |
 | New tab / close tab | `Ctrl+T` or `+` / `Ctrl+W` or `×` |
 | Switch tabs | `Ctrl+Tab`, `Ctrl+Shift+Tab`, `Ctrl+PgDn`/`PgUp`, `Ctrl+1`…`Ctrl+9` |
 | Open a link in a new tab | middle-click, or `Ctrl`+click |
