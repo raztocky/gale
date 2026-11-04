@@ -77,6 +77,7 @@ const MENUS: [(&str, &[MenuItem]); 4] = [
         &[
             item("New tab", "Ctrl+T", (Key::T, true, false, false)),
             item("Close tab", "Ctrl+W", (Key::W, true, false, false)),
+            item("Reopen closed tab", "Ctrl+Shift+T", (Key::T, true, true, false)),
             item("Quit", "Ctrl+Q", (Key::Q, true, false, false)),
         ],
     ),
@@ -645,6 +646,9 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
     // The last background tab opened from the current one: the next goes
     // after it, so tabs open in the order you opened them (as in Firefox).
     let mut child_anchor: Option<TabId> = None;
+    // Tabs you closed, most recent last, for Ctrl+Shift+T. Only in memory:
+    // gone when Brickle quits.
+    let mut closed: Vec<ClosedTab> = Vec::new();
 
     // Stop button for the load in flight.
     let mut stop = net::Cancel::new();
@@ -1030,6 +1034,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 .iter()
                 .position(|k| *k == key);
                 let action = match key {
+                    Key::T if shift => Some(TabAction::Reopen),
                     Key::T => Some(TabAction::New),
                     Key::W => Some(TabAction::Close(cur_id)),
                     Key::Tab => Some(TabAction::Next(if shift { -1 } else { 1 })),
@@ -1689,7 +1694,56 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     let j = (i + d).rem_euclid(order.len() as i32) as usize;
                     switch_to!(order[j]);
                 }
+                TabAction::Reopen => match closed.pop() {
+                    Some(c) if order.len() < MAX_TABS => {
+                        // Loaded afresh (a form's answer isn't sent again),
+                        // with its history, where it was in the strip.
+                        open_tab!(c.page.0, c.page.1, true);
+                        history.extend(c.history);
+                        forward.extend(c.forward);
+                        if let Some(i) = order.iter().position(|&t| t == cur_id) {
+                            let id = order.remove(i);
+                            order.insert(c.at.min(order.len()), id);
+                        }
+                    }
+                    Some(c) => {
+                        closed.push(c);
+                        ui.flash = Some(format!("Brickle keeps at most {MAX_TABS} tabs open"));
+                    }
+                    None => ui.flash = Some("No closed tabs to reopen".into()),
+                },
                 TabAction::Close(id) => {
+                    let at = order.iter().position(|&t| t == id).unwrap_or(order.len());
+                    let gone = if id == cur_id {
+                        Some((
+                            info.url.clone(),
+                            info.opener.clone(),
+                            history.clone(),
+                            forward.clone(),
+                        ))
+                    } else {
+                        parked.iter().find(|p| p.id == id).map(|p| {
+                            (
+                                p.info.url.clone(),
+                                p.info.opener.clone(),
+                                p.history.clone(),
+                                p.forward.clone(),
+                            )
+                        })
+                    };
+                    if let Some((url, opener, history, forward)) = gone {
+                        if !(url.is_empty() || url == "about:home") || !history.is_empty() {
+                            if closed.len() >= MAX_CLOSED_TABS {
+                                closed.remove(0);
+                            }
+                            closed.push(ClosedTab {
+                                page: (url, opener),
+                                history,
+                                forward,
+                                at,
+                            });
+                        }
+                    }
                     if order.len() == 1 {
                         // Closing the last tab leaves a fresh one.
                         open_tab!("about:home".to_string(), None, true);
@@ -1922,7 +1976,21 @@ enum TabAction {
     Next(i32),
     /// Open a link in a new tab, in the background.
     Background(String),
+    /// Bring back the tab closed last.
+    Reopen,
 }
+
+/// What Ctrl+Shift+T brings back of a closed tab.
+struct ClosedTab {
+    page: Entry,
+    history: Vec<Visit>,
+    forward: Vec<Visit>,
+    /// Its place in the tab strip.
+    at: usize,
+}
+
+/// Closed tabs remembered for reopening.
+const MAX_CLOSED_TABS: usize = 25;
 
 /// A tab that isn't showing: everything the loop keeps for the current one.
 struct Parked {

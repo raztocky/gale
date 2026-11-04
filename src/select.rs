@@ -197,6 +197,12 @@ fn copyable(c: char) -> bool {
         | '\u{feff}' | '\u{fff9}'..='\u{fffb}' | '\u{e0000}'..='\u{e007f}')
 }
 
+/// `text` without the characters [`copyable`] drops: for text copied from
+/// a form field, which the page (or a compromised renderer) supplies.
+pub fn clean(text: &str) -> String {
+    text.chars().filter(|c| copyable(*c)).collect()
+}
+
 /// The selected text, with a newline wherever the selection moves to a new
 /// line, no spaces at the ends of lines, and no invisible characters.
 pub fn text(runs: &[TextRun], a: Pos, b: Pos) -> String {
@@ -412,6 +418,14 @@ mod tests {
         assert_eq!(word(&r, (1, 1)), Some(((0, 0), (1, 3))));
         assert_eq!(word(&r, (3, 0)), Some(((3, 0), (3, 3))));
         assert_eq!(all(&r), Some(((0, 0), (3, 3))));
+    }
+
+    #[test]
+    fn field_text_is_cleaned_too() {
+        assert_eq!(
+            clean("ls\u{202e}txt.exe\u{200b}\tok\n\u{e0041}"),
+            "lstxt.exe\tok\n"
+        );
     }
 
     #[test]

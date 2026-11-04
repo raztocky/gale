@@ -125,6 +125,15 @@ pub struct Click {
 /// Most text a page may hand the clipboard from one Copy or Cut.
 pub const MAX_COPIED: usize = 1024 * 1024;
 
+/// What of a renderer's copied text goes on the clipboard: nothing unless
+/// you pressed Copy or Cut (`asked`), nothing too large, and never the
+/// invisible characters page selections lose too.
+fn accept_copied(copied: Option<String>, asked: bool) -> Option<String> {
+    copied
+        .filter(|c| asked && c.len() <= MAX_COPIED)
+        .map(|c| crate::select::clean(&c))
+}
+
 /// Something you did to a page.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Input {
@@ -298,7 +307,7 @@ impl Tab {
                     navigate: None,
                     submit: done.submit,
                     focus: done.focus,
-                    copied: done.copied.filter(|c| copy_key && c.len() <= MAX_COPIED),
+                    copied: accept_copied(done.copied, copy_key),
                 };
             }
             Backend::Sandboxed(r) => r,
@@ -330,9 +339,7 @@ impl Tab {
                         navigate,
                         submit,
                         focus,
-                        // The renderer can't put text on the clipboard
-                        // unless you asked to copy.
-                        copied: copied.filter(|c| copy_key && c.len() <= MAX_COPIED),
+                        copied: accept_copied(copied, copy_key),
                     },
                     console,
                 )),
@@ -682,6 +689,14 @@ impl Drop for Renderer {
 mod hostile_renderer_tests {
     use super::*;
     use crate::ipc::FromRenderer as F;
+
+    #[test]
+    fn renderers_reach_the_clipboard_only_when_asked() {
+        let text = || Some("rm -rf ~\u{202e}".to_string());
+        assert_eq!(accept_copied(text(), true).as_deref(), Some("rm -rf ~"));
+        assert_eq!(accept_copied(text(), false), None, "after a click or typing");
+        assert_eq!(accept_copied(Some("x".repeat(MAX_COPIED + 1)), true), None);
+    }
 
     const FAKE: &str = r#"
 import sys, time, struct
