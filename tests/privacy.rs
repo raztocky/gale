@@ -265,10 +265,10 @@ fn no_network_without_a_request_from_you() {
 #[test]
 fn https_only_asks_before_using_plain_http() {
     let home = temp_dir("httpsonly");
-    // The HTTPS attempt goes to a dead proxy and fails, like a site without HTTPS.
-    let dead = TcpListener::bind("127.0.0.1:0").unwrap();
-    let proxy = format!("http://{}", dead.local_addr().unwrap());
-    drop(dead);
+    // The HTTPS attempt goes to a proxy that hangs up at once, and fails like
+    // a site without HTTPS. (The port stays ours: a freed one could be
+    // picked up by another test's listener running alongside.)
+    let (proxy, _hangups) = trap();
     let out = brickle(&home)
         .args(["requests", "http://no-https.example/"])
         .env("HTTPS_PROXY", &proxy)
