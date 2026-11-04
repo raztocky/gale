@@ -274,6 +274,8 @@ fn build_block<'a>(node: &'a StyledNode<'a>, link: Option<String>) -> LayoutBox<
                         ListStyle::Circle => Some("◦".into()),
                         ListStyle::Square => Some("▪".into()),
                         ListStyle::Decimal => Some(format!("{}.", start + li_index - 1)),
+                        ListStyle::DisclosureClosed => Some("\u{25B8}".into()),
+                        ListStyle::DisclosureOpen => Some("\u{25BE}".into()),
                         ListStyle::None => None,
                     };
                 }
@@ -4167,5 +4169,81 @@ mod modern_layout_tests {
         );
         let line = boxes("", "<div style='float:left'>x</div>", WIN, "div")[0].h;
         assert!(close(one[0].h, line), "wrapped: {:?}", one[0]);
+    }
+
+    /// The page's text, in order, laid out with `sheet`.
+    fn text(sheet: &str, doc: &str) -> String {
+        let dom = html::parse(doc);
+        let ua = css::parse(style::UA_CSS);
+        let author = css::parse(&format!("body{{margin:0;font:16px sans-serif}} {sheet}"));
+        let ctx = StyleContext {
+            text_scale: 1.0,
+            sheets: vec![(0, &ua), (1, &author)],
+            viewport: WIN,
+        };
+        let styled = style::style_tree(&dom, &ctx);
+        let root = layout_tree_with_images(&styled, WIN, &HashMap::new());
+        fn walk(b: &LayoutBox, out: &mut String) {
+            if let BoxKind::Anonymous { frags, .. } = &b.kind {
+                for f in frags {
+                    out.push_str(&f.text);
+                }
+                out.push(' ');
+            }
+            b.children.iter().for_each(|c| walk(c, out));
+        }
+        let mut out = String::new();
+        walk(&root, &mut out);
+        out
+    }
+
+    #[test]
+    fn before_and_after_content() {
+        assert_eq!(
+            text(
+                "q::before{content:open-quote} q::after{content:close-quote}\
+                 .n::before{content:'#' attr(data-n) ': '} li::after{content:' \\2192'}\
+                 .x::before{content:none} .icon::before{content:'\\f101'}",
+                "<p class=n data-n=7>seven</p><ul><li>a</li></ul><q>hi</q>\
+                 <p class=x>plain</p><p class=icon>icon</p>",
+            )
+            .split_whitespace()
+            .collect::<Vec<_>>(),
+            [
+                "#7:",
+                "seven",
+                "a",
+                "\u{2192}",
+                "\u{201C}hi\u{201D}",
+                "plain",
+                "icon"
+            ]
+        );
+        // Not for replaced elements or hidden boxes, and never on the
+        // element itself.
+        assert_eq!(
+            text(
+                "img::before,br::after,.h::before{content:'no'} .h::before{display:none}\
+                 p::before{content:'yes'}",
+                "<img alt=pic><p class=h>t</p>",
+            ),
+            " pic t "
+        );
+        // Block boxes, and an empty one sized like an icon.
+        let b = boxes(
+            ".c::after{content:'';display:block;clear:both}\
+             i::before{content:'';display:inline-block;width:20px;height:10px}",
+            "<div class=c><div style='float:left;height:50px;width:10px'></div></div><p><i></i></p>",
+            WIN,
+            "::after",
+        );
+        assert!(close(b[0].y, 50.0) && close(b[0].h, 0.0), "clearfix: {b:?}");
+        let b = boxes(
+            "i::before{content:'';display:inline-block;width:20px;height:10px}",
+            "<p><i></i></p>",
+            WIN,
+            "::before",
+        );
+        assert!(close(b[0].w, 20.0) && close(b[0].h, 10.0), "icon: {b:?}");
     }
 }

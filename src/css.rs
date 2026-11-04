@@ -349,6 +349,15 @@ pub struct SimpleSelector {
     pub attrs: Vec<AttrSelector>,
     pub root: bool,
     pub pseudo: Vec<Pseudo>,
+    /// `::before` or `::after`: only on the subject, and the selector then
+    /// styles that generated box rather than the element.
+    pub pseudo_element: Option<PseudoElement>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PseudoElement {
+    Before,
+    After,
 }
 
 /// `[name]`, or `[name op "value"]` (with `i`: ignoring ASCII case).
@@ -417,7 +426,7 @@ impl Selector {
             };
             s.0 += p.id.iter().count();
             s.1 += p.classes.len() + p.attrs.len() + p.root as usize;
-            s.2 += p.tag.iter().count();
+            s.2 += p.tag.iter().count() + p.pseudo_element.iter().count();
             for ps in &p.pseudo {
                 match ps {
                     // The most specific selector in the list counts.
@@ -473,7 +482,10 @@ impl Value {
             Value::Percent(n) => format!("{n}%"),
             Value::Number(n) => format!("{n}"),
             Value::Color(c) => format!("rgba({}, {}, {}, {})", c.r, c.g, c.b, c.a as f32 / 255.0),
-            Value::Str(s) => format!("\"{}\"", s.replace('"', "")),
+            Value::Str(s) => format!(
+                "\"{}\"",
+                s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\a ")
+            ),
             Value::Url(u) => format!("url(\"{}\")", u.replace('"', "%22")),
             Value::Comma => ",".into(),
         }
@@ -886,6 +898,13 @@ fn parse_complex(text: &str, relative: bool, depth: usize) -> Option<Selector> {
     if compounds.is_empty() || trailing || compounds.len() > MAX_SELECTOR_PARTS {
         return None;
     }
+    // A pseudo-element can only be on the subject.
+    if compounds[..compounds.len() - 1]
+        .iter()
+        .any(|(c, _)| c.pseudo_element.is_some())
+    {
+        return None;
+    }
     // Store right-to-left, with each combinator describing the link to the
     // left (for a relative selector, the leftmost one's link to the anchor).
     let n = compounds.len();
@@ -974,10 +993,30 @@ fn parse_compound(chars: &[char], i: &mut usize, depth: usize) -> Option<SimpleS
             }
             ':' => {
                 *i += 1;
-                if *i < chars.len() && chars[*i] == ':' {
-                    return None; // pseudo-elements
+                let double = *i < chars.len() && chars[*i] == ':';
+                if double {
+                    *i += 1;
                 }
                 let name = ident(i).to_ascii_lowercase();
+                // `::before` and `::after` (also written with one colon, the
+                // old way); other pseudo-elements aren't supported. Nothing
+                // may follow them in the compound.
+                let element = match name.as_str() {
+                    "before" => Some(PseudoElement::Before),
+                    "after" => Some(PseudoElement::After),
+                    _ => None,
+                };
+                if double || element.is_some() {
+                    let at_end = *i >= chars.len()
+                        || chars[*i].is_whitespace()
+                        || matches!(chars[*i], '>' | '+' | '~');
+                    if element.is_none() || !at_end || depth > 0 || s.pseudo_element.is_some() {
+                        return None;
+                    }
+                    s.pseudo_element = element;
+                    any = true;
+                    continue;
+                }
                 // A functional pseudo-class's argument, up to its `)`.
                 let arg = if *i < chars.len() && chars[*i] == '(' {
                     let st = *i + 1;
@@ -1190,12 +1229,8 @@ pub fn parse_values(text: &str) -> Vec<Value> {
             continue;
         }
         if c == '"' || c == '\'' {
-            let st = i + 1;
             i += 1;
-            while i < chars.len() && chars[i] != c {
-                i += 1;
-            }
-            out.push(Value::Str(chars[st..i.min(chars.len())].iter().collect()));
+            out.push(Value::Str(string_body(&chars, &mut i, c)));
             i += 1;
             continue;
         }
@@ -1216,6 +1251,47 @@ pub fn parse_values(text: &str) -> Vec<Value> {
         let tok: String = chars[st..i].iter().collect();
         if let Some(v) = parse_value_token(&tok) {
             out.push(v);
+        }
+    }
+    out
+}
+
+/// A quoted string's contents from `chars[*i]` up to its closing `quote`
+/// (left at `*i`), with CSS escapes decoded: `\"`, `\\`, and hex code
+/// points like `\201C` or `\a` (a newline).
+fn string_body(chars: &[char], i: &mut usize, quote: char) -> String {
+    let mut out = String::new();
+    while *i < chars.len() && chars[*i] != quote {
+        let c = chars[*i];
+        *i += 1;
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let Some(&next) = chars.get(*i) else { break };
+        if next == '\n' {
+            // An escaped newline continues the string.
+            *i += 1;
+            continue;
+        }
+        let end = (*i..chars.len().min(*i + 6))
+            .find(|&k| !chars[k].is_ascii_hexdigit())
+            .unwrap_or(chars.len().min(*i + 6));
+        if end > *i {
+            let code: String = chars[*i..end].iter().collect();
+            let ch = u32::from_str_radix(&code, 16)
+                .ok()
+                .and_then(char::from_u32)
+                .filter(|&c| c != '\0')
+                .unwrap_or('\u{FFFD}');
+            out.push(ch);
+            *i = end;
+            if *i < chars.len() && chars[*i].is_whitespace() {
+                *i += 1;
+            }
+        } else {
+            out.push(next);
+            *i += 1;
         }
     }
     out
@@ -1495,13 +1571,52 @@ mod tests {
 
     #[test]
     fn drops_unsupported_selectors_only() {
-        let ss = parse("a::before, b { color: red } @font-face { x: y } i { color: blue }");
+        let ss = parse("a::marker, b { color: red } @font-face { x: y } i { color: blue }");
         assert_eq!(ss.rules.len(), 2);
         assert_eq!(ss.rules[0].selectors.len(), 1);
         // States the page isn't in are kept (they just don't match), so
         // `:not(:hover)` works.
         let ss = parse("a:hover, b { color: red }");
         assert_eq!(ss.rules[0].selectors.len(), 2);
+    }
+
+    #[test]
+    fn string_escapes() {
+        assert_eq!(
+            parse_values(r#""\201C" 'it\'s' "a\\b" "\a x" "\""#),
+            vec![
+                Value::Str("\u{201C}".into()),
+                Value::Str("it's".into()),
+                Value::Str("a\\b".into()),
+                Value::Str("\nx".into()),
+                Value::Str("\"".into()),
+            ]
+        );
+        // Written back so they read the same.
+        for s in ["say \"hi\"", "back\\slash", "two\nlines"] {
+            assert_eq!(
+                parse_values(&Value::Str(s.into()).to_css()),
+                vec![Value::Str(s.into())]
+            );
+        }
+    }
+
+    #[test]
+    fn pseudo_elements() {
+        let one = |t: &str| parse_selector(t).map(|s| s.parts[0].0.pseudo_element);
+        assert_eq!(one("a::before"), Some(Some(PseudoElement::Before)));
+        assert_eq!(one("p.x:after"), Some(Some(PseudoElement::After)));
+        assert_eq!(one("ul > li::after"), Some(Some(PseudoElement::After)));
+        assert_eq!(one("a"), Some(None));
+        // Only on the subject, last in it, and not inside other selectors.
+        assert_eq!(one("a::before b"), None);
+        assert_eq!(one("a::before.x"), None);
+        assert_eq!(one("a::before::after"), None);
+        assert_eq!(one(":is(a::before)"), None);
+        assert_eq!(one("a::first-line"), None);
+        assert_eq!(one("a::placeholder"), None);
+        let s = parse_selector("a::before").unwrap();
+        assert_eq!(s.specificity(), (0, 0, 2));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Selector matching, the cascade, inheritance and computed values.
 
-use crate::css::{self, Color, Declaration, Stylesheet, Unit, Value};
-use crate::dom::{ElementData, Node, NodeType};
+use crate::css::{self, Color, Declaration, PseudoElement, Stylesheet, Unit, Value};
+use crate::dom::{self, ElementData, Node, NodeType};
 use crate::selectors::{self, Flat};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -180,6 +180,9 @@ pub enum ListStyle {
     Circle,
     Square,
     Decimal,
+    /// `<summary>`'s triangle, pointing right (closed) or down (open).
+    DisclosureClosed,
+    DisclosureOpen,
     None,
 }
 
@@ -278,6 +281,9 @@ pub struct ComputedStyle {
     pub inset: [Len; 4],
     /// `None` is `auto`.
     pub z_index: Option<i32>,
+    /// A `::before`/`::after` box's `content`, as text. `None` (`normal`,
+    /// `none`, or not set) means there's no such box.
+    pub content: Option<Rc<str>>,
 }
 
 impl ComputedStyle {
@@ -345,6 +351,7 @@ impl ComputedStyle {
             position: Position::Static,
             inset: [Len::Auto; 4],
             z_index: None,
+            content: None,
         }
     }
 
@@ -577,9 +584,28 @@ impl GridLine {
 }
 
 pub struct StyledNode<'a> {
-    pub node: &'a Node,
+    pub node: NodeRef<'a>,
     pub style: Rc<ComputedStyle>,
     pub children: Vec<StyledNode<'a>>,
+}
+
+/// A styled node's DOM node: one in the document, or a `::before`/`::after`
+/// box made while styling. Generated boxes are elements named `::before` or
+/// `::after` holding their text; they carry their element's `uid`, so a
+/// click on one is a click on the element. Scripts never see them.
+pub enum NodeRef<'a> {
+    Doc(&'a Node),
+    Generated(Box<Node>),
+}
+
+impl std::ops::Deref for NodeRef<'_> {
+    type Target = Node;
+    fn deref(&self) -> &Node {
+        match self {
+            NodeRef::Doc(n) => n,
+            NodeRef::Generated(n) => n,
+        }
+    }
 }
 
 impl<'a> StyledNode<'a> {
@@ -623,7 +649,8 @@ pub fn style_tree<'a>(root: &'a Node, ctx: &StyleContext) -> StyledNode<'a> {
     base.font_size *= k;
     base.line_height *= k;
     let mut ancestors = Vec::new();
-    let index = RuleIndex::new(&ctx.sheets, ctx.viewport);
+    let index = RuleIndex::new(&ctx.sheets, ctx.viewport, false);
+    let pseudo = RuleIndex::new(&ctx.sheets, ctx.viewport, true);
     let flat = Flat::new(root);
     selectors::reset_budget();
     let mut next_id = 0;
@@ -632,10 +659,66 @@ pub fn style_tree<'a>(root: &'a Node, ctx: &StyleContext) -> StyledNode<'a> {
         &base,
         &mut ancestors,
         ctx,
-        &index,
+        &Indexes {
+            elements: &index,
+            pseudo: (!pseudo.entries.is_empty()).then_some(&pseudo),
+        },
         &flat,
         &mut next_id,
         true,
+    )
+}
+
+struct Indexes<'i, 's> {
+    elements: &'i RuleIndex<'s>,
+    /// Rules for `::before` and `::after`, if there are any.
+    pseudo: Option<&'i RuleIndex<'s>>,
+}
+
+/// Elements that never get `::before`/`::after` boxes: replaced elements and
+/// form controls (as in browsers), and ones that aren't drawn.
+const NO_GENERATED: &[&str] = &[
+    "img", "input", "br", "hr", "select", "textarea", "iframe", "video", "audio", "canvas", "embed",
+    "object", "svg", "picture", "meter", "progress", "script", "style", "head", "title", "meta", "link",
+    "template", "wbr",
+];
+
+/// Most characters of generated text in one box.
+const MAX_CONTENT: usize = 1000;
+
+/// Text for `content`, or `None` when there's no box. Strings, `attr()` and
+/// quotes are supported; counters and images give nothing. Icon-font
+/// characters (private use) are left out: Brickle doesn't load web fonts,
+/// so they'd draw as boxes.
+fn content_text(values: &[Value], e: &ElementData) -> Option<Rc<str>> {
+    let mut out = String::new();
+    for v in values {
+        match v {
+            Value::Keyword(k) if k == "none" || k == "normal" => return None,
+            Value::Str(t) => out.push_str(t),
+            Value::Keyword(k) => {
+                if let Some(name) = k.strip_prefix("attr(").and_then(|a| a.strip_suffix(')')) {
+                    // `attr(name)`, maybe with a type and fallback after it.
+                    let name = name.split([' ', ',']).next().unwrap_or("").trim();
+                    if let Some(a) = e.attrs.get(name) {
+                        out.push_str(a);
+                    }
+                } else if k == "open-quote" {
+                    out.push('\u{201C}');
+                } else if k == "close-quote" {
+                    out.push('\u{201D}');
+                }
+            }
+            _ => {}
+        }
+    }
+    let private = |c: char| matches!(c as u32, 0xE000..=0xF8FF | 0xF0000..=0x10FFFF);
+    Some(
+        out.chars()
+            .filter(|&c| !private(c))
+            .take(MAX_CONTENT)
+            .collect::<String>()
+            .into(),
     )
 }
 
@@ -652,8 +735,9 @@ struct RuleIndex<'s> {
 }
 
 impl<'s> RuleIndex<'s> {
-    /// Rules whose `@media` doesn't match `viewport` are left out.
-    fn new(sheets: &[(u8, &'s Stylesheet)], viewport: (f32, f32)) -> Self {
+    /// Rules whose `@media` doesn't match `viewport` are left out. With
+    /// `pseudo`, only the selectors for `::before`/`::after`; else the rest.
+    fn new(sheets: &[(u8, &'s Stylesheet)], viewport: (f32, f32), pseudo: bool) -> Self {
         let mut ix = RuleIndex {
             entries: Vec::new(),
             by_id: HashMap::new(),
@@ -669,6 +753,9 @@ impl<'s> RuleIndex<'s> {
                     continue;
                 }
                 for sel in &rule.selectors {
+                    if sel.parts[0].0.pseudo_element.is_some() != pseudo {
+                        continue;
+                    }
                     let i = ix.entries.len();
                     ix.entries.push((order, *origin, rule, sel));
                     let subject = &sel.parts[0].0;
@@ -715,7 +802,7 @@ fn style_node<'a>(
     parent: &ComputedStyle,
     ancestors: &mut Vec<&'a ElementData>,
     ctx: &StyleContext,
-    index: &RuleIndex,
+    index: &Indexes,
     flat: &Flat,
     next_id: &mut u32,
     is_root: bool,
@@ -723,30 +810,125 @@ fn style_node<'a>(
     let id = *next_id;
     *next_id += 1;
     let style = match &node.node_type {
-        NodeType::Text(_) => {
-            let mut s = parent.inherit();
-            s.display = Display::Inline;
-            s
-        }
-        NodeType::Element(e) => compute(e, parent, ancestors, ctx, index, (flat, id), is_root),
+        NodeType::Text(_) => text_style(parent),
+        NodeType::Element(e) => compute(
+            e,
+            parent,
+            ancestors,
+            ctx,
+            index.elements,
+            (flat, id),
+            is_root,
+            None,
+        ),
     };
     let style = Rc::new(style);
     let mut children = Vec::new();
     if let NodeType::Element(e) = &node.node_type {
+        // `::before` and `::after` boxes, if the element is drawn and some
+        // rule gives them content.
+        let generated = |pe: PseudoElement, ancestors: &[&ElementData]| -> Option<StyledNode<'a>> {
+            let pseudo = index.pseudo?;
+            if style.display == Display::None || NO_GENERATED.contains(&e.tag.as_str()) {
+                return None;
+            }
+            let ps = compute(e, &style, ancestors, ctx, pseudo, (flat, id), false, Some(pe));
+            let text = ps.content.clone()?;
+            if ps.display == Display::None {
+                return None;
+            }
+            let name = match pe {
+                PseudoElement::Before => "::before",
+                PseudoElement::After => "::after",
+            };
+            let mut t = dom::text(text.to_string());
+            t.uid = node.uid;
+            let mut g = dom::elem(name.into(), Default::default(), vec![t]);
+            g.uid = node.uid;
+            let ps = Rc::new(ps);
+            let text_node = StyledNode {
+                node: NodeRef::Generated(Box::new(g.children[0].clone())),
+                style: Rc::new(text_style(&ps)),
+                children: Vec::new(),
+            };
+            Some(StyledNode {
+                node: NodeRef::Generated(Box::new(g)),
+                style: ps,
+                children: if text.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![text_node]
+                },
+            })
+        };
+        // Matched with the element itself as the subject, so with its own
+        // ancestors.
+        let before = generated(PseudoElement::Before, ancestors);
+        let summary = summary_marker(node, e, &style, before.is_some());
+        children.extend(before.or(summary));
+        // A closed `<details>` shows only its summary (whatever the page's
+        // CSS says, as in browsers).
+        let first_summary =
+            (e.tag == "details").then(|| node.children.iter().position(|c| c.tag() == Some("summary")));
+        let closed = e.tag == "details" && !e.attrs.contains_key("open");
         ancestors.push(e);
-        for c in &node.children {
-            children.push(style_node(c, &style, ancestors, ctx, index, flat, next_id, false));
+        for (i, c) in node.children.iter().enumerate() {
+            let styled = style_node(c, &style, ancestors, ctx, index, flat, next_id, false);
+            if !closed || first_summary == Some(Some(i)) {
+                children.push(styled);
+            }
         }
         ancestors.pop();
+        children.extend(generated(PseudoElement::After, ancestors));
     }
     StyledNode {
-        node,
+        node: NodeRef::Doc(node),
         style,
         children,
     }
 }
 
+/// The triangle before a `<summary>`'s text (when the page doesn't give it
+/// a `::before` of its own or `list-style: none`): an inline box like a
+/// `::before`.
+fn summary_marker<'a>(
+    node: &Node,
+    e: &ElementData,
+    style: &Rc<ComputedStyle>,
+    has_before: bool,
+) -> Option<StyledNode<'a>> {
+    let mark = match style.list_style {
+        ListStyle::DisclosureClosed => "\u{25B8}\u{A0}",
+        ListStyle::DisclosureOpen => "\u{25BE}\u{A0}",
+        _ => return None,
+    };
+    if e.tag != "summary" || has_before || style.display == Display::None {
+        return None;
+    }
+    let mut t = dom::text(mark.into());
+    t.uid = node.uid;
+    let mut g = dom::elem("::before".into(), Default::default(), vec![]);
+    g.uid = node.uid;
+    let ps = Rc::new(text_style(style));
+    Some(StyledNode {
+        node: NodeRef::Generated(Box::new(g)),
+        style: ps.clone(),
+        children: vec![StyledNode {
+            node: NodeRef::Generated(Box::new(t)),
+            style: Rc::new(text_style(&ps)),
+            children: Vec::new(),
+        }],
+    })
+}
+
+fn text_style(parent: &ComputedStyle) -> ComputedStyle {
+    let mut s = parent.inherit();
+    s.display = Display::Inline;
+    s
+}
+
 /// `at` is the element in the document being matched against.
+#[allow(clippy::too_many_arguments)]
 fn compute(
     e: &ElementData,
     parent: &ComputedStyle,
@@ -755,6 +937,7 @@ fn compute(
     index: &RuleIndex,
     at: (&Flat, u32),
     is_root: bool,
+    pseudo: Option<PseudoElement>,
 ) -> ComputedStyle {
     let mut matched: Vec<MatchedRule> = Vec::new();
     let mut order = 0;
@@ -762,7 +945,11 @@ fn compute(
     let mut hits: std::collections::BTreeMap<usize, (u8, &css::Rule, css::Specificity)> = Default::default();
     for i in index.candidates(e) {
         let (rule_order, origin, rule, sel) = index.entries[i];
-        if selectors::matches(at.0, at.1, sel) {
+        let hit = match pseudo {
+            None => selectors::matches(at.0, at.1, sel),
+            Some(pe) => selectors::matches_pseudo(at.0, at.1, sel, pe),
+        };
+        if hit {
             let spec = sel.specificity();
             hits.entry(rule_order)
                 .and_modify(|h| h.2 = h.2.max(spec))
@@ -779,9 +966,11 @@ fn compute(
             });
         }
     }
+    // A generated box has no attributes of its own.
     let inline = e
         .attrs
         .get("style")
+        .filter(|_| pseudo.is_none())
         .map(|s| css::parse_inline(s))
         .unwrap_or_default();
     for d in &inline {
@@ -931,6 +1120,9 @@ fn compute(
             values: vec![Value::Keyword("none".into())],
             important: false,
         });
+    }
+    if pseudo.is_some() {
+        presentational.clear();
     }
     for d in &presentational {
         matched.push(MatchedRule {
@@ -1215,6 +1407,8 @@ fn compute(
                     "none" => ListStyle::None,
                     "circle" => ListStyle::Circle,
                     "square" => ListStyle::Square,
+                    "disclosure-closed" => ListStyle::DisclosureClosed,
+                    "disclosure-open" => ListStyle::DisclosureOpen,
                     "decimal"
                     | "decimal-leading-zero"
                     | "lower-alpha"
@@ -1415,11 +1609,14 @@ fn compute(
         s.root_overflow = s.overflow_clip;
         true
     } else {
-        e.tag == "body" && parent.root && !parent.root_overflow
+        pseudo.is_none() && e.tag == "body" && parent.root && !parent.root_overflow
     };
     if propagated {
         s.overflow_clip = false;
         s.scrolls = false;
+    }
+    if pseudo.is_some() {
+        s.content = props.get("content").and_then(|v| content_text(v, e));
     }
     // Absolutely positioned boxes don't float, and both are block-level.
     if matches!(s.position, Position::Absolute | Position::Fixed) {

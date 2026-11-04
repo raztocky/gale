@@ -264,6 +264,42 @@ pub fn activate(dom: &mut Dom, id: u32) -> Activation {
     }
 }
 
+/// A click on (or in) a `<details>` element's summary opens or closes it.
+/// Returns the `<details>`, if one was toggled. Links and controls inside
+/// the summary keep their own click.
+pub fn toggle_details(dom: &mut Dom, uid: u32) -> Option<u32> {
+    use crate::selectors::Tree;
+    let mut cur = Some(uid);
+    while let Some(id) = cur {
+        let e = dom.element(id);
+        if e.is_some_and(|e| e.tag == "a" || control(e).is_some()) {
+            return None;
+        }
+        if e.is_some_and(|e| e.tag == "summary") {
+            let d = dom.parent(id)?;
+            if dom.element(d)?.tag != "details" {
+                return None;
+            }
+            let first = dom
+                .children(d)
+                .iter()
+                .copied()
+                .find(|&c| dom.element(c).is_some_and(|e| e.tag == "summary"));
+            if first != Some(id) {
+                return None;
+            }
+            if dom.element(d)?.attrs.contains_key("open") {
+                dom.remove_attr(d, "open");
+            } else {
+                dom.set_attr(d, "open", "");
+            }
+            return Some(d);
+        }
+        cur = dom.parent(id);
+    }
+    None
+}
+
 /// Type text into a field. Returns whether anything changed.
 pub fn type_text(dom: &mut Dom, id: u32, text: &str) -> bool {
     if !kind(dom, id).is_some_and(Control::takes_typing) || text.is_empty() {

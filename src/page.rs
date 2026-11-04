@@ -543,6 +543,13 @@ impl Page {
                 }
                 _ => {}
             }
+        } else if !out.prevented {
+            let toggled = self
+                .with_dom(rt.as_deref_mut(), |d| forms::toggle_details(d, uid))
+                .flatten();
+            if let (Some(d), Some(rt)) = (toggled, rt.as_deref_mut()) {
+                rt.fire(d, "toggle", false, false);
+            }
         }
         self.finish(rt, before, was_focus, &mut out);
         out
@@ -1516,6 +1523,50 @@ mod text_tests {
         let mut p = Page::empty("https://a.test/", "", true);
         p.set_tree(html::parse(ddg), &mut |_, _| Err("no".into()));
         assert_eq!(p.redirect, None);
+    }
+
+    #[test]
+    fn details_open_and_close_on_a_click() {
+        let mut page = Page::parse(
+            "https://example.com/",
+            "<details><summary>Question <b>here</b></summary>Answer<p>More</p></details>\
+             <details open><summary>Shown</summary><p>Open</p></details>\
+             <style>details p { display: block }</style>",
+            "",
+            &mut |_, _| Err("none".into()),
+        );
+        let text = |p: &Page| {
+            let r = p.render(800.0, 600.0);
+            let all: String = r.texts.iter().map(|t| t.text.clone() + " ").collect();
+            all.split_whitespace().collect::<Vec<_>>().join(" ")
+        };
+        let find = |p: &Page, word: &str| {
+            let r = p.render(800.0, 600.0);
+            let t = r.texts.iter().find(|t| t.text.contains(word)).unwrap().rect;
+            (t.x + t.w / 2.0, t.y + t.h / 2.0)
+        };
+        assert_eq!(text(&page), "\u{25B8} Question here \u{25BE} Shown Open");
+        let until = Instant::now() + std::time::Duration::from_secs(5);
+        let (x, y) = find(&page, "here");
+        assert!(page.click_at(None, x, y, until).changed);
+        assert_eq!(
+            text(&page),
+            "\u{25BE} Question here Answer More \u{25BE} Shown Open"
+        );
+        let (x, y) = find(&page, "Question");
+        page.click_at(None, x, y, until);
+        let (x, y) = find(&page, "Shown");
+        page.click_at(None, x, y, until);
+        assert_eq!(text(&page), "\u{25B8} Question here \u{25B8} Shown");
+        // `list-style: none` hides the marker; a `::before` replaces it.
+        let page = Page::parse(
+            "https://example.com/",
+            "<style>.a summary { list-style: none } .b summary::before { content: '+ ' }</style>\
+             <details class=a><summary>A</summary></details><details class=b><summary>B</summary></details>",
+            "",
+            &mut |_, _| Err("none".into()),
+        );
+        assert_eq!(text(&page), "A + B");
     }
 
     #[test]

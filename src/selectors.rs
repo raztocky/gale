@@ -2,7 +2,7 @@
 //! script DOM keep their trees differently; both describe theirs through
 //! [`Tree`], so they share one matcher.
 
-use crate::css::{AttrOp, AttrSelector, Combinator, Pseudo, Selector, SimpleSelector};
+use crate::css::{AttrOp, AttrSelector, Combinator, Pseudo, PseudoElement, Selector, SimpleSelector};
 use crate::dom::{ElementData, Node, NodeType};
 use std::cell::Cell;
 
@@ -64,8 +64,15 @@ fn previous<T: Tree + ?Sized>(t: &T, id: u32) -> impl Iterator<Item = u32> + '_ 
         .filter(move |&s| t.element(s).is_some())
 }
 
+/// Does element `id` match `sel`? Selectors for `::before`/`::after` never
+/// match an element itself.
 pub fn matches<T: Tree + ?Sized>(t: &T, id: u32, sel: &Selector) -> bool {
-    t.element(id).is_some() && go(t, &sel.parts, id, None)
+    sel.parts[0].0.pseudo_element.is_none() && t.element(id).is_some() && go(t, &sel.parts, id, None)
+}
+
+/// Does `sel` style element `id`'s `pe` box?
+pub fn matches_pseudo<T: Tree + ?Sized>(t: &T, id: u32, sel: &Selector, pe: PseudoElement) -> bool {
+    sel.parts[0].0.pseudo_element == Some(pe) && t.element(id).is_some() && go(t, &sel.parts, id, None)
 }
 
 /// Does `id` match `parts` (right to left)? With a `scope`, `parts` is a
@@ -391,7 +398,7 @@ mod tests {
     #[test]
     fn what_still_does_not_parse() {
         for bad in [
-            "a::before",
+            "a::first-line",
             "a:unknown-thing",
             "li:nth-child(2n of .x)",
             ":not()",
@@ -403,7 +410,7 @@ mod tests {
             assert_eq!(css::parse_selector(bad), None, "{bad}");
         }
         // One bad selector doesn't sink the rule's others.
-        assert_eq!(css::parse_selector_list("a::before, b, c:hover").len(), 2);
+        assert_eq!(css::parse_selector_list("a::marker, b, c:hover").len(), 2);
     }
 
     #[test]
