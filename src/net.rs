@@ -1164,6 +1164,29 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(2));
     }
 
+    /// A header line with no colon used to make ureq panic (found by the
+    /// `response` fuzz target); it's now skipped like any malformed line.
+    #[test]
+    fn header_lines_without_a_colon_are_skipped() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}/", listener.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            for line in ["EEEE", "Content-Type", "Content-Length", "Location"] {
+                let Ok((mut s, _)) = listener.accept() else { return };
+                let _ = s.read(&mut [0u8; 4096]);
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n{line}\r\nContent-Length: 2\r\n\r\nhi"
+                );
+            }
+        });
+        for _ in 0..4 {
+            let r = http_get(&url, Dest::Document, None, false, None).unwrap();
+            assert_eq!((r.status, r.body.as_str()), (200, "hi"));
+        }
+    }
+
     #[test]
     fn stop_closes_a_slow_download() {
         use std::io::Write;

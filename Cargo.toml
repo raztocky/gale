@@ -47,3 +47,8 @@ opt-level = 1
 [dev-dependencies]
 # A TLS server with a self-signed certificate, for tests/privacy.rs.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
+# ureq 2.12.1 with a fix for a panic on malformed response headers (see
+# vendor/ureq/BRICKLE.md). Goes away with the move to ureq 3.
+[patch.crates-io]
+ureq = { path = "vendor/ureq" }

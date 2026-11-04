@@ -14,6 +14,10 @@ url = "2"
 [dependencies.brickle]
 path = ".."
 
+# Same patched ureq as Brickle itself (see ../vendor/ureq/BRICKLE.md).
+[patch.crates-io]
+ureq = { path = "../vendor/ureq" }
+
 [[bin]]
 name = "html"
 path = "fuzz_targets/html.rs"
