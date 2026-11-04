@@ -36,7 +36,9 @@ filter lists and your rules.
 **Linux Mint:** works out of the box on X11 (Cinnamon). If the build complains about missing
 libraries, run `sudo apt install build-essential libxkbcommon-dev`.
 
-**Controls:**
+**Controls:** the menu bar at the top (File, Edit, View, History) has everything below that
+isn't scrolling or typing, with its shortcut beside it. `A−` / `A+` at its right change the text
+size, and clicking the percentage between them goes back to the normal size.
 
 | Action | Keys |
 |---|---|
@@ -51,6 +53,8 @@ libraries, run `sudo apt install build-essential libxkbcommon-dev`.
 | Forms | click a field to type; `Tab` next field, `Enter` submit, `Esc` leave the field |
 | Find in page | `Ctrl+F`, then `Enter`/`Shift+Enter` (or `F3`, `Ctrl+G`) for the next/previous match, `Esc` to close |
 | Select text | drag, double-click a word, `Ctrl+A` for the page, `Esc` to clear |
+| Text size | `Ctrl+=` bigger, `Ctrl+-` smaller, `Ctrl+0` normal (125%, remembered between runs) |
+| Quit | `Ctrl+Q` |
 | Copy / paste | `Ctrl+C` copies the selection (or the address); `Ctrl+V` or `Shift+Insert` pastes into the address bar or a form field |
 
 ## Architecture

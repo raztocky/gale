@@ -370,10 +370,28 @@ pub struct StyleContext<'s> {
     /// (origin, sheet). Origin 0 = user agent, 1 = author.
     pub sheets: Vec<(u8, &'s Stylesheet)>,
     pub viewport: (f32, f32),
+    /// Your text size: absolute font sizes and line heights (px, pt, the
+    /// size keywords, rem) are multiplied by it; relative ones follow.
+    pub text_scale: f32,
+}
+
+/// Smallest and largest text size, as a multiple of the page's own.
+pub const MIN_TEXT_SCALE: f32 = 0.5;
+pub const MAX_TEXT_SCALE: f32 = 3.0;
+
+fn text_scale(ctx: &StyleContext) -> f32 {
+    if ctx.text_scale.is_finite() {
+        ctx.text_scale.clamp(MIN_TEXT_SCALE, MAX_TEXT_SCALE)
+    } else {
+        1.0
+    }
 }
 
 pub fn style_tree<'a>(root: &'a Node, ctx: &StyleContext) -> StyledNode<'a> {
-    let base = ComputedStyle::root(ctx.viewport);
+    let mut base = ComputedStyle::root(ctx.viewport);
+    let k = text_scale(ctx);
+    base.font_size *= k;
+    base.line_height *= k;
     let mut ancestors = Vec::new();
     let index = RuleIndex::new(&ctx.sheets);
     style_node(root, &base, &mut ancestors, ctx, &index, true)
@@ -751,27 +769,34 @@ fn compute(
     let mut s = parent.inherit();
     s.vars = vars;
     s.display = Display::Inline;
+    let scale = text_scale(ctx);
     let ctxv = Ctx {
         parent,
         viewport: ctx.viewport,
+        rem: 16.0 * scale,
     };
+    // Absolute sizes grow with your text size; em and % follow their parent.
+    let absolute = |v: &Value| matches!(v, Value::Length(_, Unit::Px | Unit::Pt));
 
     // font-size first: em units in other properties depend on it.
     if let Some(v) = props.get("font-size").and_then(|v| v.first()) {
         s.font_size = match v {
             Value::Keyword(k) => match k.as_str() {
-                "xx-small" => 9.0,
-                "x-small" => 10.0,
-                "small" => 13.0,
-                "medium" => 16.0,
-                "large" => 18.0,
-                "x-large" => 24.0,
-                "xx-large" => 32.0,
+                "xx-small" => 9.0 * scale,
+                "x-small" => 10.0 * scale,
+                "small" => 13.0 * scale,
+                "medium" => 16.0 * scale,
+                "large" => 18.0 * scale,
+                "x-large" => 24.0 * scale,
+                "xx-large" => 32.0 * scale,
                 "smaller" => parent.font_size / 1.2,
                 "larger" => parent.font_size * 1.2,
                 _ => parent.font_size,
             },
             Value::Percent(p) => parent.font_size * p / 100.0,
+            v if absolute(v) => ctxv
+                .length(v, parent.font_size)
+                .map_or(parent.font_size, |px| px * scale),
             v => ctxv.length(v, parent.font_size).unwrap_or(parent.font_size),
         };
     }
@@ -927,6 +952,7 @@ fn compute(
                     Some(Value::Number(n)) => n * fs,
                     Some(Value::Percent(p)) => p / 100.0 * fs,
                     Some(Value::Keyword(k)) if k == "normal" => fs * 1.2,
+                    Some(v) if absolute(v) => ctxv.length(v, fs).map_or(s.line_height, |px| px * scale),
                     Some(v) => ctxv.length(v, fs).unwrap_or(s.line_height),
                     None => s.line_height,
                 }
@@ -1442,6 +1468,8 @@ fn eval_calc(text: &str, font_size: f32, viewport: (f32, f32)) -> Option<Calc> {
 struct Ctx<'p> {
     parent: &'p ComputedStyle,
     viewport: (f32, f32),
+    /// 1rem in px.
+    rem: f32,
 }
 
 impl Ctx<'_> {
@@ -1451,7 +1479,7 @@ impl Ctx<'_> {
             Value::Length(n, u) => Some(match u {
                 Unit::Px => *n,
                 Unit::Em => n * font_size,
-                Unit::Rem => n * 16.0,
+                Unit::Rem => n * self.rem,
                 Unit::Pt => n * 4.0 / 3.0,
                 Unit::Vw => n * self.viewport.0 / 100.0,
                 Unit::Vh => n * self.viewport.1 / 100.0,
@@ -1710,5 +1738,50 @@ fn expand(d: &Declaration, props: &mut HashMap<String, Vec<Value>>) {
             set("flex-basis".into(), basis);
         }
         _ => set(d.name.clone(), d.values.clone()),
+    }
+}
+
+#[cfg(test)]
+mod text_scale_tests {
+    use super::*;
+
+    /// The computed styles of `<p>`s in `body`, rendered at `scale`.
+    fn paragraphs(body: &str, scale: f32) -> Vec<ComputedStyle> {
+        let dom = crate::html::parse(body);
+        let ua = css::parse(UA_CSS);
+        let ctx = StyleContext {
+            sheets: vec![(0, &ua)],
+            viewport: (1000.0, 600.0),
+            text_scale: scale,
+        };
+        let styled = style_tree(&dom, &ctx);
+        fn walk(n: &StyledNode, out: &mut Vec<ComputedStyle>) {
+            if n.node.tag() == Some("p") {
+                out.push((*n.style).clone());
+            }
+            for c in &n.children {
+                walk(c, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(&styled, &mut out);
+        out
+    }
+
+    #[test]
+    fn absolute_sizes_grow_and_relative_ones_follow() {
+        let body = "<p>plain</p><p style='font-size:20px;line-height:30px'>px</p>\
+                    <div style='font-size:10px'><p style='font-size:2em'>em</p></div>\
+                    <p style='font-size:large'>keyword</p><p style='font-size:2rem'>rem</p>\
+                    <p style='font-size:2vw'>vw</p>";
+        let one = paragraphs(body, 1.0);
+        let big = paragraphs(body, 1.5);
+        let sizes = |v: &[ComputedStyle]| v.iter().map(|s| s.font_size).collect::<Vec<_>>();
+        assert_eq!(sizes(&one), [16.0, 20.0, 20.0, 18.0, 32.0, 20.0]);
+        assert_eq!(sizes(&big), [24.0, 30.0, 30.0, 27.0, 48.0, 20.0], "vw stays put");
+        assert_eq!(big[1].line_height, 45.0);
+        // Nonsense scales are clamped or ignored.
+        assert_eq!(paragraphs(body, 100.0)[0].font_size, 16.0 * MAX_TEXT_SCALE);
+        assert_eq!(paragraphs(body, f32::NAN)[0].font_size, 16.0);
     }
 }

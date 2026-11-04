@@ -13,14 +13,73 @@ use brickle::paint::{Canvas, DisplayList, GlyphCache, Layer, TileCache};
 use brickle::select::{self, Bands, FindText, Pos};
 use brickle::tab::{Input, Tab};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// The tab strip, then the address bar.
+const MENU_H: f32 = 26.0;
 const TABS_H: f32 = 30.0;
 const ADDR_H: f32 = 40.0;
-const BAR_H: f32 = TABS_H + ADDR_H;
+const BAR_H: f32 = MENU_H + TABS_H + ADDR_H;
+/// Where the tab strip starts.
+const TABS_Y: f32 = MENU_H;
+const MENU_ITEM_H: f32 = 26.0;
+const MENU_W: f32 = 250.0;
+
+/// Text sizes the menu and Ctrl+=/Ctrl+- step through.
+const TEXT_SCALES: [f32; 12] = [0.5, 0.67, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0];
+const DEFAULT_TEXT_SCALE: f32 = 1.25;
+
+/// A menu item: its label, the shortcut shown beside it, and the key (with
+/// Ctrl, Shift, Alt) it presses, so menus and shortcuts always agree.
+struct MenuItem {
+    label: &'static str,
+    keys: &'static str,
+    press: (Key, bool, bool, bool),
+}
+
+const fn item(label: &'static str, keys: &'static str, press: (Key, bool, bool, bool)) -> MenuItem {
+    MenuItem { label, keys, press }
+}
+
+const MENUS: [(&str, &[MenuItem]); 4] = [
+    (
+        "File",
+        &[
+            item("New tab", "Ctrl+T", (Key::T, true, false, false)),
+            item("Close tab", "Ctrl+W", (Key::W, true, false, false)),
+            item("Quit", "Ctrl+Q", (Key::Q, true, false, false)),
+        ],
+    ),
+    (
+        "Edit",
+        &[
+            item("Copy", "Ctrl+C", (Key::C, true, false, false)),
+            item("Paste", "Ctrl+V", (Key::V, true, false, false)),
+            item("Find in page", "Ctrl+F", (Key::F, true, false, false)),
+            item("Edit address", "Ctrl+L", (Key::L, true, false, false)),
+        ],
+    ),
+    (
+        "View",
+        &[
+            item("Bigger text", "Ctrl+=", (Key::Equal, true, false, false)),
+            item("Smaller text", "Ctrl+-", (Key::Minus, true, false, false)),
+            item("Normal text size", "Ctrl+0", (Key::Key0, true, false, false)),
+            item("Requests panel", "F12", (Key::F12, false, false, false)),
+        ],
+    ),
+    (
+        "History",
+        &[
+            item("Back", "Alt+Left", (Key::Left, false, false, true)),
+            item("Forward", "Alt+Right", (Key::Right, false, false, true)),
+            item("Reload", "Ctrl+R", (Key::R, true, false, false)),
+        ],
+    ),
+];
 /// Most tabs open at once (each has its own renderer process).
 const MAX_TABS: usize = 30;
 const STATUS_H: f32 = 22.0;
@@ -236,6 +295,10 @@ struct Ui {
     panel_scroll: f32,
     /// A short message shown in the status bar (e.g. "block: ||x^").
     flash: Option<String>,
+    /// The menu that's open, by index into `MENUS`.
+    menu: Option<usize>,
+    /// Your text size (see `StyleContext::text_scale`).
+    text_scale: f32,
 }
 
 /// What the window knows about the current page. The `Tab` itself may be
@@ -304,7 +367,7 @@ type TabId = u64;
 /// The window's ends of the loader's channels.
 type Loader = (Sender<(TabId, Job)>, Receiver<(TabId, Done)>);
 
-fn spawn_loader(net: Arc<Mutex<Network>>, sandboxed: bool) -> Loader {
+fn spawn_loader(net: Arc<Mutex<Network>>, sandboxed: bool, scale: Arc<AtomicU32>) -> Loader {
     let (job_tx, job_rx) = mpsc::channel::<(TabId, Job)>();
     let (done_tx, done_rx) = mpsc::channel::<(TabId, Done)>();
     std::thread::Builder::new()
@@ -312,6 +375,7 @@ fn spawn_loader(net: Arc<Mutex<Network>>, sandboxed: bool) -> Loader {
         .stack_size(256 * 1024 * 1024)
         .spawn(move || {
             for (id, job) in job_rx {
+                let text_scale = f32::from_bits(scale.load(Ordering::Relaxed));
                 let done = match job {
                     Job::Open {
                         url,
@@ -338,6 +402,7 @@ fn spawn_loader(net: Arc<Mutex<Network>>, sandboxed: bool) -> Loader {
                                 None => Tab::open_sized(&mut n, &url, from.as_deref(), sandboxed, (w, h)),
                             }
                         };
+                        tab.text_scale = text_scale;
                         let rendered = Some(tab.render(w, h));
                         Done {
                             tab,
@@ -347,6 +412,7 @@ fn spawn_loader(net: Arc<Mutex<Network>>, sandboxed: bool) -> Loader {
                         }
                     }
                     Job::Render { mut tab, w, h } => {
+                        tab.text_scale = text_scale;
                         let rendered = Some(tab.render(w, h));
                         Done {
                             tab: *tab,
@@ -366,6 +432,7 @@ fn spawn_loader(net: Arc<Mutex<Network>>, sandboxed: bool) -> Loader {
                             let mut n = net.lock().unwrap_or_else(|e| e.into_inner());
                             tab.interact(&mut n, input)
                         };
+                        tab.text_scale = text_scale;
                         let rendered = click.changed.then(|| tab.render(w, h));
                         Done {
                             tab: *tab,
@@ -402,7 +469,8 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
     let mut clip = Clip(None);
 
     let net = Arc::new(Mutex::new(net));
-    let (jobs, done_rx) = spawn_loader(net.clone(), sandboxed);
+    let shared_scale = Arc::new(AtomicU32::new(DEFAULT_TEXT_SCALE.to_bits()));
+    let (jobs, done_rx) = spawn_loader(net.clone(), sandboxed, shared_scale.clone());
 
     let mut history: Vec<Entry> = Vec::new();
     let mut forward: Vec<Entry> = Vec::new();
@@ -456,7 +524,13 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         panel,
         panel_scroll: 0.0,
         flash: None,
+        menu: None,
+        text_scale: load_text_scale(),
     };
+    shared_scale.store(ui.text_scale.to_bits(), Ordering::Relaxed);
+    // A menu item picked: the shortcut it presses, next frame.
+    let mut menu_press: Option<(Key, bool, bool, bool)> = None;
+    let mut quit = false;
     let mut cache = GlyphCache::default();
     let mut was_down = false;
     // Selected text on the page (where it started, where it ends now), and a
@@ -746,7 +820,43 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         let shift = window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift);
         let alt = window.is_key_down(Key::LeftAlt) || window.is_key_down(Key::RightAlt);
         let chars: Vec<char> = std::mem::take(&mut *typed.lock().unwrap());
-        for key in window.get_keys_pressed(KeyRepeat::Yes) {
+        // A menu item stands in for this frame's keys.
+        let picked = menu_press.take();
+        let (ctrl, shift, alt) = picked.map_or((ctrl, shift, alt), |(_, c, s, a)| (c, s, a));
+        let keys = match picked {
+            Some((k, ..)) => vec![k],
+            None => window.get_keys_pressed(KeyRepeat::Yes),
+        };
+        for key in keys {
+            if key == Key::Escape && ui.menu.is_some() {
+                ui.menu = None;
+                dirty = true;
+                continue;
+            }
+            if ctrl
+                && matches!(
+                    key,
+                    Key::Equal | Key::NumPadPlus | Key::Minus | Key::NumPadMinus | Key::Key0 | Key::NumPad0
+                )
+            {
+                let next = match key {
+                    Key::Equal | Key::NumPadPlus => step_text_scale(ui.text_scale, 1),
+                    Key::Minus | Key::NumPadMinus => step_text_scale(ui.text_scale, -1),
+                    _ => DEFAULT_TEXT_SCALE,
+                };
+                if next != ui.text_scale {
+                    ui.text_scale = next;
+                    shared_scale.store(next.to_bits(), Ordering::Relaxed);
+                    save_text_scale(next);
+                    need_layout = true;
+                    for p in &mut parked {
+                        p.laid_out_at = (0.0, 0.0);
+                    }
+                }
+                ui.flash = Some(format!("Text size {}%", (ui.text_scale * 100.0).round()));
+                dirty = true;
+                continue;
+            }
             if ctrl {
                 let digit = [
                     Key::Key1,
@@ -949,6 +1059,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     dirty = true;
                 }
                 Key::R if ctrl => reload = true,
+                Key::Q if ctrl => quit = true,
                 Key::F5 => reload = true,
                 Key::F12 => ui.panel = !ui.panel,
                 Key::E if ctrl && shift => ui.panel = !ui.panel,
@@ -974,6 +1085,9 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             if scroll != before {
                 dirty = true;
             }
+        }
+        if quit {
+            break;
         }
         if ui.editing {
             let typed: String = chars.into_iter().filter(|c| !c.is_control()).collect();
@@ -1047,6 +1161,15 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     }
                     Err(_) => "Loading…".to_string(),
                 })
+            } else if let Some(t) = text_size_control_at(w as f32, mx, my) {
+                Some(
+                    match t {
+                        -1 => "Smaller text (Ctrl+-)",
+                        1 => "Bigger text (Ctrl+=)",
+                        _ => "Back to the normal text size (Ctrl+0)",
+                    }
+                    .into(),
+                )
             } else if badge.contains(mx, my) {
                 Some("Show every request this page made (F12)".into())
             } else if my > BAR_H && mx < page_w {
@@ -1058,6 +1181,16 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             if hover != ui.hover {
                 ui.hover = hover;
                 dirty = true;
+            }
+            // With a menu open, pointing at another menu's title opens it.
+            if let (Some(m), Some(t)) = (ui.menu, menu_title_at(mx, my)) {
+                if m != t {
+                    ui.menu = Some(t);
+                    dirty = true;
+                }
+            }
+            if ui.menu.is_some() {
+                dirty = true; // the item under the pointer is highlighted
             }
             let mid = window.get_mouse_down(MouseButton::Middle);
             if mid && !was_mid && my > BAR_H && mx < page_w {
@@ -1083,9 +1216,31 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     .is_some_and(|u| net::scheme(u).starts_with("http"))
             {
                 tab_action = Some(TabAction::Background(link_under.clone().unwrap_or_default()));
+            } else if down && !was_down && ui.menu.is_some() {
+                // A click with a menu open picks an item, or just closes it.
+                let m = ui.menu.unwrap_or(0);
+                if let Some(i) = menu_item_at(m, mx, my) {
+                    menu_press = Some(MENUS[m].1[i].press);
+                }
+                ui.menu = menu_title_at(mx, my).filter(|&t| t != m);
+                dirty = true;
             } else if down && !was_down {
                 ui.flash = None;
-                if my < TABS_H {
+                if my < MENU_H {
+                    if let Some(t) = menu_title_at(mx, my) {
+                        ui.menu = Some(t);
+                        if ui.editing {
+                            ui.editing = false;
+                            ui.address.set(&info.url);
+                        }
+                    } else if let Some(t) = text_size_control_at(w as f32, mx, my) {
+                        menu_press = Some(match t {
+                            -1 => (Key::Minus, true, false, false),
+                            1 => (Key::Equal, true, false, false),
+                            _ => (Key::Key0, true, false, false),
+                        });
+                    }
+                } else if my < TABS_Y + TABS_H {
                     let (rects, plus) = tab_rects(order.len(), w as f32);
                     if plus.contains(mx, my) {
                         tab_action = Some(TabAction::New);
@@ -1437,6 +1592,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 })
                 .collect();
             draw_tabs(&mut canvas, &titles, &mut cache);
+            draw_menu_bar(&mut canvas, &ui, &mut cache);
             if loading {
                 // Indeterminate progress bar under the address bar.
                 let x = (frame % 120) as f32 / 120.0 * (w as f32 + 200.0) - 200.0;
@@ -1466,6 +1622,9 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             draw_status(&mut canvas, &ui, page_w, &mut cache);
             if let Some(f) = &find {
                 draw_find(&mut canvas, f, page_w, &mut cache);
+            }
+            if let Some(m) = ui.menu {
+                draw_menu(&mut canvas, m, mouse, &mut cache);
             }
             dirty = false;
         }
@@ -1618,7 +1777,7 @@ fn tab_rects(n: usize, w: f32) -> (Vec<(Rect, Rect)>, Rect) {
     for i in 0..n {
         let r = Rect {
             x: 6.0 + i as f32 * tw,
-            y: 4.0,
+            y: TABS_Y + 4.0,
             w: tw - 4.0,
             h: TABS_H - 4.0,
         };
@@ -1632,7 +1791,7 @@ fn tab_rects(n: usize, w: f32) -> (Vec<(Rect, Rect)>, Rect) {
     }
     let plus = Rect {
         x: 6.0 + n as f32 * tw,
-        y: 6.0,
+        y: TABS_Y + 6.0,
         w: 24.0,
         h: TABS_H - 8.0,
     };
@@ -1676,6 +1835,208 @@ fn draw_tabs(c: &mut Canvas, titles: &[(String, bool)], cache: &mut GlyphCache) 
     text(c, plus.x + 7.0, plus.y + 16.0, "+", BOLD, 16.0, GRAY, cache, 0.0);
 }
 
+/// The next text size up (`dir` 1) or down (-1) from `cur`.
+fn step_text_scale(cur: f32, dir: i32) -> f32 {
+    if dir > 0 {
+        TEXT_SCALES
+            .iter()
+            .copied()
+            .find(|&s| s > cur + 0.001)
+            .unwrap_or(cur)
+    } else {
+        TEXT_SCALES
+            .iter()
+            .rev()
+            .copied()
+            .find(|&s| s < cur - 0.001)
+            .unwrap_or(cur)
+    }
+}
+
+fn text_scale_file() -> Option<std::path::PathBuf> {
+    brickle::network::config_dir().map(|d| d.join("text-size"))
+}
+
+/// Your text size from last time, or the default.
+fn load_text_scale() -> f32 {
+    text_scale_file()
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        .and_then(|t| t.trim().parse::<f32>().ok())
+        .filter(|s| s.is_finite())
+        .map_or(DEFAULT_TEXT_SCALE, |s| {
+            s.clamp(TEXT_SCALES[0], TEXT_SCALES[TEXT_SCALES.len() - 1])
+        })
+}
+
+fn save_text_scale(scale: f32) {
+    if let Some(f) = text_scale_file() {
+        let _ = f.parent().map(std::fs::create_dir_all);
+        let _ = std::fs::write(f, format!("{scale}\n"));
+    }
+}
+
+/// Where each menu's title is in the menu bar.
+fn menu_titles() -> Vec<Rect> {
+    let mut x = 6.0;
+    MENUS
+        .iter()
+        .map(|(title, _)| {
+            let w = font::measure(SANS, 13.0, title) + 20.0;
+            let r = Rect {
+                x,
+                y: 0.0,
+                w,
+                h: MENU_H,
+            };
+            x += w;
+            r
+        })
+        .collect()
+}
+
+fn menu_title_at(mx: f32, my: f32) -> Option<usize> {
+    menu_titles().iter().position(|r| r.contains(mx, my))
+}
+
+/// The dropdown of menu `m`, and each of its items.
+fn menu_rects(m: usize) -> (Rect, Vec<Rect>) {
+    let x = menu_titles()[m].x;
+    let items: Vec<Rect> = (0..MENUS[m].1.len())
+        .map(|i| Rect {
+            x: x + 4.0,
+            y: MENU_H + 4.0 + i as f32 * MENU_ITEM_H,
+            w: MENU_W - 8.0,
+            h: MENU_ITEM_H,
+        })
+        .collect();
+    let drop = Rect {
+        x,
+        y: MENU_H,
+        w: MENU_W,
+        h: items.len() as f32 * MENU_ITEM_H + 8.0,
+    };
+    (drop, items)
+}
+
+fn menu_item_at(m: usize, mx: f32, my: f32) -> Option<usize> {
+    menu_rects(m).1.iter().position(|r| r.contains(mx, my))
+}
+
+/// The text size control at the right of the menu bar: smaller, the
+/// current size (which resets it), bigger.
+fn text_size_rects(w: f32) -> [Rect; 3] {
+    let r = |x: f32, bw: f32| Rect {
+        x,
+        y: 3.0,
+        w: bw,
+        h: MENU_H - 6.0,
+    };
+    let plus = r(w - 38.0, 30.0);
+    let label = r(plus.x - 56.0, 54.0);
+    [r(label.x - 32.0, 30.0), label, plus]
+}
+
+/// -1 for smaller, 0 for the size itself, 1 for bigger.
+fn text_size_control_at(w: f32, mx: f32, my: f32) -> Option<i32> {
+    text_size_rects(w)
+        .iter()
+        .position(|r| r.contains(mx, my))
+        .map(|i| i as i32 - 1)
+}
+
+fn draw_menu_bar(c: &mut Canvas, ui: &Ui, cache: &mut GlyphCache) {
+    let w = c.width as f32;
+    c.fill(
+        Rect {
+            x: 0.0,
+            y: 0.0,
+            w,
+            h: MENU_H,
+        },
+        Color::rgb(0xf7, 0xf8, 0xfa),
+        0.0,
+    );
+    for (i, r) in menu_titles().iter().enumerate() {
+        if ui.menu == Some(i) {
+            c.fill(*r, Color::rgb(0xdb, 0xea, 0xfe), 0.0);
+        }
+        text(
+            c,
+            r.x + 10.0,
+            r.y + 17.0,
+            MENUS[i].0,
+            SANS,
+            13.0,
+            DARK,
+            cache,
+            0.0,
+        );
+    }
+    let [minus, label, plus] = text_size_rects(w);
+    for r in [minus, plus] {
+        c.fill(r, Color::WHITE, 0.0);
+    }
+    text(
+        c,
+        minus.x + 8.0,
+        minus.y + 15.0,
+        "A−",
+        SANS,
+        12.0,
+        DARK,
+        cache,
+        0.0,
+    );
+    text(c, plus.x + 6.0, plus.y + 15.0, "A+", BOLD, 14.0, DARK, cache, 0.0);
+    let pct = format!("{}%", (ui.text_scale * 100.0).round());
+    let pw = font::measure(SANS, 12.0, &pct);
+    text(
+        c,
+        label.x + (label.w - pw) / 2.0,
+        label.y + 14.0,
+        &pct,
+        SANS,
+        12.0,
+        GRAY,
+        cache,
+        0.0,
+    );
+}
+
+/// Menu `m`, open, over everything else.
+fn draw_menu(c: &mut Canvas, m: usize, mouse: Option<(f32, f32)>, cache: &mut GlyphCache) {
+    let (drop, items) = menu_rects(m);
+    c.fill(
+        drop.expand(Edges {
+            t: 1.0,
+            r: 1.0,
+            b: 1.0,
+            l: 1.0,
+        }),
+        LINE,
+        0.0,
+    );
+    c.fill(drop, Color::WHITE, 0.0);
+    for (it, r) in MENUS[m].1.iter().zip(&items) {
+        if mouse.is_some_and(|(mx, my)| r.contains(mx, my)) {
+            c.fill(*r, Color::rgb(0xdb, 0xea, 0xfe), 0.0);
+        }
+        text(c, r.x + 10.0, r.y + 17.0, it.label, SANS, 13.0, DARK, cache, 0.0);
+        let kw = font::measure(SANS, 12.0, it.keys);
+        text(
+            c,
+            r.x + r.w - 10.0 - kw,
+            r.y + 17.0,
+            it.keys,
+            SANS,
+            12.0,
+            GRAY,
+            cache,
+            0.0,
+        );
+    }
+}
+
 fn counts(log: &[LogEntry]) -> (usize, usize) {
     let blocked = log
         .iter()
@@ -1693,7 +2054,7 @@ fn badge_rect(log: &[LogEntry], w: f32) -> Rect {
     let tw = font::measure(SANS, 12.0, &badge_text(log)) + 20.0;
     Rect {
         x: w - tw - 10.0,
-        y: TABS_H + 8.0,
+        y: TABS_Y + TABS_H + 8.0,
         w: tw,
         h: ADDR_H - 16.0,
     }
@@ -1813,7 +2174,7 @@ fn draw_chrome(
 
     let field = Rect {
         x: 10.0,
-        y: TABS_H + 6.0,
+        y: TABS_Y + TABS_H + 6.0,
         w: badge.x - 20.0,
         h: ADDR_H - 12.0,
     };
@@ -2307,5 +2668,82 @@ mod clipboard_tests {
         let mut clip = Clip(None);
         assert!(clip.copy("https://example.com/brickle"));
         assert_eq!(clip.paste().as_deref(), Some("https://example.com/brickle"));
+    }
+}
+
+#[cfg(test)]
+mod menu_tests {
+    use super::*;
+
+    #[test]
+    fn text_size_steps_and_limits() {
+        assert_eq!(step_text_scale(1.25, 1), 1.5);
+        assert_eq!(step_text_scale(1.25, -1), 1.1);
+        assert_eq!(step_text_scale(3.0, 1), 3.0);
+        assert_eq!(step_text_scale(0.5, -1), 0.5);
+        // A size from an edited settings file still steps sensibly.
+        assert_eq!(step_text_scale(1.3, 1), 1.5);
+        assert_eq!(step_text_scale(1.3, -1), 1.25);
+    }
+
+    #[test]
+    fn menus_and_controls_dont_overlap() {
+        let titles = menu_titles();
+        assert_eq!(titles.len(), MENUS.len());
+        for (i, t) in titles.iter().enumerate() {
+            assert_eq!(menu_title_at(t.x + 2.0, 10.0), Some(i));
+            let (drop, items) = menu_rects(i);
+            assert!(
+                drop.y >= MENU_H
+                    && items
+                        .iter()
+                        .all(|r| r.y >= drop.y && r.y + r.h <= drop.y + drop.h)
+            );
+            assert_eq!(menu_item_at(i, items[0].x + 5.0, items[0].y + 5.0), Some(0));
+        }
+        let right = titles.last().map_or(0.0, |r| r.x + r.w);
+        let [minus, label, plus] = text_size_rects(1100.0);
+        assert!(right < minus.x && minus.x + minus.w <= label.x && label.x + label.w <= plus.x);
+        assert_eq!(text_size_control_at(1100.0, plus.x + 3.0, 10.0), Some(1));
+        assert_eq!(text_size_control_at(1100.0, label.x + 3.0, 10.0), Some(0));
+        // The tab strip is below the menu bar.
+        let (tabs, plus_tab) = tab_rects(3, 1100.0);
+        assert!(tabs.iter().all(|(r, _)| r.y >= MENU_H) && plus_tab.y >= MENU_H);
+    }
+
+    /// Paints the top of the window with the View menu open, to look at:
+    /// `cargo test --bin brickle -- --ignored menu_bar_picture`.
+    #[test]
+    #[ignore]
+    fn menu_bar_picture() {
+        let mut c = Canvas::new(1100, 260, Color::WHITE);
+        let mut cache = GlyphCache::default();
+        let mut ui = Ui {
+            address: LineEdit::new(64),
+            editing: false,
+            hover: None,
+            panel: false,
+            panel_scroll: 0.0,
+            flash: None,
+            menu: Some(2),
+            text_scale: DEFAULT_TEXT_SCALE,
+        };
+        ui.address.set("https://example.com/");
+        draw_chrome(&mut c, &ui, &[], 0.0, 0.0, 160.0, 1100.0, &mut cache);
+        draw_tabs(
+            &mut c,
+            &[("Example Domain".into(), true), ("Docs".into(), false)],
+            &mut cache,
+        );
+        draw_menu_bar(&mut c, &ui, &mut cache);
+        let (_, items) = menu_rects(2);
+        draw_menu(
+            &mut c,
+            2,
+            Some((items[0].x + 20.0, items[0].y + 10.0)),
+            &mut cache,
+        );
+        c.write_png(&std::env::var("MENU_PNG").unwrap_or("menu.png".into()))
+            .unwrap();
     }
 }

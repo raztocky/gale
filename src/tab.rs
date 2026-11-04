@@ -85,6 +85,8 @@ pub struct Tab {
     pub console: Vec<String>,
     /// A navigation the page's scripts asked for while loading.
     pub script_navigate: Option<String>,
+    /// Your text size, used when rendering.
+    pub text_scale: f32,
     backend: Backend,
 }
 
@@ -173,6 +175,7 @@ impl Tab {
                     console: vec![],
                     script_navigate: None,
                     backend: Backend::InProcess(Box::new(page)),
+                    text_scale: 1.0,
                 }
             }
         }
@@ -204,6 +207,7 @@ impl Tab {
             console: vec![],
             script_navigate: None,
             backend: Backend::Failed(String::new()),
+            text_scale: 1.0,
         };
         let blocker_css = net.cosmetic_css(url);
         if !sandbox {
@@ -318,14 +322,23 @@ impl Tab {
 
     pub fn render(&mut self, width: f32, height: f32) -> Rendered {
         let result = match &mut self.backend {
-            Backend::InProcess(p) => return p.render(width, height),
+            Backend::InProcess(p) => {
+                p.text_scale = self.text_scale;
+                return p.render(width, height);
+            }
             Backend::Failed(e) => Err(e.clone()),
-            Backend::Sandboxed(r) => r.send(ToRenderer::Render { width, height }).and_then(|_| {
-                match r.recv(Instant::now() + RENDERER_TIMEOUT, &mut { MAX_FRAME })? {
-                    FromRenderer::Rendered(out) => Ok(out),
-                    _ => Err(r.kill("renderer sent an unexpected message and was killed")),
-                }
-            }),
+            Backend::Sandboxed(r) => r
+                .send(ToRenderer::Render {
+                    width,
+                    height,
+                    text_scale: self.text_scale,
+                })
+                .and_then(
+                    |_| match r.recv(Instant::now() + RENDERER_TIMEOUT, &mut { MAX_FRAME })? {
+                        FromRenderer::Rendered(out) => Ok(out),
+                        _ => Err(r.kill("renderer sent an unexpected message and was killed")),
+                    },
+                ),
         };
         result.unwrap_or_else(|e| {
             self.backend = Backend::Failed(e.clone());
@@ -763,6 +776,7 @@ except BrokenPipeError:
             .send(ToRenderer::Render {
                 width: 100.0,
                 height: 100.0,
+                text_scale: 1.0,
             })
             .unwrap_err();
         assert!(err.contains("nobody asked"), "{err}");

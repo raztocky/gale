@@ -71,6 +71,8 @@ pub enum ToRenderer {
     Render {
         width: f32,
         height: f32,
+        /// Your text size.
+        text_scale: f32,
     },
     Dom,
 }
@@ -420,10 +422,15 @@ impl ToRenderer {
                     }
                 }
             }
-            ToRenderer::Render { width, height } => {
+            ToRenderer::Render {
+                width,
+                height,
+                text_scale,
+            } => {
                 e.u8(3);
                 e.f32(*width);
                 e.f32(*height);
+                e.f32(*text_scale);
             }
             ToRenderer::Dom => e.u8(4),
             ToRenderer::ImageReply(r) => {
@@ -489,6 +496,7 @@ impl ToRenderer {
             3 => ToRenderer::Render {
                 width: d.f32()?,
                 height: d.f32()?,
+                text_scale: d.f32()?,
             },
             4 => ToRenderer::Dom,
             10 => match d.u8()? {
@@ -1060,6 +1068,7 @@ mod tests {
             ToRenderer::Render {
                 width: 800.0,
                 height: 600.0,
+                text_scale: 1.25,
             },
             ToRenderer::Dom,
         ];

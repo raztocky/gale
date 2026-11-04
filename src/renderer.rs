@@ -152,8 +152,13 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                 page = Some(p);
                 rt = new_rt;
             }
-            ToRenderer::Render { width, height } => {
-                let p = page.as_ref().ok_or("render before load")?;
+            ToRenderer::Render {
+                width,
+                height,
+                text_scale,
+            } => {
+                let p = page.as_mut().ok_or("render before load")?;
+                p.text_scale = text_scale;
                 let width = width.clamp(1.0, 16_000.0);
                 let rendered = p.render(width, height.clamp(1.0, 16_000.0));
                 if let Some(rt) = rt.as_mut() {

@@ -42,6 +42,8 @@ pub struct Page {
     images: HashMap<String, Option<Decoded>>,
     /// Bytes of decoded pixels kept in `images`.
     image_bytes: usize,
+    /// Your text size (see `StyleContext::text_scale`).
+    pub text_scale: f32,
 }
 
 /// Decoded image pixels a page may keep (the renderer has 4 GB in all).
@@ -254,6 +256,7 @@ impl Page {
             focus: None,
             images: HashMap::new(),
             image_bytes: 0,
+            text_scale: 1.0,
         }
     }
 
@@ -299,6 +302,7 @@ impl Page {
         let mut all = vec![(0u8, ua_sheet())];
         all.extend(self.sheets.iter().map(|s| (1u8, s)));
         let ctx = StyleContext {
+            text_scale: 1.0,
             sheets: all,
             viewport: (1024.0, 768.0),
         };
@@ -583,6 +587,7 @@ impl Page {
         all.extend(self.sheets.iter().map(|s| (1u8, s)));
         all.push((3u8, &self.blocker));
         let ctx = StyleContext {
+            text_scale: self.text_scale,
             sheets: all,
             viewport: (width, viewport_h),
         };

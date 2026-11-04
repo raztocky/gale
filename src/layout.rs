@@ -2591,6 +2591,7 @@ mod line_break_tests {
         ));
         let ua = css::parse(style::UA_CSS);
         let ctx = StyleContext {
+            text_scale: 1.0,
             sheets: vec![(0, &ua)],
             viewport: (width, 600.0),
         };
@@ -2674,6 +2675,7 @@ mod inline_edge_tests {
         ));
         let ua = css::parse(style::UA_CSS);
         let ctx = StyleContext {
+            text_scale: 1.0,
             sheets: vec![(0, &ua)],
             viewport: (width, 600.0),
         };
@@ -2785,6 +2787,7 @@ mod table_tests {
         ));
         let ua = css::parse(style::UA_CSS);
         let ctx = StyleContext {
+            text_scale: 1.0,
             sheets: vec![(0, &ua)],
             viewport: (width, 600.0),
         };
@@ -3006,6 +3009,7 @@ mod float_tests {
         ));
         let ua = css::parse(style::UA_CSS);
         let ctx = StyleContext {
+            text_scale: 1.0,
             sheets: vec![(0, &ua)],
             viewport: (width, 600.0),
         };
@@ -3248,6 +3252,7 @@ mod position_tests {
         let dom = html::parse(page);
         let ua = css::parse(style::UA_CSS);
         let ctx = StyleContext {
+            text_scale: 1.0,
             sheets: vec![(0, &ua)],
             viewport: (400.0, 600.0),
         };
@@ -3268,6 +3273,7 @@ mod position_tests {
         let dom = html::parse("<div style='z-index:-3;position:relative'>x</div>");
         let ua = css::parse(style::UA_CSS);
         let ctx = StyleContext {
+            text_scale: 1.0,
             sheets: vec![(0, &ua)],
             viewport: (400.0, 600.0),
         };
@@ -3461,6 +3467,7 @@ mod calc_var_tests {
         let ua = css::parse(style::UA_CSS);
         let author = css::parse(sheet);
         let ctx = StyleContext {
+            text_scale: 1.0,
             sheets: vec![(0, &ua), (1, &author)],
             viewport: (400.0, 600.0),
         };
