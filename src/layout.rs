@@ -11,8 +11,8 @@ use crate::dom::NodeType;
 use crate::font;
 use crate::image::Decoded;
 use crate::style::{
-    Align, Clear, ComputedStyle, Display, Float, Justify, Len, ListStyle, Position, StyledNode, TextAlign,
-    VAlign,
+    Align, Clear, ComputedStyle, Display, Float, GridLine, Justify, Len, ListStyle, Position, StyledNode,
+    TextAlign, Track, TrackSize, VAlign, MAX_GRID_TRACKS,
 };
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -147,6 +147,9 @@ pub struct LayoutBox<'a> {
     pub uid: u32,
     /// A decoded `<img>`: the box is sized from it and paints it.
     pub image: Option<Decoded>,
+    /// The containing block's height, when it's known before its content
+    /// is laid out (what percentage heights are of).
+    pub cb_h: Option<f32>,
 }
 
 impl<'a> LayoutBox<'a> {
@@ -163,6 +166,7 @@ impl<'a> LayoutBox<'a> {
             link: None,
             uid: kind_uid.unwrap_or(0),
             image: None,
+            cb_h: None,
         }
     }
 
@@ -579,6 +583,8 @@ pub fn layout_tree_with_images<'a>(
     if !images.is_empty() {
         attach_images(&mut b, images);
     }
+    // The root's percentage height is of the window.
+    b.cb_h = (viewport.1 > 0.0).then_some(viewport.1);
     b.layout_block(0.0, viewport_w, 0.0, None);
     // The initial containing block: absolutely positioned boxes with no
     // positioned ancestor, and fixed ones, are placed in it. Pages are
@@ -806,7 +812,11 @@ impl<'a> LayoutBox<'a> {
             self.layout_table(t);
         } else if is_flex(s.display) {
             let vz = self.dims.border_box().h - self.dims.content.h;
-            let definite_h = content_height(s.height, &s, vz);
+            let definite_h =
+                content_height(s.height, &s, vz, self.cb_h).or_else(|| ratio_height(&s, &self.dims));
+            for c in &mut self.children {
+                c.cb_h = definite_h;
+            }
             self.layout_flex(definite_h);
         } else {
             self.layout_block_children(floats);
@@ -819,12 +829,17 @@ impl<'a> LayoutBox<'a> {
         }
 
         let s = self.style().clone();
+        let cb_h = self.cb_h;
         let d = &mut self.dims;
         let vz = d.padding.t + d.padding.b + d.border.t + d.border.b;
-        if let Some(h) = content_height(s.height, &s, vz) {
-            d.content.h = h;
+        if let Some(h) = content_height(s.height, &s, vz, cb_h) {
+            // A box meant to scroll can't here: it grows to fit instead.
+            d.content.h = if s.scrolls { d.content.h.max(h) } else { h };
+        } else if let Some(h) = ratio_height(&s, d) {
+            // Content may make it taller, unless it's clipped.
+            d.content.h = if s.overflow_clip { h } else { d.content.h.max(h) };
         }
-        if let Some(h) = content_height(s.min_height, &s, vz) {
+        if let Some(h) = content_height(s.min_height, &s, vz, cb_h) {
             d.content.h = d.content.h.max(h);
         }
         // A positioned box is the containing block of the absolutely
@@ -937,7 +952,14 @@ impl<'a> LayoutBox<'a> {
         let content = self.dims.content;
         let mut cursor = content.y;
         let mut prev_mb = 0.0f32;
+        let definite = {
+            let s = self.style();
+            let d = &self.dims;
+            let vz = d.padding.t + d.padding.b + d.border.t + d.border.b;
+            content_height(s.height, s, vz, self.cb_h).or_else(|| ratio_height(s, d))
+        };
         for child in &mut self.children {
+            child.cb_h = definite;
             let (mt, clear) = match child.kind {
                 BoxKind::Block(n) => (n.style.margin[0].or_zero(content.w), n.style.clear),
                 _ => (0.0, Clear::None),
@@ -990,7 +1012,9 @@ impl<'a> LayoutBox<'a> {
         }
         let mut items = items;
         items.sort_by_key(|&i| self.children[i].flex().order);
-        if s.flex_row {
+        if s.is_grid {
+            self.layout_grid(items, &s);
+        } else if s.flex_row {
             self.layout_flex_row(items, &s, definite_h);
         } else {
             if s.flex_reverse {
@@ -1013,7 +1037,7 @@ impl<'a> LayoutBox<'a> {
             let (lo, hi) = c.intrinsic_widths(avail);
             // The automatic minimum: the content's minimum, but no more
             // than a width that's set.
-            let lo = lo.min(c.intrinsic_widths_of(avail, false).0);
+            let lo = lo.min(c.intrinsic_widths_of(0.0, false).0);
             let outer_extra = c.outer_extra_w(avail);
             base.push(
                 match content_size(
@@ -1114,7 +1138,7 @@ impl<'a> LayoutBox<'a> {
             let mut x = content.x + start;
             for &k in line {
                 let item = items[k];
-                let align = self.children[item].flex().align.unwrap_or(s.align_items);
+                let align = cross_align(&self.children[item], s, false);
                 let c = &mut self.children[item];
                 let mb = c.dims.margin_box();
                 let dy = match align {
@@ -1152,7 +1176,7 @@ impl<'a> LayoutBox<'a> {
         // Width across: stretched, or shrink-to-fit when aligned.
         let mut size = Vec::with_capacity(items.len());
         for &i in &items {
-            let align = self.children[i].flex().align.unwrap_or(s.align_items);
+            let align = cross_align(&self.children[i], s, true);
             let c = &mut self.children[i];
             let w = if align == Align::Stretch && c.flex().auto_width {
                 content.w
@@ -1193,7 +1217,7 @@ impl<'a> LayoutBox<'a> {
         };
         let mut y = content.y + start;
         for (k, &i) in items.iter().enumerate() {
-            let align = self.children[i].flex().align.unwrap_or(s.align_items);
+            let align = cross_align(&self.children[i], s, true);
             let c = &mut self.children[i];
             let mb = c.dims.margin_box();
             c.dims.content.h += (size[k] - mb.h).max(0.0);
@@ -1210,6 +1234,245 @@ impl<'a> LayoutBox<'a> {
         } else {
             y - gap - extra - content.y
         };
+    }
+
+    /// Lay out `items` as a CSS grid: columns from `grid-template-columns`,
+    /// items placed row by row in order (`grid-column` can pick a column or
+    /// a span), each row as tall as its tallest item. Rows aren't templated:
+    /// `grid-template-rows` and `grid-row` are ignored.
+    fn layout_grid(&mut self, items: Vec<usize>, s: &ComputedStyle) {
+        let content = self.dims.content;
+        let (cgap, rgap) = (s.gap, s.row_gap);
+        let auto = Track {
+            min: TrackSize::Auto,
+            max: TrackSize::Auto,
+        };
+        let tpl = s.grid_columns.clone();
+        let mut tracks: Vec<Track> = tpl.as_ref().map(|t| t.tracks.clone()).unwrap_or_default();
+        // `repeat(auto-fill, ...)`: as many as fit.
+        let mut repeated = 0..0;
+        if let Some(r) = tpl.as_ref().and_then(|t| t.repeat.as_ref()) {
+            let floor = |ts: &[Track]| -> f32 {
+                ts.iter()
+                    .map(|t| match (t.max, t.min) {
+                        (TrackSize::Px(v), _) | (_, TrackSize::Px(v)) => v,
+                        (TrackSize::Percent(p), _) | (_, TrackSize::Percent(p)) => content.w * p / 100.0,
+                        _ => 0.0,
+                    })
+                    .sum::<f32>()
+                    + cgap * ts.len() as f32
+            };
+            let one = floor(&r.tracks);
+            let rest = floor(&tracks);
+            let n = if one > 0.0 {
+                ((content.w - rest + cgap) / one).floor().max(1.0) as usize
+            } else {
+                1
+            };
+            let n = n.min(MAX_GRID_TRACKS / r.tracks.len());
+            let at = r.at.min(tracks.len());
+            let ins: Vec<Track> = r
+                .tracks
+                .iter()
+                .cycle()
+                .take(n * r.tracks.len())
+                .copied()
+                .collect();
+            repeated = at..at + ins.len();
+            tracks.splice(at..at, ins);
+        }
+        if tracks.is_empty() {
+            tracks.push(auto);
+        }
+        let ncols = tracks.len();
+
+        // Placement: (item, column, span, row).
+        let mut placed: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(items.len());
+        let mut occupied: Vec<Vec<bool>> = Vec::new();
+        let (mut cur_r, mut cur_c) = (0usize, 0usize);
+        for &i in &items {
+            let [a, b] = self.children[i].style().grid_column;
+            // 0-based line index; negative counts from the end.
+            let line = |l: i32| -> usize {
+                if l > 0 {
+                    (l - 1) as usize
+                } else {
+                    (ncols as i32 + 1 + l).max(0) as usize
+                }
+            };
+            let (start, span) = match (a, b) {
+                (GridLine::Line(x), GridLine::Line(y)) => {
+                    let (x, y) = (line(x), line(y));
+                    (Some(x.min(y)), x.abs_diff(y).max(1))
+                }
+                (GridLine::Line(x), GridLine::Span(n)) => (Some(line(x)), n as usize),
+                (GridLine::Span(n), GridLine::Line(y)) => {
+                    (Some(line(y).saturating_sub(n as usize)), n as usize)
+                }
+                (GridLine::Line(x), GridLine::Auto) => (Some(line(x)), 1),
+                (GridLine::Auto, GridLine::Line(y)) => (Some(line(y).saturating_sub(1)), 1),
+                (GridLine::Span(n), _) | (GridLine::Auto, GridLine::Span(n)) => (None, n as usize),
+                (GridLine::Auto, GridLine::Auto) => (None, 1),
+            };
+            let span = span.clamp(1, ncols);
+            let free = |occ: &Vec<Vec<bool>>, r: usize, c: usize| {
+                (c..c + span).all(|k| !occ.get(r).is_some_and(|row| row[k]))
+            };
+            let (r, c) = match start {
+                Some(c) => {
+                    let c = c.min(ncols - span);
+                    let mut r = cur_r + usize::from(c < cur_c);
+                    while !free(&occupied, r, c) {
+                        r += 1;
+                    }
+                    (r, c)
+                }
+                None => loop {
+                    if cur_c + span > ncols {
+                        cur_r += 1;
+                        cur_c = 0;
+                    } else if free(&occupied, cur_r, cur_c) {
+                        break (cur_r, cur_c);
+                    } else {
+                        cur_c += 1;
+                    }
+                },
+            };
+            (cur_r, cur_c) = (r, c + span);
+            while occupied.len() <= r {
+                occupied.push(vec![false; ncols]);
+            }
+            occupied[r][c..c + span].iter_mut().for_each(|o| *o = true);
+            placed.push((i, c, span, r));
+        }
+
+        // Column widths.
+        let mut collapsed = vec![false; ncols];
+        if tpl
+            .as_ref()
+            .and_then(|t| t.repeat.as_ref())
+            .is_some_and(|r| r.fit)
+        {
+            for c in repeated {
+                collapsed[c] = !placed
+                    .iter()
+                    .any(|&(_, pc, span, _)| (pc..pc + span).contains(&c));
+            }
+        }
+        let shown = collapsed.iter().filter(|c| !**c).count();
+        let avail = (content.w - cgap * shown.saturating_sub(1) as f32).max(0.0);
+        let (mut cmin, mut cmax) = (vec![0.0f32; ncols], vec![0.0f32; ncols]);
+        for &(i, c, span, _) in &placed {
+            if span == 1 {
+                // Percentages are of the column being sized: for its
+                // minimum they count as `auto`.
+                let lo = self.children[i].intrinsic_widths(0.0).0;
+                let hi = self.children[i].intrinsic_widths(content.w).1;
+                cmin[c] = cmin[c].max(lo);
+                cmax[c] = cmax[c].max(hi.max(lo));
+            }
+        }
+        let size = |t: TrackSize, content: f32| match t {
+            TrackSize::Px(v) => Some(v),
+            TrackSize::Percent(p) => Some(avail * p / 100.0),
+            TrackSize::Auto => Some(content),
+            TrackSize::Fr(_) => None,
+        };
+        let mut w = vec![0.0f32; ncols];
+        let mut limit = vec![0.0f32; ncols];
+        for c in 0..ncols {
+            if collapsed[c] {
+                continue;
+            }
+            w[c] = size(tracks[c].min, cmin[c]).unwrap_or(cmin[c]);
+            limit[c] = size(tracks[c].max, cmax[c]).unwrap_or(f32::INFINITY).max(w[c]);
+        }
+        let flexible: Vec<usize> = (0..ncols)
+            .filter(|&c| !collapsed[c] && matches!(tracks[c].max, TrackSize::Fr(_)))
+            .collect();
+        // Grow the other columns towards their limits.
+        let free = avail - w.iter().sum::<f32>();
+        let want: f32 = (0..ncols)
+            .filter(|c| !flexible.contains(c) && !collapsed[*c])
+            .map(|c| limit[c] - w[c])
+            .sum();
+        if free > 0.0 && want > 0.0 {
+            let f = (free / want).min(1.0);
+            for c in (0..ncols).filter(|c| !flexible.contains(c) && !collapsed[*c]) {
+                w[c] += (limit[c] - w[c]) * f;
+            }
+        }
+        if !flexible.is_empty() {
+            // Share what's left by `fr`, but never below a column's minimum.
+            let fr = |c: usize| match tracks[c].max {
+                TrackSize::Fr(f) => f.max(0.0),
+                _ => 0.0,
+            };
+            let mut flex = flexible.clone();
+            for _ in 0..ncols {
+                let others: f32 = (0..ncols).filter(|c| !flex.contains(c)).map(|c| w[c]).sum();
+                let total_fr: f32 = flex.iter().map(|&c| fr(c)).sum::<f32>().max(1.0);
+                let unit = ((avail - others) / total_fr).max(0.0);
+                let small: Vec<usize> = flex.iter().copied().filter(|&c| w[c] > unit * fr(c)).collect();
+                if small.is_empty() {
+                    flex.iter().for_each(|&c| w[c] = unit * fr(c));
+                    break;
+                }
+                flex.retain(|c| !small.contains(c));
+            }
+        } else {
+            // No `fr`: what's left stretches the `auto` columns.
+            let free = avail - w.iter().sum::<f32>();
+            let stretch: Vec<usize> = (0..ncols)
+                .filter(|&c| !collapsed[c] && tracks[c].max == TrackSize::Auto)
+                .collect();
+            if free > 0.0 && !stretch.is_empty() && s.justify == Justify::Start {
+                stretch.iter().for_each(|&c| w[c] += free / stretch.len() as f32);
+            }
+        }
+        let mut col_x = vec![content.x; ncols];
+        let mut x = content.x;
+        for c in 0..ncols {
+            col_x[c] = x;
+            if !collapsed[c] {
+                x += w[c] + cgap;
+            }
+        }
+
+        // Rows: lay items out in their columns, then size and place.
+        let nrows = occupied.len();
+        let mut row_h = vec![0.0f32; nrows];
+        for &(i, c, span, r) in &placed {
+            let last = c + span - 1;
+            let area_w = (col_x[last] + w[last] - col_x[c]).max(0.0);
+            let item = &mut self.children[i];
+            item.layout_outer(col_x[c], content.y, area_w, area_w);
+            row_h[r] = row_h[r].max(item.dims.margin_box().h);
+        }
+        let mut row_y = vec![content.y; nrows];
+        let mut y = content.y;
+        for r in 0..nrows {
+            row_y[r] = y;
+            y += row_h[r] + rgap;
+        }
+        for &(i, c, _, r) in &placed {
+            let align = cross_align(&self.children[i], s, false);
+            let item = &mut self.children[i];
+            let mb = item.dims.margin_box();
+            let dy = match align {
+                Align::Stretch => {
+                    if item.flex().auto_height {
+                        item.dims.content.h += (row_h[r] - mb.h).max(0.0);
+                    }
+                    0.0
+                }
+                Align::Start => 0.0,
+                Align::End => row_h[r] - mb.h,
+                Align::Center => (row_h[r] - mb.h) / 2.0,
+            };
+            item.translate(col_x[c] - mb.x, row_y[r] + dy - mb.y);
+        }
+        self.dims.content.h = if nrows == 0 { 0.0 } else { y - rgap - content.y };
     }
 
     /// Does this child of a flex container take part in the flex layout?
@@ -1303,8 +1566,11 @@ impl<'a> LayoutBox<'a> {
 
     /// `intrinsic_widths`, but with `sized: false` this box's own `width` is
     /// ignored (its descendants' still count): the size of its content.
+    /// With `cb_w` 0 the containing block's width is unknown: percentage
+    /// widths count as `auto` (they're of the size being worked out).
     fn intrinsic_widths_of(&self, cb_w: f32, sized: bool) -> (f32, f32) {
         let s = self.style();
+        let unknown = |l: Len| cb_w <= 0.0 && matches!(l, Len::Percent(_) | Len::Calc(_, _));
         let edges = |l: &[Len; 4]| l[1].or_zero(cb_w) + l[3].or_zero(cb_w);
         let (pb, m) = match self.kind {
             BoxKind::Block(_) => (
@@ -1333,7 +1599,7 @@ impl<'a> LayoutBox<'a> {
             }
             // A cell with a fixed width still grows to fit its content.
             // Percentages are left to the table.
-            if s.display != Display::TableCell && sized {
+            if s.display != Display::TableCell && sized && !unknown(s.width) {
                 if let Some(w) = content_size(s.width, cb_w, s, pb) {
                     return (w + hz, w + hz);
                 }
@@ -1344,6 +1610,9 @@ impl<'a> LayoutBox<'a> {
                 let (mut best, mut line) = (0.0f32, 0.0f32);
                 // Widest unbreakable run, and the one we're in.
                 let (mut min, mut run) = (0.0f32, 0.0f32);
+                // As `layout_inline`'s `last_space`: a leading space collapses
+                // at the start of a line or after a space.
+                let mut spaced = true;
                 for item in items {
                     match item {
                         InlineItem::Text { text, style, .. } => {
@@ -1359,15 +1628,25 @@ impl<'a> LayoutBox<'a> {
                             };
                             let f = font::index(style);
                             let measure = |t: &str| font::measure(f, style.font_size, t);
+                            let ws = |c: char| c.is_ascii_whitespace();
+                            if !style.pre && text.starts_with(ws) && !spaced {
+                                line += measure(" ");
+                                spaced = true;
+                            }
                             for (i, part) in txt.split('\n').enumerate() {
                                 if i > 0 {
                                     best = best.max(line);
                                     line = 0.0;
                                 }
                                 line += measure(part);
-                                if !style.pre && text.ends_with(|c: char| c.is_ascii_whitespace()) {
+                                if !style.pre && text.ends_with(ws) && !(part.is_empty() && spaced) {
                                     line += measure(" ");
                                 }
+                            }
+                            if style.pre {
+                                spaced = false;
+                            } else if !txt.is_empty() {
+                                spaced = text.ends_with(ws);
                             }
                             if style.pre {
                                 for part in txt.split('\n') {
@@ -1407,6 +1686,7 @@ impl<'a> LayoutBox<'a> {
                             best = best.max(line);
                             line = 0.0;
                             run = 0.0;
+                            spaced = true;
                         }
                         InlineItem::OutOfFlow(_) => {}
                         InlineItem::Edge {
@@ -1421,6 +1701,9 @@ impl<'a> LayoutBox<'a> {
                             min = min.max(run);
                         }
                         InlineItem::Atomic(i) | InlineItem::Float(i) => {
+                            if matches!(item, InlineItem::Atomic(_)) {
+                                spaced = false;
+                            }
                             let (cmin, cmax) = self.children[*i].intrinsic_widths(cb_w);
                             line += cmax;
                             min = min.max(cmin);
@@ -1438,7 +1721,28 @@ impl<'a> LayoutBox<'a> {
                     .filter(|c| !is_flex(s.display) || c.is_flex_item())
                     .map(|c| c.intrinsic_widths(cb_w))
                     .collect();
-                if row {
+                if s.is_grid {
+                    // Each column as wide as it's set, or as its widest item.
+                    let tracks: Vec<Track> = s.grid_columns.as_ref().map_or_else(Vec::new, |t| {
+                        let mut v = t.tracks.clone();
+                        if let Some(r) = &t.repeat {
+                            v.extend(&r.tracks);
+                        }
+                        v
+                    });
+                    let widest = ws
+                        .iter()
+                        .fold((0.0f32, 0.0f32), |(a, b), (x, y)| (a.max(*x), b.max(*y)));
+                    let n = tracks.len().max(1);
+                    let gaps = s.gap * (n - 1) as f32;
+                    let col = |t: Option<&Track>, content: f32| match t.map(|t| t.max) {
+                        Some(TrackSize::Px(v)) => v,
+                        _ => content,
+                    };
+                    let min = (0..n).map(|c| col(tracks.get(c), widest.0)).sum::<f32>() + gaps;
+                    let max = (0..n).map(|c| col(tracks.get(c), widest.1)).sum::<f32>() + gaps;
+                    (min, max)
+                } else if row {
                     let gaps = s.gap * ws.len().saturating_sub(1) as f32;
                     let max = ws.iter().map(|w| w.1).sum::<f32>() + gaps;
                     // Wrapping lines can be as narrow as their widest item.
@@ -1462,7 +1766,7 @@ impl<'a> LayoutBox<'a> {
                 max = min;
             }
         }
-        if let Some(m) = content_size(s.max_width, cb_w, s, pb) {
+        if let Some(m) = content_size(s.max_width, cb_w, s, pb).filter(|_| !unknown(s.max_width)) {
             min = min.min(m + hz);
             max = max.min(m + hz);
         }
@@ -2214,6 +2518,20 @@ impl TableCols {
     }
 }
 
+/// How a flex item lines up across the main axis: `auto` margins on that
+/// axis win over `align-self` and keep the item from stretching
+/// (`margin: 0 auto` centres an item in a column).
+fn cross_align(item: &LayoutBox, container: &ComputedStyle, column: bool) -> Align {
+    let m = &item.style().margin;
+    let (before, after) = if column { (m[3], m[1]) } else { (m[0], m[2]) };
+    match (before, after) {
+        (Len::Auto, Len::Auto) => Align::Center,
+        (Len::Auto, _) => Align::End,
+        (_, Len::Auto) => Align::Start,
+        _ => item.flex().align.unwrap_or(container.align_items),
+    }
+}
+
 /// Grow `cols[range]` so they add up to at least `target`, sharing the
 /// difference in proportion to `weights` (or equally).
 fn grow(cols: &mut [f32], weights: &[f32], target: f32) {
@@ -2559,12 +2877,34 @@ fn content_size(l: Len, cb_w: f32, s: &ComputedStyle, extra: f32) -> Option<f32>
 }
 
 /// The same for a fixed height (percentage heights aren't supported).
-fn content_height(l: Len, s: &ComputedStyle, extra: f32) -> Option<f32> {
-    match l {
-        Len::Px(h) if s.border_box => Some((h - extra).max(0.0)),
-        Len::Px(h) => Some(h),
-        _ => None,
-    }
+fn content_height(l: Len, s: &ComputedStyle, extra: f32, cb_h: Option<f32>) -> Option<f32> {
+    let h = match l {
+        Len::Px(h) => h,
+        // Percentages only of a containing block whose height is known.
+        Len::Percent(p) => cb_h? * p / 100.0,
+        Len::Calc(px, p) => px + cb_h? * p / 100.0,
+        Len::Auto => return None,
+    };
+    Some(if s.border_box {
+        (h - extra).max(0.0)
+    } else {
+        h.max(0.0)
+    })
+}
+
+/// The content height `aspect-ratio` gives a box whose height is `auto`
+/// (the ratio is of the border box with `box-sizing: border-box`).
+fn ratio_height(s: &ComputedStyle, d: &Dimensions) -> Option<f32> {
+    let r = s.aspect_ratio.filter(|_| s.height == Len::Auto)?;
+    let (hz, vz) = (
+        d.padding.l + d.padding.r + d.border.l + d.border.r,
+        d.padding.t + d.padding.b + d.border.t + d.border.b,
+    );
+    Some(if s.border_box {
+        ((d.content.w + hz) / r - vz).max(0.0)
+    } else {
+        d.content.w / r
+    })
 }
 
 /// Horizontal padding and border, from the style.
@@ -3637,5 +3977,194 @@ mod box_sizing_tests {
             "{:?}",
             div.dims.border_box()
         );
+    }
+}
+
+#[cfg(test)]
+mod modern_layout_tests {
+    use super::table_tests::close;
+    use super::*;
+    use crate::style::StyleContext;
+    use crate::{css, html, style};
+
+    /// Border boxes of `tag` elements in `doc`, styled with `sheet` and
+    /// laid out in a `w` x `h` window.
+    fn boxes(sheet: &str, doc: &str, (w, h): (f32, f32), tag: &str) -> Vec<Rect> {
+        let dom = html::parse(doc);
+        let ua = css::parse(style::UA_CSS);
+        let author = css::parse(&format!("body{{margin:0;font:16px sans-serif}} {sheet}"));
+        let ctx = StyleContext {
+            text_scale: 1.0,
+            sheets: vec![(0, &ua), (1, &author)],
+            viewport: (w, h),
+        };
+        let styled = style::style_tree(&dom, &ctx);
+        let root = layout_tree_with_images(&styled, (w, h), &HashMap::new());
+        fn walk(b: &LayoutBox, tag: &str, out: &mut Vec<Rect>) {
+            if let BoxKind::Block(n) = b.kind {
+                if n.node.element().is_some_and(|e| e.tag == tag) {
+                    out.push(b.dims.border_box());
+                }
+            }
+            b.children.iter().for_each(|c| walk(c, tag, out));
+        }
+        let mut out = Vec::new();
+        walk(&root, tag, &mut out);
+        out
+    }
+    const WIN: (f32, f32) = (1000.0, 800.0);
+
+    #[test]
+    fn grid_columns_spans_and_auto_fill() {
+        let b = boxes(
+            "",
+            "<div style='display:grid;grid-template-columns:repeat(3,1fr);gap:20px;width:640px'>\
+                 <p>a</p><p>b</p><p>c</p><p style='grid-column:span 2'>d</p><p style='grid-column:1 / -1'>e</p></div>",
+            WIN,
+            "p",
+        );
+        let w = (640.0 - 40.0) / 3.0;
+        assert!(
+            close(b[0].w, w) && close(b[1].x, w + 20.0) && close(b[2].x, 2.0 * (w + 20.0)),
+            "{b:?}"
+        );
+        assert!(
+            close(b[3].w, 2.0 * w + 20.0) && b[3].y > b[0].y,
+            "span 2: {:?}",
+            b[3]
+        );
+        assert!(close(b[4].w, 640.0) && b[4].y > b[3].y, "1 / -1: {:?}", b[4]);
+        // As many 150px-or-more columns as fit in 640px: four.
+        let b = boxes(
+            "",
+            "<div style='display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));width:640px'>\
+                 <p>1</p><p>2</p><p>3</p><p>4</p><p>5</p></div>",
+            WIN,
+            "p",
+        );
+        assert!(
+            close(b[3].x, 480.0) && close(b[4].x, 0.0) && b[4].y > b[0].y,
+            "{b:?}"
+        );
+        // `200px 1fr`, and a percentage width doesn't take a whole column.
+        let b = boxes(
+            "",
+            "<div style='display:grid;grid-template-columns:200px 1fr 1fr;width:600px'>\
+                 <p style='width:100%'>x</p><p style='width:100%'>y</p><p>z</p></div>",
+            WIN,
+            "p",
+        );
+        assert!(
+            close(b[0].w, 200.0) && close(b[1].w, 200.0) && close(b[2].x, 400.0),
+            "{b:?}"
+        );
+    }
+
+    #[test]
+    fn aspect_ratio_and_percentage_heights() {
+        let b = boxes(
+            "",
+            "<div style='width:300px;aspect-ratio:3 / 1'></div>",
+            WIN,
+            "div",
+        );
+        assert!(close(b[0].h, 100.0), "{:?}", b[0]);
+        // `height: 100%` all the way down from the window.
+        let b = boxes(
+            "html,body{height:100%}",
+            "<div style='height:50%'><p style='height:50%;margin:0'></p></div>",
+            WIN,
+            "p",
+        );
+        assert!(close(b[0].h, 200.0), "{:?}", b[0]);
+        // Without a known height to be a percentage of, it's `auto`.
+        let b = boxes("", "<div><p style='height:50%;margin:0'>x</p></div>", WIN, "p");
+        assert!(b[0].h > 0.0 && b[0].h < 50.0, "{:?}", b[0]);
+    }
+
+    #[test]
+    fn boxes_meant_to_scroll_grow_to_fit() {
+        // DuckDuckGo: the root scrolls (that's the window's job), and a box
+        // that would scroll inside shows everything instead.
+        let tall = "<p style='height:2000px;margin:0'>x</p>";
+        let dom = html::parse(tall);
+        let ua = css::parse(style::UA_CSS);
+        let author = css::parse("html{height:100%;overflow:hidden;overflow-y:auto} body{overflow:hidden}");
+        let ctx = StyleContext {
+            text_scale: 1.0,
+            sheets: vec![(0, &ua), (1, &author)],
+            viewport: WIN,
+        };
+        let styled = style::style_tree(&dom, &ctx);
+        let root = layout_tree_with_images(&styled, WIN, &HashMap::new());
+        let html = &root;
+        assert!(
+            html.style().root && !html.style().overflow_clip,
+            "the root never clips"
+        );
+        let body = html
+            .children
+            .iter()
+            .find(|c| matches!(c.kind, BoxKind::Block(_)))
+            .unwrap();
+        assert!(
+            body.style().overflow_clip,
+            "body's overflow is its own when the root has one"
+        );
+        assert!(close(html.dims.border_box().h, 800.0), "{:?}", html.dims);
+        let b = boxes(
+            "",
+            &format!("<div style='height:100px;overflow:auto'>{tall}</div>"),
+            WIN,
+            "div",
+        );
+        assert!(b[0].h >= 2000.0, "{:?}", b[0]);
+        let b = boxes(
+            "",
+            &format!("<div style='height:100px;overflow:hidden'>{tall}</div>"),
+            WIN,
+            "div",
+        );
+        assert!(close(b[0].h, 100.0), "hidden still clips: {:?}", b[0]);
+    }
+
+    #[test]
+    fn flex_auto_margins_and_shrinking_lists() {
+        // `margin: 0 auto` in a column centres instead of stretching.
+        let b = boxes(
+            "",
+            "<div style='display:flex;flex-direction:column;width:600px'><p style='margin:0 auto'>x</p></div>",
+            WIN,
+            "p",
+        );
+        assert!(
+            b[0].w < 100.0 && close(b[0].x + b[0].w / 2.0, 300.0),
+            "{:?}",
+            b[0]
+        );
+        // Two `width: 100%` lists share a row; one with a `width: 100%`
+        // item can still shrink (Search My Site's navbar).
+        let b = boxes(
+            "",
+            "<div style='display:flex;width:600px'>\
+                 <ul style='display:flex;flex-wrap:wrap;width:100%;margin:0;padding:0'><li>Browse</li><li>Newest</li></ul>\
+                 <ul style='display:flex;width:100%;margin:0;padding:0'><li style='width:100%'>Filters</li></ul></div>",
+            WIN,
+            "ul",
+        );
+        assert!(close(b[0].w, 300.0) && close(b[1].w, 300.0), "{b:?}");
+    }
+
+    #[test]
+    fn fit_content_counts_the_space_after_an_element() {
+        // Marginalia's "<i class=icon></i> Privacy by default" stays on one line.
+        let one = boxes(
+            "",
+            "<div style='float:left'><span style='margin:0 8px'>x</span> Privacy by default</div>",
+            WIN,
+            "div",
+        );
+        let line = boxes("", "<div style='float:left'>x</div>", WIN, "div")[0].h;
+        assert!(close(one[0].h, line), "wrapped: {:?}", one[0]);
     }
 }

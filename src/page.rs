@@ -1111,7 +1111,8 @@ fn collect_hits(b: &LayoutBox, clip: Option<Rect>, out: &mut Vec<(Rect, u32)>) {
             out.push((r, uid));
         }
     };
-    if b.uid != 0 {
+    // Hidden boxes take no clicks (a closed drawer over the page).
+    if b.uid != 0 && b.style().visible {
         push(b.dims.border_box(), b.uid);
     }
     if let BoxKind::Anonymous { frags, .. } = &b.kind {

@@ -545,6 +545,12 @@ fn clip_ops(list: &mut Vec<DrawOp>, start: usize, c: Rect) {
 /// Paint one box (not its children).
 fn render_box(list: &mut Vec<DrawOp>, b: &LayoutBox, backgrounds: &Backgrounds, gradient_bytes: &mut usize) {
     let s = b.style();
+    // `visibility: hidden` hides the box itself; its children may still
+    // show (`visibility: visible` inside).
+    // (Text runs check their own.)
+    if !s.visible && matches!(b.kind, BoxKind::Block(_)) {
+        return;
+    }
     if let BoxKind::Block(_) = b.kind {
         let bb = b.dims.border_box();
         if s.background.a > 0 {

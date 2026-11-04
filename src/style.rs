@@ -238,6 +238,21 @@ pub struct ComputedStyle {
     /// `Auto` takes the item's width (or height), else its content's size.
     pub flex_basis: Len,
     pub order: i32,
+    /// `overflow: auto | scroll`. Brickle doesn't scroll inside boxes, so
+    /// these grow to fit their content instead (the page scrolls).
+    pub scrolls: bool,
+    /// The root element, and whether its `overflow` was set (then `body`'s
+    /// isn't the window's).
+    pub root: bool,
+    pub root_overflow: bool,
+    /// `aspect-ratio` (width / height) for boxes whose height is `auto`.
+    pub aspect_ratio: Option<f32>,
+    /// `display: grid`: laid out as a grid of [`ComputedStyle::grid_columns`]
+    /// (its items are built like a flex container's, so `display` is `Flex`).
+    pub is_grid: bool,
+    pub grid_columns: Option<Rc<GridTemplate>>,
+    /// A grid item's `grid-column` start and end.
+    pub grid_column: [GridLine; 2],
     /// `column-gap`: between items in a row, or between columns.
     pub gap: f32,
     pub row_gap: f32,
@@ -310,6 +325,13 @@ impl ComputedStyle {
             flex_shrink: 1.0,
             flex_basis: Len::Auto,
             order: 0,
+            scrolls: false,
+            root: false,
+            root_overflow: false,
+            aspect_ratio: None,
+            is_grid: false,
+            grid_columns: None,
+            grid_column: [GridLine::Auto; 2],
             gap: 0.0,
             row_gap: 0.0,
             border_spacing: [0.0; 2],
@@ -348,6 +370,209 @@ impl ComputedStyle {
         s.border_collapse = self.border_collapse;
         s.display = Display::Inline;
         s
+    }
+}
+
+/// One size in a grid track: the smallest or largest a column may be.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TrackSize {
+    Px(f32),
+    Percent(f32),
+    /// A share of the space left (`1fr`); only as a largest size.
+    Fr(f32),
+    /// Sized by the content (`auto`, `min-content`, `max-content`).
+    Auto,
+}
+
+/// A column: `200px` is 200px at both ends, `1fr` is `minmax(auto, 1fr)`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Track {
+    pub min: TrackSize,
+    pub max: TrackSize,
+}
+
+/// `grid-template-columns`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GridTemplate {
+    pub tracks: Vec<Track>,
+    /// `repeat(auto-fill | auto-fit, ...)`: tracks repeated as often as they
+    /// fit, inserted before `tracks[at]`. `fit` collapses the empty ones.
+    pub repeat: Option<AutoRepeat>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AutoRepeat {
+    pub tracks: Vec<Track>,
+    pub at: usize,
+    pub fit: bool,
+}
+
+/// Most columns a template may ask for.
+pub const MAX_GRID_TRACKS: usize = 1000;
+
+impl GridTemplate {
+    /// Parse the value (`none` or nonsense gives `None`).
+    fn parse(text: &str, font_size: f32, rem: f32) -> Option<GridTemplate> {
+        let mut t = GridTemplate {
+            tracks: Vec::new(),
+            repeat: None,
+        };
+        for tok in grid_tokens(text) {
+            if let Some(args) = tok.strip_prefix("repeat(").and_then(|a| a.strip_suffix(')')) {
+                let (count, rest) = args.split_once(',')?;
+                let inner: Vec<Track> = grid_tokens(rest)
+                    .iter()
+                    .map(|t| Track::parse(t, font_size, rem))
+                    .collect::<Option<_>>()?;
+                if inner.is_empty() {
+                    return None;
+                }
+                match count.trim() {
+                    c @ ("auto-fill" | "auto-fit") if t.repeat.is_none() => {
+                        t.repeat = Some(AutoRepeat {
+                            tracks: inner,
+                            at: t.tracks.len(),
+                            fit: c == "auto-fit",
+                        })
+                    }
+                    c => {
+                        let n: usize = c.parse().ok().filter(|&n| n > 0)?;
+                        for _ in 0..n {
+                            if t.tracks.len() + inner.len() > MAX_GRID_TRACKS {
+                                return None;
+                            }
+                            t.tracks.extend(&inner);
+                        }
+                    }
+                }
+            } else if tok.starts_with('[') {
+                // Line names.
+            } else {
+                t.tracks.push(Track::parse(&tok, font_size, rem)?);
+            }
+            if t.tracks.len() > MAX_GRID_TRACKS {
+                return None;
+            }
+        }
+        (!t.tracks.is_empty() || t.repeat.is_some()).then_some(t)
+    }
+}
+
+/// Split a track list at spaces outside parentheses and brackets.
+fn grid_tokens(text: &str) -> Vec<String> {
+    let (mut out, mut cur, mut depth) = (Vec::new(), String::new(), 0i32);
+    for c in text.chars() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            _ => {}
+        }
+        if (c.is_whitespace() || c == ',') && depth <= 0 {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+        } else if !c.is_whitespace() || depth > 0 {
+            cur.push(c);
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+impl Track {
+    fn parse(tok: &str, font_size: f32, rem: f32) -> Option<Track> {
+        let tok = tok.trim();
+        if let Some(args) = tok.strip_prefix("minmax(").and_then(|a| a.strip_suffix(')')) {
+            let (a, b) = args.split_once(',')?;
+            let min = match track_size(a, font_size, rem)? {
+                TrackSize::Fr(_) => TrackSize::Auto,
+                m => m,
+            };
+            return Some(Track {
+                min,
+                max: track_size(b, font_size, rem)?,
+            });
+        }
+        if let Some(arg) = tok.strip_prefix("fit-content(").and_then(|a| a.strip_suffix(')')) {
+            return Some(Track {
+                min: TrackSize::Auto,
+                max: track_size(arg, font_size, rem)?,
+            });
+        }
+        let size = track_size(tok, font_size, rem)?;
+        Some(match size {
+            TrackSize::Fr(_) => Track {
+                min: TrackSize::Auto,
+                max: size,
+            },
+            _ => Track { min: size, max: size },
+        })
+    }
+}
+
+fn track_size(tok: &str, font_size: f32, rem: f32) -> Option<TrackSize> {
+    let tok = tok.trim();
+    if matches!(tok, "auto" | "min-content" | "max-content") {
+        return Some(TrackSize::Auto);
+    }
+    let end = tok
+        .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
+        .unwrap_or(tok.len());
+    let n: f32 = tok[..end]
+        .parse()
+        .ok()
+        .filter(|n: &f32| n.is_finite() && *n >= 0.0)?;
+    Some(match &tok[end..] {
+        "px" => TrackSize::Px(n),
+        "" if n == 0.0 => TrackSize::Px(0.0),
+        "fr" => TrackSize::Fr(n),
+        "%" => TrackSize::Percent(n),
+        "em" => TrackSize::Px(n * font_size),
+        "rem" => TrackSize::Px(n * rem),
+        "pt" => TrackSize::Px(n * 4.0 / 3.0),
+        _ => return None,
+    })
+}
+
+/// A `grid-column` start or end.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GridLine {
+    Auto,
+    /// A line number: 1 is the first, -1 the last.
+    Line(i32),
+    Span(u32),
+}
+
+impl GridLine {
+    /// The lines in a `grid-column` value (`2 / span 3` arrives as `2 span 3`:
+    /// slashes are dropped).
+    fn parse(vals: &[Value]) -> Vec<GridLine> {
+        let mut out = Vec::new();
+        let mut span = false;
+        for v in vals {
+            match v {
+                Value::Keyword(k) if k == "span" => span = true,
+                Value::Keyword(k) if k == "auto" => out.push(GridLine::Auto),
+                Value::Number(n) if n.is_finite() => {
+                    let n = n.clamp(-1000.0, 1000.0) as i32;
+                    out.push(if span {
+                        GridLine::Span(n.max(1) as u32)
+                    } else if n == 0 {
+                        GridLine::Auto
+                    } else {
+                        GridLine::Line(n)
+                    });
+                    span = false;
+                }
+                _ => {}
+            }
+        }
+        if span {
+            out.push(GridLine::Span(1));
+        }
+        out
     }
 }
 
@@ -811,14 +1036,17 @@ fn compute(
         }
         match name.as_str() {
             "display" => {
+                s.is_grid = matches!(kw, "grid" | "inline-grid");
                 s.display = match kw {
-                    "block" | "grid" => Display::Block,
+                    "block" => Display::Block,
+                    "grid" => Display::Flex,
                     "flow-root" => {
                         s.contain_floats = true;
                         Display::Block
                     }
                     "inline" => Display::Inline,
-                    "inline-block" | "inline-grid" => Display::InlineBlock,
+                    "inline-block" => Display::InlineBlock,
+                    "inline-grid" => Display::InlineFlex,
                     "inline-flex" => Display::InlineFlex,
                     "list-item" => Display::ListItem,
                     "flex" => Display::Flex,
@@ -1029,6 +1257,41 @@ fn compute(
                     s.order = n.clamp(-1e6, 1e6) as i32;
                 }
             }
+            "aspect-ratio" => {
+                // `16 / 9` (the slash is dropped), `1.5` or `auto 4/3`.
+                let n: Vec<f32> = vals
+                    .iter()
+                    .filter_map(|v| match v {
+                        Value::Number(n) => Some(*n),
+                        _ => None,
+                    })
+                    .collect();
+                s.aspect_ratio = match n.as_slice() {
+                    [a] => Some(*a),
+                    [a, b, ..] if *b > 0.0 => Some(a / b),
+                    _ => None,
+                }
+                .filter(|r| r.is_finite() && *r > 0.0)
+                .map(|r| r.clamp(1e-3, 1e3));
+            }
+            "grid-template-columns" => {
+                let text: Vec<String> = vals.iter().map(|v| v.to_css()).collect();
+                s.grid_columns = GridTemplate::parse(&text.join(" "), fs, ctxv.rem).map(Rc::new);
+            }
+            "grid-column" | "grid-column-start" | "grid-column-end" => {
+                let lines = GridLine::parse(vals);
+                match name.as_str() {
+                    "grid-column" => {
+                        // `a / b`; `a` alone is `a / auto`, but a span stays one.
+                        let at = |i: usize| lines.get(i).copied().unwrap_or(GridLine::Auto);
+                        s.grid_column = [at(0), at(1)];
+                    }
+                    "grid-column-start" => {
+                        s.grid_column[0] = lines.first().copied().unwrap_or(GridLine::Auto)
+                    }
+                    _ => s.grid_column[1] = lines.first().copied().unwrap_or(GridLine::Auto),
+                }
+            }
             "column-gap" => {
                 if let Some(v) = first {
                     s.gap = ctxv.length(v, fs).unwrap_or(0.0)
@@ -1084,6 +1347,7 @@ fn compute(
                 if matches!(kw, "hidden" | "auto" | "scroll" | "clip") {
                     s.contain_floats = true;
                     s.overflow_clip = true;
+                    s.scrolls |= matches!(kw, "auto" | "scroll");
                 }
             }
             "vertical-align" => {
@@ -1143,6 +1407,19 @@ fn compute(
     s.line_height = s.line_height.clamp(0.0, MAX_FONT_SIZE * 4.0);
     if is_root && s.display == Display::Inline {
         s.display = Display::Block;
+    }
+    // The root's `overflow` (or `body`'s, if the root has none) is the
+    // window's: it doesn't clip the box.
+    let propagated = if is_root {
+        s.root = true;
+        s.root_overflow = s.overflow_clip;
+        true
+    } else {
+        e.tag == "body" && parent.root && !parent.root_overflow
+    };
+    if propagated {
+        s.overflow_clip = false;
+        s.scrolls = false;
     }
     // Absolutely positioned boxes don't float, and both are block-level.
     if matches!(s.position, Position::Absolute | Position::Fixed) {

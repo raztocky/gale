@@ -901,12 +901,42 @@ fn parse_complex(text: &str, relative: bool, depth: usize) -> Option<Selector> {
 
 /// One compound selector (`a.b#c[d]:e`) starting at `chars[*i]`.
 fn parse_compound(chars: &[char], i: &mut usize, depth: usize) -> Option<SimpleSelector> {
+    // A name, with CSS escapes (`.md\:flex` is the class `md:flex`;
+    // `\31 0` is `10`).
     let ident = |j: &mut usize| -> String {
-        let st = *j;
-        while *j < chars.len() && (chars[*j].is_alphanumeric() || chars[*j] == '-' || chars[*j] == '_') {
-            *j += 1;
+        let mut out = String::new();
+        while *j < chars.len() {
+            let c = chars[*j];
+            if c.is_alphanumeric() || c == '-' || c == '_' || !c.is_ascii() {
+                out.push(c);
+                *j += 1;
+            } else if c == '\\' && *j + 1 < chars.len() && chars[*j + 1] != '\n' {
+                *j += 1;
+                let hex_end = (*j..chars.len().min(*j + 6))
+                    .find(|&k| !chars[k].is_ascii_hexdigit())
+                    .unwrap_or(chars.len().min(*j + 6));
+                if hex_end > *j {
+                    let code: String = chars[*j..hex_end].iter().collect();
+                    let ch = u32::from_str_radix(&code, 16)
+                        .ok()
+                        .and_then(char::from_u32)
+                        .filter(|&c| c != '\0')
+                        .unwrap_or('\u{FFFD}');
+                    out.push(ch);
+                    *j = hex_end;
+                    // One whitespace after a hex escape belongs to it.
+                    if *j < chars.len() && chars[*j].is_whitespace() {
+                        *j += 1;
+                    }
+                } else {
+                    out.push(chars[*j]);
+                    *j += 1;
+                }
+            } else {
+                break;
+            }
         }
-        chars[st..*j].iter().collect()
+        out
     };
     let mut s = SimpleSelector::default();
     let mut any = false;
@@ -1249,6 +1279,8 @@ fn parse_value_token(tok: &str) -> Option<Value> {
                 "vw" => Value::Length(n, Unit::Vw),
                 "vh" => Value::Length(n, Unit::Vh),
                 "ex" | "ch" => Value::Length(n * 0.5, Unit::Em),
+                // Grid fractions, read by `grid-template-columns`.
+                "fr" => Value::Keyword(lower),
                 _ => return None,
             });
         }
@@ -1346,6 +1378,26 @@ fn named_color(name: &str) -> Option<Color> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escaped_names() {
+        let sheet = parse(
+            r".md\:flex-row{a:b} .max-w-\[1400px\]{a:b} .w-1\/2{a:b} #\31 0{a:b} .\E9t\E9{a:b} .a\.b>.c{a:b}",
+        );
+        let names: Vec<String> = sheet
+            .rules
+            .iter()
+            .map(|r| {
+                let s = &r.selectors[0].parts[0].0;
+                s.classes.first().or(s.id.as_ref()).cloned().unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            ["md:flex-row", "max-w-[1400px]", "w-1/2", "10", "été", "c"]
+        );
+        assert_eq!(sheet.rules[5].selectors[0].parts[1].0.classes, ["a.b"]);
+    }
 
     #[test]
     fn background_shorthand_size() {
