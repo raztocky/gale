@@ -31,8 +31,8 @@ zune-jpeg = "0.5.15"
 gif = { version = "0.14.2", default-features = false, features = ["std"] }
 image-webp = "0.2.4"
 # SVG images (shapes only: no text, no embedded images, no files).
-resvg = { version = "0.49", default-features = false }
-usvg = { version = "0.49", default-features = false }
+resvg = { version = "0.49", default-features = false, features = ["text"] }
+usvg = { version = "0.49", default-features = false, features = ["text"] }
 tiny-skia = { version = "0.12", default-features = false, features = ["std"] }
 roxmltree = "0.21"
 arboard = { version = "3.7.0", default-features = false, optional = true }

@@ -379,13 +379,23 @@ pub fn fake_italic(i: usize) -> bool {
 }
 
 pub fn index(style: &ComputedStyle) -> usize {
-    let fam = match style.family {
+    index_of(style.family, style.bold, style.italic)
+}
+
+/// The bundled font for a family and style.
+pub fn index_of(family: Family, bold: bool, italic: bool) -> usize {
+    let fam = match family {
         Family::Sans => 0,
         Family::Serif => 4,
         Family::Mono => 8,
         Family::System => 12,
     };
-    fam + 2 * style.italic as usize + style.bold as usize
+    fam + 2 * italic as usize + bold as usize
+}
+
+/// A bundled font's file (`index` below [`COUNT`]).
+pub fn data(index: usize) -> &'static [u8] {
+    FONT_DATA[index]
 }
 
 pub fn measure(font_idx: usize, size: f32, text: &str) -> f32 {

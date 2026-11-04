@@ -105,7 +105,7 @@ pub enum TextAlign {
 /// Which bundled family stands in for a `font-family` name (lowercase);
 /// None for names we know nothing about, so the next one in the list is
 /// tried.
-fn family_of(name: &str) -> Option<Family> {
+pub(crate) fn family_of(name: &str) -> Option<Family> {
     let has = |words: &[&str]| words.iter().any(|w| name.contains(w));
     if has(&["mono", "courier", "consol", "menlo", "monaco", "code"]) {
         Some(Family::Mono)

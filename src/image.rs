@@ -1,5 +1,6 @@
 //! Image decoding: PNG, JPEG, GIF (first frame), WebP (first frame) and
-//! SVG (shapes only: no text, no embedded images, nothing external).
+//! SVG (shapes and text in Brickle's own fonts; no embedded images, nothing
+//! external).
 //!
 //! Images are only ever decoded in the sandboxed renderer: decoders are a
 //! classic place for memory-safety bugs, and image bytes come straight from
@@ -9,6 +10,7 @@
 //! Decompression bombs: an image's size is checked from its header before
 //! any pixels are decoded, and every decoder is given a memory limit.
 
+use crate::font;
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -229,6 +231,47 @@ fn svg_expanded_size(doc: &roxmltree::Document) -> Option<u64> {
     cost.get(&doc.root_element().id()).copied()
 }
 
+/// Brickle's fonts for SVG text (loaded on first use), and their ids by
+/// [`font::index_of`] index.
+type SvgFonts = (Arc<usvg::fontdb::Database>, Vec<Option<usvg::fontdb::ID>>);
+
+fn svg_fonts() -> &'static SvgFonts {
+    static FONTS: std::sync::OnceLock<SvgFonts> = std::sync::OnceLock::new();
+    FONTS.get_or_init(|| {
+        let mut db = usvg::fontdb::Database::new();
+        let ids = (0..font::COUNT)
+            .map(|i| {
+                let src = usvg::fontdb::Source::Binary(Arc::new(font::data(i)));
+                db.load_font_source(src).first().copied()
+            })
+            .collect();
+        (Arc::new(db), ids)
+    })
+}
+
+/// The bundled font for an SVG `font-family` list: named families as in
+/// HTML (Arial is Liberation Sans...), generic ones directly, and serif
+/// when nothing matches, as in browsers.
+fn svg_font(f: &usvg::Font, _: &mut Arc<usvg::fontdb::Database>) -> Option<usvg::fontdb::ID> {
+    use crate::style::{family_of, Family};
+    let family = f
+        .families()
+        .iter()
+        .find_map(|fam| match fam {
+            usvg::FontFamily::Named(n) => family_of(&n.to_ascii_lowercase()),
+            usvg::FontFamily::Serif => Some(Family::Serif),
+            usvg::FontFamily::Monospace => Some(Family::Mono),
+            usvg::FontFamily::SansSerif | usvg::FontFamily::Cursive | usvg::FontFamily::Fantasy => {
+                Some(Family::Sans)
+            }
+        })
+        .unwrap_or(Family::Serif);
+    let italic = f.style() != usvg::FontStyle::Normal;
+    *svg_fonts()
+        .1
+        .get(font::index_of(family, f.weight() >= 600, italic))?
+}
+
 fn decode_svg(bytes: &[u8]) -> Result<Decoded, String> {
     if bytes.len() > MAX_SVG_BYTES {
         return Err("SVG: file too large".into());
@@ -250,16 +293,42 @@ fn decode_svg(bytes: &[u8]) -> Result<Decoded, String> {
     }
     svg_expanded_size(&doc).ok_or("SVG: too complex")?;
     // Nothing outside the file is ever used: no linked or embedded images
-    // (and no nested SVGs), no files, no fonts (text isn't drawn at all).
+    // (and no nested SVGs), no files. Text is drawn with Brickle's own
+    // fonts, never the system's.
+    let has_text = doc.descendants().any(|n| n.has_tag_name("text"));
     let opt = usvg::Options {
         image_href_resolver: usvg::ImageHrefResolver {
             resolve_data: Box::new(|_, _, _| None),
             resolve_string: Box::new(|_, _| None),
         },
+        fontdb: if has_text {
+            svg_fonts().0.clone()
+        } else {
+            Default::default()
+        },
+        font_resolver: usvg::FontResolver {
+            select_font: Box::new(svg_font),
+            select_fallback: usvg::FontResolver::default_fallback_selector(),
+        },
         ..usvg::Options::default()
     };
     let tree = usvg::Tree::from_xmltree(&doc, &opt).map_err(|e| format!("SVG: {e}"))?;
     let size = tree.size();
+    // Absurd geometry (a stroke billions of pixels wide) trips up the
+    // rasterizer (found by fuzzing); no real drawing reaches this far.
+    let reach = MAX_SIDE as f32 * 64.0;
+    let scale = STORE_SIDE as f32 / size.width().min(size.height()).max(1e-3);
+    // (A filtered group's layer box is its filter region, which leaves its
+    // strokes out, so both are checked.)
+    let root = tree.root();
+    let fits = |b: usvg::Rect| {
+        [b.left(), b.top(), b.right(), b.bottom()]
+            .iter()
+            .all(|v| v.is_finite() && (v * scale.max(1.0)).abs() <= reach)
+    };
+    if !fits(root.abs_layer_bounding_box().to_rect()) || !fits(root.abs_stroke_bounding_box()) {
+        return Err("SVG: drawing far too large".into());
+    }
     let natural = (
         (size.width().ceil() as u32).clamp(1, MAX_SIDE),
         (size.height().ceil() as u32).clamp(1, MAX_SIDE),
@@ -659,20 +728,41 @@ mod tests {
 
     #[test]
     fn svg_never_reaches_outside_the_file() {
-        // Linked and embedded images, nested SVGs and text are all left out;
-        // the rest is still drawn.
+        // Linked and embedded images and nested SVGs are all left out; the
+        // rest is still drawn.
         let svg = format!(
             "<svg {NS} width='2' height='2'>\
              <image href='file:///etc/passwd' width='2' height='2'/>\
              <image xlink:href='https://tracker.example/x.png' width='2' height='2'/>\
              <image href='data:image/svg+xml;base64,PHN2Zy8+' width='2' height='2'/>\
-             <text y='2' font-size='9'>hi</text>\
              <script>alert(1)</script>\
              <a href='https://example.com'><rect width='1' height='1' fill='lime'/></a></svg>"
         );
         let d = decode(svg.as_bytes()).unwrap();
         assert_eq!(&d.bitmap.rgba[0..4], &[0, 255, 0, 255]);
         assert_eq!(d.bitmap.rgba[3 * 4 + 3], 0, "nothing else drawn");
+    }
+
+    #[test]
+    fn svg_text_uses_the_bundled_fonts() {
+        let ink = |family: &str| {
+            let svg = format!(
+                "<svg {NS} width='120' height='40'><text x='2' y='30' font-size='28' \
+                 font-family=\"{family}\" font-weight='bold'>Hello</text></svg>"
+            );
+            let d = decode(svg.as_bytes()).unwrap();
+            // Columns with any ink: how wide the word came out.
+            let w = d.bitmap.w as usize;
+            (0..w)
+                .filter(|x| (0..d.bitmap.h as usize).any(|y| d.bitmap.rgba[(y * w + x) * 4 + 3] > 128))
+                .count()
+        };
+        let (arial, courier, unknown) = (ink("Arial, sans-serif"), ink("'Courier New'"), ink("NoSuchFont"));
+        assert!(arial > 40, "text is drawn: {arial}");
+        // Arial is Liberation Sans, Courier New is Liberation Mono (wider),
+        // and an unknown family is serif, as in browsers.
+        assert!(courier > arial, "{courier} vs {arial}");
+        assert!(unknown > 20 && unknown != arial, "{unknown}");
     }
 
     #[test]
@@ -688,6 +778,13 @@ mod tests {
         }
         s.push_str("</defs><use href='#l10'/></svg>");
         assert!(decode(s.as_bytes()).unwrap_err().contains("too complex"));
+        // A blurred path with a stroke billions of pixels wide panicked the
+        // rasterizer (found by fuzzing).
+        let wide = format!(
+            "<svg {NS}><defs><filter id='f'><feGaussianBlur/></filter><path id='p' d='M8 2 1 1Z'/></defs>\
+             <use href='#p' stroke='#000' stroke-width='5555555555' filter='url(#f)'/></svg>"
+        );
+        assert!(decode(wide.as_bytes()).unwrap_err().contains("far too large"));
         // Through fill references too.
         let fill = format!(
             "<svg {NS}><linearGradient id='a' href='#b'/><linearGradient id='b' href='#a'/>\
