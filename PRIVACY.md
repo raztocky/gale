@@ -63,7 +63,12 @@ tree. CI runs `cargo deny check` on every push.
 Brickle identifies as **vanilla Firefox on Linux**, with the same `User-Agent`, `Accept`,
 `Accept-Language` (`en-US,en;q=0.5`), `Accept-Encoding`, `Sec-Fetch-*` and `Priority` headers
 Firefox sends, in Firefox's order. A unique name like "Brickle/0.1" would make you trackable on
-its own. The version is `FIREFOX_VERSION` in `src/net.rs`; update it when Firefox releases.
+its own. The version is `FIREFOX_VERSION` in `src/net.rs`, with its release date. Firefox
+ships every two weeks and an old version number is rare in the wild, so a Brickle build that's a
+few weeks old works out from the date which version is current and presents as that, without
+asking anyone. It assumes at most six releases (about three months); past that, in case Mozilla
+changed the schedule, it stops guessing and the request panel and command line ask you to update
+Brickle.
 
 Limits, honestly:
 - Brickle's TLS handshake comes from rustls, not Firefox's NSS, so services doing TLS

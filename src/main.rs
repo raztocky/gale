@@ -143,6 +143,9 @@ fn network(filters: bool) -> Network {
     if n.lists_loaded == 0 {
         eprintln!("brickle: no filter lists installed; run `brickle filters update` to download them");
     }
+    if net::firefox_version().1 {
+        eprintln!("brickle: {}", net::stale_notice());
+    }
     n
 }
 

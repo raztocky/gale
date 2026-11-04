@@ -105,14 +105,67 @@ impl Cancel {
 pub const MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Brickle presents itself as stock Firefox on Linux, sending the same
-/// headers in the same order, so it doesn't stand out. Bump this with
-/// Firefox releases (see `browser/config/version_display.txt` in Firefox).
-pub const FIREFOX_VERSION: &str = "159.0";
+/// headers in the same order, so it doesn't stand out. This is the Firefox
+/// release Brickle was last updated to, and its release date (bump both
+/// with Firefox releases; Mozilla's product-details lists them).
+pub const FIREFOX_VERSION: u32 = 159;
+pub const FIREFOX_RELEASED: (i32, u32, u32) = (2026, 10, 27);
+/// Firefox ships a new version this often (since 2026-09).
+const FIREFOX_CADENCE_DAYS: i64 = 14;
+/// Most releases Brickle assumes have come out since [`FIREFOX_VERSION`]
+/// (about three months). Past that it stops guessing, in case the
+/// schedule changed, and asks to be updated.
+pub const MAX_ASSUMED_RELEASES: u32 = 6;
+
+/// The Firefox version Brickle presents as, and whether Brickle is too old
+/// to know (its identity then stands out a little more each release).
+/// An old version number is rare in the wild, so a Brickle build that's a
+/// few weeks old assumes the releases since have happened, from the date
+/// alone: nothing is downloaded to find out.
+pub fn firefox_version() -> (u32, bool) {
+    static V: OnceLock<(u32, bool)> = OnceLock::new();
+    *V.get_or_init(|| {
+        let today = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| (d.as_secs() / 86_400) as i64);
+        firefox_version_on(today)
+    })
+}
+
+/// [`firefox_version`] on a day (days since 1970-01-01).
+pub fn firefox_version_on(today: i64) -> (u32, bool) {
+    let (y, m, d) = FIREFOX_RELEASED;
+    let released = days_from_civil(y, m, d);
+    let since = ((today - released).max(0) / FIREFOX_CADENCE_DAYS) as u32;
+    (
+        FIREFOX_VERSION + since.min(MAX_ASSUMED_RELEASES),
+        since > MAX_ASSUMED_RELEASES,
+    )
+}
+
+/// Days since 1970-01-01 of a date (Howard Hinnant's algorithm).
+pub const fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y } as i64;
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let m = m as i64;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// What to tell you when [`firefox_version`] says Brickle is too old.
+pub fn stale_notice() -> String {
+    format!(
+        "this Brickle presents as Firefox {}, which is months old; update Brickle so it doesn't stand out",
+        firefox_version().0
+    )
+}
 
 pub fn user_agent() -> String {
     format!(
-        "Mozilla/5.0 (X11; Linux x86_64; rv:{v}) Gecko/20100101 Firefox/{v}",
-        v = FIREFOX_VERSION
+        "Mozilla/5.0 (X11; Linux x86_64; rv:{v}.0) Gecko/20100101 Firefox/{v}.0",
+        v = firefox_version().0
     )
 }
 
@@ -1165,6 +1218,30 @@ mod tests {
 
     /// A header line with no colon used to make ureq panic (found by the
     /// `response` fuzz target); it's now skipped like any malformed line.
+    #[test]
+    fn firefox_version_follows_the_release_schedule() {
+        let (y, m, d) = FIREFOX_RELEASED;
+        let day = days_from_civil(y, m, d);
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(2026, 10, 27), 20_753);
+        assert_eq!(days_from_civil(2000, 3, 1), 11_017);
+        assert_eq!(days_from_civil(1969, 12, 31), -1);
+        assert_eq!(firefox_version_on(day - 30), (FIREFOX_VERSION, false));
+        assert_eq!(firefox_version_on(day + 13), (FIREFOX_VERSION, false));
+        assert_eq!(firefox_version_on(day + 14), (FIREFOX_VERSION + 1, false));
+        let cap = FIREFOX_VERSION + MAX_ASSUMED_RELEASES;
+        assert_eq!(
+            firefox_version_on(day + 14 * MAX_ASSUMED_RELEASES as i64 + 13),
+            (cap, false)
+        );
+        assert_eq!(
+            firefox_version_on(day + 14 * (MAX_ASSUMED_RELEASES as i64 + 1)),
+            (cap, true)
+        );
+        assert_eq!(firefox_version_on(day + 3650), (cap, true));
+        assert!(user_agent().ends_with(&format!("Firefox/{}.0", firefox_version().0)));
+    }
+
     #[test]
     fn header_lines_without_a_colon_are_skipped() {
         use std::io::{Read, Write};

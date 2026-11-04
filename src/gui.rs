@@ -2725,6 +2725,9 @@ fn draw_panel(
     );
     let sub = match net {
         None => "Loading…".to_string(),
+        Some(_) if net::firefox_version().1 => {
+            "Brickle is out of date: update it so it doesn't stand out.".to_string()
+        }
         Some(n) if n.lists_loaded == 0 => "No filter lists. Run `brickle filters update`.".to_string(),
         Some(n) => {
             let stats = n.filter_stats();

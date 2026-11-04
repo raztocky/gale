@@ -164,8 +164,8 @@ fn blocking_stripping_and_firefox_headers() {
     assert_eq!(
         header("User-Agent").unwrap(),
         format!(
-            "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:{v}) Gecko/20100101 Firefox/{v}",
-            v = brickle::net::FIREFOX_VERSION
+            "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:{v}.0) Gecko/20100101 Firefox/{v}.0",
+            v = brickle::net::firefox_version().0
         )
     );
     assert_eq!(
