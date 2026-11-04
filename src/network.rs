@@ -1237,14 +1237,13 @@ mod tests {
     #[test]
     fn blocked_requests_never_leave_the_browser() {
         let mut n = Network::with_filters(Filters::parse("||tracker.example^\n"));
-        let before = net::requests_sent();
         let r = n.subresource(
             "https://news.example/",
             "https://tracker.example/t.css?utm_source=x",
             Dest::Stylesheet,
         );
         assert!(r.is_err());
-        assert_eq!(net::requests_sent(), before);
+        assert_eq!(net::requests_sent_to("https://tracker.example/"), 0);
         let log = n.take_log();
         assert_eq!(log.len(), 1);
         assert!(matches!(log[0].outcome, Outcome::Blocked { .. }));
@@ -1305,7 +1304,6 @@ mod tests {
     #[test]
     fn websites_cannot_reach_the_local_network() {
         let mut n = Network::empty();
-        let before = net::requests_sent();
         for target in [
             "http://192.168.1.1/reboot.css",
             "http://localhost:8080/x.css",
@@ -1320,7 +1318,9 @@ mod tests {
                 "{target}"
             );
         }
-        assert_eq!(net::requests_sent(), before, "nothing was sent");
+        for target in ["http://192.168.1.1/", "http://localhost/", "http://[::1]/"] {
+            assert_eq!(net::requests_sent_to(target), 0, "nothing was sent to {target}");
+        }
         match n.navigate("http://192.168.1.1/admin", Some("https://evil.example/")) {
             Nav::Interstitial {
                 action: Action::AllowLocal { host, .. },
@@ -1334,17 +1334,16 @@ mod tests {
     fn page_time_budget() {
         let mut n = Network::empty();
         n.deadline = std::time::Instant::now() - std::time::Duration::from_secs(1);
-        let before = net::requests_sent();
         assert!(n
             .subresource(
-                "https://a.example/",
-                "https://a.example/late.css",
+                "https://late.example/",
+                "https://late.example/late.css",
                 Dest::Stylesheet
             )
             .unwrap_err()
             .contains("too long"));
         assert_eq!(n.take_log()[0].outcome, Outcome::OverLimit);
-        assert_eq!(net::requests_sent(), before);
+        assert_eq!(net::requests_sent_to("https://late.example/"), 0);
     }
 
     #[test]
@@ -1363,9 +1362,8 @@ mod tests {
         assert_eq!(n.take_log().last().unwrap().outcome, Outcome::NotAllowed);
         // Past the per-page count, nothing more is fetched.
         n.page_images = MAX_IMAGES;
-        let before = net::requests_sent();
         assert!(n
-            .image("https://a.example/", "https://a.example/x.png")
+            .image("https://budget.example/", "https://budget.example/x.png")
             .unwrap_err()
             .contains("too many images"));
         assert_eq!(n.take_log()[0].outcome, Outcome::OverLimit);
@@ -1373,10 +1371,10 @@ mod tests {
         n.restart_page_budget();
         n.image_bytes = IMAGE_BYTE_BUDGET + 1;
         assert!(n
-            .image("https://a.example/", "https://a.example/x.png")
+            .image("https://budget.example/", "https://budget.example/x.png")
             .unwrap_err()
             .contains("too large"));
-        assert_eq!(net::requests_sent(), before);
+        assert_eq!(net::requests_sent_to("https://budget.example/"), 0);
         // Images can't come from the local network either.
         n.restart_page_budget();
         assert!(n

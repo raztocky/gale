@@ -116,11 +116,20 @@ pub fn user_agent() -> String {
     )
 }
 
-static REQUESTS: AtomicUsize = AtomicUsize::new(0);
+/// How many HTTP requests this process has sent to each host, for privacy
+/// tests (which run side by side, so each checks only its own hosts).
+#[cfg(test)]
+static REQUESTS: std::sync::Mutex<Option<std::collections::HashMap<String, usize>>> =
+    std::sync::Mutex::new(None);
 
-/// How many HTTP requests this process has sent (for privacy tests).
-pub fn requests_sent() -> usize {
-    REQUESTS.load(Ordering::SeqCst)
+/// How many HTTP requests this process has sent to `url`'s host.
+#[cfg(test)]
+pub fn requests_sent_to(url: &str) -> usize {
+    let map = REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
+    map.as_ref()
+        .and_then(|m| m.get(&crate::filter::host_of(url)))
+        .copied()
+        .unwrap_or(0)
 }
 
 /// The scheme of a URL, as the URL parser sees it ("" if it doesn't parse).
@@ -653,7 +662,13 @@ fn http_get_timeout(
             .set("Accept-Encoding", "gzip, deflate, br, zstd")
             .set("Connection", "keep-alive"),
     };
-    REQUESTS.fetch_add(1, Ordering::SeqCst);
+    #[cfg(test)]
+    {
+        let mut map = REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
+        *map.get_or_insert_with(Default::default)
+            .entry(crate::filter::host_of(url))
+            .or_default() += 1;
+    }
     let sent = match script.and_then(|o| o.body) {
         Some(body) => req.send_string(body),
         None => req.call(),

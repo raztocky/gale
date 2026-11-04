@@ -907,7 +907,6 @@ except BrokenPipeError:
             return;
         };
         let mut net = Network::with_filters(crate::filter::Filters::parse("||tracker.example^\n"));
-        let before = net::requests_sent();
         let mut replies = vec![];
         load(&mut r, 5.0, &mut |u, _| {
             let res = net.subresource("https://page.example/", u, Dest::Stylesheet);
@@ -916,7 +915,9 @@ except BrokenPipeError:
         })
         .unwrap();
         assert!(replies.iter().all(|r| r.is_err()), "{replies:?}");
-        assert_eq!(net::requests_sent(), before, "nothing left the browser");
+        for t in &targets[1..] {
+            assert_eq!(net::requests_sent_to(t), 0, "nothing left the browser for {t}");
+        }
         let log = net.take_log();
         use crate::network::Outcome;
         assert!(matches!(log[0].outcome, Outcome::NotAllowed));
