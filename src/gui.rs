@@ -167,6 +167,8 @@ const GRAY: Color = Color::rgb(0x6b, 0x72, 0x80);
 const DARK: Color = Color::rgb(0x22, 0x22, 0x22);
 const LINE: Color = Color::rgb(0xc8, 0xcc, 0xd2);
 const CHROME: Color = Color::rgb(0xec, 0xee, 0xf1);
+/// What a request was for, in the request panel.
+const EXPLAIN: Color = Color::rgb(0x31, 0x2e, 0x81);
 const RED: Color = Color::rgb(0xc0, 0x1c, 0x1c);
 const GREEN: Color = Color::rgb(0x15, 0x80, 0x3d);
 const AMBER: Color = Color::rgb(0xb4, 0x53, 0x09);
@@ -1373,7 +1375,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             // About three lines a notch (X11 reports 1 per notch), more
             // with bigger text.
             if over_panel {
-                let rows = panel_rows(&info.log, (w as f32 - page_w) / k);
+                let rows = panel_rows(&info.log, &info.url, (w as f32 - page_w) / k);
                 let total = rows.last().map_or(0.0, |r| r.y + r.h);
                 let room = view_h / k - PANEL_HEAD;
                 ui.panel_scroll = (ui.panel_scroll - dy * WHEEL_STEP).clamp(0.0, (total - room).max(0.0));
@@ -1400,7 +1402,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             // The pointer in interface units, for the bars and panels.
             let (lx, ly) = (mx / k, my / k);
             let row = if over_panel {
-                panel_row(&info.log, ly, ui.panel_scroll, (w as f32 - page_w) / k)
+                panel_row(&info.log, &info.url, ly, ui.panel_scroll, (w as f32 - page_w) / k)
             } else {
                 None
             };
@@ -2753,12 +2755,12 @@ fn site_button_at(x0: f32, mx: f32, my: f32) -> Option<SiteButton> {
         .map(|(_, b)| b)
 }
 
-fn panel_row(log: &[LogEntry], my: f32, panel_scroll: f32, pw: f32) -> Option<usize> {
+fn panel_row(log: &[LogEntry], page_url: &str, my: f32, panel_scroll: f32, pw: f32) -> Option<usize> {
     let y = my - bars() - PANEL_HEAD + panel_scroll;
     if y < 0.0 {
         return None;
     }
-    let rows = panel_rows(log, pw);
+    let rows = panel_rows(log, page_url, pw);
     rows.iter().position(|r| y >= r.y && y < r.y + r.h)
 }
 
@@ -2772,6 +2774,8 @@ struct PanelRow {
     head: String,
     url: Vec<String>,
     notes: Vec<String>,
+    /// What the request was for ([`brickle::explain`]).
+    why: Vec<String>,
 }
 
 thread_local! {
@@ -2780,11 +2784,12 @@ thread_local! {
 
 /// The panel's rows for `log` at width `pw` (cached: laid out again only
 /// when the log or the width changes).
-fn panel_rows(log: &[LogEntry], pw: f32) -> std::rc::Rc<Vec<PanelRow>> {
+fn panel_rows(log: &[LogEntry], page_url: &str, pw: f32) -> std::rc::Rc<Vec<PanelRow>> {
     use std::hash::{Hash, Hasher};
     let described: Vec<(&str, String)> = log.iter().map(describe).collect();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     pw.to_bits().hash(&mut hasher);
+    page_url.hash(&mut hasher);
     for (e, (status, notes)) in log.iter().zip(&described) {
         (&e.url, status, notes).hash(&mut hasher);
     }
@@ -2815,13 +2820,18 @@ fn panel_rows(log: &[LogEntry], pw: f32) -> std::rc::Rc<Vec<PanelRow>> {
         } else {
             wrap(&notes, pw - 28.0, pw - 28.0, SANS, 10.0, true)
         };
-        let h = ROW_PAD * 2.0 + ROW_LINE * (url.len().max(1) + notes.len()) as f32;
+        let why: Vec<String> = brickle::explain::explain(e, page_url)
+            .iter()
+            .flat_map(|l| wrap(l, pw - 28.0, pw - 28.0, SANS, 10.5, true))
+            .collect();
+        let h = ROW_PAD * 2.0 + ROW_LINE * (url.len().max(1) + notes.len() + why.len()) as f32;
         rows.push(PanelRow {
             y,
             h,
             head,
             url,
             notes,
+            why,
         });
         y += h;
     }
@@ -3238,7 +3248,7 @@ fn draw_panel(
     );
 
     let clip = bars() + PANEL_HEAD;
-    let rows = panel_rows(log, pw);
+    let rows = panel_rows(log, page_url, pw);
     for (e, r) in log.iter().zip(rows.iter()) {
         let y = clip + r.y - panel_scroll;
         if y + r.h < clip || y > h {
@@ -3283,6 +3293,20 @@ fn draw_panel(
                 SANS,
                 10.0,
                 GRAY,
+                cache,
+                clip,
+            );
+        }
+        let wb = nb + r.notes.len() as f32 * ROW_LINE;
+        for (i, l) in r.why.iter().enumerate() {
+            text(
+                c,
+                x0 + 14.0,
+                wb + i as f32 * ROW_LINE,
+                l,
+                SANS,
+                10.5,
+                EXPLAIN,
                 cache,
                 clip,
             );
@@ -3742,7 +3766,7 @@ mod menu_tests {
     fn panel_picture() {
         use brickle::bookmarks::Bookmark;
         use brickle::network::{LogEntry, Outcome};
-        let mut c = Canvas::new(1100, 520, Color::WHITE);
+        let mut c = Canvas::new(1100, 820, Color::WHITE);
         c.dark = std::env::var("MENU_LIGHT").is_err();
         let mut cache = GlyphCache::default();
         let mut ui = Ui {
@@ -3772,6 +3796,7 @@ mod menu_tests {
             cookies_set: vec!["fr".into()],
             cookies_refused: vec![],
             cors_blocked: false,
+            list: None,
         };
         let log = vec![
             entry("https://www.facebook.com/?_fb_noscript=1", net::Dest::Document, Outcome::Loaded { status: 200 }),
@@ -3786,6 +3811,18 @@ mod menu_tests {
                 Outcome::Loaded { status: 200 },
             ),
             entry("https://static.xx.fbcdn.net/rsrc.php/yc/r/78KLk3JFzeg.webp", net::Dest::Image, Outcome::Loaded { status: 200 }),
+            LogEntry {
+                list: Some("EasyPrivacy (trackers)".into()),
+                cookies_sent: vec![],
+                cookies_set: vec![],
+                ..entry(
+                    "https://www.facebook.com/tr?id=1234567&ev=PageView&dl=https%3A%2F%2Fshop.example%2F&fbp=fb.1.1699999999.987654321abc&v=2",
+                    net::Dest::Image,
+                    Outcome::Blocked {
+                        rule: "||facebook.com/tr^".into(),
+                    },
+                )
+            },
         ];
         let bm = |u: &str, t: &str| Bookmark {
             url: u.into(),
@@ -3807,7 +3844,15 @@ mod menu_tests {
             Some((90.0, TOP_H + 10.0)),
             &mut cache,
         );
-        draw_panel(&mut c, &ui.address.text, &log, None, 0.0, w - pw, &mut cache);
+        draw_panel(
+            &mut c,
+            "https://shop.example/",
+            &log,
+            None,
+            0.0,
+            w - pw,
+            &mut cache,
+        );
         c.write_png(&std::env::var("PANEL_PNG").unwrap_or("panel.png".into()))
             .unwrap();
     }

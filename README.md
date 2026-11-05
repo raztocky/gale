@@ -91,6 +91,8 @@ browser validates before painting.
 | `filter.rs` | EasyList/uBlock filter engine: network rules, exceptions, options, cosmetic hiding, `$removeparam` |
 | `lists.rs` | `brickle filters update` / `status` |
 | `urlclean.rs` | Tracking-parameter stripping |
+| `explain.rs` | What a request was for, in plain words, for the request panel: known trackers (a built-in table), what it carried, which list blocked it |
+| `bookmarks.rs` | Your bookmarks, in a local file; nothing is fetched for them |
 | `csp.rs` | Content Security Policy for pages' scripts (`script-src`, `connect-src` and friends), enforced in the renderer; never sends reports |
 | `tab.rs` | Browser side of a page: spawns and supervises the renderer, answers its fetch requests |
 | `renderer.rs` | The renderer process's message loop |

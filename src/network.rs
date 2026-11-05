@@ -98,6 +98,8 @@ pub struct LogEntry {
     /// A script's cross-origin request whose response the server didn't
     /// allow the page to read (CORS), so it was withheld from the page.
     pub cors_blocked: bool,
+    /// For a block: the name of the filter list whose rule it was.
+    pub list: Option<String>,
 }
 
 impl LogEntry {
@@ -274,7 +276,12 @@ impl Network {
                 paths.sort();
                 for p in paths.iter().filter(|p| p.extension().is_some_and(|e| e == "txt")) {
                     if let Ok(text) = std::fs::read_to_string(p) {
-                        n.filters.add_list(&text);
+                        let file = p.file_name().and_then(|f| f.to_str()).unwrap_or("");
+                        let name = crate::lists::LISTS
+                            .iter()
+                            .find(|l| l.file == file)
+                            .map_or(file, |l| l.name);
+                        n.filters.add_named_list(name, &text);
                         n.lists_loaded += 1;
                     }
                 }
@@ -1002,6 +1009,7 @@ impl Network {
             cookies_set: vec![],
             cookies_refused: vec![],
             cors_blocked: false,
+            list: None,
         });
         self.log.last_mut().unwrap()
     }
@@ -1091,7 +1099,9 @@ impl Network {
                     ));
                 }
                 Decision::Blocked(rule) => {
-                    self.record(&url, dest, Outcome::Blocked { rule: rule.clone() }, stripped);
+                    let list = self.filters.blocking_list(&url, page, fdest).map(str::to_string);
+                    self.record(&url, dest, Outcome::Blocked { rule: rule.clone() }, stripped)
+                        .list = list;
                     return Fetch::FilterBlocked { host, url, rule };
                 }
                 Decision::Allowed(by) => by,
@@ -1851,6 +1861,7 @@ mod tests {
             cookies_set: vec![],
             cookies_refused: vec![],
             cors_blocked: false,
+            list: None,
         };
         assert_eq!(n.toggle_preview(&e), ("||cdn.example^".into(), "block"));
         n.toggle(&e).unwrap();

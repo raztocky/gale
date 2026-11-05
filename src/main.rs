@@ -174,7 +174,7 @@ fn run(args: Vec<String>, sandboxed: bool, filters: bool, panel: bool, js: bool)
             let mut net = network(filters);
             let mut tab = open_tab(&mut net, u, sandboxed);
             let _ = tab.render(1024.0, 768.0);
-            print_log(&tab.log);
+            print_log(&tab.log, &tab.url);
             if !tab.console.is_empty() {
                 println!("console:");
                 for l in &tab.console {
@@ -405,7 +405,7 @@ pub fn describe(e: &LogEntry) -> (&'static str, String) {
     (status, notes.join("; "))
 }
 
-fn print_log(log: &[LogEntry]) {
+fn print_log(log: &[LogEntry], page_url: &str) {
     let kind = |e: &LogEntry| match e.dest {
         net::Dest::Document => "page",
         net::Dest::Stylesheet => "css",
@@ -427,6 +427,9 @@ fn print_log(log: &[LogEntry]) {
                 format!("\n               {notes}")
             }
         );
+        for why in brickle::explain::explain(e, page_url) {
+            println!("               > {why}");
+        }
     }
     let sent = log.iter().filter(|e| e.was_sent()).count();
     println!(

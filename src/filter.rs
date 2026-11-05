@@ -54,6 +54,8 @@ struct NetRule {
     /// ("strict blocking", as uBlock does).
     pure_host: bool,
     text: String,
+    /// Which list it came from (an index into `Filters::list_names`).
+    list: u16,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -403,6 +405,8 @@ pub struct Filters {
     /// `$removeparam=name` rules: (optional URL pattern, parameter).
     removeparam: Vec<(Option<NetRule>, String)>,
     pub stats: Stats,
+    /// The lists' names, in the order they were added.
+    list_names: Vec<String>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -419,7 +423,31 @@ impl Filters {
         f
     }
 
+    /// Add a list, named so a block can say which list it was
+    /// ([`Filters::blocking_list`]).
+    pub fn add_named_list(&mut self, name: &str, text: &str) {
+        self.list_names.push(name.to_string());
+        self.add_list_text(text);
+    }
+
     pub fn add_list(&mut self, text: &str) {
+        self.add_named_list("", text);
+    }
+
+    /// The name of the list whose rule blocks this request, if it has one.
+    pub fn blocking_list(&self, url: &str, page_url: Option<&str>, dest: Dest) -> Option<&str> {
+        let req = Req::new(url, page_url, dest);
+        let r = self
+            .block
+            .find(&req, true)
+            .or_else(|| self.block.find(&req, false))?;
+        self.list_names
+            .get(r.list as usize)
+            .map(String::as_str)
+            .filter(|n| !n.is_empty())
+    }
+
+    fn add_list_text(&mut self, text: &str) {
         let mut badfilters = HashSet::new();
         // Stack of booleans for `!#if`; a line is active if all are true.
         let mut cond: Vec<bool> = Vec::new();
@@ -496,8 +524,9 @@ impl Filters {
             return false;
         }
         match parse_network(line) {
-            Some(Parsed::Rule { rule, allow }) => {
+            Some(Parsed::Rule { mut rule, allow }) => {
                 self.stats.network += 1;
+                rule.list = self.list_names.len().saturating_sub(1).min(u16::MAX as usize) as u16;
                 if allow {
                     self.allow.add(rule)
                 } else {
@@ -845,6 +874,7 @@ fn parse_network(line: &str) -> Option<Parsed> {
         important,
         pure_host,
         text: line.to_string(),
+        list: 0,
     };
     if let Some(name) = removeparam {
         if allow {
@@ -888,6 +918,21 @@ mod tests {
 
     #[test]
     fn host_anchor_and_separator() {
+        let mut named = Filters::default();
+        named.add_named_list("EasyList (ads)", "||ads.example^\n");
+        named.add_named_list("EasyPrivacy (trackers)", "||tracker.example^\n");
+        assert_eq!(
+            named.blocking_list("https://tracker.example/p", None, Dest::Image),
+            Some("EasyPrivacy (trackers)")
+        );
+        assert_eq!(
+            named.blocking_list("https://ads.example/p", None, Dest::Image),
+            Some("EasyList (ads)")
+        );
+        assert_eq!(
+            named.blocking_list("https://fine.example/p", None, Dest::Image),
+            None
+        );
         let f = Filters::parse("||tracker.example^\n");
         assert!(matches!(f.check(&css("https://news.site/")), Verdict::Block(_)));
         let ok = Req::new(

@@ -8,6 +8,7 @@ pub mod csp;
 pub mod css;
 pub mod doh;
 pub mod dom;
+pub mod explain;
 pub mod filter;
 pub mod font;
 pub mod forms;

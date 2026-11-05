@@ -42,7 +42,11 @@ doesn't save form data or passwords anywhere.
 
 Every request a page makes is listed in the **request panel** (F12 or Ctrl+Shift+E, or click the
 "N blocked · M requests" button). Each entry shows whether it was sent, blocked by a filter, or
-denied by you, plus any tracking parameters removed and any HTTPS upgrade. Click a row to block
+denied by you, plus any tracking parameters removed and any HTTPS upgrade. It also says, in plain
+words, what the request was for: which company a known tracker belongs to and what it does, what
+the request carried (your cookies, this page's address, ID-like values) or would have, had it not
+been blocked, and which filter list blocked it. That comes from a table built into Brickle; nothing
+is looked up online, and it only describes what Brickle can see. Click a row to block
 that host, or to unblock it. Your choices are saved as filter rules in
 `~/.config/brickle/rules.txt` and always take priority over the filter lists.
 `brickle requests URL` prints the same list in the terminal, and `brickle filters update` prints
