@@ -19,11 +19,12 @@ Planned work, roughly in priority order. Items marked *discuss* need a decision 
 - [x] JavaScript: Boa in the sandboxed renderer, off unless you allow a site (see below)
 
 ## Text
-- [ ] Text shaping with **HarfRust** (the HarfBuzz project's safe-Rust port), in the renderer:
-      kerning, ligatures, Arabic/Indic/Thai shaping (*discuss*)
+- [x] Text shaping with **HarfRust** (the HarfBuzz project's safe-Rust port), in the renderer:
+      kerning, ligatures, Arabic/Indic/Thai shaping
 - [x] Font fallback: bundled Noto subsets for CJK, Korean, Devanagari, Thai, emoji, symbols
 - [ ] More fallback scripts on request (Bengali, Tamil, Ethiopic, ...); color emoji
-- [ ] Bidirectional text (Arabic, Hebrew) with `unicode-bidi`
+- [x] Right-to-left words read from the right (runs mirrored within each line)
+- [ ] Full bidirectional text (paragraph direction, `dir="rtl"`, numbers inside RTL), with `unicode-bidi`
 - [x] Unicode line breaking (UAX #14) with `unicode-linebreak`
 - [ ] Thai/Lao/Khmer word breaking (needs a dictionary)
 - [x] Page titles in the tab bar are drawn by the page's own sandboxed renderer; the browser only

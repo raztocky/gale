@@ -46,7 +46,9 @@ browser treats everything it sends as hostile (`src/tab.rs`, `src/ipc.rs`):
   of memory-safety bugs, so the browser never runs one on a website's bytes. It only receives
   finished RGBA pixels, which it checks (sizes, references, total pixels, painting cost) before
   painting. Image sizes are checked from their headers before decoding, every decoder gets a
-  memory limit, and a decoder panic only loses that image.
+  memory limit, and a decoder panic only loses that image. Text shaping (HarfRust) runs there
+  too, on at most 4,096 bytes of text at a time; the browser draws its own interface text without
+  it.
 
 `hostile_renderer_tests` in `src/tab.rs` runs fake renderers that flood, stall, send partial,
 oversized, out-of-order and unsolicited messages, stop reading, and ask for local files, local

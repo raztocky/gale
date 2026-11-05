@@ -1,4 +1,4 @@
-//! Bundled fonts and text measurement.
+//! Bundled fonts, text measurement and (in the renderer) text shaping.
 //!
 //! Sixteen primary fonts: Liberation Sans, Serif and Mono (the same letter
 //! widths as Arial, Times New Roman and Courier New, so pages lay out as
@@ -123,8 +123,13 @@ const MAX_BITMAP_SIDE: usize = 2048;
 /// Draw `ch` in font `i` at `size` px: its metrics, and its coverage
 /// (0-255, row by row from the top).
 pub fn rasterize(i: usize, ch: char, size: f32) -> (Metrics, Vec<u8>) {
+    rasterize_glyph(i, face(i).glyph(ch).to_u32(), size)
+}
+
+/// Draw glyph `id` of font `i` (as shaping chose it) at `size` px.
+pub fn rasterize_glyph(i: usize, id: u32, size: f32) -> (Metrics, Vec<u8>) {
     let f = face(i);
-    let g = f.glyph(ch);
+    let g = GlyphId::new(id);
     let mut m = Metrics {
         advance_width: f.advance(g, size),
         ..Metrics::default()
@@ -407,6 +412,215 @@ pub fn measure(font_idx: usize, size: f32, text: &str) -> f32 {
         .sum()
 }
 
+// ---------------------------------------------------------------------------
+// Shaping (in the renderer): kerning, ligatures, and the scripts that need it
+// ---------------------------------------------------------------------------
+
+/// A glyph placed by shaping.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Glyph {
+    pub font: usize,
+    pub id: u32,
+    /// Where it's drawn: px right of the text's start, and up from the
+    /// baseline.
+    pub x: f32,
+    pub y: f32,
+    /// The pen position it's drawn from (`x` less the glyph's offset) and
+    /// how far it moves the pen on.
+    pub pen: f32,
+    pub advance: f32,
+    /// Byte index in the text of the first character it stands for.
+    pub cluster: usize,
+}
+
+/// Text shaped into glyphs, left to right as they're drawn, and its width.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Shaped {
+    pub glyphs: Vec<Glyph>,
+    pub width: f32,
+}
+
+/// Longest text shaped at once; anything past it is measured, not shaped,
+/// so one enormous word can't take long.
+const MAX_SHAPED: usize = 4096;
+/// Shaped texts remembered (layout measures the same words many times).
+const SHAPE_CACHE: usize = 20_000;
+
+fn shaper_font(i: usize) -> Option<&'static harfrust::Font> {
+    static FONTS: [OnceLock<Option<harfrust::Font>>; COUNT] = [const { OnceLock::new() }; COUNT];
+    FONTS[i.min(COUNT - 1)]
+        .get_or_init(|| harfrust::Font::new(FONT_DATA[i.min(COUNT - 1)], 0))
+        .as_ref()
+}
+
+/// Shape `text` in the style's font `primary` (with fallbacks for what it
+/// lacks) at `size` px. Each run of text in one font is shaped by HarfRust
+/// (the HarfBuzz project's Rust port), in its script's direction; marks and
+/// joiners stay in the font of the letter before them.
+pub fn shape(primary: usize, size: f32, text: &str) -> std::rc::Rc<Shaped> {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+    type Cache = HashMap<(usize, u32, String), Rc<Shaped>>;
+    thread_local! {
+        static CACHE: RefCell<Cache> = RefCell::new(HashMap::new());
+    }
+    let key = (primary, size.to_bits(), text.to_string());
+    if let Some(hit) = CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return hit;
+    }
+    let shaped = Rc::new(shape_uncached(primary, size, text));
+    CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() >= SHAPE_CACHE {
+            c.clear();
+        }
+        c.insert(key, shaped.clone());
+    });
+    shaped
+}
+
+impl Shaped {
+    /// Where each character of `text` (which this is the shaping of)
+    /// starts, and the end: `chars + 1` positions from 0, never decreasing,
+    /// for selecting and copying. Characters sharing a glyph (a ligature,
+    /// a conjunct) split it evenly. Text drawn right to left can't be
+    /// split that way, so its characters share the width evenly.
+    pub fn char_offsets(&self, text: &str) -> Vec<f32> {
+        let n = text.chars().count();
+        let even = || {
+            (0..=n)
+                .map(|i| self.width * i as f32 / n.max(1) as f32)
+                .collect::<Vec<f32>>()
+        };
+        // Each cluster's start and end on the line, by its first byte.
+        let mut spans: std::collections::BTreeMap<usize, (f32, f32)> = Default::default();
+        for g in &self.glyphs {
+            let e = spans.entry(g.cluster).or_insert((g.pen, g.pen + g.advance));
+            *e = (e.0.min(g.pen), e.1.max(g.pen + g.advance));
+        }
+        let spans: Vec<(usize, f32, f32)> = spans.into_iter().map(|(c, (a, b))| (c, a, b)).collect();
+        if spans.windows(2).any(|w| w[1].1 < w[0].1 - 0.01) || spans.first().is_none_or(|s| s.0 != 0) {
+            return even();
+        }
+        let mut out = Vec::with_capacity(n + 1);
+        for (k, &(start, a, b)) in spans.iter().enumerate() {
+            let end = spans.get(k + 1).map_or(text.len(), |s| s.0);
+            let chars = text.get(start..end).map_or(0, |t| t.chars().count());
+            for j in 0..chars {
+                out.push(a + (b - a) * j as f32 / chars as f32);
+            }
+        }
+        out.push(self.width);
+        if out.len() != n + 1 {
+            return even();
+        }
+        // Never decreasing, as selection expects.
+        for i in 1..out.len() {
+            out[i] = out[i].max(out[i - 1]);
+        }
+        out
+    }
+}
+
+/// The width `text` takes, shaped.
+pub fn shaped_width(primary: usize, size: f32, text: &str) -> f32 {
+    shape(primary, size, text).width
+}
+
+/// Which way a piece of text reads, by its first letter: right to left
+/// (`Some(true)`) for Hebrew, Arabic and the like, left to right for other
+/// letters, neither for spaces, digits and punctuation.
+pub fn direction(text: &str) -> Option<bool> {
+    text.chars().find_map(|c| {
+        let rtl = matches!(c as u32,
+            0x0590..=0x08FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF | 0x10800..=0x10FFF | 0x1E800..=0x1EFFF);
+        if rtl {
+            Some(true)
+        } else if c.is_alphabetic() {
+            Some(false)
+        } else {
+            None
+        }
+    })
+}
+
+fn shape_uncached(primary: usize, size: f32, text: &str) -> Shaped {
+    let mut out = Shaped::default();
+    if !(size.is_finite() && size > 0.0) || text.is_empty() {
+        return out;
+    }
+    // Runs of characters drawn by one font: (font, start, end) in bytes.
+    let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+    for (i, ch) in text.char_indices() {
+        let end = i + ch.len_utf8();
+        let inherit = matches!(harfrust::unicode::script(ch as u32), harfrust::Script::INHERITED)
+            || matches!(ch, '\u{200c}' | '\u{200d}' | '\u{fe00}'..='\u{fe0f}');
+        match runs.last_mut() {
+            Some(r) if inherit || r.0 == resolve(primary, ch) => r.2 = end,
+            _ => runs.push((resolve(primary, ch), i, end)),
+        }
+    }
+    // Text that reads right to left puts its runs (each shaped in its own
+    // direction) right to left too: "العربية:" ends with its colon on the left.
+    if direction(text) == Some(true) {
+        runs.reverse();
+    }
+    for (font, start, end) in runs {
+        let part = &text[start..end];
+        let base = out.width;
+        match shaper_font(font).filter(|_| end <= MAX_SHAPED) {
+            Some(f) => {
+                let shaper = harfrust::ShaperFont::new(f);
+                let mut buf = harfrust::Buffer::new();
+                buf.push_str(part);
+                buf.guess_segment_properties();
+                let Ok(()) = harfrust::shape(&shaper, &mut buf, harfrust::ShapeOptions::new()) else {
+                    continue;
+                };
+                let k = size / face(font).units_per_em;
+                let mut pen = 0.0;
+                for (info, pos) in buf.glyph_infos().iter().zip(buf.glyph_positions()) {
+                    let advance = pos.x_advance as f32 * k;
+                    out.glyphs.push(Glyph {
+                        font,
+                        id: info.glyph_id,
+                        x: base + pen + pos.x_offset as f32 * k,
+                        y: pos.y_offset as f32 * k,
+                        pen: base + pen,
+                        advance,
+                        cluster: start + (info.cluster as usize).min(part.len()),
+                    });
+                    pen += advance;
+                }
+                out.width += pen;
+            }
+            // Past the limit: one glyph per character, unshaped.
+            None => {
+                let fc = face(font);
+                for (i, ch) in part.char_indices() {
+                    let g = fc.glyph(ch);
+                    let advance = fc.advance(g, size);
+                    out.glyphs.push(Glyph {
+                        font,
+                        id: g.to_u32(),
+                        x: out.width,
+                        y: 0.0,
+                        pen: out.width,
+                        advance,
+                        cluster: start + i,
+                    });
+                    out.width += advance;
+                }
+            }
+        }
+    }
+    if !out.width.is_finite() {
+        out.width = 0.0;
+    }
+    out
+}
+
 /// (ascent, descent) in px, both positive, from the font's `hhea` table.
 pub fn vmetrics(font_idx: usize, size: f32) -> (f32, f32) {
     let f = face(font_idx);
@@ -486,6 +700,99 @@ mod tests {
         // Advances match the font's own widths: Liberation Sans is
         // metric-compatible with Arial, where "W" is 1933/2048 em.
         assert!((measure(0, 2048.0, "W") - 1933.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn shaping_kerns_ligates_and_joins() {
+        // Kerning: "AV" sits tighter than its letters' own widths.
+        assert!(shaped_width(4, 40.0, "AV") < measure(4, 40.0, "AV") - 1.0);
+        // A Devanagari conjunct: क + ् + ष is one glyph, from Noto.
+        let ksha = shape(0, 20.0, "क्ष");
+        assert!(
+            ksha.glyphs.len() < 3 && ksha.glyphs.iter().all(|g| g.font == 20),
+            "{ksha:?}"
+        );
+        // The vowel sign ि is drawn before the consonant it follows.
+        let ki = shape(0, 20.0, "कि");
+        assert_eq!(ki.glyphs.len(), 2);
+        assert!(
+            ki.glyphs[0].cluster == 0 && ki.glyphs[0].x <= ki.glyphs[1].x,
+            "{ki:?}"
+        );
+        // Arabic letters take their joining forms and read right to left.
+        let nominal = face(16).glyph('ب').to_u32();
+        let bb = shape(0, 20.0, "ببب");
+        assert!(
+            bb.glyphs.iter().all(|g| g.font == 16 && g.id != nominal),
+            "{bb:?}"
+        );
+        let first = bb.glyphs.iter().find(|g| g.cluster == 0).unwrap();
+        assert!(
+            bb.glyphs.iter().all(|g| g.x <= first.x),
+            "first letter on the right"
+        );
+        // ...including punctuation from another font: the colon ends up left.
+        let word = shape(0, 20.0, "عربي:");
+        let colon = word.glyphs.iter().find(|g| g.cluster == "عربي".len()).unwrap();
+        assert!(word.glyphs.iter().all(|g| g.x >= colon.x), "{word:?}");
+        // A combining accent stays with its letter's font and over it.
+        // (With a precomposed form, the two become that one glyph.)
+        let e = shape(4, 40.0, "e\u{301}");
+        assert_eq!((e.glyphs.len(), e.glyphs[0].id), (1, face(4).glyph('é').to_u32()));
+        let q = shape(4, 40.0, "q\u{301}");
+        assert_eq!(q.glyphs.len(), 2);
+        assert!(q.glyphs.iter().all(|g| g.font == 4));
+        assert!(
+            (q.width - measure(4, 40.0, "q")).abs() < 0.5,
+            "the accent takes no room"
+        );
+    }
+
+    #[test]
+    fn character_offsets_for_selection() {
+        for (font, text) in [
+            (4, "AVATAR"),
+            (12, "office"),
+            (0, "क्षत्रिय"),
+            (0, "مرحبا"),
+            (0, "a b"),
+            (0, ""),
+        ] {
+            let sh = shape(font, 16.0, text);
+            let o = sh.char_offsets(text);
+            assert_eq!(o.len(), text.chars().count() + 1, "{text}");
+            assert!(o.windows(2).all(|w| w[1] >= w[0]), "{text}: {o:?}");
+            assert_eq!(o[0], 0.0);
+            assert!((o[o.len() - 1] - sh.width).abs() < 1e-3, "{text}");
+        }
+        // A ligature's letters each get part of it.
+        let sh = shape(12, 16.0, "ffi");
+        let o = sh.char_offsets("ffi");
+        assert!(o[1] > 0.0 && o[2] > o[1], "{o:?}");
+    }
+
+    #[test]
+    fn shaping_hostile_text_is_safe_and_quick() {
+        let t = std::time::Instant::now();
+        let long: String = "\u{94d}क\u{301}ب\u{200d}🐈ﷺ".repeat(2000);
+        for text in [
+            long.as_str(),
+            "\u{0}\u{fffe}\u{10ffff}\u{e0001}",
+            "\u{301}\u{301}\u{301}",
+            "\u{200d}",
+            &"x".repeat(MAX_SHAPED + 10),
+        ] {
+            for f in [0, 4, 9, 12] {
+                let sh = shape(f, 16.0, text);
+                assert!(sh.width.is_finite() && sh.width >= 0.0);
+                assert_eq!(sh.char_offsets(text).len(), text.chars().count() + 1);
+            }
+        }
+        for size in [0.0, -1.0, f32::NAN, f32::INFINITY, 1e30] {
+            let sh = shape(0, size, "abc");
+            assert!(sh.width.is_finite());
+        }
+        assert!(t.elapsed().as_secs() < 5, "{:?}", t.elapsed());
     }
 
     #[test]

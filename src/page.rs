@@ -1019,14 +1019,7 @@ fn collect_text(b: &LayoutBox, seen: &Seen, mut under: Color, out: &mut Vec<Text
                 return;
             }
             *chars += n;
-            let mut x = 0.0;
-            let mut offsets = Vec::with_capacity(n + 1);
-            offsets.push(0.0);
-            let mut buf = [0u8; 4];
-            for c in f.text.chars() {
-                x += font::measure(fi, f.style.font_size, c.encode_utf8(&mut buf));
-                offsets.push(x);
-            }
+            let offsets = font::shape(fi, f.style.font_size, &f.text).char_offsets(&f.text);
             out.push(TextRun {
                 rect,
                 text: f.text.clone(),

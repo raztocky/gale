@@ -91,20 +91,19 @@ pub fn text_mask(text: &str, font_idx: usize, size: f32, max_w: u16) -> Option<G
     }
     let (ascent, descent) = font::vmetrics(font_idx, size);
     let h = ((ascent + descent).ceil() as usize).min(MAX_TITLE_H as usize);
-    let w = (font::measure(font_idx, size, text).ceil() as usize).min(max_w.min(MAX_TITLE_W) as usize);
+    let shaped = font::shape(font_idx, size, text);
+    let w = (shaped.width.ceil() as usize).min(max_w.min(MAX_TITLE_W) as usize);
     if w == 0 || h == 0 {
         return None;
     }
     let mut data = vec![0u8; w * h];
-    let mut pen = 0.0f32;
-    for ch in text.chars() {
-        if pen >= w as f32 {
+    for g in &shaped.glyphs {
+        if g.pen >= w as f32 {
             break;
         }
-        let fi = font::resolve(font_idx, ch);
-        let (m, bitmap) = font::rasterize(fi, ch, size);
-        let gx = (pen + m.xmin as f32).round() as i64;
-        let gy = (ascent - (m.height as i32 + m.ymin) as f32).round() as i64;
+        let (m, bitmap) = font::rasterize_glyph(g.font, g.id, size);
+        let gx = (g.x + m.xmin as f32).round() as i64;
+        let gy = (ascent - g.y - (m.height as i32 + m.ymin) as f32).round() as i64;
         for row in 0..m.height {
             let y = gy + row as i64;
             if !(0..h as i64).contains(&y) {
@@ -118,7 +117,6 @@ pub fn text_mask(text: &str, font_idx: usize, size: f32, max_w: u16) -> Option<G
                 }
             }
         }
-        pen += m.advance_width;
     }
     Some(GlyphBitmap {
         w: w as u16,
@@ -129,8 +127,8 @@ pub fn text_mask(text: &str, font_idx: usize, size: f32, max_w: u16) -> Option<G
 /// Stop adding glyphs to a page's atlas beyond this many bytes.
 pub const MAX_ATLAS_BYTES: usize = 24 * 1024 * 1024;
 
-/// (font, character, size in quarter pixels, italic)
-type AtlasKey = (usize, char, u32, bool);
+/// (font, glyph, size in quarter pixels, italic)
+type AtlasKey = (usize, u32, u32, bool);
 
 /// Turn text runs into glyph placements plus a bitmap atlas.
 fn contains(outer: Rect, inner: Rect) -> bool {
@@ -233,17 +231,17 @@ pub fn rasterize_indexed(ops: Vec<DrawOp>) -> (DisplayList, Vec<GlyphBitmap>, Ve
                 if !(MIN_TEXT_SIZE..=crate::style::MAX_FONT_SIZE).contains(&size) || font >= font::COUNT {
                     continue;
                 }
-                let mut pen = x;
                 let mut glyphs = Vec::new();
-                for ch in text.chars() {
-                    // Per character: the style's font, or a fallback that has it.
-                    let fi = font::resolve(font, ch);
-                    let key = (fi, ch, (size * 4.0) as u32, italic);
+                // Shaped as layout measured it: the style's font, with
+                // fallbacks for what it lacks.
+                for g in &font::shape(font, size, &text).glyphs {
+                    let fi = g.font;
+                    let key = (fi, g.id, (size * 4.0) as u32, italic);
                     let entry = ids.entry(key).or_insert_with(|| {
                         if atlas_bytes > MAX_ATLAS_BYTES {
                             return None;
                         }
-                        let (m, bitmap) = font::rasterize(fi, ch, size);
+                        let (m, bitmap) = font::rasterize_glyph(fi, g.id, size);
                         let bmp = if italic && font::fake_italic(fi) {
                             skew(&m, &bitmap)
                         } else {
@@ -262,14 +260,13 @@ pub fn rasterize_indexed(ops: Vec<DrawOp>) -> (DisplayList, Vec<GlyphBitmap>, Ve
                     });
                     let Some((id, m)) = *entry else { continue };
                     if id != u32::MAX {
-                        let gx = (pen + m.xmin as f32).round();
-                        let gy = (baseline - (m.height as i32 + m.ymin) as f32).round();
+                        let gx = (x + g.x + m.xmin as f32).round();
+                        let gy = (baseline - g.y - (m.height as i32 + m.ymin) as f32).round();
                         let (cx, cy) = (gx + m.width as f32 / 2.0, gy + m.height as f32 / 2.0);
                         if clip.is_none_or(|c| c.contains(cx, cy)) {
                             glyphs.push(PlacedGlyph { x: gx, y: gy, id });
                         }
                     }
-                    pen += m.advance_width;
                 }
                 if !glyphs.is_empty() {
                     list.push(DisplayCommand::Glyphs { color, glyphs });
@@ -603,7 +600,7 @@ fn render_box(list: &mut Vec<DrawOp>, b: &LayoutBox, backgrounds: &Backgrounds, 
         }
         if let Some(m) = &b.marker {
             let f = font::index(s);
-            let w = font::measure(f, s.font_size, m);
+            let w = font::shaped_width(f, s.font_size, m);
             let (a, d) = font::vmetrics(f, s.font_size);
             let baseline = b.dims.content.y + (s.line_height - (a + d)) / 2.0 + a;
             list.push(DrawOp::Text {

@@ -266,6 +266,7 @@ dependencies = [
  "clubcard-crlite",
  "flate2",
  "gif",
+ "harfrust 0.15.0",
  "image-webp",
  "landlock",
  "libc",
@@ -901,6 +902,19 @@ dependencies = [
  "bytemuck",
  "read-fonts 0.41.0",
  "smallvec",
+]
+
+[[package]]
+name = "harfrust"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "865dcc4105d51c323d8fedbb2d75b5e9c8ecddf5613f74c82f851d0afbc97114"
+dependencies = [
+ "bitflags 2.13.2",
+ "bytemuck",
+ "read-fonts 0.46.0",
+ "smallvec",
+ "yoke",
 ]
 
 [[package]]
@@ -2423,7 +2437,7 @@ dependencies = [
  "base64 0.23.1",
  "data-url",
  "fontdb",
- "harfrust",
+ "harfrust 0.12.0",
  "imagesize",
  "kurbo",
  "log",

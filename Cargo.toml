@@ -37,6 +37,7 @@ tiny-skia = { version = "0.12", default-features = false, features = ["std"] }
 roxmltree = "0.21"
 arboard = { version = "3.7.0", default-features = false, optional = true }
 skrifa = "0.49"
+harfrust = "0.15"
 
 # The renderer sandbox (Landlock + seccomp + rlimits) is Linux-only.
 [target.'cfg(target_os = "linux")'.dependencies]

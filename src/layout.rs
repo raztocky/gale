@@ -1774,7 +1774,7 @@ impl<'a> LayoutBox<'a> {
                                 collapsed
                             };
                             let f = font::index(style);
-                            let measure = |t: &str| font::measure(f, style.font_size, t);
+                            let measure = |t: &str| font::shaped_width(f, style.font_size, t);
                             let ws = |c: char| c.is_ascii_whitespace();
                             if !style.pre && text.starts_with(ws) && !spaced {
                                 line += measure(" ");
@@ -2036,7 +2036,7 @@ impl<'a> LayoutBox<'a> {
                         bg: *bg,
                         link: link.clone(),
                         uid: *uid,
-                        w: font::measure(f, style.font_size, t),
+                        w: font::shaped_width(f, style.font_size, t),
                         glue,
                     };
                     if style.pre {
@@ -2102,7 +2102,7 @@ impl<'a> LayoutBox<'a> {
                                     bg: *bg,
                                     link: link.clone(),
                                     uid: *uid,
-                                    w: font::measure(f, style.font_size, " "),
+                                    w: font::shaped_width(f, style.font_size, " "),
                                 });
                                 last_space = true;
                             }
@@ -2323,6 +2323,7 @@ impl<'a> LayoutBox<'a> {
                 break;
             }
         }
+        mirror_rtl_runs(&mut line);
         let mut asc = 0.0f32;
         let mut desc = 0.0f32;
         for p in &line {
@@ -2478,6 +2479,49 @@ enum Placed {
     Text(TextFrag),
     /// An inline-block child, and its x on the line.
     Atomic(usize, f32),
+}
+
+/// Words are shaped (each in its own direction) and set left to right; a
+/// run of right-to-left words on a line, with the spaces and punctuation
+/// between them, is mirrored within the space it takes, so it reads from
+/// the right. (The paragraph itself stays left to right: this isn't the
+/// whole Unicode bidi algorithm.)
+fn mirror_rtl_runs(line: &mut [Placed]) {
+    let rtl: Vec<Option<bool>> = line
+        .iter()
+        .map(|p| match p {
+            Placed::Text(t) => font::direction(&t.text),
+            Placed::Atomic(..) => Some(false),
+        })
+        .collect();
+    let mut i = 0;
+    while i < line.len() {
+        if rtl[i] != Some(true) {
+            i += 1;
+            continue;
+        }
+        // The run ends at the last right-to-left word before anything that
+        // reads left to right.
+        let mut end = i;
+        let mut j = i + 1;
+        while j < line.len() && rtl[j] != Some(false) {
+            if rtl[j] == Some(true) {
+                end = j;
+            }
+            j += 1;
+        }
+        let span = |p: &Placed| match p {
+            Placed::Text(t) => (t.x, t.x + t.w),
+            Placed::Atomic(_, x) => (*x, *x),
+        };
+        let (x0, x1) = (span(&line[i]).0, span(&line[end]).1);
+        for p in &mut line[i..=end] {
+            if let Placed::Text(t) = p {
+                t.x = x0 + x1 - (t.x + t.w);
+            }
+        }
+        i = end + 1;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4387,6 +4431,32 @@ mod modern_layout_tests {
             "p",
         );
         assert!(b[1].y > b[0].y, "{b:?}");
+    }
+
+    #[test]
+    fn right_to_left_words_read_from_the_right() {
+        let dom = html::parse("<p>one مرحبا بالعالم two</p>");
+        let ua = css::parse(style::UA_CSS);
+        let ctx = StyleContext {
+            text_scale: 1.0,
+            sheets: vec![(0, &ua)],
+            viewport: WIN,
+        };
+        let styled = style::style_tree(&dom, &ctx);
+        let root = layout_tree_with_images(&styled, WIN, &HashMap::new());
+        fn walk(b: &LayoutBox, out: &mut Vec<(String, f32)>) {
+            if let BoxKind::Anonymous { frags, .. } = &b.kind {
+                out.extend(frags.iter().map(|f| (f.text.clone(), f.x)));
+            }
+            b.children.iter().for_each(|c| walk(c, out));
+        }
+        let mut f = Vec::new();
+        walk(&root, &mut f);
+        let x = |w: &str| f.iter().find(|(t, _)| t == w).unwrap().1;
+        assert!(
+            x("one") < x("بالعالم") && x("بالعالم") < x("مرحبا") && x("مرحبا") < x("two"),
+            "{f:?}"
+        );
     }
 
     #[test]
