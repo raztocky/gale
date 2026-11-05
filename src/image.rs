@@ -326,7 +326,15 @@ fn decode_svg(bytes: &[u8]) -> Result<Decoded, String> {
             .iter()
             .all(|v| v.is_finite() && (v * scale.max(1.0)).abs() <= reach)
     };
-    if !fits(root.abs_layer_bounding_box().to_rect()) || !fits(root.abs_stroke_bounding_box()) {
+    let group_fits =
+        |g: &usvg::Group| fits(g.abs_layer_bounding_box().to_rect()) && fits(g.abs_stroke_bounding_box());
+    // Clip paths and masks are drawn too, but no bounding box covers them.
+    let clips_fit = tree.clip_paths().iter().all(|c| group_fits(c.root()));
+    let masks_fit = tree
+        .masks()
+        .iter()
+        .all(|m| fits(m.rect().to_rect()) && group_fits(m.root()));
+    if !group_fits(root) || !clips_fit || !masks_fit {
         return Err("SVG: drawing far too large".into());
     }
     let natural = (
@@ -785,6 +793,25 @@ mod tests {
              <use href='#p' stroke='#000' stroke-width='5555555555' filter='url(#f)'/></svg>"
         );
         assert!(decode(wide.as_bytes()).unwrap_err().contains("far too large"));
+        // So did a clip path or mask that size, which no bounding box covers.
+        for defs in [
+            "<clipPath id='c'><circle cx='8' cy='8' r='5555555555555555555555557'/></clipPath>",
+            "<mask id='c'><circle cx='8' cy='8' r='5555555555555555555555557' fill='#fff'/></mask>",
+        ] {
+            let kind = if defs.starts_with("<clip") {
+                "clip-path"
+            } else {
+                "mask"
+            };
+            let svg = format!(
+                "<svg {NS} width='16' height='16'><defs>{defs}</defs>\
+                 <rect width='16' height='16' fill='red' {kind}='url(#c)'/></svg>"
+            );
+            assert!(
+                decode(svg.as_bytes()).unwrap_err().contains("far too large"),
+                "{kind}"
+            );
+        }
         // Through fill references too.
         let fill = format!(
             "<svg {NS}><linearGradient id='a' href='#b'/><linearGradient id='b' href='#a'/>\
