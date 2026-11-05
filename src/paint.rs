@@ -1157,6 +1157,32 @@ impl TileCache {
         got
     }
 
+    /// Draw only the tiles already painted (for showing the page as it was
+    /// while a changed version is painted, instead of a blank flash).
+    pub fn draw_painted(&self, canvas: &mut Canvas, scroll: f32, top: usize) {
+        let scroll = scroll.max(0.0).round() as usize;
+        let view_h = canvas.height.saturating_sub(top);
+        let first = scroll / TILE_H;
+        let last = (scroll + view_h) / TILE_H;
+        let tw = self.scene.width;
+        let w = tw.min(canvas.width);
+        for i in first..=last {
+            let Some(tile) = self.tiles.get(&i) else { continue };
+            for row in 0..TILE_H {
+                let page_y = i * TILE_H + row;
+                if page_y < scroll {
+                    continue;
+                }
+                let y = top + (page_y - scroll);
+                if y >= canvas.height {
+                    break;
+                }
+                let dst = y * canvas.width;
+                canvas.pixels[dst..dst + w].copy_from_slice(&tile[row * tw..row * tw + w]);
+            }
+        }
+    }
+
     /// Composite the page, scrolled by `scroll`, into `canvas` from row
     /// `top` down. Missing tiles are painted right here without a
     /// `painter`; with one, they're asked for (with one more above and
@@ -1223,6 +1249,31 @@ fn pack(c: Color) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn painted_tiles_can_be_shown_again_without_painting() {
+        let list = vec![DisplayCommand::Rect {
+            rect: Rect {
+                x: 0.0,
+                y: 10.0,
+                w: 50.0,
+                h: 700.0,
+            },
+            color: Color::rgb(0x12, 0x34, 0x56),
+        }];
+        let mut tc = TileCache::new(&list, &[], 64, 800.0, Color::WHITE);
+        let mut a = Canvas::new(64, 300, Color::WHITE);
+        assert!(tc.draw(&mut a, 100.0, 20, None));
+        // What was painted shows the same, without the painter.
+        let mut b = Canvas::new(64, 300, Color::WHITE);
+        tc.draw_painted(&mut b, 100.0, 20);
+        assert_eq!(a.pixels, b.pixels);
+        // Nothing painted yet: nothing drawn, no panic.
+        let fresh = TileCache::new(&list, &[], 64, 800.0, Color::WHITE);
+        let mut c = Canvas::new(64, 300, Color::BLACK);
+        fresh.draw_painted(&mut c, 5000.0, 0);
+        assert!(c.pixels.iter().all(|&p| p == c.pixels[0]));
+    }
 
     #[test]
     fn tiny_and_odd_text_sizes_are_safe() {

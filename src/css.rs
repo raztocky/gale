@@ -1098,12 +1098,19 @@ fn parse_compound(chars: &[char], i: &mut usize, depth: usize) -> Option<SimpleS
                     ("has", Some(a)) => s.pseudo.push(Pseudo::Has(list(a, true)?)),
                     (
                         "hover" | "active" | "focus" | "focus-visible" | "focus-within" | "visited"
-                        | "checked" | "target" | "target-within" | "indeterminate" | "invalid"
-                        | "user-invalid" | "autofill" | "placeholder-shown" | "fullscreen" | "modal"
-                        | "popover-open" | "open",
+                        | "target" | "target-within" | "indeterminate" | "invalid" | "user-invalid"
+                        | "autofill" | "placeholder-shown" | "fullscreen" | "modal" | "popover-open" | "open",
                         None,
                     ) => s.pseudo.push(Pseudo::Never),
-                    // Form states we can tell from attributes.
+                    // Form states we can tell from attributes. A checkbox or
+                    // radio button you click gets or loses `checked` (see
+                    // `forms::activate`), so `:checked` follows your clicks.
+                    ("checked", None) => s.attrs.push(AttrSelector {
+                        name: "checked".into(),
+                        op: AttrOp::Exists,
+                        value: String::new(),
+                        ignore_case: false,
+                    }),
                     ("disabled", None) => s.attrs.push(AttrSelector {
                         name: "disabled".into(),
                         op: AttrOp::Exists,

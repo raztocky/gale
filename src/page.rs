@@ -1724,6 +1724,43 @@ mod text_tests {
     }
 
     #[test]
+    fn picking_pictures_through_hidden_checkboxes() {
+        // As in no-JavaScript captchas: each picture is a label for a
+        // hidden checkbox, and `:checked` styles show which are picked.
+        let mut page = Page::parse(
+            "https://example.com/",
+            "<form><input type=checkbox id=a name=a style='display:none'><label for=a>Duck</label>\
+             <label><input type=checkbox name=b style='display:none'>Swan</label>\
+             <input type=radio name=r id=r1 checked hidden><label for=r1>One</label>\
+             <input type=radio name=r id=r2 hidden><label for=r2>Two</label></form>\
+             <style>input:checked + label::after, label:has(input:checked)::after { content: ' picked' }</style>",
+            "",
+            &mut |_, _| Err("none".into()),
+        );
+        let text = |p: &Page| {
+            let r = p.render(800.0, 600.0);
+            let all: String = r.texts.iter().map(|t| t.text.clone() + " ").collect();
+            all.split_whitespace().collect::<Vec<_>>().join(" ")
+        };
+        let click = |p: &mut Page, word: &str| {
+            let r = p.render(800.0, 600.0);
+            let t = r.texts.iter().find(|t| t.text.contains(word)).unwrap().rect;
+            let until = Instant::now() + std::time::Duration::from_secs(5);
+            assert!(
+                p.click_at(None, t.x + 2.0, t.y + t.h / 2.0, until).changed,
+                "{word}"
+            );
+        };
+        assert_eq!(text(&page), "Duck Swan One picked Two");
+        click(&mut page, "Duck");
+        click(&mut page, "Swan");
+        assert_eq!(text(&page), "Duck picked Swan picked One picked Two");
+        click(&mut page, "Duck");
+        click(&mut page, "Two");
+        assert_eq!(text(&page), "Duck Swan picked One Two picked");
+    }
+
+    #[test]
     fn details_open_and_close_on_a_click() {
         let mut page = Page::parse(
             "https://example.com/",

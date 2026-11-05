@@ -674,6 +674,9 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
     let mut scroll_drag: Option<f32> = None;
     // Dragging the requests panel's left edge to resize it.
     let mut panel_drag = false;
+    // The page as it was painted before its latest change, shown until the
+    // new tiles are painted.
+    let mut stale_tiles: Option<TileCache> = None;
     let mut bookmarks = brickle::bookmarks::Bookmarks::load(brickle::network::data_dir().as_deref());
     let mut was_right = false;
     let mut resize_cursor = false;
@@ -770,6 +773,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             ui.panel_scroll = 0.0;
             script_hops = p.script_hops;
             tiles = None;
+            stale_tiles = None;
             if p.discarded && busy.is_none() {
                 // Its renderer was let go: load it again, from where it
                 // was opened, so the same checks apply.
@@ -890,7 +894,10 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 if let Some(f) = &mut find {
                     f.page_changed(&rendered);
                 }
-                tiles = None; // new content: repaint tiles on demand
+                // New content: repaint tiles on demand. The same page
+                // changed (a click, a script) keeps showing as it was
+                // until the new tiles arrive, rather than flashing blank.
+                stale_tiles = if done.new_page { None } else { tiles.take() };
                 laid_out_at = (page_w, view_h);
             }
             if done.new_page {
@@ -1978,7 +1985,12 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     rendered.background,
                 )
             });
-            tc.draw(&mut canvas, scroll, bar as usize, Some(&painter));
+            if let Some(old) = stale_tiles.as_ref().filter(|o| o.width() == page_w as usize) {
+                old.draw_painted(&mut canvas, scroll, bar as usize);
+            }
+            if tc.draw(&mut canvas, scroll, bar as usize, Some(&painter)) {
+                stale_tiles = None;
+            }
             // Fixed and sticky boxes, where scrolling puts them.
             for (l, list) in &ix.layers {
                 canvas.paint(list, &rendered.atlas, scroll - l.shift(scroll), bar);
