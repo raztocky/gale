@@ -955,6 +955,55 @@ fn script_requests_are_checked_at_every_redirect() {
     assert!(!auth(&req("OPTIONS /put2 ")));
 }
 
+/// The server's Content-Security-Policy reaches the sandboxed renderer and
+/// holds scripts injected into the page: only the nonce'd script runs, and
+/// requests go only where `connect-src` says. No report is ever sent.
+#[test]
+fn the_servers_content_security_policy_is_enforced() {
+    let home = temp_dir("csp");
+    let (port, seen) = serve(vec![
+        (
+            "/",
+            "text/html\r\nContent-Security-Policy: script-src 'nonce-abc'; connect-src 'self'; report-uri /report",
+            "<script nonce=abc>console.log('trusted ran'); fetch('/ok').then(() => console.log('same-origin ok'));\
+             fetch('http://localhost:1/x').catch(e => console.log('connect refused'));</script>\
+             <script>console.log('INJECTED ran')</script><script src=/evil.js></script>"
+                .into(),
+        ),
+        ("/ok", "text/plain", "fine".into()),
+        ("/evil.js", "application/javascript", "console.log('EVIL ran')".into()),
+    ]);
+    let url = format!("http://127.0.0.1:{port}/");
+    assert!(brickle(&home)
+        .args(["js", "allow", "127.0.0.1"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let out = brickle(&home).args(["requests", &url]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for want in [
+        "[log] trusted ran",
+        "[log] same-origin ok",
+        "[log] connect refused",
+        "[csp] refused to run an inline script",
+    ] {
+        assert!(stdout.contains(want), "missing {want:?}:\n{stdout}");
+    }
+    assert!(
+        !stdout.contains("INJECTED ran") && !stdout.contains("EVIL ran"),
+        "{stdout}"
+    );
+    let got: Vec<String> = seen.lock().unwrap().iter().map(|r| r[0].clone()).collect();
+    assert!(got.iter().any(|l| l.starts_with("GET /ok ")), "{got:?}");
+    for p in ["/evil.js", "/report"] {
+        assert!(
+            !got.iter().any(|l| l.contains(p)),
+            "{p} must not be requested: {got:?}"
+        );
+    }
+}
+
 /// Forms: what you type is submitted only when you submit, through the
 /// browser's checks, with Firefox's headers and the page's own cookies.
 #[test]

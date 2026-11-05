@@ -193,7 +193,9 @@ impl Tab {
 
     fn from_nav(net: &mut Network, nav: Nav, from: Option<&str>, sandbox: bool, viewport: (f32, f32)) -> Tab {
         match nav {
-            Nav::Page { url, html } => Tab::with_html_sized(net, &url, from, &html, sandbox, viewport),
+            Nav::Page { url, html, csp } => {
+                Tab::with_html_csp(net, &url, from, &html, sandbox, viewport, &csp)
+            }
             Nav::Interstitial { url, html, action } => {
                 // Our own trusted HTML: no renderer or subresources needed.
                 let page = Page::trusted(&url, &html);
@@ -228,6 +230,21 @@ impl Tab {
         sandbox: bool,
         viewport: (f32, f32),
     ) -> Tab {
+        Tab::with_html_csp(net, url, from, html, sandbox, viewport, &[])
+    }
+
+    /// `csp`: the page's `Content-Security-Policy` headers, which its
+    /// scripts are held to.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_html_csp(
+        net: &mut Network,
+        url: &str,
+        from: Option<&str>,
+        html: &str,
+        sandbox: bool,
+        viewport: (f32, f32),
+        csp: &[String],
+    ) -> Tab {
         // JavaScript only in the sandboxed renderer, and only where you
         // allowed it.
         let scripts = sandbox && net.scripts_allowed(url);
@@ -256,13 +273,13 @@ impl Tab {
             tab.log = net.take_log();
             return tab;
         }
-        let mut result = load_sandboxed(net, url, html, &blocker_css, scripts, viewport);
+        let mut result = load_sandboxed(net, url, html, &blocker_css, scripts, viewport, csp);
         if scripts && result.is_err() && !net.cancel.is_cancelled() {
             // Scripts hung or crashed the renderer: show the page without
             // them rather than not at all.
             let why = result.as_ref().err().cloned().unwrap_or_default();
             net.restart_page_budget();
-            result = load_sandboxed(net, url, html, &blocker_css, false, viewport);
+            result = load_sandboxed(net, url, html, &blocker_css, false, viewport, csp);
             tab.scripts = false;
             tab.console.push(format!(
                 "[brickle] JavaScript failed ({why}); showing the page without it"
@@ -429,6 +446,7 @@ fn load_sandboxed(
     blocker_css: &str,
     scripts: bool,
     viewport: (f32, f32),
+    csp: &[String],
 ) -> Result<(Renderer, Loaded), String> {
     let mut deadline = net.deadline().max(Instant::now()) + LOAD_EXTRA;
     if scripts {
@@ -447,6 +465,7 @@ fn load_sandboxed(
         blocker_css.to_string(),
         scripts,
         viewport,
+        csp.to_vec(),
         deadline,
         &mut host,
     )?;
@@ -528,6 +547,7 @@ impl Renderer {
         blocker_css: String,
         scripts: bool,
         viewport: (f32, f32),
+        csp: Vec<String>,
         deadline: Instant,
         host: &mut dyn Host,
     ) -> Result<Loaded, String> {
@@ -539,6 +559,7 @@ impl Renderer {
             scripts,
             viewport,
             cookies,
+            csp,
         })?;
         let budget = if scripts { SCRIPT_BYTES } else { LOAD_BYTES };
         match self.serve(deadline, budget, host)? {
@@ -762,6 +783,7 @@ except BrokenPipeError:
             String::new(),
             false,
             DEFAULT_VIEWPORT,
+            vec![],
             deadline,
             &mut crate::page::FetchOnly(fetch),
         )
@@ -935,6 +957,7 @@ except BrokenPipeError:
                 String::new(),
                 false,
                 DEFAULT_VIEWPORT,
+                vec![],
                 deadline,
                 &mut crate::page::FetchOnly(no_fetch),
             )

@@ -23,6 +23,9 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 const MAX_REDIRECTS: usize = 5;
+/// Most `Content-Security-Policy` headers kept for a page, and the longest.
+const MAX_CSP_HEADERS: usize = 8;
+const MAX_CSP_HEADER: usize = 16 * 1024;
 /// Most external stylesheets one page may pull in.
 pub const MAX_STYLESHEETS: usize = 16;
 /// Total time a page's subresources may take, however many there are.
@@ -121,6 +124,8 @@ pub enum Nav {
     Page {
         url: String,
         html: String,
+        /// The page's `Content-Security-Policy` headers, for its scripts.
+        csp: Vec<String>,
     },
     Interstitial {
         url: String,
@@ -436,9 +441,17 @@ impl Network {
             eprintln!("brickle: saving cookies: {e}");
         }
         match fetched {
-            Fetch::Done { url, body, .. } => {
+            Fetch::Done {
+                url, body, headers, ..
+            } => {
                 self.page_bytes = body.len();
-                Nav::Page { url, html: body }
+                let csp = headers
+                    .into_iter()
+                    .filter(|(k, v)| k == "content-security-policy" && v.len() <= MAX_CSP_HEADER)
+                    .map(|(_, v)| v)
+                    .take(MAX_CSP_HEADERS)
+                    .collect();
+                Nav::Page { url, html: body, csp }
             }
             Fetch::LocalNetwork { host, url } => Nav::Interstitial {
                 html: interstitial(
@@ -458,6 +471,7 @@ impl Network {
                 url,
             },
             Fetch::Certificate { host, err } if err.ends_with("Revoked") => Nav::Page {
+                csp: vec![],
                 html: interstitial_page(
                     "This site's certificate has been revoked",
                     &format!(
@@ -470,6 +484,7 @@ impl Network {
                 url: url.to_string(),
             },
             Fetch::Certificate { host, err } => Nav::Page {
+                csp: vec![],
                 html: interstitial_page(
                     "Brickle couldn't verify this site's identity",
                     &format!(
@@ -485,11 +500,13 @@ impl Network {
             Fetch::Stopped(why) => Nav::Page {
                 url: url.to_string(),
                 html: error_page(url, &why),
+                csp: vec![],
             },
             // Only script requests stop at a redirect.
             Fetch::OpaqueRedirect => Nav::Page {
                 url: url.to_string(),
                 html: error_page(url, "redirected"),
+                csp: vec![],
             },
             Fetch::NeedsHttp { host, url } => Nav::Interstitial {
                 html: interstitial(

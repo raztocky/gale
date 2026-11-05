@@ -148,7 +148,8 @@
     if (own && typeof own[type] === 'function') return own[type];
     if (target instanceof Element) {
       const code = target.getAttribute('on' + type);
-      if (code !== null) {
+      // The page's Content Security Policy decides (`'unsafe-inline'`).
+      if (code !== null && dom.allowHandler(code)) {
         try {
           // eslint-disable-next-line no-new-func
           return new Function('event', code);

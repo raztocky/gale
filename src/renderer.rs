@@ -140,6 +140,7 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                 scripts,
                 viewport,
                 cookies: start_cookies,
+                csp,
             } => {
                 cookies = start_cookies;
                 let mut host = IpcHost {
@@ -149,7 +150,7 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                     broken: None,
                 };
                 let (mut p, new_rt, out) = if scripts {
-                    Page::load_with_scripts(&url, &html, &blocker_css, viewport, &mut host)
+                    Page::load_with_scripts(&url, &html, &blocker_css, viewport, &csp, &mut host)
                 } else {
                     let p = Page::parse(&url, &html, &blocker_css, &mut |u, d| host.fetch(u, d));
                     (p, None, ScriptOutput::default())

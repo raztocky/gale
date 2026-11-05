@@ -48,6 +48,8 @@ pub enum ToRenderer {
         viewport: (f32, f32),
         /// `document.cookie` to start with (empty unless scripts run).
         cookies: String,
+        /// The page's `Content-Security-Policy` headers, for its scripts.
+        csp: Vec<String>,
     },
     /// The answer to a script's request, and `document.cookie` after it.
     Response {
@@ -367,6 +369,7 @@ impl ToRenderer {
                 scripts,
                 viewport,
                 cookies,
+                csp,
             } => {
                 e.u8(1);
                 e.str(url);
@@ -376,6 +379,7 @@ impl ToRenderer {
                 e.f32(viewport.0);
                 e.f32(viewport.1);
                 e.str(cookies);
+                e.strs(csp);
             }
             ToRenderer::Response { result, cookies } => {
                 e.u8(6);
@@ -483,6 +487,7 @@ impl ToRenderer {
                 scripts: d.bool()?,
                 viewport: (d.f32()?, d.f32()?),
                 cookies: d.str()?,
+                csp: d.strs(16)?,
             },
             6 => ToRenderer::Response {
                 result: if d.bool()? {
@@ -1134,6 +1139,7 @@ mod tests {
                 scripts: true,
                 viewport: (1000.0, 700.0),
                 cookies: "a=1".into(),
+                csp: vec!["script-src 'self'".into()],
             },
             ToRenderer::Response {
                 result: Ok(ScriptResponse {

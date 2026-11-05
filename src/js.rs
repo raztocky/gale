@@ -29,7 +29,8 @@ use boa_engine::object::builtins::JsArray;
 use boa_engine::object::ObjectInitializer;
 use boa_engine::property::Attribute;
 use boa_engine::{
-    js_string, Context, JsArgs, JsError, JsNativeError, JsObject, JsResult, JsValue, NativeFunction, Source,
+    js_string, Context, JsArgs, JsError, JsNativeError, JsObject, JsResult, JsString, JsValue,
+    NativeFunction, Source,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -453,6 +454,10 @@ struct State {
     /// `form.submit()`: (form, submitter).
     submit: Option<(u32, Option<u32>)>,
     warned_selectors: bool,
+    /// The page's Content Security Policy.
+    csp: crate::csp::Csp,
+    /// An inline handler the policy allowed, about to be compiled (once).
+    approved_handler: Option<String>,
 }
 
 thread_local! {
@@ -832,6 +837,25 @@ fn n_url(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
     Ok(js_string!(with(|s| s.url.clone())).into())
 }
 
+/// May this inline handler run? If so, the next compile of exactly this
+/// code is let through even without `'unsafe-eval'`.
+fn n_allow_handler(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let code = arg_str(a, 0, c)?;
+    Ok(with(|s| {
+        if s.csp.handler(&code) {
+            s.approved_handler = Some(code);
+            true
+        } else {
+            push_console(
+                s,
+                "[csp] refused an inline event handler ('unsafe-inline' isn't allowed)".into(),
+            );
+            false
+        }
+    })
+    .into())
+}
+
 fn n_resolve(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
     let href = arg_str(a, 0, c)?;
     Ok(js_string!(with(|s| crate::net::resolve(&s.url, &href))).into())
@@ -871,6 +895,17 @@ fn n_request(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
         "manual" => crate::net::Redirect::Manual,
         _ => crate::net::Redirect::Follow,
     };
+    let refused = with(|s| {
+        let url = crate::net::resolve(&s.url, &url);
+        (!s.csp.connect(&url)).then(|| {
+            let msg = format!("Content Security Policy: connect-src doesn't allow {url}");
+            push_console(s, format!("[csp] {msg}"));
+            msg
+        })
+    });
+    if let Some(msg) = refused {
+        return Err(type_error(&msg));
+    }
     let id = with(|s| {
         if s.requests.len() >= MAX_QUEUED_REQUESTS {
             return None;
@@ -974,6 +1009,7 @@ const NATIVES: &[(&str, Native, usize)] = &[
     ("setUrl", n_set_url, 1),
     ("url", n_url, 0),
     ("resolve", n_resolve, 1),
+    ("allowHandler", n_allow_handler, 1),
 ];
 
 // ---------------------------------------------------------------------------
@@ -988,6 +1024,36 @@ struct Hooks;
 impl HostHooks for Hooks {
     fn local_timezone_offset_seconds(&self, _unix_time_seconds: i64) -> i32 {
         0
+    }
+    /// `eval`, `new Function` and timers given strings need the page's
+    /// policy to allow `'unsafe-eval'`, except an inline handler the policy
+    /// allowed just now (`allowHandler`), compiled once.
+    fn ensure_can_compile_strings(
+        &self,
+        _realm: boa_engine::realm::Realm,
+        _parameters: &[JsString],
+        body: &JsString,
+        _direct: bool,
+        _context: &mut Context,
+    ) -> JsResult<()> {
+        with(|s| {
+            if s.csp.eval() {
+                return Ok(());
+            }
+            if s.approved_handler
+                .take()
+                .is_some_and(|h| h == body.to_std_string_escaped())
+            {
+                return Ok(());
+            }
+            push_console(
+                s,
+                "[csp] refused to evaluate a string as code ('unsafe-eval' isn't allowed)".into(),
+            );
+            Err(JsNativeError::eval()
+                .with_message("Content Security Policy: 'unsafe-eval' isn't allowed")
+                .into())
+        })
     }
     fn max_buffer_size(&self, _context: &mut Context) -> u64 {
         256 * 1024 * 1024
@@ -1283,6 +1349,25 @@ impl Runtime {
                     Some((id, src, code))
                 })
                 .collect()
+        })
+    }
+
+    /// Hold the page's scripts to this policy.
+    pub fn set_csp(&mut self, csp: crate::csp::Csp) {
+        with(|s| s.csp = csp);
+    }
+
+    /// May script element `id` run (from `src`, else its `code`)? Refusals
+    /// go to the console. `parser_inserted`: it came with the document.
+    pub fn script_allowed(&self, id: u32, src: Option<&str>, code: &str, parser_inserted: bool) -> bool {
+        with(|s| {
+            let nonce = s.dom.element(id).and_then(|e| e.attrs.get("nonce").cloned());
+            let ok = s.csp.script_element(nonce.as_deref(), src, code, parser_inserted);
+            if !ok {
+                let what = src.map_or("an inline script".to_string(), |u| u.to_string());
+                push_console(s, format!("[csp] refused to run {what}"));
+            }
+            ok
         })
     }
 

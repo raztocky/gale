@@ -1,0 +1,401 @@
+//! Content Security Policy, for pages whose scripts you allowed: the
+//! server's `Content-Security-Policy` headers (and `<meta http-equiv>`
+//! ones) decide which scripts run and where scripts may send requests, so a
+//! script injected into a page is held to what the page's own authors
+//! allowed.
+//!
+//! Enforced, in the renderer where scripts run: `script-src`,
+//! `script-src-elem`, `script-src-attr` and `connect-src`, with `default-src`
+//! standing in for any of them that's missing. Sources: `'none'`, `'self'`,
+//! `*`, schemes (`https:`), hosts (`*.example.com:443/path`),
+//! `'unsafe-inline'`, `'unsafe-eval'`, `'unsafe-hashes'`, `'strict-dynamic'`,
+//! nonces and SHA-256/384/512 hashes. Several policies all have to agree.
+//! Reports (`report-uri`, `report-to`) are never sent: that would be a
+//! request you didn't ask for. `Content-Security-Policy-Report-Only` is
+//! ignored for the same reason.
+
+use std::collections::HashMap;
+
+/// Most policies, directives per policy and sources per directive kept;
+/// a hostile page gets no further.
+const MAX_POLICIES: usize = 16;
+const MAX_DIRECTIVES: usize = 64;
+const MAX_SOURCES: usize = 256;
+
+#[derive(Debug, Clone, Default)]
+pub struct Csp {
+    policies: Vec<HashMap<String, Vec<String>>>,
+    /// The page's scheme, host and port.
+    page: Option<(String, String, u16)>,
+}
+
+fn parts(url: &str) -> Option<(String, String, u16)> {
+    let u = url::Url::parse(url).ok()?;
+    let host = u.host_str()?.to_ascii_lowercase();
+    Some((u.scheme().to_string(), host, u.port_or_known_default()?))
+}
+
+impl Csp {
+    /// No policies yet, for a page at `page_url`.
+    pub fn new(page_url: &str) -> Csp {
+        Csp {
+            policies: Vec::new(),
+            page: parts(page_url),
+        }
+    }
+
+    /// Add the policies in a `Content-Security-Policy` header (or meta)
+    /// value: commas separate policies, semicolons directives.
+    pub fn add(&mut self, value: &str) {
+        for policy in value.split(',') {
+            if self.policies.len() >= MAX_POLICIES {
+                return;
+            }
+            let mut dirs: HashMap<String, Vec<String>> = HashMap::new();
+            for d in policy.split(';').take(MAX_DIRECTIVES) {
+                let mut words = d.split_ascii_whitespace();
+                let Some(name) = words.next() else { continue };
+                // The first of a repeated directive wins.
+                dirs.entry(name.to_ascii_lowercase())
+                    .or_insert_with(|| words.take(MAX_SOURCES).map(str::to_string).collect());
+            }
+            if !dirs.is_empty() {
+                self.policies.push(dirs);
+            }
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.policies.is_empty()
+    }
+
+    /// May a `<script>` run? `src` for an external one, else its `code`.
+    /// `parser_inserted`: it was in the document as sent, rather than added
+    /// by a script (which `'strict-dynamic'` trusts).
+    pub fn script_element(
+        &self,
+        nonce: Option<&str>,
+        src: Option<&str>,
+        code: &str,
+        parser_inserted: bool,
+    ) -> bool {
+        self.all(&["script-src-elem", "script-src", "default-src"], |list| {
+            let nonce_ok = nonce.is_some_and(|n| !n.is_empty() && has_nonce(list, n));
+            let dynamic = has(list, "'strict-dynamic'");
+            match src {
+                None => nonce_ok || hash_matches(list, code) || inline_allowed(list),
+                Some(url) => {
+                    nonce_ok || (dynamic && !parser_inserted) || (!dynamic && self.url_matches(list, url))
+                }
+            }
+        })
+    }
+
+    /// May an inline event handler (`onclick="..."`) run?
+    pub fn handler(&self, code: &str) -> bool {
+        self.all(&["script-src-attr", "script-src", "default-src"], |list| {
+            inline_allowed(list) || (has(list, "'unsafe-hashes'") && hash_matches(list, code))
+        })
+    }
+
+    /// May scripts turn strings into code (`eval`, `new Function`, timers
+    /// given a string)?
+    pub fn eval(&self) -> bool {
+        self.all(&["script-src", "default-src"], |list| has(list, "'unsafe-eval'"))
+    }
+
+    /// May scripts send a request (`fetch`, `XMLHttpRequest`, beacons) to
+    /// `url`?
+    pub fn connect(&self, url: &str) -> bool {
+        self.all(&["connect-src", "default-src"], |list| {
+            self.url_matches(list, url)
+        })
+    }
+
+    /// Every policy allows it: the first of `names` each has decides, and
+    /// one with none of them doesn't restrict this.
+    fn all(&self, names: &[&str], allows: impl Fn(&[String]) -> bool) -> bool {
+        self.policies.iter().all(|p| {
+            names
+                .iter()
+                .find_map(|n| p.get(*n))
+                .is_none_or(|list| allows(list))
+        })
+    }
+
+    fn url_matches(&self, list: &[String], url: &str) -> bool {
+        let Ok(u) = url::Url::parse(url) else { return false };
+        let scheme = u.scheme();
+        let host = u.host_str().unwrap_or("").to_ascii_lowercase();
+        let port = u.port_or_known_default();
+        let page = self.page.as_ref();
+        // Same scheme as the page, or a secure version of it.
+        let scheme_ok = |want: &str| {
+            scheme == want
+                || (want == "http" && scheme == "https")
+                || (want == "ws" && scheme == "wss")
+                || (want == "http" && scheme == "wss")
+                || (want == "https" && scheme == "wss")
+        };
+        list.iter().any(|tok| {
+            let lower = tok.to_ascii_lowercase();
+            if lower == "*" {
+                return matches!(scheme, "http" | "https" | "ws" | "wss")
+                    || page.is_some_and(|p| p.0 == scheme);
+            }
+            if lower == "'self'" {
+                return page.is_some_and(|(ps, ph, pp)| {
+                    *ph == host
+                        && (scheme_ok(ps))
+                        && (Some(*pp) == port || (ps == "http" && scheme == "https" && port == Some(443)))
+                });
+            }
+            if lower.starts_with('\'') {
+                return false; // keywords, nonces, hashes
+            }
+            if let Some(s) = lower.strip_suffix(':').filter(|s| !s.contains('/')) {
+                return scheme_ok(s);
+            }
+            // [scheme://]host[:port][/path]
+            let (tok_scheme, rest) = match lower.split_once("://") {
+                Some((s, r)) => (Some(s), r),
+                None => (None, lower.as_str()),
+            };
+            let scheme_fits = match tok_scheme {
+                Some(s) => scheme_ok(s),
+                None => page.map_or(matches!(scheme, "http" | "https"), |p| scheme_ok(&p.0)),
+            };
+            let (hostport, path) = match rest.find('/') {
+                Some(i) => (&rest[..i], Some(&rest[i..])),
+                None => (rest, None),
+            };
+            let (h, p) = match hostport.rsplit_once(':') {
+                Some((h, p)) if !h.is_empty() && !p.contains(']') => (h, Some(p)),
+                _ => (hostport, None),
+            };
+            let host_fits = match h.strip_prefix("*.") {
+                Some(base) => host.ends_with(&format!(".{base}")),
+                None => h == host,
+            };
+            let port_fits = match p {
+                Some("*") => true,
+                Some(n) => n.parse::<u16>().ok() == port,
+                // The default port for the URL's scheme (or an upgrade
+                // from the page's).
+                None => u.port().is_none() || (scheme == "https" && port == Some(443)),
+            };
+            let path_fits = path.is_none_or(|want| {
+                let have = u.path();
+                if want.ends_with('/') {
+                    have.starts_with(want)
+                } else {
+                    have == want
+                }
+            });
+            scheme_fits && host_fits && port_fits && path_fits
+        })
+    }
+}
+
+fn has(list: &[String], keyword: &str) -> bool {
+    list.iter().any(|t| t.eq_ignore_ascii_case(keyword))
+}
+
+fn has_nonce(list: &[String], nonce: &str) -> bool {
+    list.iter().any(|t| {
+        t.len() > 8
+            && t[..7].eq_ignore_ascii_case("'nonce-")
+            && t.ends_with('\'')
+            && t[7..t.len() - 1] == *nonce
+    })
+}
+
+/// `'unsafe-inline'` counts only if there's no nonce, hash or
+/// `'strict-dynamic'` in the list (as in CSP level 2 and later).
+fn inline_allowed(list: &[String]) -> bool {
+    has(list, "'unsafe-inline'")
+        && !has(list, "'strict-dynamic'")
+        && !list.iter().any(|t| {
+            let t = t.to_ascii_lowercase();
+            t.starts_with("'nonce-")
+                || t.starts_with("'sha256-")
+                || t.starts_with("'sha384-")
+                || t.starts_with("'sha512-")
+        })
+}
+
+/// Does `code`'s hash appear in the list?
+fn hash_matches(list: &[String], code: &str) -> bool {
+    use ring::digest;
+    list.iter().any(|t| {
+        let lower = t.to_ascii_lowercase();
+        let alg = if lower.starts_with("'sha256-") {
+            &digest::SHA256
+        } else if lower.starts_with("'sha384-") {
+            &digest::SHA384
+        } else if lower.starts_with("'sha512-") {
+            &digest::SHA512
+        } else {
+            return false;
+        };
+        let Some(want) = t.get(8..t.len().saturating_sub(1)).filter(|_| t.ends_with('\'')) else {
+            return false;
+        };
+        let got = base64(digest::digest(alg, code.as_bytes()).as_ref());
+        // base64 or base64url, padded or not.
+        let norm = |s: &str| -> String {
+            s.trim_end_matches('=')
+                .chars()
+                .map(|c| match c {
+                    '-' => '+',
+                    '_' => '/',
+                    c => c,
+                })
+                .collect()
+        };
+        norm(want) == norm(&got)
+    })
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(A[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn csp(v: &str) -> Csp {
+        let mut c = Csp::new("https://site.example/app/");
+        c.add(v);
+        c
+    }
+
+    #[test]
+    fn no_policy_allows_everything() {
+        let c = Csp::new("https://a.example/");
+        assert!(c.is_empty() && c.eval() && c.handler("x()") && c.connect("https://b.example/"));
+        assert!(c.script_element(None, None, "x", true));
+        // A policy without script directives doesn't restrict scripts.
+        let c = csp("img-src 'none'; frame-ancestors 'none'");
+        assert!(c.eval() && c.script_element(None, Some("https://cdn.example/a.js"), "", true));
+    }
+
+    #[test]
+    fn script_sources() {
+        let c = csp("script-src 'self' https://cdn.example *.trusted.example:8443 static.example/js/");
+        let ok = |u: &str| c.script_element(None, Some(u), "", true);
+        assert!(ok("https://site.example/a.js"));
+        assert!(ok("https://cdn.example/lib.js"));
+        assert!(ok("https://x.trusted.example:8443/a.js"));
+        assert!(ok("https://static.example/js/app.js"));
+        assert!(!ok("https://static.example/other.js"), "outside the path");
+        assert!(!ok("https://trusted.example:8443/a.js"), "*. is subdomains only");
+        assert!(!ok("https://evil.example/a.js"));
+        assert!(!ok("http://cdn.example/lib.js"), "no downgrade");
+        assert!(!ok("data:text/javascript,alert(1)"));
+        // Inline needs 'unsafe-inline', a nonce or a hash.
+        assert!(!c.script_element(None, None, "alert(1)", true));
+        assert!(!c.handler("alert(1)"));
+        assert!(!c.eval());
+        assert!(!csp("default-src 'none'").script_element(None, None, "", true));
+        assert!(csp("script-src *").script_element(None, Some("https://any.example/x.js"), "", true));
+        assert!(!csp("script-src *").script_element(None, Some("data:,x"), "", true));
+        assert!(csp("script-src https:").script_element(None, Some("https://any.example/x.js"), "", true));
+    }
+
+    #[test]
+    fn nonces_hashes_and_unsafe_inline() {
+        let c = csp("script-src 'nonce-r4nd0m' 'unsafe-inline'");
+        assert!(c.script_element(Some("r4nd0m"), None, "x()", true));
+        assert!(!c.script_element(Some("guess"), None, "x()", true));
+        assert!(
+            !c.script_element(None, None, "x()", true),
+            "a nonce cancels 'unsafe-inline'"
+        );
+        assert!(!c.handler("x()"));
+        assert!(c.script_element(Some("r4nd0m"), Some("https://anywhere.example/a.js"), "", true));
+        // sha256 of "alert(1)", in base64 and base64url.
+        let h = base64(ring::digest::digest(&ring::digest::SHA256, b"alert(1)").as_ref());
+        let c = csp(&format!("script-src 'sha256-{h}'"));
+        assert!(c.script_element(None, None, "alert(1)", true));
+        assert!(!c.script_element(None, None, "alert(2)", true));
+        let url_safe = h
+            .replace('+', "-")
+            .replace('/', "_")
+            .trim_end_matches('=')
+            .to_string();
+        assert!(csp(&format!("script-src 'sha256-{url_safe}'")).script_element(None, None, "alert(1)", true));
+        // Handlers: 'unsafe-inline', or 'unsafe-hashes' with a hash.
+        assert!(csp("script-src 'unsafe-inline'").handler("go()"));
+        assert!(csp(&format!("script-src 'unsafe-hashes' 'sha256-{h}'")).handler("alert(1)"));
+        assert!(!csp(&format!("script-src 'sha256-{h}'")).handler("alert(1)"));
+        // script-src-attr and -elem take over from script-src.
+        let c = csp("script-src 'none'; script-src-attr 'unsafe-inline'");
+        assert!(c.handler("go()") && !c.script_element(None, None, "go()", true));
+        assert_eq!(base64(b"ab"), "YWI=");
+        assert_eq!(base64(b"abc"), "YWJj");
+    }
+
+    #[test]
+    fn strict_dynamic_trusts_what_trusted_scripts_add() {
+        let c = csp("script-src 'nonce-n' 'strict-dynamic' https://cdn.example 'unsafe-inline'");
+        assert!(c.script_element(None, Some("https://other.example/x.js"), "", false));
+        assert!(
+            !c.script_element(None, Some("https://cdn.example/x.js"), "", true),
+            "hosts are ignored"
+        );
+        assert!(!c.script_element(None, None, "x()", true));
+        assert!(c.script_element(Some("n"), None, "x()", true));
+    }
+
+    #[test]
+    fn eval_connect_and_several_policies() {
+        assert!(csp("script-src 'self' 'unsafe-eval'").eval());
+        assert!(!csp("default-src 'self'").eval());
+        let c = csp("default-src 'self'; connect-src 'self' https://api.example");
+        assert!(c.connect("https://site.example/x") && c.connect("https://api.example/v1"));
+        assert!(!c.connect("https://tracker.example/"));
+        assert!(!csp("connect-src 'none'").connect("https://site.example/x"));
+        // Each policy must allow it.
+        let c = csp("connect-src *, connect-src 'self'");
+        assert!(c.connect("https://site.example/x") && !c.connect("https://other.example/"));
+        // Directive names ignore case; the first of a repeat wins.
+        assert!(!csp("CONNECT-SRC 'none'; connect-src *").connect("https://site.example/"));
+    }
+
+    #[test]
+    fn hostile_policies_are_bounded() {
+        let mut c = Csp::new("https://a.example/");
+        c.add(&",script-src 'none'".repeat(10_000));
+        assert!(c.policies.len() <= MAX_POLICIES);
+        c.add(&format!("connect-src {}", "x ".repeat(100_000)));
+        for junk in [
+            "",
+            ";;;",
+            "'nonce-'",
+            "script-src 'sha256-'",
+            "script-src :::// *.:/",
+            "\u{0}\u{ffff}",
+        ] {
+            let c = csp(junk);
+            let _ = c.script_element(Some(""), Some("not a url"), "", true);
+            let _ = c.connect("::");
+            let _ = c.handler("");
+        }
+        assert!(!csp("script-src 'nonce-'").script_element(Some(""), None, "", true));
+    }
+}
