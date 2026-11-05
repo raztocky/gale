@@ -53,7 +53,10 @@ what's next:
 - Cookie selection and network authorization stay in the browser process, using the browser's
   own record of the page's origin, never what the renderer claims.
 - [x] `fetch`/XHR through the browser, with same-origin policy, CORS and credentials rules.
-- [x] CORS preflight (`OPTIONS`) for non-simple cross-origin requests.
+- [x] CORS preflight (`OPTIONS`) for non-simple cross-origin requests, and checks at every redirect hop.
+- [x] `fetch`'s `mode` and `redirect`, enforced by the browser.
+- [x] Content Security Policy for scripts (`script-src`, `-elem`, `-attr`, `connect-src`, `default-src`).
+- [ ] CSP for other resources (`img-src`, `style-src`, `frame-src`…), `upgrade-insecure-requests`.
 - [x] Scripts can't send to other sites (requests, or files they put on the page) unless you allow it.
 - [x] `document.cookie` for non-HttpOnly cookies, answered by the browser.
 - [ ] JavaScript modules (`type=module`, `import`).

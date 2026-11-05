@@ -118,8 +118,10 @@ revoked certificate, downloaded by `brickle filters update` (from the rustls pro
 republication of Mozilla's data, each file checked against its published SHA-256). Everyone
 downloads the same files and the lookup happens on your computer, so no certificate authority
 learns which sites you visit (unlike OCSP). A revoked certificate is refused like any invalid
-one, with no way to continue. Without the data, or for certificates newer than it, sites load as
-before; `brickle filters status` shows how old it is.
+one, with no way to continue. Every certificate the server sent (or you trust) with the issuer's
+name is looked up, so decoys can't hide the real issuer, and a server that sends more than 16 of
+them is refused. Without the data, or for certificates newer than it, sites load as before;
+`brickle filters status` shows how old it is.
 
 *Enforced by:* `https_only_asks_before_using_plain_http` and
 `bad_certificates_are_refused_not_downgraded` in `tests/privacy.rs`.
@@ -155,7 +157,9 @@ a link (`https://user:pass@host/`) are removed too, and never sent.
   site you're visiting, as with Firefox's Total Cookie Protection.
 - **No bounce tracking.** Cookies set while a link redirects you through another site on the way
   to the real page are dropped.
-- **Safer defaults.** A cookie without `SameSite` is treated as `Lax`; `Secure` cookies only go
+- **Safer defaults.** A cookie without `SameSite` is treated as `Lax`. `Lax` cookies go along
+  when you follow a link to their site from another one, but not with a form another site
+  POSTs there, so a hostile page can't submit forms on your behalf with your login; `Secure` cookies only go
   over HTTPS (plain HTTP to your own computer, `localhost`, is the one exception; other
   local-network devices don't count); a plain-HTTP response can't overwrite, shadow or delete a
   `Secure` cookie; lifetimes are capped at 400 days; cookies for a whole public suffix (like
@@ -189,15 +193,26 @@ in `src/cookies.rs`.
   as the server sent it load as usual. These show in the request panel as "BLOCKED (script
   sending to another site)"; clicking one adds an allow rule for just that site and kind of
   request (`@@||api.other.example^$xhr,domain=example.com`), which also overrides the filter
-  lists for it. What a script sends to its own site can't be stopped: the site could pass it on
-  from its servers anyway. The renderer tells the browser which files a script added; a
+  lists for it. A request that's redirected is checked again at every hop before anything is sent
+  there, so an allowed address can't bounce it on to one you didn't allow. What a script sends to
+  its own site can't be stopped: the site could pass it on from its servers anyway. The renderer tells the browser which files a script added; a
   renderer taken over by an exploit could lie about that, though the sandbox still holds.
 - **Other sites' data stays theirs (CORS).** Where you allowed a script to reach another site, it
   only sees the answer if that site allows it (`Access-Control-Allow-Origin`). Otherwise the
   response is withheld and the panel says so. A request that isn't "simple" (another method,
   or headers of its own) is sent only after a CORS preflight: an `OPTIONS` request without
   cookies, through the same checks, asking whether the server takes it. Yes answers are
-  remembered for the session, for as long as the server says (at most two hours).
+  remembered for the session, for as long as the server says (at most two hours). Redirects get
+  the same treatment at each hop: a cross-origin redirect must allow the page before it's
+  followed, a non-simple request gets a preflight for each new origin, a script's
+  `Authorization` header never follows it to another origin, and `fetch`'s `mode`
+  (`same-origin`, `no-cors`) and `redirect` (`error`, `manual`) are enforced by the browser.
+- **The site's own Content Security Policy holds.** A page's `Content-Security-Policy` (header or
+  `<meta>`) decides which of its scripts run (nonces, hashes, hosts, `'strict-dynamic'`, inline
+  scripts and handlers only with `'unsafe-inline'`, `eval` only with `'unsafe-eval'`) and where
+  scripts may send requests (`connect-src`), so a script injected into a site you allowed is held
+  to what the site's authors allowed. Brickle never sends CSP violation reports: that would be a
+  request you didn't ask for.
 - **No beacons.** `navigator.sendBeacon` sends nothing, and an image a script makes but doesn't
   put on the page (`new Image().src = ...`, the usual tracking pixel) loads nothing. Images a
   script adds to the page from its own site load like any other image (rule 10).
@@ -211,8 +226,10 @@ in `src/cookies.rs`.
   JavaScript interpreter written in Rust with no JIT. Loops and recursion are capped. If scripts
   hang or crash, the page is shown without them after at most 15 seconds.
 
-*Enforced by:* `javascript_is_off_by_default_and_its_requests_follow_the_rules` in
-`tests/privacy.rs`, and the tests in `src/js.rs` and `src/cookies.rs`.
+*Enforced by:* `javascript_is_off_by_default_and_its_requests_follow_the_rules`,
+`script_requests_are_checked_at_every_redirect`, `the_servers_content_security_policy_is_enforced`
+and `forms_submit_through_the_browser` in `tests/privacy.rs`, and the tests in `src/js.rs`,
+`src/csp.rs`, `src/page.rs` and `src/cookies.rs`.
 
 ## 10. Images
 

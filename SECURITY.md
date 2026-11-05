@@ -62,7 +62,11 @@ executable memory anyway). What a script can reach is the page's own DOM through
 native functions in `src/js.rs`, which validate every node id and string. Scripts' network
 requests and cookie changes are queued and answered by the browser process, which applies the
 network policy, CORS (with preflights) and the rule that scripts only send to their own site,
-using its own record of the page's origin (`Network::script_request`). Which images, stylesheets
+using its own record of the page's origin (`Network::script_request`), again at every redirect hop
+before it's followed. The page's Content Security Policy (`src/csp.rs`) is enforced in the
+renderer, where scripts run: which scripts run, inline handlers, `eval` (through Boa's
+`HostEnsureCanCompileStrings` hook) and `connect-src`; it guards the page against injected scripts,
+not against a compromised renderer, which the browser-side rules are for. Which images, stylesheets
 and scripts a script added to the page is reported by the renderer, so a compromised renderer
 could pass one off as part of the page; it still can't reach anything the sandbox forbids, or a
 request the other rules block. Loop-iteration and recursion limits can't be caught by scripts, work

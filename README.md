@@ -89,6 +89,7 @@ browser validates before painting.
 | `filter.rs` | EasyList/uBlock filter engine: network rules, exceptions, options, cosmetic hiding, `$removeparam` |
 | `lists.rs` | `brickle filters update` / `status` |
 | `urlclean.rs` | Tracking-parameter stripping |
+| `csp.rs` | Content Security Policy for pages' scripts (`script-src`, `connect-src` and friends), enforced in the renderer; never sends reports |
 | `tab.rs` | Browser side of a page: spawns and supervises the renderer, answers its fetch requests |
 | `renderer.rs` | The renderer process's message loop |
 | `ipc.rs` | Length-limited binary protocol between the two. The browser treats every renderer message as hostile |
