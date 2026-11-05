@@ -226,6 +226,39 @@ pub enum Status {
     /// Too new for the data, not logged in Certificate Transparency, or no
     /// data downloaded.
     Unknown,
+    /// The server sent more certificates named like the issuer than any
+    /// real chain has: refused, so decoys can't hide the real issuer.
+    TooManyIssuers,
+}
+
+/// Most distinct certificates (sent or trusted) that may carry the issuer's
+/// name. Real chains have one or two.
+const MAX_ISSUER_CANDIDATES: usize = 16;
+
+/// The public keys of every certificate that could have issued `ee`: those
+/// with its issuer's name, sent by the server or among your roots. All of
+/// them are looked up (the server chooses what it sends, so the real issuer
+/// may come after decoys); `None` if there are too many to be a real chain.
+fn issuer_keys(ee: &CertInfo, intermediates: &[&[u8]], roots: &[(Vec<u8>, Vec<u8>)]) -> Option<Vec<Vec<u8>>> {
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    let sent = intermediates
+        .iter()
+        .filter_map(|c| parse_cert(c))
+        .filter(|c| c.subject == ee.issuer)
+        .map(|c| c.spki.to_vec());
+    let trusted = roots
+        .iter()
+        .filter(|(s, _)| s == ee.issuer)
+        .map(|(_, k)| k.clone());
+    for k in sent.chain(trusted) {
+        if !keys.contains(&k) {
+            if keys.len() == MAX_ISSUER_CANDIDATES {
+                return None;
+            }
+            keys.push(k);
+        }
+    }
+    Some(keys)
 }
 
 /// Look a certificate up, given the certificates that could have issued it
@@ -250,23 +283,13 @@ fn check_in(
     if ee.scts.is_empty() {
         return Status::Unknown;
     }
-    // The issuer's public key: from the chain, else a trusted root. (rustls
-    // has already checked the chain, so a certificate with this name that
-    // was sent along is the issuer.)
-    let mut keys: Vec<Vec<u8>> = intermediates
-        .iter()
-        .filter_map(|c| parse_cert(c))
-        .filter(|c| c.subject == ee.issuer)
-        .map(|c| c.spki.to_vec())
-        .collect();
-    keys.extend(
-        roots
-            .iter()
-            .filter(|(s, _)| s == ee.issuer)
-            .map(|(_, k)| k.clone()),
-    );
+    // Revoked under any candidate issuer counts: a decoy can add a key but
+    // can't hide the real issuer's.
+    let Some(keys) = issuer_keys(&ee, intermediates, roots) else {
+        return Status::TooManyIssuers;
+    };
     let mut status = Status::Unknown;
-    for key in keys.iter().take(8) {
+    for key in &keys {
         let issuer = IssuerSpkiHash(sha256(&[key]));
         let key = CRLiteKey::with_hash(&issuer, ee.serial, sha256(&[&issuer.0, ee.serial]));
         for f in filters {
@@ -325,6 +348,9 @@ impl rustls::client::danger::ServerCertVerifier for Verifier {
         match check(end_entity, &chain, &self.roots) {
             Status::Revoked => Err(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::Revoked,
+            )),
+            Status::TooManyIssuers => Err(rustls::Error::General(
+                "the server sent too many certificates named like the issuer to check revocation".into(),
             )),
             Status::NotRevoked | Status::Unknown => Ok(ok),
         }
@@ -558,6 +584,38 @@ mod tests {
         // The public key info is a whole DER SEQUENCE.
         assert_eq!(issuer.spki[0], 0x30);
         assert_eq!(der(issuer.spki).unwrap().1, &[] as &[u8]);
+    }
+
+    /// `ISSUER` with a different public key (one byte of its key changed),
+    /// same name: a decoy a server could send.
+    fn decoy(n: u8) -> Vec<u8> {
+        let mut d = ISSUER.to_vec();
+        let spki = parse_cert(ISSUER).unwrap().spki;
+        let at = ISSUER.windows(spki.len()).position(|w| w == spki).unwrap() + spki.len() - 2;
+        d[at] ^= n;
+        d
+    }
+
+    #[test]
+    fn decoys_cant_hide_the_real_issuer() {
+        let ee = parse_cert(EE).unwrap();
+        let real = parse_cert(ISSUER).unwrap().spki.to_vec();
+        // Eight decoys first (the old limit), then the real issuer.
+        let decoys: Vec<Vec<u8>> = (1..=8).map(decoy).collect();
+        let mut chain: Vec<&[u8]> = decoys.iter().map(|d| d.as_slice()).collect();
+        chain.push(ISSUER);
+        let keys = issuer_keys(&ee, &chain, &[]).unwrap();
+        assert_eq!(keys.len(), 9);
+        assert!(keys.contains(&real));
+        // The real issuer as a trusted root, after the decoys, counts too.
+        let roots = vec![(ee.issuer.to_vec(), real.clone())];
+        assert!(issuer_keys(&ee, &chain[..8], &roots).unwrap().contains(&real));
+        // Repeats don't count twice; past the limit, the chain is refused.
+        assert_eq!(issuer_keys(&ee, &[ISSUER, ISSUER, ISSUER], &[]).unwrap().len(), 1);
+        let many: Vec<Vec<u8>> = (1..=MAX_ISSUER_CANDIDATES as u8 + 1).map(decoy).collect();
+        let chain: Vec<&[u8]> = many.iter().map(|d| d.as_slice()).collect();
+        assert_eq!(issuer_keys(&ee, &chain, &[]), None);
+        assert!(matches!(check_in(&[], EE, &chain, &[]), Status::TooManyIssuers));
     }
 
     #[test]
