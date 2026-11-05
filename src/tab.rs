@@ -47,8 +47,7 @@ impl Host for NetHost<'_> {
         self.net.subresource(&self.page, url, dest)
     }
     fn fetch_added(&mut self, url: &str, dest: Dest) -> Result<String, String> {
-        self.net.script_added(&self.page, url, dest)?;
-        self.net.subresource(&self.page, url, dest)
+        self.net.subresource_added(&self.page, url, dest)
     }
     fn image(&mut self, url: &str) -> Result<Vec<u8>, String> {
         self.net.image(&self.page, url, false)

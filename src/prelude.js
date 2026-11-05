@@ -989,20 +989,21 @@
       this.headers = new Headers(init.headers || (base && base.headers));
       this.credentials = init.credentials || (base && base.credentials) || 'same-origin';
       this.signal = init.signal || (base && base.signal) || null;
-      this.mode = init.mode || 'cors';
+      this.mode = init.mode || (base && base.mode) || 'cors';
+      this.redirect = init.redirect || (base && base.redirect) || 'follow';
       this._body = init.body !== undefined ? init.body : base ? base._body : null;
     }
     clone() { return new Request(this); }
   }
 
   // Send a request to the browser; `done(err, response)` is called later.
-  function send(method, url, headers, body, credentials, done) {
+  function send(method, url, headers, body, credentials, done, mode = 'cors', redirect = 'follow') {
     const [text, implied] = encodeBody(body);
     const h = headers instanceof Headers ? headers : new Headers(headers);
     if (implied && !h.has('content-type')) h.set('content-type', implied);
     const flat = [];
     for (const [k, v] of h) flat.push(k, v);
-    const id = dom.request(method, url, flat, text, credentials);
+    const id = dom.request(method, url, flat, text, credentials, str(mode), str(redirect));
     pending.set(id, done);
     return id;
   }
@@ -1019,9 +1020,11 @@
           if (settled) return;
           settled = true;
           if (err !== null) { reject(new TypeError('NetworkError when attempting to fetch resource: ' + err)); return; }
+          // `redirect: "manual"` stopped at a redirect: nothing to read.
+          if (r.status === 0) { resolve(new Response(null, { status: 0, _url: r.url, _type: 'opaqueredirect' })); return; }
           resolve(new Response(r.method === 'HEAD' ? '' : r.body, { status: r.status, headers: new Headers(r.headers),
             _url: r.url, _redirected: r.redirected, _type: new URLImpl(r.url).origin === location.origin ? 'basic' : 'cors' }));
-        });
+        }, req.mode, req.redirect);
       } catch (e) { settled = true; reject(new TypeError('NetworkError: ' + (e && e.message))); }
     });
   }

@@ -16,7 +16,7 @@
 use crate::cookies::{self, Jar};
 use crate::filter::{self, Filters, Req, Verdict};
 use crate::forms::Submission;
-use crate::net::{self, Cancel, Credentials, Dest, NetError, ScriptRequest};
+use crate::net::{self, Cancel, Credentials, Dest, Mode, NetError, Redirect, ScriptRequest};
 use crate::page::error_page;
 use crate::urlclean;
 use std::collections::HashSet;
@@ -166,6 +166,9 @@ enum Fetch {
         host: String,
         err: String,
     },
+    /// A script request with `redirect: "manual"` was redirected: that's
+    /// its answer, with nothing in it the page can read.
+    OpaqueRedirect,
 }
 
 pub struct Network {
@@ -409,6 +412,7 @@ impl Network {
                 .collect(),
             body: sub.body.clone(),
             credentials: Credentials::Include,
+            ..ScriptRequest::default()
         };
         self.navigate_with(&sub.url, from, Some(&req))
     }
@@ -427,7 +431,7 @@ impl Network {
         self.image_bytes = 0;
         self.deadline = std::time::Instant::now() + PAGE_TIME_BUDGET;
         self.page_bytes = 0;
-        let fetched = self.fetch_with(url, from, Dest::Document, post);
+        let fetched = self.fetch_with(url, from, Dest::Document, post, false);
         if let Err(e) = self.cookies.save() {
             eprintln!("brickle: saving cookies: {e}");
         }
@@ -482,6 +486,11 @@ impl Network {
                 url: url.to_string(),
                 html: error_page(url, &why),
             },
+            // Only script requests stop at a redirect.
+            Fetch::OpaqueRedirect => Nav::Page {
+                url: url.to_string(),
+                html: error_page(url, "redirected"),
+            },
             Fetch::NeedsHttp { host, url } => Nav::Interstitial {
                 html: interstitial(
                     "This site doesn't support a secure connection",
@@ -522,6 +531,24 @@ impl Network {
     /// Fetch a stylesheet for the page at `page_url`. The page URL comes from
     /// the browser's own state, never from the renderer.
     pub fn subresource(&mut self, page_url: &str, url: &str, dest: Dest) -> Result<String, String> {
+        self.subresource_from(page_url, url, dest, false)
+    }
+
+    /// A stylesheet or script a page's script put on the page: it may only
+    /// come from the page's site (see [`Network::script_added`]), wherever
+    /// it redirects.
+    pub fn subresource_added(&mut self, page_url: &str, url: &str, dest: Dest) -> Result<String, String> {
+        self.script_added(page_url, url, dest)?;
+        self.subresource_from(page_url, url, dest, true)
+    }
+
+    fn subresource_from(
+        &mut self,
+        page_url: &str,
+        url: &str,
+        dest: Dest,
+        added: bool,
+    ) -> Result<String, String> {
         let why = match dest {
             Dest::Stylesheet => {
                 self.page_stylesheets += 1;
@@ -555,11 +582,12 @@ impl Network {
             self.record(url, dest, Outcome::OverLimit, vec![]);
             return Err(format!("{why}, skipped {url}"));
         }
-        match self.fetch(url, Some(page_url), dest) {
+        match self.fetch_with(url, Some(page_url), dest, None, added) {
             Fetch::Done { body, .. } => {
                 self.page_bytes += body.len();
                 Ok(body)
             }
+            Fetch::OpaqueRedirect => Err(format!("{url} redirected")),
             Fetch::LocalNetwork { url, .. } => Err(format!("blocked local-network request {url}")),
             Fetch::Stopped(why) => Err(why),
             Fetch::NeedsHttp { url, .. } => Err(format!("blocked insecure {url}")),
@@ -617,7 +645,8 @@ impl Network {
             self.record(url, Dest::Image, Outcome::OverLimit, vec![]);
             return Err(format!("{why}, skipped {url}"));
         }
-        match self.fetch(url, Some(page_url), Dest::Image) {
+        match self.fetch_with(url, Some(page_url), Dest::Image, None, added) {
+            Fetch::OpaqueRedirect => Err(format!("{url} redirected")),
             Fetch::Done { bytes, status, .. } if (200..300).contains(&status) => {
                 self.image_bytes += bytes.len();
                 Ok(bytes)
@@ -680,6 +709,17 @@ impl Network {
         let target: String = target.into();
         self.script_added(page_url, &target, dest)?;
         let cross = !same_origin(page_url, &target);
+        match req.mode {
+            Mode::SameOrigin if cross => {
+                self.record(&target, dest, Outcome::NotAllowed, vec![]);
+                return Err(format!("{target} isn't this page's origin (mode: same-origin)"));
+            }
+            Mode::NoCors if !is_cors_simple(&req) => {
+                self.record(&target, dest, Outcome::NotAllowed, vec![]);
+                return Err("mode: no-cors allows only GET, HEAD and POST with simple headers".into());
+            }
+            _ => {}
+        }
         // After the page has loaded, each script request gets its own time.
         let now = std::time::Instant::now();
         if now >= self.deadline {
@@ -689,7 +729,14 @@ impl Network {
             self.preflight(page_url, &target, &req)?;
         }
         let creds = req.credentials;
-        match self.fetch_with(&target, Some(page_url), dest, Some(&req)) {
+        match self.fetch_with(&target, Some(page_url), dest, Some(&req), true) {
+            Fetch::OpaqueRedirect => Ok(ScriptResponse {
+                status: 0,
+                url: target,
+                redirected: false,
+                headers: vec![],
+                body: String::new(),
+            }),
             Fetch::Done {
                 url: final_url,
                 body,
@@ -698,22 +745,9 @@ impl Network {
                 ..
             } => {
                 self.page_bytes += body.len();
-                let header = |name: &str| {
-                    headers
-                        .iter()
-                        .find(|(k, _)| k == name)
-                        .map(|(_, v)| v.trim().to_string())
-                };
                 let cross = !same_origin(page_url, &final_url);
                 if cross {
-                    let origin = origin_of(page_url);
-                    let acao = header("access-control-allow-origin").unwrap_or_default();
-                    let ok = if creds == Credentials::Include {
-                        acao == origin
-                            && header("access-control-allow-credentials").as_deref() == Some("true")
-                    } else {
-                        acao == "*" || acao == origin
-                    };
+                    let ok = cors_allows(&headers, &origin_of(page_url), creds == Credentials::Include);
                     if !ok {
                         if let Some(e) = self.log.last_mut() {
                             e.cors_blocked = true;
@@ -738,6 +772,45 @@ impl Network {
             Fetch::FilterBlocked { url, .. } => Err(format!("blocked {url}")),
             Fetch::Certificate { host, err } => Err(format!("{host}: {err}")),
         }
+    }
+
+    /// May a script request that `from` redirected go on to `next`? (`Err`
+    /// with an empty reason: stop here and answer with the redirect, for
+    /// `redirect: "manual"`.) `cors` says this hop was cross-origin, so its
+    /// redirect response must allow the page (`Access-Control-Allow-Origin`)
+    /// before it's followed.
+    #[allow(clippy::too_many_arguments)]
+    fn script_hop(
+        &mut self,
+        page_url: &str,
+        from: &str,
+        next: &str,
+        req: &ScriptRequest,
+        cors: bool,
+        origin: &str,
+        headers: &[(String, String)],
+    ) -> Result<(), String> {
+        match req.redirect {
+            Redirect::Error => return Err(format!("{} redirected (redirect: error)", filter::host_of(from))),
+            Redirect::Manual => return Err(String::new()),
+            Redirect::Follow => {}
+        }
+        if cors && !cors_allows(headers, origin, req.credentials == Credentials::Include) {
+            if let Some(e) = self.log.last_mut() {
+                e.cors_blocked = true;
+            }
+            return Err(format!(
+                "CORS: {} redirected without allowing this page",
+                filter::host_of(from)
+            ));
+        }
+        if req.mode == Mode::SameOrigin && !same_origin(page_url, next) {
+            return Err(format!("{next} isn't this page's origin (mode: same-origin)"));
+        }
+        if url::Url::parse(next).is_ok_and(|u| !u.username().is_empty() || u.password().is_some()) {
+            return Err("a script request was redirected to an address with a password".into());
+        }
+        Ok(())
     }
 
     /// Ask the server whether this page may send `req` (an `OPTIONS`
@@ -767,9 +840,12 @@ impl Network {
             headers,
             body: None,
             credentials: Credentials::Omit,
+            // A preflight that redirects fails, without following it.
+            redirect: Redirect::Error,
+            ..ScriptRequest::default()
         };
         let refused = |why: String| format!("CORS preflight: {} {why}", filter::host_of(target));
-        let (status, got) = match self.fetch_with(target, Some(page_url), Dest::Xhr, Some(&ask)) {
+        let (status, got) = match self.fetch_with(target, Some(page_url), Dest::Xhr, Some(&ask), true) {
             Fetch::Done {
                 url, status, headers, ..
             } if url == target => (status, headers),
@@ -887,23 +963,30 @@ impl Network {
         self.log.last_mut().unwrap()
     }
 
-    fn fetch(&mut self, url: &str, initiator: Option<&str>, dest: Dest) -> Fetch {
-        self.fetch_with(url, initiator, dest, None)
-    }
-
     /// `script`: the method, headers, body and credentials of a page
-    /// script's request (`dest` is then `Xhr`).
+    /// script's request (`dest` is then `Xhr`). `added`: a page's script
+    /// asked for this (a request, or a file it put on the page), so every
+    /// redirect hop must pass [`Network::script_added`] too, and a script
+    /// request's hops get the checks its first request did (mode, CORS,
+    /// preflight).
     fn fetch_with(
         &mut self,
         url: &str,
         initiator: Option<&str>,
         dest: Dest,
         script: Option<&ScriptRequest>,
+        added: bool,
     ) -> Fetch {
         let fdest = filter_dest(dest);
         let mut method = script.map(|s| s.method.clone()).unwrap_or_else(|| "GET".into());
         let mut body = script.and_then(|s| s.body.clone());
+        let mut script_headers: Vec<(String, String)> = script.map(|s| s.headers.clone()).unwrap_or_default();
         let page = if dest == Dest::Document { None } else { initiator };
+        // After a redirect from one origin to another (neither the page's),
+        // the request's origin is hidden: `Origin: null` (as in browsers).
+        let mut tainted = false;
+        // Once a script request has been cross-origin, it stays a CORS one.
+        let mut was_cross = false;
         let mut url = url.to_string();
         let mut from = initiator.map(str::to_string);
         for _ in 0..=MAX_REDIRECTS {
@@ -1016,9 +1099,13 @@ impl Network {
             };
             // A form POST's Origin is the page it was submitted from.
             let origin_page = if dest == Dest::Document { initiator } else { page };
-            let page_origin = origin_page.map(origin_of).unwrap_or_else(|| "null".into());
-            let cors = dest != Dest::Document && page.is_some_and(|p| !same_origin(p, &target));
-            let script_headers: Vec<(String, String)> = script.map(|s| s.headers.clone()).unwrap_or_default();
+            let page_origin = match origin_page {
+                Some(p) if !tainted => origin_of(p),
+                _ => "null".into(),
+            };
+            let cors =
+                dest != Dest::Document && (was_cross || page.is_some_and(|p| !same_origin(p, &target)));
+            was_cross |= cors;
             let outgoing = script.map(|_| net::Outgoing {
                 method: &method,
                 headers: &script_headers,
@@ -1056,6 +1143,18 @@ impl Network {
             match result {
                 Ok(resp) if (300..400).contains(&resp.status) && resp.location.is_some() => {
                     let next = net::resolve(&target, resp.location.as_deref().unwrap_or(""));
+                    // What a page's script asked for gets each hop checked
+                    // before it's sent, as its first request was.
+                    let refused = match (script, page) {
+                        (Some(s), Some(p)) if dest != Dest::Document => {
+                            self.script_hop(p, &target, &next, s, cors, &page_origin, &resp.headers)
+                        }
+                        _ => Ok(()),
+                    };
+                    let refused = refused.and_then(|()| match page {
+                        Some(p) if added && dest != Dest::Document => self.script_added(p, &next, dest),
+                        _ => Ok(()),
+                    });
                     let e = self.record(
                         &entry_url,
                         dest,
@@ -1066,10 +1165,43 @@ impl Network {
                     e.upgraded = upgraded;
                     e.insecure = insecure;
                     e.allowed_by = allowed_by;
+                    match refused {
+                        Err(why) if why.is_empty() => return Fetch::OpaqueRedirect,
+                        Err(why) => return Fetch::Stopped(why),
+                        Ok(()) => {}
+                    }
                     // 303, and 301/302 after a POST, continue as a GET.
                     if resp.status == 303 || (matches!(resp.status, 301 | 302) && method == "POST") {
                         method = "GET".into();
                         body = None;
+                        // Without the body, its headers go too (as in Fetch).
+                        script_headers.retain(|(k, _)| {
+                            !matches!(
+                                k.to_ascii_lowercase().as_str(),
+                                "content-type" | "content-language" | "content-encoding" | "content-location"
+                            )
+                        });
+                    }
+                    if !same_origin(&target, &next) {
+                        // Credentials a script set for one origin never go
+                        // to another.
+                        script_headers.retain(|(k, _)| !k.eq_ignore_ascii_case("authorization"));
+                        tainted |= page.is_some_and(|p| !same_origin(p, &target));
+                    }
+                    // The next hop of a request that needs a preflight gets
+                    // its own, before anything is sent there.
+                    if let (Some(s), Some(p)) = (script, page) {
+                        let now = ScriptRequest {
+                            method: method.clone(),
+                            headers: script_headers.clone(),
+                            body: body.clone(),
+                            ..s.clone()
+                        };
+                        if dest != Dest::Document && !same_origin(p, &next) && !is_cors_simple(&now) {
+                            if let Err(why) = self.preflight(p, &next, &now) {
+                                return Fetch::Stopped(why);
+                            }
+                        }
                     }
                     from = Some(target);
                     url = next;
@@ -1298,6 +1430,23 @@ fn allowed_script_headers(headers: Vec<(String, String)>) -> Vec<(String, String
 }
 
 /// A cross-origin request that needs no preflight (Fetch spec "CORS-safelisted").
+/// Does a cross-origin response let the page with `origin` read it?
+fn cors_allows(headers: &[(String, String)], origin: &str, creds: bool) -> bool {
+    let header = |name: &str| {
+        headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.trim().to_string())
+            .unwrap_or_default()
+    };
+    let acao = header("access-control-allow-origin");
+    if creds {
+        acao == origin && header("access-control-allow-credentials") == "true"
+    } else {
+        acao == "*" || acao == origin
+    }
+}
+
 fn is_cors_simple(req: &ScriptRequest) -> bool {
     matches!(req.method.as_str(), "GET" | "HEAD" | "POST")
         && req.headers.iter().all(|(k, v)| cors_safelisted(k, v))

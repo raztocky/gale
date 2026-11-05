@@ -861,6 +861,16 @@ fn n_request(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
         "include" => Credentials::Include,
         _ => Credentials::SameOrigin,
     };
+    let mode = match arg_str(a, 5, c)?.as_str() {
+        "same-origin" => crate::net::Mode::SameOrigin,
+        "no-cors" => crate::net::Mode::NoCors,
+        _ => crate::net::Mode::Cors,
+    };
+    let redirect = match arg_str(a, 6, c)?.as_str() {
+        "error" => crate::net::Redirect::Error,
+        "manual" => crate::net::Redirect::Manual,
+        _ => crate::net::Redirect::Follow,
+    };
     let id = with(|s| {
         if s.requests.len() >= MAX_QUEUED_REQUESTS {
             return None;
@@ -875,6 +885,8 @@ fn n_request(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
                 headers,
                 body,
                 credentials,
+                mode,
+                redirect,
             },
         ));
         Some(s.next_request)
@@ -1508,6 +1520,8 @@ mod tests {
             fetch('/form', { method: 'POST', body: f });
             const c = new AbortController(); fetch('/aborted', { signal: c.signal }).catch(e => console.log('aborted'));
             c.abort();
+            fetch(new Request('/opts', { mode: 'same-origin', redirect: 'error' }));
+            fetch('/manual', { mode: 'no-cors', redirect: 'manual' });
             "#,
             0,
             "test",
@@ -1539,6 +1553,28 @@ mod tests {
             .headers
             .iter()
             .any(|(k, v)| k == "content-type" && v.starts_with("text/plain")));
+        assert_eq!(
+            (req.mode, req.redirect),
+            (crate::net::Mode::Cors, crate::net::Redirect::Follow)
+        );
+        let opts = |end: &str| {
+            host.seen
+                .iter()
+                .find(|(u, _)| u.ends_with(end))
+                .unwrap()
+                .1
+                .clone()
+        };
+        let o = opts("/opts");
+        assert_eq!(
+            (o.mode, o.redirect),
+            (crate::net::Mode::SameOrigin, crate::net::Redirect::Error)
+        );
+        let o = opts("/manual");
+        assert_eq!(
+            (o.mode, o.redirect),
+            (crate::net::Mode::NoCors, crate::net::Redirect::Manual)
+        );
         let form = host.seen.iter().find(|(u, _)| u.ends_with("/form")).unwrap();
         let body = form.1.body.as_deref().unwrap();
         assert!(body.contains("name=\"q\"") && body.contains("cats"), "{body}");

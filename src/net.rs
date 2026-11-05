@@ -469,6 +469,33 @@ pub struct ScriptRequest {
     pub headers: Vec<(String, String)>,
     pub body: Option<String>,
     pub credentials: Credentials,
+    /// `fetch`'s `mode`.
+    pub mode: Mode,
+    /// `fetch`'s `redirect`.
+    pub redirect: Redirect,
+}
+
+/// Where a script request may go (`fetch`'s `mode`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Mode {
+    /// Anywhere the rules allow, reading the answer only if CORS allows.
+    #[default]
+    Cors,
+    /// Only to the page's own origin, redirects included.
+    SameOrigin,
+    /// Only requests a form could make (no preflight needed).
+    NoCors,
+}
+
+/// What a redirect does to a script request (`fetch`'s `redirect`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Redirect {
+    #[default]
+    Follow,
+    /// A redirect fails the request.
+    Error,
+    /// The redirect itself is the answer (with nothing readable in it).
+    Manual,
 }
 
 /// Whether a script request carries cookies (`fetch`'s `credentials`).

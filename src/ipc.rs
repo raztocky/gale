@@ -10,7 +10,7 @@ use crate::css::Color;
 use crate::forms::Submission;
 use crate::image::{Bitmap, MAX_DRAW_SIDE};
 use crate::layout::Rect;
-use crate::net::{Credentials, Dest, ScriptRequest};
+use crate::net::{Credentials, Dest, Mode, Redirect, ScriptRequest};
 use crate::network::ScriptResponse;
 use crate::page::Key;
 use crate::page::{Rendered, MAX_LINKS, MAX_TEXT_CHARS, MAX_TEXT_RUNS};
@@ -589,6 +589,16 @@ impl FromRenderer {
                     Credentials::SameOrigin => 1,
                     Credentials::Include => 2,
                 });
+                e.u8(match req.mode {
+                    Mode::Cors => 0,
+                    Mode::SameOrigin => 1,
+                    Mode::NoCors => 2,
+                });
+                e.u8(match req.redirect {
+                    Redirect::Follow => 0,
+                    Redirect::Error => 1,
+                    Redirect::Manual => 2,
+                });
             }
             FromRenderer::SetCookie(v) => {
                 e.u8(7);
@@ -745,6 +755,18 @@ impl FromRenderer {
                         1 => Credentials::SameOrigin,
                         2 => Credentials::Include,
                         c => return Err(format!("invalid credentials mode {c}")),
+                    },
+                    mode: match d.u8()? {
+                        0 => Mode::Cors,
+                        1 => Mode::SameOrigin,
+                        2 => Mode::NoCors,
+                        m => return Err(format!("invalid request mode {m}")),
+                    },
+                    redirect: match d.u8()? {
+                        0 => Redirect::Follow,
+                        1 => Redirect::Error,
+                        2 => Redirect::Manual,
+                        r => return Err(format!("invalid redirect mode {r}")),
                     },
                 },
             },
@@ -1070,6 +1092,8 @@ mod tests {
                     headers: vec![("content-type".into(), "text/plain".into())],
                     body: Some("hi".into()),
                     credentials: Credentials::Include,
+                    mode: Mode::SameOrigin,
+                    redirect: Redirect::Manual,
                 },
             },
             FromRenderer::SetCookie("x=1".into()),

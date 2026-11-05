@@ -778,6 +778,183 @@ fn javascript_is_off_by_default_and_its_requests_follow_the_rules() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("\"static\""));
 }
 
+/// A script request that's redirected gets every check again at each hop,
+/// before anything is sent there: the other-site rule (also for files
+/// scripts put on the page), `mode`, `redirect`, CORS on the redirect, and a
+/// preflight; and a script's `Authorization` never follows it to another
+/// origin.
+#[test]
+fn script_requests_are_checked_at_every_redirect() {
+    let home = temp_dir("js-redirects");
+    let (port, seen) = serve_dynamic(|port| {
+        let other = format!("http://localhost:{port}");
+        let page = format!(
+            "<script>\
+             const log = (m) => console.log(m);\
+             if (location.search !== '?b') {{\
+             fetch('/bounce').then(() => log('LEAK bounce'), () => log('bounce refused'));\
+             const i = document.createElement('img'); i.src = '/img-bounce'; document.body.appendChild(i);\
+             fetch('/same-redirect').then(r => r.text()).then(t => log('followed ' + t));\
+             fetch('/r-error', {{redirect: 'error'}}).then(() => log('LEAK error'), () => log('redirect error'));\
+             fetch('/r-manual', {{redirect: 'manual'}}).then(r => log('manual ' + r.type + ' ' + r.status));\
+             fetch('{other}/open', {{mode: 'same-origin'}}).then(() => log('LEAK mode'), () => log('mode refused'));\
+             }} else {{\
+               fetch('/to-put', {{method: 'PUT', headers: {{'X-Custom': '1', 'Authorization': 'Bearer s3cret'}}}})\
+                 .then(r => r.text()).then(t => log('put ' + t), e => log('put failed ' + e));\
+               fetch('/to-closed', {{method: 'PUT', headers: {{'X-Custom': '1'}}}})\
+                 .then(() => log('LEAK closed'), () => log('closed preflight refused'));\
+               fetch('{other}/xbounce').then(() => log('LEAK xbounce'), () => log('xbounce refused'));\
+               fetch('/bounce2', {{mode: 'same-origin'}}).then(() => log('LEAK bounce2'), () => log('bounce2 refused'));\
+             }}</script>"
+        );
+        let to = |path: &str| format!("302 text/plain\r\nLocation: {other}{path}");
+        let leak = |p: &'static str| {
+            (
+                p,
+                "text/plain\r\nAccess-Control-Allow-Origin: *",
+                "LEAK".to_string(),
+            )
+        };
+        vec![
+            ("/", "text/html", page.clone()),
+            ("/?b", "text/html", page),
+            (
+                "/bounce",
+                Box::leak(to("/stolen?c=1").into_boxed_str()),
+                String::new(),
+            ),
+            (
+                "/img-bounce",
+                Box::leak(to("/pixel2.png").into_boxed_str()),
+                String::new(),
+            ),
+            (
+                "/same-redirect",
+                "302 text/plain\r\nLocation: /api4",
+                String::new(),
+            ),
+            ("/api4", "text/plain", "ok".into()),
+            ("/r-error", "302 text/plain\r\nLocation: /api2", String::new()),
+            ("/r-manual", "302 text/plain\r\nLocation: /api3", String::new()),
+            (
+                "/to-put",
+                Box::leak(format!("307 text/plain\r\nLocation: {other}/put2").into_boxed_str()),
+                String::new(),
+            ),
+            (
+                "/put2",
+                "text/plain\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: PUT\r\n\
+                 Access-Control-Allow-Headers: X-Custom",
+                "done".into(),
+            ),
+            (
+                "/to-closed",
+                Box::leak(format!("307 text/plain\r\nLocation: {other}/closed2").into_boxed_str()),
+                String::new(),
+            ),
+            ("/closed2", "text/plain", "LEAK".into()),
+            // A cross-origin redirect that doesn't allow the page.
+            (
+                "/xbounce",
+                Box::leak(to("/open2").into_boxed_str()),
+                String::new(),
+            ),
+            (
+                "/bounce2",
+                Box::leak(to("/stolen2").into_boxed_str()),
+                String::new(),
+            ),
+            leak("/stolen?c=1"),
+            leak("/stolen2"),
+            leak("/pixel2.png"),
+            leak("/api2"),
+            leak("/api3"),
+            leak("/open"),
+            leak("/open2"),
+        ]
+    });
+    let url = format!("http://127.0.0.1:{port}/");
+    assert!(brickle(&home)
+        .args(["js", "allow", "127.0.0.1"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let lines = |seen: &Arc<Mutex<Vec<Vec<String>>>>| -> Vec<String> {
+        seen.lock().unwrap().iter().map(|r| r[0].clone()).collect()
+    };
+    let run = |url: &str| {
+        let out = brickle(&home).args(["requests", url]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    // Without a rule allowing the other site.
+    let stdout = run(&url);
+    for want in [
+        "[log] bounce refused",
+        "[log] followed ok",
+        "[log] redirect error",
+        "[log] manual opaqueredirect 0",
+        "[log] mode refused",
+        "BLOCKED (script sending to another site) xhr   http://localhost",
+        "BLOCKED (script sending to another site) img   http://localhost",
+    ] {
+        assert!(stdout.contains(want), "missing {want:?}:\n{stdout}");
+    }
+    assert!(!stdout.contains("LEAK"), "{stdout}");
+    let got = lines(&seen);
+    for p in ["/stolen", "/pixel2.png", "/api2", "/api3", "/open "] {
+        assert!(
+            !got.iter().any(|l| l.contains(p)),
+            "{p} must not be sent: {got:?}"
+        );
+    }
+    assert!(got.iter().any(|l| l.starts_with("GET /api4 ")), "{got:?}");
+    seen.lock().unwrap().clear();
+
+    // With one: CORS and preflights decide, at each hop.
+    std::fs::create_dir_all(home.join("config/brickle")).unwrap();
+    std::fs::write(
+        home.join("config/brickle/rules.txt"),
+        "@@||localhost^$xhr,domain=127.0.0.1\n",
+    )
+    .unwrap();
+    let stdout = run(&format!("{url}?b"));
+    for want in [
+        "[log] put done",
+        "[log] closed preflight refused",
+        "[log] xbounce refused",
+        "[log] bounce2 refused",
+    ] {
+        assert!(stdout.contains(want), "missing {want:?}:\n{stdout}");
+    }
+    assert!(!stdout.contains("LEAK"), "{stdout}");
+    let got = lines(&seen);
+    for p in ["PUT /closed2", "GET /open2", "GET /stolen2"] {
+        assert!(
+            !got.iter().any(|l| l.starts_with(p)),
+            "{p} must not be sent: {got:?}"
+        );
+    }
+    // The preflight for the second hop came before the PUT there.
+    let at = |want: &str| got.iter().position(|l| l.starts_with(want));
+    assert!(
+        at("OPTIONS /put2 ").unwrap() < at("PUT /put2 ").unwrap(),
+        "{got:?}"
+    );
+    assert!(at("OPTIONS /closed2 ").is_some(), "{got:?}");
+    // Authorization went to the page's own origin, not across the redirect.
+    let seen = seen.lock().unwrap();
+    let req = |start: &str| seen.iter().find(|r| r[0].starts_with(start)).unwrap().clone();
+    let auth = |r: &Vec<String>| {
+        r.iter()
+            .any(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+    };
+    assert!(auth(&req("PUT /to-put ")));
+    assert!(!auth(&req("PUT /put2 ")), "{:?}", req("PUT /put2 "));
+    assert!(!auth(&req("OPTIONS /put2 ")));
+}
+
 /// Forms: what you type is submitted only when you submit, through the
 /// browser's checks, with Firefox's headers and the page's own cookies.
 #[test]
