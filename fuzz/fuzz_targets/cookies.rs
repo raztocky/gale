@@ -27,6 +27,7 @@ fuzz_target!(|data: &[u8]| {
         top,
         initiator: (pick[2] & 1 == 1).then_some(top),
         navigation: nav,
+        safe_method: pick[2] & 8 == 8,
     };
     let mut jar = Jar::new();
     let headers: Vec<String> = text.split('\n').map(str::to_string).collect();
