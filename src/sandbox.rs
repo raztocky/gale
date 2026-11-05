@@ -217,14 +217,24 @@ mod linux {
         let mut allow: BTreeMap<i64, Vec<SeccompRule>> = ALLOWED.iter().map(|&n| (n, Vec::new())).collect();
         // (Answered with ENOSYS by filter 2, which takes precedence.)
         allow.insert(libc::SYS_clone3, Vec::new());
-        // Threads only: clone must carry CLONE_THREAD (no new processes).
+        // Threads only: clone must carry CLONE_THREAD (no new processes),
+        // and no new namespaces. (The kernel itself refuses CLONE_THREAD
+        // without CLONE_VM, or with a new user or PID namespace; this also
+        // keeps out network, mount, IPC, UTS and cgroup ones.)
         let thread = libc::CLONE_THREAD as u64;
+        let namespaces = (libc::CLONE_NEWNS
+            | libc::CLONE_NEWCGROUP
+            | libc::CLONE_NEWUTS
+            | libc::CLONE_NEWIPC
+            | libc::CLONE_NEWUSER
+            | libc::CLONE_NEWPID
+            | libc::CLONE_NEWNET) as u64;
         allow.insert(
             libc::SYS_clone,
             vec![rule(vec![cond(
                 0,
                 Qword,
-                SeccompCmpOp::MaskedEq(thread),
+                SeccompCmpOp::MaskedEq(thread | namespaces),
                 thread,
             )?])?],
         );

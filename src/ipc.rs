@@ -1484,5 +1484,61 @@ mod tests {
         // Oversized frame header.
         let mut r: &[u8] = &(u32::MAX).to_le_bytes();
         assert!(read_frame(&mut r).is_err());
+        // Sizes that would overflow if multiplied unchecked never get that
+        // far: each side is capped first.
+        let mut e = Enc::default();
+        e.u8(3);
+        e.f32(100.0);
+        e.color(Color::WHITE);
+        e.u32(1);
+        e.u32(0x4000_0000);
+        e.u32(1);
+        assert!(FromRenderer::decode(&e.0).unwrap_err().contains("bad size"));
+        // Glyph counts are added up across commands and refused as soon as
+        // the total passes the limit, long before it could wrap.
+        let mut r = sample();
+        let glyph = PlacedGlyph {
+            x: 0.0,
+            y: 0.0,
+            id: 0,
+        };
+        r.list = (0..3)
+            .map(|_| DisplayCommand::Glyphs {
+                color: Color::BLACK,
+                glyphs: vec![glyph; MAX_GLYPHS / 2 + 1],
+            })
+            .collect();
+        assert!(FromRenderer::decode(&FromRenderer::Rendered(r).encode())
+            .unwrap_err()
+            .contains("too many glyphs"));
+        // A rectangle reaching in from far off-screen costs what's drawn of
+        // it (the painter clips to the canvas), however wide it claims to
+        // be, so a few are fine and a flood of tall ones isn't.
+        let far = |n: usize, h: f32| {
+            (0..n)
+                .map(|_| DisplayCommand::Rect {
+                    rect: Rect {
+                        x: -9_999_990.0,
+                        y: 0.0,
+                        w: 9_999_995.0,
+                        h,
+                    },
+                    color: Color::BLACK,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(check_paint_budget(&far(10, 1000.0), &[], 1000.0).is_ok());
+        let wide = (0..5000)
+            .map(|_| DisplayCommand::Rect {
+                rect: Rect {
+                    x: -9_999_990.0,
+                    y: 0.0,
+                    w: 19_999_990.0,
+                    h: 1000.0,
+                },
+                color: Color::BLACK,
+            })
+            .collect::<Vec<_>>();
+        assert!(check_paint_budget(&wide, &[], 1000.0).is_err());
     }
 }
