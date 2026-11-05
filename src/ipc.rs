@@ -90,6 +90,9 @@ pub enum FromRenderer {
         /// A script put it on the page: it wasn't in the document as the
         /// server sent it (the browser keeps those to the page's site).
         added: bool,
+        /// For a script, the page's Content Security Policy source lists
+        /// every redirect hop must match ([`crate::csp::Csp::script_sources`]).
+        csp: Vec<Vec<String>>,
     },
     Loaded {
         title: String,
@@ -202,6 +205,12 @@ impl Enc {
             self.str(s);
         }
     }
+    fn lists(&mut self, v: &[Vec<String>]) {
+        self.u32(v.len() as u32);
+        for l in v {
+            self.strs(l);
+        }
+    }
     fn rect(&mut self, r: Rect) {
         for v in [r.x, r.y, r.w, r.h] {
             self.f32(v);
@@ -265,6 +274,23 @@ impl<'a> Dec<'a> {
             return Err("list too long".into());
         }
         (0..n).map(|_| self.str()).collect()
+    }
+    /// Content Security Policy source lists, as bounded as the policies
+    /// they came from.
+    fn lists(&mut self) -> DecResult<Vec<Vec<String>>> {
+        let n = self.count(4)?;
+        if n > crate::csp::MAX_LISTS {
+            return Err("too many source lists".into());
+        }
+        (0..n)
+            .map(|_| {
+                let l = self.strs(crate::csp::MAX_SOURCES)?;
+                match l.iter().all(|s| s.len() <= crate::csp::MAX_SOURCE_LEN) {
+                    true => Ok(l),
+                    false => Err("source too long".into()),
+                }
+            })
+            .collect()
     }
     fn color(&mut self) -> DecResult<Color> {
         let b = self.take(4)?;
@@ -563,7 +589,12 @@ impl FromRenderer {
     pub fn encode(&self) -> Vec<u8> {
         let mut e = Enc::default();
         match self {
-            FromRenderer::Fetch { url, dest, added } => {
+            FromRenderer::Fetch {
+                url,
+                dest,
+                added,
+                csp,
+            } => {
                 e.u8(1);
                 e.str(url);
                 e.u8(match dest {
@@ -572,6 +603,7 @@ impl FromRenderer {
                     _ => 1,
                 });
                 e.u8(*added as u8);
+                e.lists(csp);
             }
             FromRenderer::Loaded {
                 title,
@@ -604,6 +636,7 @@ impl FromRenderer {
                     Redirect::Error => 1,
                     Redirect::Manual => 2,
                 });
+                e.lists(&req.csp);
             }
             FromRenderer::SetCookie(v) => {
                 e.u8(7);
@@ -743,6 +776,7 @@ impl FromRenderer {
                     t => return Err(format!("invalid request type {t}")),
                 },
                 added: d.bool()?,
+                csp: d.lists()?,
             },
             2 => FromRenderer::Loaded {
                 title: d.str()?,
@@ -773,6 +807,7 @@ impl FromRenderer {
                         2 => Redirect::Manual,
                         r => return Err(format!("invalid redirect mode {r}")),
                     },
+                    csp: d.lists()?,
                 },
             },
             7 => FromRenderer::SetCookie(d.str()?),
@@ -1074,16 +1109,19 @@ mod tests {
                 url: "https://a/b.css".into(),
                 dest: Dest::Stylesheet,
                 added: false,
+                csp: vec![],
             },
             FromRenderer::Fetch {
                 url: "https://a/b.js".into(),
                 dest: Dest::Script,
                 added: true,
+                csp: vec![vec!["'self'".into(), "https://cdn.example/js/".into()], vec![]],
             },
             FromRenderer::Fetch {
                 url: "https://a/b.png".into(),
                 dest: Dest::Image,
                 added: true,
+                csp: vec![],
             },
             FromRenderer::Loaded {
                 title: "T".into(),
@@ -1099,6 +1137,7 @@ mod tests {
                     credentials: Credentials::Include,
                     mode: Mode::SameOrigin,
                     redirect: Redirect::Manual,
+                    csp: vec![vec!["'self'".into()]],
                 },
             },
             FromRenderer::SetCookie("x=1".into()),

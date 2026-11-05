@@ -922,6 +922,7 @@ fn n_request(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
                 credentials,
                 mode,
                 redirect,
+                csp: s.csp.connect_sources(),
             },
         ));
         Some(s.next_request)
@@ -1366,6 +1367,31 @@ impl Runtime {
             if !ok {
                 let what = src.map_or("an inline script".to_string(), |u| u.to_string());
                 push_console(s, format!("[csp] refused to run {what}"));
+            }
+            ok
+        })
+    }
+
+    /// Where external script element `id`, which the policy allowed, may
+    /// be redirected ([`crate::csp::Csp::script_sources`]).
+    pub fn script_sources(&self, id: u32, parser_inserted: bool) -> Vec<Vec<String>> {
+        with(|s| {
+            let nonce = s.dom.element(id).and_then(|e| e.attrs.get("nonce").cloned());
+            s.csp.script_sources(nonce.as_deref(), parser_inserted)
+        })
+    }
+
+    /// Does the code fetched for script element `id` match its `integrity`
+    /// attribute (if any)? A mismatch goes to the console.
+    pub fn integrity_ok(&self, id: u32, url: &str, code: &str) -> bool {
+        with(|s| {
+            let want = s.dom.element(id).and_then(|e| e.attrs.get("integrity").cloned());
+            let ok = want.is_none_or(|w| crate::csp::integrity_matches(&w, code));
+            if !ok {
+                push_console(
+                    s,
+                    format!("[integrity] {url} doesn't match its integrity hash; not run"),
+                );
             }
             ok
         })

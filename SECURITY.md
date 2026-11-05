@@ -65,7 +65,10 @@ network policy, CORS (with preflights) and the rule that scripts only send to th
 using its own record of the page's origin (`Network::script_request`), again at every redirect hop
 before it's followed. The page's Content Security Policy (`src/csp.rs`) is enforced in the
 renderer, where scripts run: which scripts run, inline handlers, `eval` (through Boa's
-`HostEnsureCanCompileStrings` hook) and `connect-src`; it guards the page against injected scripts,
+`HostEnsureCanCompileStrings` hook) and `connect-src`. The browser follows redirects, so the
+renderer hands it the policy's source lists with each script and script request, and it checks
+every hop against them. `integrity` hashes are checked in the renderer, `nosniff` in the browser.
+The policy guards the page against injected scripts,
 not against a compromised renderer, which the browser-side rules are for. Which images, stylesheets
 and scripts a script added to the page is reported by the renderer, so a compromised renderer
 could pass one off as part of the page; it still can't reach anything the sandbox forbids, or a

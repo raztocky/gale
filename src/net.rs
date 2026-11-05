@@ -473,6 +473,9 @@ pub struct ScriptRequest {
     pub mode: Mode,
     /// `fetch`'s `redirect`.
     pub redirect: Redirect,
+    /// The page's Content Security Policy for this request
+    /// ([`crate::csp::Csp::connect_sources`]): every redirect hop must match.
+    pub csp: Vec<Vec<String>>,
 }
 
 /// Where a script request may go (`fetch`'s `mode`).

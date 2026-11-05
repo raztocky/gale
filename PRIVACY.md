@@ -210,9 +210,12 @@ in `src/cookies.rs`.
 - **The site's own Content Security Policy holds.** A page's `Content-Security-Policy` (header or
   `<meta>`) decides which of its scripts run (nonces, hashes, hosts, `'strict-dynamic'`, inline
   scripts and handlers only with `'unsafe-inline'`, `eval` only with `'unsafe-eval'`) and where
-  scripts may send requests (`connect-src`), so a script injected into a site you allowed is held
-  to what the site's authors allowed. Brickle never sends CSP violation reports: that would be a
-  request you didn't ask for.
+  scripts may send requests (`connect-src`), at every redirect hop too, so a script injected into
+  a site you allowed is held to what the site's authors allowed. Brickle never sends CSP violation
+  reports: that would be a request you didn't ask for.
+- **Scripts are what the site said they are.** A script whose `integrity` hash doesn't match
+  isn't run, and a file served as another type with `X-Content-Type-Options: nosniff` (or as an
+  image, audio, video or CSV, nosniff or not) never runs as a script.
 - **No beacons.** `navigator.sendBeacon` sends nothing, and an image a script makes but doesn't
   put on the page (`new Image().src = ...`, the usual tracking pixel) loads nothing. Images a
   script adds to the page from its own site load like any other image (rule 10).

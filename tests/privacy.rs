@@ -1004,6 +1004,86 @@ fn the_servers_content_security_policy_is_enforced() {
     }
 }
 
+/// Redirects can't take a page's scripts past its Content Security Policy
+/// (the browser checks each hop), a `nosniff` text file never runs as a
+/// script, and a script that doesn't match its `integrity` hash doesn't
+/// run.
+#[test]
+fn csp_holds_across_redirects_and_scripts_are_checked() {
+    let home = temp_dir("csp-redirects");
+    // Another origin on the same site: only the policy stands in the way.
+    let (other, other_seen) = serve(vec![
+        (
+            "/sink",
+            "text/plain\r\nAccess-Control-Allow-Origin: *",
+            "LEAK".into(),
+        ),
+        (
+            "/evil.js",
+            "application/javascript",
+            "console.log('REDIRECTED SCRIPT ran')".into(),
+        ),
+    ]);
+    let o = format!("http://127.0.0.1:{other}");
+    let (port, _) = serve_dynamic(|port| {
+        let page = "<script src=/js/ok.js></script>\
+             <script src=/js/bounce.js></script>\
+             <script src=/js/plain.js></script>\
+             <script src=/js/sri.js integrity='sha384-ILTwP2ca5vkltgnvohEsdfVLU99DuqBMCY9WHGHmJiohQJnSaRGlJPKZDXRWuvAy'></script>\
+             <script src=/js/sri-bad.js integrity='sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= sha384-ILTwP2ca5vkltgnvohEsdfVLU99DuqBMCY9WHGHmJiohQJnSaRGlJPKZDXRWuvAy'></script>"
+            .to_string();
+        let csp = format!("text/html\r\nContent-Security-Policy: script-src http://127.0.0.1:{port}/js/; connect-src 'self'");
+        vec![
+            ("/", Box::leak(csp.into_boxed_str()), page),
+            (
+                "/js/ok.js",
+                "text/javascript",
+                "fetch('/go', {method: 'POST', body: 'secret'}).then(() => console.log('LEAK go'), \
+                 () => console.log('go refused')); console.log('ok ran')"
+                    .into(),
+            ),
+            (
+                "/go",
+                Box::leak(format!("307 text/plain\r\nLocation: {o}/sink").into_boxed_str()),
+                String::new(),
+            ),
+            (
+                "/js/bounce.js",
+                Box::leak(format!("302 text/plain\r\nLocation: {o}/evil.js").into_boxed_str()),
+                String::new(),
+            ),
+            (
+                "/js/plain.js",
+                "text/plain\r\nX-Content-Type-Options: nosniff",
+                "console.log('PLAIN TEXT ran')".into(),
+            ),
+            ("/js/sri.js", "text/javascript", "console.log('sri ok')".into()),
+            (
+                "/js/sri-bad.js",
+                "text/javascript",
+                "console.log('TAMPERED ran')".into(),
+            ),
+        ]
+    });
+    let url = format!("http://127.0.0.1:{port}/");
+    assert!(brickle(&home)
+        .args(["js", "allow", "127.0.0.1"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let out = brickle(&home).args(["requests", &url]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for want in ["[log] ok ran", "[log] go refused", "[log] sri ok", "[integrity]"] {
+        assert!(stdout.contains(want), "missing {want:?}:\n{stdout}");
+    }
+    for bad in ["LEAK", "REDIRECTED SCRIPT ran", "PLAIN TEXT ran", "TAMPERED ran"] {
+        assert!(!stdout.contains(bad), "{bad}:\n{stdout}");
+    }
+    let got: Vec<String> = other_seen.lock().unwrap().iter().map(|r| r[0].clone()).collect();
+    assert!(got.is_empty(), "the other origin must not be reached: {got:?}");
+}
+
 /// Forms: what you type is submitted only when you submit, through the
 /// browser's checks, with Firefox's headers and the page's own cookies.
 #[test]

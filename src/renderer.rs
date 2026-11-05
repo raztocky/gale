@@ -51,11 +51,12 @@ impl<R: Read, W: Write> IpcHost<'_, R, W> {
         r
     }
 
-    fn file(&mut self, url: &str, dest: Dest, added: bool) -> Result<String, String> {
+    fn file(&mut self, url: &str, dest: Dest, added: bool, csp: &[Vec<String>]) -> Result<String, String> {
         match self.ask(FromRenderer::Fetch {
             url: url.to_string(),
             dest,
             added,
+            csp: csp.to_vec(),
         })? {
             ToRenderer::FetchReply(r) => r,
             _ => {
@@ -70,6 +71,7 @@ impl<R: Read, W: Write> IpcHost<'_, R, W> {
             url: url.to_string(),
             dest: Dest::Image,
             added,
+            csp: vec![],
         })? {
             ToRenderer::ImageReply(r) => r,
             _ => {
@@ -82,11 +84,15 @@ impl<R: Read, W: Write> IpcHost<'_, R, W> {
 
 impl<R: Read, W: Write> Host for IpcHost<'_, R, W> {
     fn fetch(&mut self, url: &str, dest: Dest) -> Result<String, String> {
-        self.file(url, dest, false)
+        self.file(url, dest, false, &[])
     }
 
     fn fetch_added(&mut self, url: &str, dest: Dest) -> Result<String, String> {
-        self.file(url, dest, true)
+        self.file(url, dest, true, &[])
+    }
+
+    fn fetch_script(&mut self, url: &str, added: bool, csp: &[Vec<String>]) -> Result<String, String> {
+        self.file(url, Dest::Script, added, csp)
     }
 
     fn image(&mut self, url: &str) -> Result<Vec<u8>, String> {

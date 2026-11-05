@@ -141,6 +141,17 @@ pub trait Host {
     fn fetch_added(&mut self, url: &str, dest: Dest) -> Result<String, String> {
         self.fetch(url, dest)
     }
+    /// An external script, `added` by a script or not. `csp`: source
+    /// lists from the page's Content Security Policy that every redirect
+    /// hop must match (the browser follows redirects, so it checks).
+    fn fetch_script(&mut self, url: &str, added: bool, csp: &[Vec<String>]) -> Result<String, String> {
+        let _ = csp;
+        if added {
+            self.fetch_added(url, Dest::Script)
+        } else {
+            self.fetch(url, Dest::Script)
+        }
+    }
     /// An image's bytes.
     fn image(&mut self, url: &str) -> Result<Vec<u8>, String> {
         Err(format!("images are off, skipped {url}"))
@@ -1227,15 +1238,18 @@ impl ScriptLoader<'_> {
         let (code, name) = match src {
             Some(url) if self.fetched < js::MAX_SCRIPTS => {
                 self.fetched += 1;
-                let code = if self.from_server.contains(&url) {
-                    host.fetch(&url, Dest::Script)
-                } else {
-                    host.fetch_added(&url, Dest::Script)
-                };
-                match code {
-                    Ok(code) => (code, url),
+                let csp = rt.script_sources(id, parser_inserted);
+                let added = !self.from_server.contains(&url);
+                let code = match host.fetch_script(&url, added, &csp) {
+                    Ok(code) => code,
                     Err(_) => return, // shown in the request log
+                };
+                // Subresource Integrity: the file must be the one the page
+                // expected.
+                if !rt.integrity_ok(id, &url, &code) {
+                    return;
                 }
+                (code, url)
             }
             Some(_) => return,
             None => (code, "inline script".to_string()),

@@ -20,7 +20,9 @@ use std::collections::HashMap;
 /// a hostile page gets no further.
 const MAX_POLICIES: usize = 16;
 const MAX_DIRECTIVES: usize = 64;
-const MAX_SOURCES: usize = 256;
+pub const MAX_SOURCES: usize = 256;
+/// Longer sources are dropped (a list only gets stricter without one).
+pub const MAX_SOURCE_LEN: usize = 2048;
 
 #[derive(Debug, Clone, Default)]
 pub struct Csp {
@@ -56,8 +58,13 @@ impl Csp {
                 let mut words = d.split_ascii_whitespace();
                 let Some(name) = words.next() else { continue };
                 // The first of a repeated directive wins.
-                dirs.entry(name.to_ascii_lowercase())
-                    .or_insert_with(|| words.take(MAX_SOURCES).map(str::to_string).collect());
+                dirs.entry(name.to_ascii_lowercase()).or_insert_with(|| {
+                    words
+                        .filter(|w| w.len() <= MAX_SOURCE_LEN)
+                        .take(MAX_SOURCES)
+                        .map(str::to_string)
+                        .collect()
+                });
             }
             if !dirs.is_empty() {
                 self.policies.push(dirs);
@@ -85,7 +92,9 @@ impl Csp {
             match src {
                 None => nonce_ok || hash_matches(list, code) || inline_allowed(list),
                 Some(url) => {
-                    nonce_ok || (dynamic && !parser_inserted) || (!dynamic && self.url_matches(list, url))
+                    nonce_ok
+                        || (dynamic && !parser_inserted)
+                        || (!dynamic && self.url_matches(list, url, false))
                 }
             }
         })
@@ -108,8 +117,34 @@ impl Csp {
     /// `url`?
     pub fn connect(&self, url: &str) -> bool {
         self.all(&["connect-src", "default-src"], |list| {
-            self.url_matches(list, url)
+            self.url_matches(list, url, false)
         })
+    }
+
+    /// The source lists a script request must match at each redirect hop,
+    /// one per policy that restricts it: the browser follows redirects, so
+    /// it checks them ([`redirect_allowed`]).
+    pub fn connect_sources(&self) -> Vec<Vec<String>> {
+        self.lists(&["connect-src", "default-src"], |_| true)
+    }
+
+    /// The same for an external `<script>` that [`Csp::script_element`]
+    /// allowed: one let in by its nonce or `'strict-dynamic'` may go
+    /// anywhere, the rest only where the list allows.
+    pub fn script_sources(&self, nonce: Option<&str>, parser_inserted: bool) -> Vec<Vec<String>> {
+        self.lists(&["script-src-elem", "script-src", "default-src"], |list| {
+            let nonce_ok = nonce.is_some_and(|n| !n.is_empty() && has_nonce(list, n));
+            !nonce_ok && !(has(list, "'strict-dynamic'") && !parser_inserted)
+        })
+    }
+
+    fn lists(&self, names: &[&str], keep: impl Fn(&[String]) -> bool) -> Vec<Vec<String>> {
+        self.policies
+            .iter()
+            .filter_map(|p| names.iter().find_map(|n| p.get(*n)))
+            .filter(|list| keep(list))
+            .cloned()
+            .collect()
     }
 
     /// Every policy allows it: the first of `names` each has decides, and
@@ -123,7 +158,9 @@ impl Csp {
         })
     }
 
-    fn url_matches(&self, list: &[String], url: &str) -> bool {
+    /// `redirected`: `url` is where a redirect led, which only has to match
+    /// a source's host, not its path (as in CSP, so paths don't leak).
+    fn url_matches(&self, list: &[String], url: &str, redirected: bool) -> bool {
         let Ok(u) = url::Url::parse(url) else { return false };
         let scheme = u.scheme();
         let host = u.host_str().unwrap_or("").to_ascii_lowercase();
@@ -184,17 +221,56 @@ impl Csp {
                 // from the page's).
                 None => u.port().is_none() || (scheme == "https" && port == Some(443)),
             };
-            let path_fits = path.is_none_or(|want| {
-                let have = u.path();
-                if want.ends_with('/') {
-                    have.starts_with(want)
-                } else {
-                    have == want
-                }
-            });
+            let path_fits = redirected
+                || path.is_none_or(|want| {
+                    let have = u.path();
+                    if want.ends_with('/') {
+                        have.starts_with(want)
+                    } else {
+                        have == want
+                    }
+                });
             scheme_fits && host_fits && port_fits && path_fits
         })
     }
+}
+
+/// Lists from the page's renderer, at most this many, each at most
+/// [`MAX_SOURCES`] long.
+pub const MAX_LISTS: usize = MAX_POLICIES;
+
+/// May a request the page at `page_url` made, under `lists` (from
+/// [`Csp::connect_sources`] or [`Csp::script_sources`]), follow a redirect
+/// to `url`? Checked by the browser, which follows redirects.
+pub fn redirect_allowed(page_url: &str, lists: &[Vec<String>], url: &str) -> bool {
+    let csp = Csp::new(page_url);
+    lists.iter().all(|list| csp.url_matches(list, url, true))
+}
+
+/// Does `code` match a `<script integrity>` value (Subresource
+/// Integrity)? Only the strongest algorithm listed counts, any of its
+/// hashes may match, and a value with no hash Brickle knows allows it.
+pub fn integrity_matches(integrity: &str, code: &str) -> bool {
+    let rank = |t: &str| match t.get(..7).map(str::to_ascii_lowercase).as_deref() {
+        Some("sha256-") => 1,
+        Some("sha384-") => 2,
+        Some("sha512-") => 3,
+        _ => 0,
+    };
+    // Options after `?` are ignored.
+    let tokens: Vec<&str> = integrity
+        .split_ascii_whitespace()
+        .take(MAX_SOURCES)
+        .map(|t| t.split('?').next().unwrap_or(""))
+        .filter(|t| rank(t) > 0)
+        .collect();
+    let Some(best) = tokens.iter().map(|t| rank(t)).max() else {
+        return true;
+    };
+    tokens
+        .iter()
+        .filter(|t| rank(t) == best)
+        .any(|t| hash_matches(&[format!("'{t}'")], code))
 }
 
 fn has(list: &[String], keyword: &str) -> bool {
@@ -375,6 +451,55 @@ mod tests {
         assert!(c.connect("https://site.example/x") && !c.connect("https://other.example/"));
         // Directive names ignore case; the first of a repeat wins.
         assert!(!csp("CONNECT-SRC 'none'; connect-src *").connect("https://site.example/"));
+    }
+
+    #[test]
+    fn redirects_are_held_to_the_source_lists() {
+        let page = "https://site.example/app/";
+        let c =
+            csp("script-src 'self' https://cdn.example/js/ 'nonce-n'; connect-src https://api.example/v1/");
+        let lists = c.connect_sources();
+        assert_eq!(lists.len(), 1);
+        // After a redirect only the host counts, not the path.
+        assert!(redirect_allowed(page, &lists, "https://api.example/elsewhere"));
+        assert!(!redirect_allowed(page, &lists, "https://evil.example/v1/"));
+        let scripts = c.script_sources(None, true);
+        assert!(redirect_allowed(page, &scripts, "https://cdn.example/other.js"));
+        assert!(redirect_allowed(page, &scripts, "https://site.example/x.js"));
+        assert!(!redirect_allowed(page, &scripts, "https://evil.example/js/a.js"));
+        // A script let in by its nonce may go anywhere.
+        assert!(c.script_sources(Some("n"), true).is_empty());
+        // So may one 'strict-dynamic' trusts, but not one from the document.
+        let d = csp("script-src 'strict-dynamic' https://cdn.example");
+        assert!(d.script_sources(None, false).is_empty());
+        assert_eq!(d.script_sources(None, true).len(), 1);
+        // No policy, nothing to check; every policy must allow it.
+        assert!(Csp::new(page).connect_sources().is_empty());
+        let two = csp("connect-src *, connect-src 'self'");
+        assert!(!redirect_allowed(
+            page,
+            &two.connect_sources(),
+            "https://other.example/"
+        ));
+    }
+
+    #[test]
+    fn integrity_hashes() {
+        let code = "console.log('sri ok')";
+        let good = "sha384-ILTwP2ca5vkltgnvohEsdfVLU99DuqBMCY9WHGHmJiohQJnSaRGlJPKZDXRWuvAy";
+        assert!(integrity_matches(good, code));
+        assert!(integrity_matches(
+            &format!("{good}?ct=application/javascript"),
+            code
+        ));
+        assert!(!integrity_matches(good, "console.log('evil')"));
+        // Only the strongest algorithm counts.
+        assert!(!integrity_matches(&format!("{good} sha512-AAAA"), code));
+        assert!(integrity_matches(&format!("{good} sha256-AAAA"), code));
+        // Nothing Brickle knows: not checked (as in browsers).
+        assert!(integrity_matches("md5-abc", code));
+        assert!(integrity_matches("", code));
+        assert!(integrity_matches("é€é€é€é€", code));
     }
 
     #[test]

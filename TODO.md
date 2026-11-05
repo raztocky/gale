@@ -55,7 +55,9 @@ what's next:
 - [x] `fetch`/XHR through the browser, with same-origin policy, CORS and credentials rules.
 - [x] CORS preflight (`OPTIONS`) for non-simple cross-origin requests, and checks at every redirect hop.
 - [x] `fetch`'s `mode` and `redirect`, enforced by the browser.
-- [x] Content Security Policy for scripts (`script-src`, `-elem`, `-attr`, `connect-src`, `default-src`).
+- [x] Content Security Policy for scripts (`script-src`, `-elem`, `-attr`, `connect-src`, `default-src`), checked at every redirect hop.
+- [x] Subresource Integrity for scripts; `nosniff` for scripts and stylesheets.
+- [ ] Subresource Integrity for stylesheets.
 - [ ] CSP for other resources (`img-src`, `style-src`, `frame-src`…), `upgrade-insecure-requests`.
 - [x] Scripts can't send to other sites (requests, or files they put on the page) unless you allow it.
 - [x] `document.cookie` for non-HttpOnly cookies, answered by the browser.

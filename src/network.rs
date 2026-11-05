@@ -436,7 +436,7 @@ impl Network {
         self.image_bytes = 0;
         self.deadline = std::time::Instant::now() + PAGE_TIME_BUDGET;
         self.page_bytes = 0;
-        let fetched = self.fetch_with(url, from, Dest::Document, post, false);
+        let fetched = self.fetch_with(url, from, Dest::Document, post, false, &[]);
         if let Err(e) = self.cookies.save() {
             eprintln!("brickle: saving cookies: {e}");
         }
@@ -548,7 +548,24 @@ impl Network {
     /// Fetch a stylesheet for the page at `page_url`. The page URL comes from
     /// the browser's own state, never from the renderer.
     pub fn subresource(&mut self, page_url: &str, url: &str, dest: Dest) -> Result<String, String> {
-        self.subresource_from(page_url, url, dest, false)
+        self.subresource_from(page_url, url, dest, false, &[])
+    }
+
+    /// An external script for the page; `csp` holds the source lists from
+    /// its Content Security Policy that every redirect hop must match
+    /// ([`crate::csp::Csp::script_sources`]). `added`: a script put it on
+    /// the page (see [`Network::subresource_added`]).
+    pub fn script_file(
+        &mut self,
+        page_url: &str,
+        url: &str,
+        added: bool,
+        csp: &[Vec<String>],
+    ) -> Result<String, String> {
+        if added {
+            self.script_added(page_url, url, Dest::Script)?;
+        }
+        self.subresource_from(page_url, url, Dest::Script, added, csp)
     }
 
     /// A stylesheet or script a page's script put on the page: it may only
@@ -556,7 +573,7 @@ impl Network {
     /// it redirects.
     pub fn subresource_added(&mut self, page_url: &str, url: &str, dest: Dest) -> Result<String, String> {
         self.script_added(page_url, url, dest)?;
-        self.subresource_from(page_url, url, dest, true)
+        self.subresource_from(page_url, url, dest, true, &[])
     }
 
     fn subresource_from(
@@ -565,6 +582,7 @@ impl Network {
         url: &str,
         dest: Dest,
         added: bool,
+        csp: &[Vec<String>],
     ) -> Result<String, String> {
         let why = match dest {
             Dest::Stylesheet => {
@@ -599,9 +617,17 @@ impl Network {
             self.record(url, dest, Outcome::OverLimit, vec![]);
             return Err(format!("{why}, skipped {url}"));
         }
-        match self.fetch_with(url, Some(page_url), dest, None, added) {
-            Fetch::Done { body, .. } => {
+        match self.fetch_with(url, Some(page_url), dest, None, added, csp) {
+            Fetch::Done {
+                body, headers, url, ..
+            } => {
                 self.page_bytes += body.len();
+                if let Some(why) = sniff_refused(dest, &headers) {
+                    if let Some(e) = self.log.last_mut() {
+                        e.outcome = Outcome::NotAllowed;
+                    }
+                    return Err(format!("{url}: {why}"));
+                }
                 Ok(body)
             }
             Fetch::OpaqueRedirect => Err(format!("{url} redirected")),
@@ -662,7 +688,7 @@ impl Network {
             self.record(url, Dest::Image, Outcome::OverLimit, vec![]);
             return Err(format!("{why}, skipped {url}"));
         }
-        match self.fetch_with(url, Some(page_url), Dest::Image, None, added) {
+        match self.fetch_with(url, Some(page_url), Dest::Image, None, added, &[]) {
             Fetch::OpaqueRedirect => Err(format!("{url} redirected")),
             Fetch::Done { bytes, status, .. } if (200..300).contains(&status) => {
                 self.image_bytes += bytes.len();
@@ -746,7 +772,7 @@ impl Network {
             self.preflight(page_url, &target, &req)?;
         }
         let creds = req.credentials;
-        match self.fetch_with(&target, Some(page_url), dest, Some(&req), true) {
+        match self.fetch_with(&target, Some(page_url), dest, Some(&req), true, &req.csp) {
             Fetch::OpaqueRedirect => Ok(ScriptResponse {
                 status: 0,
                 url: target,
@@ -862,7 +888,7 @@ impl Network {
             ..ScriptRequest::default()
         };
         let refused = |why: String| format!("CORS preflight: {} {why}", filter::host_of(target));
-        let (status, got) = match self.fetch_with(target, Some(page_url), Dest::Xhr, Some(&ask), true) {
+        let (status, got) = match self.fetch_with(target, Some(page_url), Dest::Xhr, Some(&ask), true, &[]) {
             Fetch::Done {
                 url, status, headers, ..
             } if url == target => (status, headers),
@@ -993,6 +1019,7 @@ impl Network {
         dest: Dest,
         script: Option<&ScriptRequest>,
         added: bool,
+        csp: &[Vec<String>],
     ) -> Fetch {
         let fdest = filter_dest(dest);
         let mut method = script.map(|s| s.method.clone()).unwrap_or_else(|| "GET".into());
@@ -1170,6 +1197,17 @@ impl Network {
                     };
                     let refused = refused.and_then(|()| match page {
                         Some(p) if added && dest != Dest::Document => self.script_added(p, &next, dest),
+                        _ => Ok(()),
+                    });
+                    // The page's Content Security Policy holds at every hop
+                    // (the renderer only saw the first address).
+                    let refused = refused.and_then(|()| match page {
+                        Some(p) if !csp.is_empty() && !crate::csp::redirect_allowed(p, csp, &next) => {
+                            Err(format!(
+                                "Content Security Policy doesn't allow the redirect to {}",
+                                filter::host_of(&next)
+                            ))
+                        }
                         _ => Ok(()),
                     });
                     let e = self.record(
@@ -1464,6 +1502,61 @@ fn cors_allows(headers: &[(String, String)], origin: &str, creds: bool) -> bool 
     }
 }
 
+/// `X-Content-Type-Options: nosniff` holds a server to the type it sent:
+/// a script must be a JavaScript type and a stylesheet `text/css`. Images,
+/// audio, video and CSV never run as scripts, nosniff or not (as in
+/// Firefox).
+fn sniff_refused(dest: Dest, headers: &[(String, String)]) -> Option<String> {
+    let get = |name: &str| {
+        headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.trim().to_ascii_lowercase())
+    };
+    let nosniff = get("x-content-type-options")
+        .is_some_and(|v| v.split(',').next().is_some_and(|v| v.trim() == "nosniff"));
+    let ctype = get("content-type").unwrap_or_default();
+    let essence = ctype.split(';').next().unwrap_or("").trim().to_string();
+    match dest {
+        Dest::Script => {
+            let js = matches!(
+                essence.as_str(),
+                "application/ecmascript"
+                    | "application/javascript"
+                    | "application/x-ecmascript"
+                    | "application/x-javascript"
+                    | "text/ecmascript"
+                    | "text/javascript"
+                    | "text/javascript1.0"
+                    | "text/javascript1.1"
+                    | "text/javascript1.2"
+                    | "text/javascript1.3"
+                    | "text/javascript1.4"
+                    | "text/javascript1.5"
+                    | "text/jscript"
+                    | "text/livescript"
+                    | "text/x-ecmascript"
+                    | "text/x-javascript"
+            );
+            let never = ["image/", "audio/", "video/"]
+                .iter()
+                .any(|p| essence.starts_with(p))
+                || essence == "text/csv";
+            (never || (nosniff && !js)).then(|| {
+                format!(
+                    "a {} file isn't a script",
+                    if essence.is_empty() { "untyped" } else { &essence }
+                )
+            })
+        }
+        Dest::Stylesheet if nosniff && essence != "text/css" => Some(format!(
+            "a {} file isn't a stylesheet (nosniff)",
+            if essence.is_empty() { "untyped" } else { &essence }
+        )),
+        _ => None,
+    }
+}
+
 fn is_cors_simple(req: &ScriptRequest) -> bool {
     matches!(req.method.as_str(), "GET" | "HEAD" | "POST")
         && req.headers.iter().all(|(k, v)| cors_safelisted(k, v))
@@ -1563,6 +1656,32 @@ fn interstitial(title: &str, body: &str, proceed: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nosniff_holds_servers_to_their_types() {
+        let h = |t: &str, nosniff: bool| {
+            let mut v = vec![("Content-Type".to_string(), t.to_string())];
+            if nosniff {
+                v.push(("x-content-type-options".into(), " NoSniff ".into()));
+            }
+            v
+        };
+        assert!(sniff_refused(Dest::Script, &h("text/plain", true)).is_some());
+        assert!(sniff_refused(Dest::Script, &h("text/plain", false)).is_none());
+        assert!(sniff_refused(Dest::Script, &h("text/javascript; charset=utf-8", true)).is_none());
+        assert!(sniff_refused(Dest::Script, &h("Application/JavaScript", true)).is_none());
+        assert!(sniff_refused(Dest::Script, &h("image/png", false)).is_some());
+        assert!(sniff_refused(Dest::Script, &h("text/csv", false)).is_some());
+        assert!(sniff_refused(
+            Dest::Script,
+            &[("x-content-type-options".into(), "nosniff".into())]
+        )
+        .is_some());
+        assert!(sniff_refused(Dest::Stylesheet, &h("text/css", true)).is_none());
+        assert!(sniff_refused(Dest::Stylesheet, &h("text/html", true)).is_some());
+        assert!(sniff_refused(Dest::Stylesheet, &h("text/html", false)).is_none());
+        assert!(sniff_refused(Dest::Image, &h("text/html", true)).is_none());
+    }
 
     #[test]
     fn blocked_requests_never_leave_the_browser() {

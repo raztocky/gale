@@ -49,6 +49,9 @@ impl Host for NetHost<'_> {
     fn fetch_added(&mut self, url: &str, dest: Dest) -> Result<String, String> {
         self.net.subresource_added(&self.page, url, dest)
     }
+    fn fetch_script(&mut self, url: &str, added: bool, csp: &[Vec<String>]) -> Result<String, String> {
+        self.net.script_file(&self.page, url, added, csp)
+    }
     fn image(&mut self, url: &str) -> Result<Vec<u8>, String> {
         self.net.image(&self.page, url, false)
     }
@@ -596,6 +599,7 @@ impl Renderer {
                     url,
                     dest: Dest::Image,
                     added,
+                    ..
                 } if fetches < MAX_FETCHES => {
                     fetches += 1;
                     let r = if added {
@@ -605,7 +609,17 @@ impl Renderer {
                     };
                     self.send(ToRenderer::ImageReply(r))?
                 }
-                FromRenderer::Fetch { url, dest, added } if fetches < MAX_FETCHES => {
+                FromRenderer::Fetch {
+                    url,
+                    dest: Dest::Script,
+                    added,
+                    csp,
+                } if fetches < MAX_FETCHES => {
+                    fetches += 1;
+                    let r = host.fetch_script(&url, added, &csp);
+                    self.send(ToRenderer::FetchReply(r))?
+                }
+                FromRenderer::Fetch { url, dest, added, .. } if fetches < MAX_FETCHES => {
                     fetches += 1;
                     let r = if added {
                         host.fetch_added(&url, dest)
@@ -761,6 +775,7 @@ except BrokenPipeError:
             url: url.into(),
             dest: Dest::Stylesheet,
             added: false,
+            csp: vec![],
         })
     }
     fn loaded() -> String {
