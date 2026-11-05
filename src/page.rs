@@ -482,7 +482,7 @@ impl Page {
                     let abs = net::resolve(&self.url, href);
                     if let Some(s) = self.sheet_cache.get(&abs) {
                         sheets.push(s.clone());
-                    } else if let Ok(text) = fetch(&abs, Dest::Stylesheet) {
+                    } else if let Ok(text) = data_css(&abs).unwrap_or_else(|| fetch(&abs, Dest::Stylesheet)) {
                         // Failures are shown in the request log.
                         let mut s = css::parse(&text);
                         css::resolve_urls(&mut s, &abs);
@@ -1105,6 +1105,26 @@ fn data_url(url: &str) -> Option<Result<Vec<u8>, String>> {
     Some(Err("only base64 image data is supported".into()))
 }
 
+/// A `data:text/css` stylesheet's text (decoded here, no request): base64
+/// or percent-encoded. `None` for any other address.
+fn data_css(url: &str) -> Option<Result<String, String>> {
+    let rest = url
+        .get(..5)
+        .filter(|p| p.eq_ignore_ascii_case("data:"))
+        .map(|_| &url[5..])?;
+    let (meta, payload) = rest.split_once(',')?;
+    let meta: String = meta.to_ascii_lowercase().split_whitespace().collect();
+    if !meta.starts_with("text/css") {
+        return Some(Err("not a stylesheet".into()));
+    }
+    let bytes = if meta.ends_with(";base64") {
+        base64(payload).ok_or_else(|| "bad base64".to_string())
+    } else {
+        Ok(percent_decode(payload))
+    };
+    Some(bytes.map(|b| String::from_utf8_lossy(&b).into_owned()))
+}
+
 /// `%XX` escapes decoded; anything malformed is kept as it is.
 fn percent_decode(s: &str) -> Vec<u8> {
     let b = s.as_bytes();
@@ -1606,6 +1626,23 @@ mod image_tests {
             })
             .expect("image drawn");
         assert_eq!((img.w, img.h), (100, 50));
+    }
+
+    #[test]
+    fn data_stylesheets_are_decoded_without_a_request() {
+        // ".a{color:red}" in base64, and percent-encoded.
+        assert_eq!(
+            data_css("data:text/css; charset=utf-8;base64,LmF7Y29sb3I6cmVkfQ==")
+                .unwrap()
+                .unwrap(),
+            ".a{color:red}"
+        );
+        assert_eq!(
+            data_css("data:text/css,.b%7Bcolor:blue%7D").unwrap().unwrap(),
+            ".b{color:blue}"
+        );
+        assert!(data_css("data:text/html,x").unwrap().is_err());
+        assert!(data_css("https://a.example/x.css").is_none());
     }
 
     #[test]

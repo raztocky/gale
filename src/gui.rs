@@ -22,7 +22,11 @@ use std::time::Instant;
 const MENU_H: f32 = 26.0;
 const TABS_H: f32 = 30.0;
 const ADDR_H: f32 = 40.0;
-const BAR_H: f32 = MENU_H + TABS_H + ADDR_H;
+/// The menu, tab and address bars.
+const TOP_H: f32 = MENU_H + TABS_H + ADDR_H;
+/// The bookmarks toolbar, under them (View → Bookmarks toolbar).
+const BOOK_H: f32 = 28.0;
+static BOOKMARKS_BAR: AtomicBool = AtomicBool::new(true);
 /// Where the tab strip starts.
 const TABS_Y: f32 = MENU_H;
 const MENU_ITEM_H: f32 = 26.0;
@@ -41,8 +45,18 @@ fn ui_scale() -> f32 {
 }
 
 /// The top bars' height in window pixels: where the page starts.
+/// All the bars above the page, in interface units.
+fn bars() -> f32 {
+    TOP_H
+        + if BOOKMARKS_BAR.load(Ordering::Relaxed) {
+            BOOK_H
+        } else {
+            0.0
+        }
+}
+
 fn bar_h() -> f32 {
-    (BAR_H * ui_scale()).round()
+    (bars() * ui_scale()).round()
 }
 
 /// The interface is dark (the default) or light.
@@ -71,7 +85,7 @@ const fn item(label: &'static str, keys: &'static str, press: (Key, bool, bool, 
     MenuItem { label, keys, press }
 }
 
-const MENUS: [(&str, &[MenuItem]); 4] = [
+const MENUS: [(&str, &[MenuItem]); 5] = [
     (
         "File",
         &[
@@ -119,13 +133,30 @@ const MENUS: [(&str, &[MenuItem]); 4] = [
             item("Reload", "Ctrl+R", (Key::R, true, false, false)),
         ],
     ),
+    (
+        "Bookmarks",
+        &[
+            item("Bookmark this page", "Ctrl+D", (Key::D, true, false, false)),
+            item("Bookmarks toolbar", "Ctrl+Shift+B", (Key::B, true, true, false)),
+        ],
+    ),
 ];
 /// Most tabs open at once (each has its own renderer process).
 const MAX_TABS: usize = 30;
 const STATUS_H: f32 = 22.0;
-const PANEL_W: f32 = 400.0;
+/// The requests panel's width, in interface units: drag its left edge.
+static PANEL_W: AtomicU32 = AtomicU32::new(0x43c8_0000); // 400.0
+const MIN_PANEL_W: f32 = 260.0;
+
+fn panel_w() -> f32 {
+    f32::from_bits(PANEL_W.load(Ordering::Relaxed))
+}
 const PANEL_HEAD: f32 = 116.0;
-const ROW_H: f32 = 38.0;
+/// A request row's first line, and each line after it.
+const ROW_LINE: f32 = 15.0;
+const ROW_PAD: f32 = 8.0;
+/// Most lines a request's address, or its notes, wrap onto.
+const ROW_MAX_LINES: usize = 8;
 /// Longest address, and longest paste, we take from the clipboard.
 const MAX_ADDRESS: usize = 8 * 1024;
 const MAX_PASTE: usize = 64 * 1024;
@@ -606,6 +637,16 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         loading: false,
     };
     shared_scale.store(ui.text_scale.to_bits(), Ordering::Relaxed);
+    BOOKMARKS_BAR.store(
+        brickle::network::config_dir()
+            .and_then(|d| std::fs::read_to_string(d.join("bookmarks-toolbar")).ok())
+            .is_none_or(|t| t.trim() != "off"),
+        Ordering::Relaxed,
+    );
+    PANEL_W.store(
+        load_scale("panel-width", &[MIN_PANEL_W, 2000.0], 400.0).to_bits(),
+        Ordering::Relaxed,
+    );
     UI_SCALE.store(
         load_scale("interface-size", &UI_SCALES, 1.0).to_bits(),
         Ordering::Relaxed,
@@ -629,6 +670,11 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
     let mut press: Option<(f32, f32)> = None;
     // Dragging the scrollbar: where on the thumb you grabbed it.
     let mut scroll_drag: Option<f32> = None;
+    // Dragging the requests panel's left edge to resize it.
+    let mut panel_drag = false;
+    let mut bookmarks = brickle::bookmarks::Bookmarks::load(brickle::network::data_dir().as_deref());
+    let mut was_right = false;
+    let mut resize_cursor = false;
     let mut dragged = false;
     let mut word_press = false;
     let mut last_press: Option<(Instant, f32, f32)> = None;
@@ -1247,6 +1293,23 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     ui.flash = Some(format!("{} interface", if dark { "Dark" } else { "Light" }));
                     dirty = true;
                 }
+                Key::D if ctrl => {
+                    ui.flash = Some(match bookmarks.toggle(&info.url, &info.title) {
+                        Ok(m) | Err(m) => m,
+                    });
+                    dirty = true;
+                }
+                Key::B if ctrl && shift => {
+                    let on = !BOOKMARKS_BAR.load(Ordering::Relaxed);
+                    BOOKMARKS_BAR.store(on, Ordering::Relaxed);
+                    if let Some(d) = brickle::network::config_dir() {
+                        let _ = std::fs::create_dir_all(&d);
+                        let _ =
+                            std::fs::write(d.join("bookmarks-toolbar"), if on { "on\n" } else { "off\n" });
+                    }
+                    tiles = None;
+                    dirty = true;
+                }
                 Key::F5 => reload = true,
                 Key::F12 => ui.panel = !ui.panel,
                 Key::E if ctrl && shift => ui.panel = !ui.panel,
@@ -1310,7 +1373,10 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             // About three lines a notch (X11 reports 1 per notch), more
             // with bigger text.
             if over_panel {
-                ui.panel_scroll = (ui.panel_scroll - dy * WHEEL_STEP).max(0.0);
+                let rows = panel_rows(&info.log, (w as f32 - page_w) / k);
+                let total = rows.last().map_or(0.0, |r| r.y + r.h);
+                let room = view_h / k - PANEL_HEAD;
+                ui.panel_scroll = (ui.panel_scroll - dy * WHEEL_STEP).clamp(0.0, (total - room).max(0.0));
             } else {
                 scroll -= dy * WHEEL_STEP * ui.text_scale;
             }
@@ -1319,11 +1385,22 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         scroll = scroll.clamp(0.0, max_scroll);
         let badge = badge_rect(&info.log, w as f32 / ui_scale());
         let down = window.get_mouse_down(MouseButton::Left);
+        // The panel's left edge, which you can drag to resize it.
+        let on_panel_edge =
+            ui.panel && mouse.is_some_and(|(mx, my)| my > bar && mx >= page_w - 3.0 && mx <= page_w + 5.0);
+        if (on_panel_edge || panel_drag) != resize_cursor {
+            resize_cursor = on_panel_edge || panel_drag;
+            window.set_cursor_style(if resize_cursor {
+                minifb::CursorStyle::ResizeLeftRight
+            } else {
+                minifb::CursorStyle::Arrow
+            });
+        }
         if let Some((mx, my)) = mouse {
             // The pointer in interface units, for the bars and panels.
             let (lx, ly) = (mx / k, my / k);
             let row = if over_panel {
-                panel_row(&info.log, ly, ui.panel_scroll)
+                panel_row(&info.log, ly, ui.panel_scroll, (w as f32 - page_w) / k)
             } else {
                 None
             };
@@ -1371,6 +1448,8 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     }
                     .into(),
                 )
+            } else if let Some(b) = bookmark_at(&bookmarks.list, w as f32 / k, lx, ly) {
+                Some(format!("{}  ·  right-click to remove", bookmarks.list[b].url))
             } else if badge.contains(lx, ly) {
                 Some("Show every request this page made (F12)".into())
             } else if my > bar && mx < page_w {
@@ -1402,7 +1481,22 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     }
                 }
             }
+            if mid && !was_mid {
+                if let Some(b) = bookmark_at(&bookmarks.list, w as f32 / k, lx, ly) {
+                    tab_action = Some(TabAction::Background(bookmarks.list[b].url.clone()));
+                }
+            }
             was_mid = mid;
+            let right = window.get_mouse_down(MouseButton::Right);
+            if right && !was_right {
+                if let Some(b) = bookmark_at(&bookmarks.list, w as f32 / k, lx, ly) {
+                    ui.flash = Some(match bookmarks.remove(b) {
+                        Ok(m) | Err(m) => m,
+                    });
+                    dirty = true;
+                }
+            }
+            was_right = right;
             let link_under = (my > bar && mx < page_w)
                 .then(|| {
                     ix.link_at_window(&rendered, mx, my, scroll)
@@ -1444,7 +1538,9 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 dirty = true;
             } else if down && !was_down {
                 ui.flash = None;
-                if ly < MENU_H {
+                if on_panel_edge {
+                    panel_drag = true;
+                } else if ly < MENU_H {
                     if let Some(t) = menu_title_at(lx, ly) {
                         ui.menu = Some(t);
                         if ui.editing {
@@ -1480,6 +1576,20 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     }
                 } else if badge.contains(lx, ly) {
                     ui.panel = !ui.panel;
+                } else if ly >= TOP_H && my < bar {
+                    // The bookmarks toolbar: Ctrl+click opens in a new tab.
+                    if let Some(b) = bookmark_at(&bookmarks.list, w as f32 / k, lx, ly) {
+                        let url = bookmarks.list[b].url.clone();
+                        if ctrl {
+                            tab_action = Some(TabAction::Background(url));
+                        } else {
+                            navigate = Some((url, None));
+                        }
+                    }
+                    if ui.editing {
+                        ui.editing = false;
+                        ui.address.set(&info.url);
+                    }
                 } else if my < bar {
                     if ui.editing {
                         // Already typing: put the cursor where you clicked.
@@ -1570,6 +1680,19 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     ui.address.set(&info.url);
                 }
                 dirty = true;
+            }
+        }
+        if panel_drag {
+            if !down {
+                panel_drag = false;
+                save_scale("panel-width", panel_w());
+            } else if let Some((mx, _)) = mouse {
+                let max = (w as f32 / k - 200.0).max(MIN_PANEL_W);
+                let pw = ((w as f32 - mx) / k).clamp(MIN_PANEL_W, max).round();
+                if pw != panel_w() {
+                    PANEL_W.store(pw.to_bits(), Ordering::Relaxed);
+                    dirty = true;
+                }
             }
         }
         if let Some(grab) = scroll_drag {
@@ -1900,6 +2023,10 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 page_w / k,
                 &mut cache,
             );
+            if BOOKMARKS_BAR.load(Ordering::Relaxed) {
+                let at = mouse.map(|(x, y)| (x / k, y / k));
+                draw_bookmarks(&mut canvas, &bookmarks.list, &info.url, at, &mut cache);
+            }
             let titles: Vec<(TabLabel, bool)> = order
                 .iter()
                 .map(|&id| {
@@ -1922,7 +2049,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 canvas.fill(
                     Rect {
                         x,
-                        y: BAR_H - 3.0,
+                        y: TOP_H - 3.0,
                         w: 200.0,
                         h: 3.0,
                     },
@@ -2125,7 +2252,7 @@ fn blank_rendered() -> Rendered {
 
 fn page_w_now(ui: &Ui, w: usize) -> f32 {
     if ui.panel {
-        (w as f32 - PANEL_W * ui_scale()).max(200.0).round()
+        (w as f32 - panel_w() * ui_scale()).max(200.0).round()
     } else {
         w as f32
     }
@@ -2309,6 +2436,92 @@ fn save_scale(name: &str, scale: f32) {
     if let Some(d) = brickle::network::config_dir() {
         let _ = std::fs::create_dir_all(&d);
         let _ = std::fs::write(d.join(name), format!("{scale}\n"));
+    }
+}
+
+/// Where each bookmark is on the toolbar, left to right, as many as fit
+/// in `w`.
+fn bookmark_rects(list: &[brickle::bookmarks::Bookmark], w: f32) -> Vec<Rect> {
+    let mut x = 8.0;
+    let mut out = Vec::new();
+    for b in list {
+        let bw = (font::measure(SANS, 11.5, &b.shown()) + 20.0).min(200.0);
+        if x + bw > w - 40.0 {
+            break;
+        }
+        out.push(Rect {
+            x,
+            y: TOP_H + 3.0,
+            w: bw,
+            h: BOOK_H - 6.0,
+        });
+        x += bw + 4.0;
+    }
+    out
+}
+
+fn bookmark_at(list: &[brickle::bookmarks::Bookmark], w: f32, x: f32, y: f32) -> Option<usize> {
+    if !BOOKMARKS_BAR.load(Ordering::Relaxed) || !(TOP_H..TOP_H + BOOK_H).contains(&y) {
+        return None;
+    }
+    bookmark_rects(list, w).iter().position(|r| r.contains(x, y))
+}
+
+/// The bookmarks toolbar, under the address bar.
+fn draw_bookmarks(
+    c: &mut Canvas,
+    list: &[brickle::bookmarks::Bookmark],
+    page_url: &str,
+    mouse: Option<(f32, f32)>,
+    cache: &mut GlyphCache,
+) {
+    let w = c.size().0;
+    if list.is_empty() {
+        let hint = "Bookmark a page with Ctrl+D and it appears here  ·  Ctrl+Shift+B hides this bar";
+        text(
+            c,
+            12.0,
+            TOP_H + 18.0,
+            &fit(hint, w - 24.0, SANS, 11.0),
+            SANS,
+            11.0,
+            GRAY,
+            cache,
+            0.0,
+        );
+        return;
+    }
+    let rects = bookmark_rects(list, w);
+    for (b, r) in list.iter().zip(&rects) {
+        let hovered = mouse.is_some_and(|(x, y)| r.contains(x, y));
+        if hovered || b.url == page_url {
+            c.fill(
+                *r,
+                if hovered {
+                    LINE
+                } else {
+                    Color::rgb(0xdd, 0xe1, 0xe6)
+                },
+                0.0,
+            );
+        }
+        let label = fit(&b.shown(), r.w - 20.0, SANS, 11.5);
+        text(c, r.x + 10.0, r.y + 15.5, &label, SANS, 11.5, DARK, cache, 0.0);
+    }
+    if rects.len() < list.len() {
+        let more = format!("+{}", list.len() - rects.len());
+        let mw = font::measure(SANS, 11.0, &more);
+        text(
+            c,
+            w - mw - 10.0,
+            TOP_H + 18.0,
+            &more,
+            SANS,
+            11.0,
+            GRAY,
+            cache,
+            0.0,
+        );
     }
 }
 
@@ -2522,7 +2735,7 @@ enum SiteButton {
 fn site_buttons(x0: f32) -> [(Rect, SiteButton); 3] {
     let r = |x: f32, y: f32, w: f32| Rect {
         x: x0 + x,
-        y: BAR_H + y,
+        y: bars() + y,
         w,
         h: 22.0,
     };
@@ -2540,13 +2753,135 @@ fn site_button_at(x0: f32, mx: f32, my: f32) -> Option<SiteButton> {
         .map(|(_, b)| b)
 }
 
-fn panel_row(log: &[LogEntry], my: f32, panel_scroll: f32) -> Option<usize> {
-    let y = my - BAR_H - PANEL_HEAD + panel_scroll;
+fn panel_row(log: &[LogEntry], my: f32, panel_scroll: f32, pw: f32) -> Option<usize> {
+    let y = my - bars() - PANEL_HEAD + panel_scroll;
     if y < 0.0 {
         return None;
     }
-    let i = (y / ROW_H) as usize;
-    (i < log.len()).then_some(i)
+    let rows = panel_rows(log, pw);
+    rows.iter().position(|r| y >= r.y && y < r.y + r.h)
+}
+
+/// A request row in the panel, laid out: the address and notes wrapped
+/// to the panel's width so all of them can be read.
+#[derive(Clone)]
+struct PanelRow {
+    /// Top, from the first row's, and height.
+    y: f32,
+    h: f32,
+    head: String,
+    url: Vec<String>,
+    notes: Vec<String>,
+}
+
+thread_local! {
+    static PANEL_ROWS: std::cell::RefCell<(u64, std::rc::Rc<Vec<PanelRow>>)> = Default::default();
+}
+
+/// The panel's rows for `log` at width `pw` (cached: laid out again only
+/// when the log or the width changes).
+fn panel_rows(log: &[LogEntry], pw: f32) -> std::rc::Rc<Vec<PanelRow>> {
+    use std::hash::{Hash, Hasher};
+    let described: Vec<(&str, String)> = log.iter().map(describe).collect();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    pw.to_bits().hash(&mut hasher);
+    for (e, (status, notes)) in log.iter().zip(&described) {
+        (&e.url, status, notes).hash(&mut hasher);
+    }
+    let key = hasher.finish();
+    if let Some(rows) = PANEL_ROWS.with(|c| {
+        let c = c.borrow();
+        (c.0 == key && !c.1.is_empty()).then(|| c.1.clone())
+    }) {
+        return rows;
+    }
+    let mut rows = Vec::with_capacity(log.len());
+    let mut y = 0.0;
+    for (e, (status, notes)) in log.iter().zip(described) {
+        let head = format!("{status} · {}", dest_kind(e.dest));
+        let hw = font::measure(BOLD, 11.0, &head) + 8.0;
+        let (host, rest) = net::display_parts(&e.url);
+        let host = host.split_once("://").map(|(_, h)| h.to_string()).unwrap_or(host);
+        let url = wrap(
+            &format!("{host}{rest}"),
+            pw - 24.0 - hw,
+            pw - 24.0,
+            SANS,
+            11.0,
+            false,
+        );
+        let notes = if notes.is_empty() {
+            vec![]
+        } else {
+            wrap(&notes, pw - 28.0, pw - 28.0, SANS, 10.0, true)
+        };
+        let h = ROW_PAD * 2.0 + ROW_LINE * (url.len().max(1) + notes.len()) as f32;
+        rows.push(PanelRow {
+            y,
+            h,
+            head,
+            url,
+            notes,
+        });
+        y += h;
+    }
+    let rows = std::rc::Rc::new(rows);
+    PANEL_ROWS.with(|c| *c.borrow_mut() = (key, rows.clone()));
+    rows
+}
+
+/// `text` broken into lines: the first at most `first_w` wide, the rest
+/// `rest_w`, at most [`ROW_MAX_LINES`] (the last ends in "…" if it's cut
+/// short). `words`: break at spaces where possible (addresses break
+/// anywhere).
+fn wrap(text: &str, first_w: f32, rest_w: f32, font_idx: usize, size: f32, words: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut lw = 0.0;
+    let mut buf = [0u8; 4];
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        let max = if lines.is_empty() { first_w } else { rest_w }.max(20.0);
+        let cw = font::measure(font_idx, size, ch.encode_utf8(&mut buf));
+        if lw + cw > max && !line.is_empty() {
+            if lines.len() + 1 == ROW_MAX_LINES {
+                lines.push(fit(
+                    &format!("{line}{ch}{}", chars.collect::<String>()),
+                    max,
+                    font_idx,
+                    size,
+                ));
+                return lines;
+            }
+            let mut next = String::new();
+            if words {
+                if let Some(i) = line.rfind(' ').filter(|&i| i > 0) {
+                    next = line[i + 1..].to_string();
+                    line.truncate(i);
+                }
+            }
+            lines.push(std::mem::take(&mut line));
+            lw = font::measure(font_idx, size, &next);
+            line = next;
+        }
+        line.push(ch);
+        lw += cw;
+    }
+    if !line.is_empty() || lines.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+fn dest_kind(d: net::Dest) -> &'static str {
+    match d {
+        net::Dest::Document => "page",
+        net::Dest::Stylesheet => "css",
+        net::Dest::Script => "js",
+        net::Dest::Xhr => "xhr",
+        net::Dest::Image => "img",
+        net::Dest::Download => "list",
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2581,7 +2916,7 @@ fn draw_chrome(
             x: 0.0,
             y: 0.0,
             w,
-            h: BAR_H,
+            h: bars(),
         },
         CHROME,
         0.0,
@@ -2589,7 +2924,7 @@ fn draw_chrome(
     c.fill(
         Rect {
             x: 0.0,
-            y: BAR_H - 1.0,
+            y: bars() - 1.0,
             w,
             h: 1.0,
         },
@@ -2746,7 +3081,7 @@ fn draw_chrome(
     if let Some((y, thumb)) = scrollbar_thumb(scroll, max_scroll, view_h * c.scale, c.scale) {
         let bar = Rect {
             x: page_w - SCROLLBAR_W + 2.0,
-            y: BAR_H + y / c.scale,
+            y: bars() + y / c.scale,
             w: SCROLLBAR_W - 4.0,
             h: thumb / c.scale,
         };
@@ -2760,7 +3095,7 @@ fn draw_chrome(
                 b: 0,
                 a: 90,
             },
-            BAR_H,
+            bars(),
         );
         c.dark = dark;
     }
@@ -2780,34 +3115,34 @@ fn draw_panel(
     c.fill(
         Rect {
             x: x0,
-            y: BAR_H,
+            y: bars(),
             w: pw,
-            h: h - BAR_H,
+            h: h - bars(),
         },
         Color::rgb(0xf8, 0xf9, 0xfb),
-        BAR_H,
+        bars(),
     );
     c.fill(
         Rect {
             x: x0,
-            y: BAR_H,
+            y: bars(),
             w: 1.0,
-            h: h - BAR_H,
+            h: h - bars(),
         },
         LINE,
-        BAR_H,
+        bars(),
     );
     let (blocked, total) = counts(log);
     text(
         c,
         x0 + 14.0,
-        BAR_H + 22.0,
+        bars() + 22.0,
         &format!("Requests  {total}  ·  blocked {blocked}"),
         BOLD,
         13.0,
         DARK,
         cache,
-        BAR_H,
+        bars(),
     );
     let sub = match net {
         None => "Loading…".to_string(),
@@ -2825,22 +3160,32 @@ fn draw_panel(
         }
     };
     let sub = fit(&sub, pw - 28.0, SANS, 11.0);
-    text(c, x0 + 14.0, BAR_H + 42.0, &sub, SANS, 11.0, GRAY, cache, BAR_H);
+    text(c, x0 + 14.0, bars() + 42.0, &sub, SANS, 11.0, GRAY, cache, bars());
     if let Some(n) = net.filter(|_| net::scheme(page_url).starts_with("http")) {
         let count = n.cookies.for_site(page_url).len();
         let kept = n.cookies.is_kept(page_url);
         let label = format!("Cookies: {count}");
-        text(c, x0 + 14.0, BAR_H + 68.0, &label, BOLD, 11.0, DARK, cache, BAR_H);
         text(
             c,
             x0 + 14.0,
-            BAR_H + 96.0,
+            bars() + 68.0,
+            &label,
+            BOLD,
+            11.0,
+            DARK,
+            cache,
+            bars(),
+        );
+        text(
+            c,
+            x0 + 14.0,
+            bars() + 96.0,
             "JavaScript:",
             BOLD,
             11.0,
             DARK,
             cache,
-            BAR_H,
+            bars(),
         );
         let js = n.scripts_allowed(page_url);
         for (r, b) in site_buttons(x0) {
@@ -2856,7 +3201,7 @@ fn draw_panel(
             } else {
                 (Color::WHITE, DARK)
             };
-            c.fill(r, LINE, BAR_H);
+            c.fill(r, LINE, bars());
             c.fill(
                 Rect {
                     x: r.x + 1.0,
@@ -2865,7 +3210,7 @@ fn draw_panel(
                     h: r.h - 2.0,
                 },
                 bg,
-                BAR_H,
+                bars(),
             );
             let tw = font::measure(SANS, 11.0, caption);
             text(
@@ -2877,28 +3222,28 @@ fn draw_panel(
                 11.0,
                 fg,
                 cache,
-                BAR_H,
+                bars(),
             );
         }
     }
     c.fill(
         Rect {
             x: x0,
-            y: BAR_H + PANEL_HEAD - 1.0,
+            y: bars() + PANEL_HEAD - 1.0,
             w: pw,
             h: 1.0,
         },
         LINE,
-        BAR_H,
+        bars(),
     );
 
-    let clip = BAR_H + PANEL_HEAD;
-    for (i, e) in log.iter().enumerate() {
-        let y = clip + i as f32 * ROW_H - panel_scroll;
-        if y + ROW_H < clip || y > h {
+    let clip = bars() + PANEL_HEAD;
+    let rows = panel_rows(log, pw);
+    for (e, r) in log.iter().zip(rows.iter()) {
+        let y = clip + r.y - panel_scroll;
+        if y + r.h < clip || y > h {
             continue;
         }
-        let (status, notes) = describe(e);
         let color = match e.outcome {
             Outcome::Blocked { .. }
             | Outcome::Denied { .. }
@@ -2916,34 +3261,36 @@ fn draw_panel(
                 x: x0 + 1.0,
                 y,
                 w: 4.0,
-                h: ROW_H - 1.0,
+                h: r.h - 1.0,
             },
             color,
             clip,
         );
-        let kind = match e.dest {
-            net::Dest::Document => "page",
-            net::Dest::Stylesheet => "css",
-            net::Dest::Script => "js",
-            net::Dest::Xhr => "xhr",
-            net::Dest::Image => "img",
-            net::Dest::Download => "list",
-        };
-        let head = format!("{status} · {kind}");
-        text(c, x0 + 14.0, y + 15.0, &head, BOLD, 11.0, color, cache, clip);
-        let hx = x0 + 14.0 + font::measure(BOLD, 11.0, &head) + 8.0;
-        let (host, rest) = net::display_parts(&e.url);
-        let host = host.split_once("://").map(|(_, h)| h.to_string()).unwrap_or(host);
-        let shown = fit(&format!("{host}{rest}"), w - hx - 10.0, SANS, 11.0);
-        text(c, hx, y + 15.0, &shown, SANS, 11.0, DARK, cache, clip);
-        if !notes.is_empty() {
-            let notes = fit(&notes, pw - 28.0, SANS, 10.0);
-            text(c, x0 + 14.0, y + 30.0, &notes, SANS, 10.0, GRAY, cache, clip);
+        let base = y + ROW_PAD + 11.0;
+        text(c, x0 + 14.0, base, &r.head, BOLD, 11.0, color, cache, clip);
+        let hx = x0 + 14.0 + font::measure(BOLD, 11.0, &r.head) + 8.0;
+        for (i, l) in r.url.iter().enumerate() {
+            let x = if i == 0 { hx } else { x0 + 14.0 };
+            text(c, x, base + i as f32 * ROW_LINE, l, SANS, 11.0, DARK, cache, clip);
+        }
+        let nb = base + r.url.len().max(1) as f32 * ROW_LINE;
+        for (i, l) in r.notes.iter().enumerate() {
+            text(
+                c,
+                x0 + 14.0,
+                nb + i as f32 * ROW_LINE,
+                l,
+                SANS,
+                10.0,
+                GRAY,
+                cache,
+                clip,
+            );
         }
         c.fill(
             Rect {
                 x: x0,
-                y: y + ROW_H - 1.0,
+                y: y + r.h - 1.0,
                 w: pw,
                 h: 1.0,
             },
@@ -2971,11 +3318,11 @@ fn draw_find(c: &mut Canvas, f: &Find, page_w: f32, cache: &mut GlyphCache) {
             l: 1.0,
         }),
         Color::rgb(0x3b, 0x82, 0xf6),
-        BAR_H,
+        bars(),
     );
-    c.fill(bar, Color::WHITE, BAR_H);
+    c.fill(bar, Color::WHITE, bars());
     let base = bar.y + 20.0;
-    text(c, bar.x + 8.0, base, "Find", BOLD, 13.0, GRAY, cache, BAR_H);
+    text(c, bar.x + 8.0, base, "Find", BOLD, 13.0, GRAY, cache, bars());
     let count = match (f.query.text.is_empty(), f.matches.len()) {
         (true, _) => String::new(),
         (false, 0) => "No matches".into(),
@@ -2993,7 +3340,7 @@ fn draw_find(c: &mut Canvas, f: &Find, page_w: f32, cache: &mut GlyphCache) {
         12.0,
         color,
         cache,
-        BAR_H,
+        bars(),
     );
     let x0 = bar.x + 46.0;
     let avail = bar.w - 46.0 - count_w - 20.0;
@@ -3014,7 +3361,7 @@ fn draw_find(c: &mut Canvas, f: &Find, page_w: f32, cache: &mut GlyphCache) {
                 h: bar.h - 12.0,
             },
             Color::rgb(0xbf, 0xdb, 0xfe),
-            BAR_H,
+            bars(),
         );
     }
     let shown: String = chars[start..].iter().collect();
@@ -3027,7 +3374,7 @@ fn draw_find(c: &mut Canvas, f: &Find, page_w: f32, cache: &mut GlyphCache) {
         14.0,
         DARK,
         cache,
-        BAR_H,
+        bars(),
     );
     c.fill(
         Rect {
@@ -3037,7 +3384,7 @@ fn draw_find(c: &mut Canvas, f: &Find, page_w: f32, cache: &mut GlyphCache) {
             h: bar.h - 12.0,
         },
         DARK,
-        BAR_H,
+        bars(),
     );
 }
 
@@ -3061,7 +3408,7 @@ fn draw_status(c: &mut Canvas, ui: &Ui, page_w: f32, cache: &mut GlyphCache) {
                 h: STATUS_H,
             },
             CHROME,
-            BAR_H,
+            bars(),
         );
         text(
             c,
@@ -3072,7 +3419,7 @@ fn draw_status(c: &mut Canvas, ui: &Ui, page_w: f32, cache: &mut GlyphCache) {
             12.0,
             Color::rgb(0x33, 0x33, 0x33),
             cache,
-            BAR_H,
+            bars(),
         );
     }
 }
@@ -3108,8 +3455,8 @@ fn draw_resend(c: &mut Canvas, page_w: f32, top: f32, cache: &mut GlyphCache) {
         b: 1.0,
         l: 1.0,
     };
-    c.fill(b.expand(edge), Color::rgb(0x3b, 0x82, 0xf6), BAR_H);
-    c.fill(b, Color::WHITE, BAR_H);
+    c.fill(b.expand(edge), Color::rgb(0x3b, 0x82, 0xf6), bars());
+    c.fill(b, Color::WHITE, bars());
     text(
         c,
         b.x + 14.0,
@@ -3119,17 +3466,17 @@ fn draw_resend(c: &mut Canvas, page_w: f32, top: f32, cache: &mut GlyphCache) {
         14.0,
         DARK,
         cache,
-        BAR_H,
+        bars(),
     );
     let line = "This page is the answer to a form you sent. Loading it again sends the form again,                 which can repeat an action such as a purchase or a post.";
     let mut y = b.y + 50.0;
     for l in wrap_words(line, b.w - 28.0, SANS, 12.5).iter().take(3) {
-        text(c, b.x + 14.0, y, l, SANS, 12.5, GRAY, cache, BAR_H);
+        text(c, b.x + 14.0, y, l, SANS, 12.5, GRAY, cache, bars());
         y += 18.0;
     }
     let [resend, cancel] = resend_buttons(page_w, top);
-    c.fill(resend, Color::rgb(0x1d, 0x4e, 0xd8), BAR_H);
-    c.fill(cancel, CHROME, BAR_H);
+    c.fill(resend, Color::rgb(0x1d, 0x4e, 0xd8), bars());
+    c.fill(cancel, CHROME, bars());
     for (r, label, color) in [(resend, "Resend", Color::WHITE), (cancel, "Cancel", DARK)] {
         let tw = font::measure(SANS, 13.0, label);
         text(
@@ -3141,7 +3488,7 @@ fn draw_resend(c: &mut Canvas, page_w: f32, top: f32, cache: &mut GlyphCache) {
             13.0,
             color,
             cache,
-            BAR_H,
+            bars(),
         );
     }
 }
@@ -3373,7 +3720,7 @@ mod menu_tests {
         );
         draw_menu_bar(&mut c, &ui, &mut cache);
         if std::env::var("MENU_RESEND").is_ok() {
-            draw_resend(&mut c, w as f32 / k, BAR_H, &mut cache);
+            draw_resend(&mut c, w as f32 / k, bars(), &mut cache);
         }
         if let Some(m) = ui.menu {
             let (_, items) = menu_rects(m);
@@ -3385,6 +3732,83 @@ mod menu_tests {
             );
         }
         c.write_png(&std::env::var("MENU_PNG").unwrap_or("menu.png".into()))
+            .unwrap();
+    }
+
+    /// The bookmarks toolbar and the requests panel with long addresses
+    /// (`PANEL_PNG=x.png cargo test panel_picture -- --ignored`).
+    #[test]
+    #[ignore]
+    fn panel_picture() {
+        use brickle::bookmarks::Bookmark;
+        use brickle::network::{LogEntry, Outcome};
+        let mut c = Canvas::new(1100, 520, Color::WHITE);
+        c.dark = std::env::var("MENU_LIGHT").is_err();
+        let mut cache = GlyphCache::default();
+        let mut ui = Ui {
+            address: LineEdit::new(64),
+            editing: false,
+            hover: None,
+            panel: true,
+            panel_scroll: 0.0,
+            flash: None,
+            menu: None,
+            text_scale: DEFAULT_TEXT_SCALE,
+            can_back: true,
+            can_forward: false,
+            resend: None,
+            loading: false,
+        };
+        ui.address.set("https://www.facebook.com/?_fb_noscript=1");
+        let entry = |url: &str, dest, outcome| LogEntry {
+            url: url.into(),
+            dest,
+            outcome,
+            stripped: vec![],
+            upgraded: false,
+            insecure: false,
+            allowed_by: None,
+            cookies_sent: vec!["datr".into(), "fr".into(), "sb".into()],
+            cookies_set: vec!["fr".into()],
+            cookies_refused: vec![],
+            cors_blocked: false,
+        };
+        let log = vec![
+            entry("https://www.facebook.com/?_fb_noscript=1", net::Dest::Document, Outcome::Loaded { status: 200 }),
+            entry(
+                "data:text/css; charset=utf-8;base64,LnRyeXtjb2xvcjpyZWR9LmFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6MDEyMzQ1Njc4OQ==",
+                net::Dest::Stylesheet,
+                Outcome::NotAllowed,
+            ),
+            entry(
+                "https://static.xx.fbcdn.net/rsrc.php/v5/yu/l/0,cross/pmVGPoqGaceAa3Xr8bBdCv.css?_nc_x=Ij3Wp8lg5Kz",
+                net::Dest::Stylesheet,
+                Outcome::Loaded { status: 200 },
+            ),
+            entry("https://static.xx.fbcdn.net/rsrc.php/yc/r/78KLk3JFzeg.webp", net::Dest::Image, Outcome::Loaded { status: 200 }),
+        ];
+        let bm = |u: &str, t: &str| Bookmark {
+            url: u.into(),
+            title: t.into(),
+        };
+        let marks = vec![
+            bm("https://www.facebook.com/?_fb_noscript=1", "Facebook"),
+            bm("https://lobste.rs/", "Lobsters"),
+            bm("https://example.com/a/very/long/path", ""),
+        ];
+        let w = c.size().0;
+        let pw = 340.0;
+        draw_chrome(&mut c, &ui, &log, 0.0, 0.0, 300.0, w - pw, &mut cache);
+        draw_menu_bar(&mut c, &ui, &mut cache);
+        draw_bookmarks(
+            &mut c,
+            &marks,
+            &ui.address.text,
+            Some((90.0, TOP_H + 10.0)),
+            &mut cache,
+        );
+        draw_panel(&mut c, &ui.address.text, &log, None, 0.0, w - pw, &mut cache);
+        c.write_png(&std::env::var("PANEL_PNG").unwrap_or("panel.png".into()))
             .unwrap();
     }
 }

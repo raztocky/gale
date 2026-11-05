@@ -282,7 +282,10 @@ field.
 - `~/.config/brickle/keep-cookies.txt` and `~/.local/share/brickle/cookies.txt`: the sites whose
   cookies you keep, and those cookies.
 - `~/.config/brickle/text-size`, `interface-size` and `interface-theme`: your text and interface
-  sizes and whether the interface is light or dark, the same for every site.
+  sizes and whether the interface is light or dark, the same for every site; `panel-width` and
+  `bookmarks-toolbar`, the request panel's width and whether the bookmarks toolbar shows.
+- `~/.local/share/brickle/bookmarks.txt`: your bookmarks (address and title, one per line). Nothing
+  is ever fetched for them: no icons, no previews.
 
 There is no history file. Back/forward history, and the closed tabs `Ctrl+Shift+T` can reopen,
 exist only in memory while the window is open.

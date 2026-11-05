@@ -1,6 +1,7 @@
 //! Brickle Browser engine.
 #![forbid(unsafe_code)]
 
+pub mod bookmarks;
 pub mod cookies;
 pub mod crlite;
 pub mod csp;

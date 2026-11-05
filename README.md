@@ -47,6 +47,8 @@ size, and clicking the percentage between them goes back to the normal size.
 | Scroll | mouse wheel, arrow keys, `Space`, `PgUp`/`PgDn` |
 | Back / forward | the ← → buttons, `Backspace` or `Alt+←` / `Alt+→` |
 | Reload / stop | the ↻ button (✕ while loading), `Ctrl+R` or `F5` / `Esc` |
+| Bookmark this page (again to remove) / bookmarks toolbar | `Ctrl+D` / `Ctrl+Shift+B`; right-click a bookmark to remove it |
+| Resize the request panel | drag its left edge |
 | New tab / close tab / reopen closed tab | `Ctrl+T` or `+` / `Ctrl+W` or `×` / `Ctrl+Shift+T` |
 | Switch tabs | `Ctrl+Tab`, `Ctrl+Shift+Tab`, `Ctrl+PgDn`/`PgUp`, `Ctrl+1`…`Ctrl+9` |
 | Open a link in a new tab | middle-click, or `Ctrl`+click |
