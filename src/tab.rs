@@ -810,6 +810,29 @@ except BrokenPipeError:
     }
 
     #[test]
+    fn a_renderer_dying_mid_load_is_an_error_and_others_carry_on() {
+        // It reads the request and dies (crash, out of memory, killed)
+        // without answering, or after half a frame.
+        for script in [
+            vec!["read".to_string()],
+            vec!["read".into(), "raw:ff000000aabb".into()],
+        ] {
+            let Some(mut r) = fake(&script, Cancel::new()) else {
+                return;
+            };
+            let start = Instant::now();
+            assert!(load(&mut r, 10.0, &mut no_fetch).is_err());
+            assert!(start.elapsed() < Duration::from_secs(3), "{:?}", start.elapsed());
+        }
+        // Another renderer (another tab) is unaffected.
+        let s = vec!["read".into(), format!("send:{}", loaded())];
+        let Some(mut r) = fake(&s, Cancel::new()) else {
+            return;
+        };
+        assert_eq!(load(&mut r, 5.0, &mut no_fetch).as_deref(), Ok("t"));
+    }
+
+    #[test]
     fn well_behaved_renderer_works() {
         let s = vec![
             "read".into(),

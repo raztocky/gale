@@ -267,6 +267,7 @@ pub const PROBES: &[&str] = &[
     "open a UDP socket",
     "run another program",
     "replace itself with another program",
+    "allocate past the memory limit",
 ];
 
 /// Run one probe (after [`enter`]). Returns true if it was blocked.
@@ -298,6 +299,9 @@ pub fn probe(name: &str) -> bool {
             let _ = std::process::Command::new("/bin/true").exec();
             true
         }
+        // rlimit: the address space is capped at 4 GiB, so 8 GiB can't be reserved
+        // (and a renderer that grows past it fails there, not the browser).
+        "allocate past the memory limit" => Vec::<u8>::new().try_reserve_exact(8 << 30).is_err(),
         _ => false,
     }
 }

@@ -4053,6 +4053,27 @@ mod calc_var_tests {
     }
 
     #[test]
+    fn circular_variables_are_invalid_not_endless() {
+        // Each refers to the other, or to itself: all invalid, so the
+        // property falls back (here, to the inherited colour).
+        let start = std::time::Instant::now();
+        let s = b_style(
+            "<div style='color: #123456'><b style='--a: var(--b); --b: var(--a); --c: var(--c, red); \
+             --d: var(--a) var(--c); color: var(--a); width: var(--d); background: var(--c)'>x</b></div>",
+            "",
+        );
+        assert!(start.elapsed().as_secs() < 1, "{:?}", start.elapsed());
+        assert_eq!((s.color.r, s.color.g, s.color.b), (0x12, 0x34, 0x56));
+        // The same through a stylesheet, across elements.
+        let s = b_style(
+            "<div><b>x</b></div>",
+            ":root { --x: var(--y); } div { --y: var(--x); } b { color: var(--y, #00ff00) }",
+        );
+        assert!(start.elapsed().as_secs() < 1);
+        let _ = s;
+    }
+
+    #[test]
     fn nested_variables_cant_blow_up() {
         // Each level doubles the last: 2^40 values if expanded fully.
         let mut css = String::from("--v0: aaaaaaaa;");
