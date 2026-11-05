@@ -897,7 +897,8 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 // New content: repaint tiles on demand. The same page
                 // changed (a click, a script) keeps showing as it was
                 // until the new tiles arrive, rather than flashing blank.
-                stale_tiles = if done.new_page { None } else { tiles.take() };
+                let old = tiles.take();
+                stale_tiles = if done.new_page { None } else { old };
                 laid_out_at = (page_w, view_h);
             }
             if done.new_page {
