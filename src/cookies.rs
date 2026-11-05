@@ -61,6 +61,10 @@ pub struct Context<'a> {
     pub initiator: Option<&'a str>,
     /// Loading a page (as opposed to a stylesheet etc.).
     pub navigation: bool,
+    /// The request's method is GET, HEAD, OPTIONS or TRACE: only then do
+    /// `Lax` cookies go along on a navigation from another site, so a
+    /// form on another site can't POST with them.
+    pub safe_method: bool,
 }
 
 /// What happened to the cookies of one response.
@@ -375,6 +379,7 @@ impl Jar {
             top: page_url,
             initiator: Some(page_url),
             navigation: false,
+            safe_method: true,
         };
         self.cookie_string(page_url, ctx, false)
             .map(|(s, _)| s)
@@ -388,6 +393,7 @@ impl Jar {
             top: page_url,
             initiator: Some(page_url),
             navigation: false,
+            safe_method: true,
         };
         match parse(value, page_url, now()) {
             Ok(c) if c.http_only => Stored {
@@ -440,7 +446,7 @@ impl Jar {
             .filter(|c| http_only || !c.http_only)
             .filter(|c| match c.same_site {
                 SameSite::Strict => !cross_site,
-                SameSite::Lax => !cross_site || ctx.navigation,
+                SameSite::Lax => !cross_site || (ctx.navigation && ctx.safe_method),
                 SameSite::None => true,
             })
             .collect();
@@ -721,6 +727,7 @@ mod tests {
             top,
             initiator: from,
             navigation: true,
+            safe_method: true,
         }
     }
     fn sub(top: &str) -> Context<'_> {
@@ -728,6 +735,7 @@ mod tests {
             top,
             initiator: Some(top),
             navigation: false,
+            safe_method: true,
         }
     }
     fn set(j: &mut Jar, url: &str, ctx: Context, h: &[&str]) -> Stored {
@@ -814,6 +822,19 @@ mod tests {
         // Arriving from another site: Strict stays home.
         let h = j.header_for(u, nav(u, Some("https://evil.example/")));
         assert_eq!(h.unwrap().0, "l=1; n=1");
+        // A form on another site POSTing here: Lax (the default) stays
+        // home too, so it can't ride along as a CSRF.
+        let post = Context {
+            safe_method: false,
+            ..nav(u, Some("https://evil.example/"))
+        };
+        assert_eq!(j.header_for(u, post).unwrap().0, "n=1");
+        // The bank's own forms still carry everything.
+        let own = Context {
+            safe_method: false,
+            ..nav(u, Some("https://bank.example/form"))
+        };
+        assert_eq!(j.header_for(u, own).unwrap().0, "s=1; l=1; n=1");
         // A redirect hop through a tracker can't set cookies.
         let hop = "https://bounce.example/r?to=bank";
         let h: Vec<String> = vec!["id=1".into()];

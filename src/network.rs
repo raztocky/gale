@@ -1000,6 +1000,8 @@ impl Network {
                 top: &top,
                 initiator: from.as_deref(),
                 navigation: dest == Dest::Document,
+                // This hop's method: a POST answered by 303 continues as a GET.
+                safe_method: matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS" | "TRACE"),
             };
             // Script requests carry cookies per their `credentials`.
             let cookies_ok = match script.map(|s| s.credentials) {

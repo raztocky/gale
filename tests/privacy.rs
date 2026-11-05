@@ -815,6 +815,7 @@ fn forms_submit_through_the_browser() {
     let r = tab.interact(&mut net, Input::Key(Key::Enter));
     let sub = r.submit.expect("Enter submits");
     let _ = Tab::submit(&mut net, &sub, Some(&url), false, (800.0, 600.0));
+    let log = seen.clone();
     let seen = seen.lock().unwrap();
     let post = &seen[1];
     assert_eq!(post[0], "POST /login HTTP/1.1");
@@ -830,6 +831,26 @@ fn forms_submit_through_the_browser() {
         Some("Sec-Fetch-Mode: navigate")
     );
     assert_eq!(header("BODY").as_deref(), Some("BODY: user=raz&pw=p%26ss+w%3Drd"));
+    drop(seen);
+
+    // The same POST from a page on another site (localhost isn't
+    // 127.0.0.1's site): the cookie (Lax, by default) stays home, so a
+    // hostile form can't ride on your login. A link from there still
+    // carries it, as Lax allows.
+    let evil = format!("http://localhost:{port}/");
+    let _ = Tab::submit(&mut net, &sub, Some(&evil), false, (800.0, 600.0));
+    let _ = Tab::open(
+        &mut net,
+        &format!("http://127.0.0.1:{port}/search"),
+        Some(&evil),
+        false,
+    );
+    let seen = log.lock().unwrap();
+    let n = seen.len();
+    let cookie = |req: &Vec<String>| req.iter().any(|l| l.starts_with("Cookie: "));
+    assert_eq!(seen[n - 2][0], "POST /login HTTP/1.1");
+    assert!(!cookie(&seen[n - 2]), "cross-site POST: {:?}", seen[n - 2]);
+    assert!(cookie(&seen[n - 1]), "cross-site link: {:?}", seen[n - 1]);
     drop(seen);
 
     // A GET form goes to its URL with the data as the query.
