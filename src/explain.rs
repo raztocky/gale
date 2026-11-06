@@ -20,6 +20,8 @@ pub enum Kind {
     Monitoring,
     Consent,
     Content,
+    BotDetection,
+    Affiliate,
 }
 
 impl Kind {
@@ -35,6 +37,8 @@ impl Kind {
             Kind::Monitoring => "performance and error monitoring",
             Kind::Consent => "cookie consent",
             Kind::Content => "third-party content",
+            Kind::BotDetection => "bot detection",
+            Kind::Affiliate => "affiliate marketing",
         }
     }
 }
@@ -70,6 +74,10 @@ use Kind::*;
 
 /// Well-known third parties. More specific entries (with a path) first.
 pub const TRACKERS: &[Tracker] = &[
+    t("google.com/recaptcha", "reCAPTCHA", "Google", BotDetection, "checks you're not a bot by examining your browser and how you move, click and type"),
+    t("gstatic.com/recaptcha", "reCAPTCHA", "Google", BotDetection, "checks you're not a bot by examining your browser and how you move, click and type"),
+    t("google.com/pagead", "Google Ads conversion tracking", "Google", Advertising, "tells Google Ads that you came from one of its ads or did something the advertiser counts"),
+    t("google.com/ads", "Google Analytics advertising features", "Google", Advertising, "adds you to ad audiences based on this visit, so the site's ads can follow you"),
     t("facebook.com/tr", "Meta Pixel", "Meta", Advertising, "tells Meta which pages you visit and what you do on them, to target and measure ads, whether or not you use Facebook"),
     t("facebook.com/plugins", "Facebook social plugin", "Meta", Social, "shows a Like or share button, and lets Meta see that you visited this page"),
     t("connect.facebook.net", "Meta Pixel / Facebook SDK", "Meta", Advertising, "loads Meta's tracking code, which reports your visit and actions on this page to Meta for ads"),
@@ -145,6 +153,186 @@ pub const TRACKERS: &[Tracker] = &[
     t("sharethis.com", "ShareThis", "ShareThis", Social, "shows share buttons, and collects data about your visit"),
     t("branch.io", "Branch", "Branch", Advertising, "tracks which link or ad brought you here, across apps and sites"),
     t("appsflyer.com", "AppsFlyer", "AppsFlyer", Advertising, "tracks which ad brought you here, for the advertiser"),
+    // More advertising.
+    t("googletagservices.com", "Google Publisher Tag", "Google", Advertising, "loads Google's ad-serving code, which picks ads using what Google knows about you"),
+    t("2mdn.net", "Google ad content (DoubleClick)", "Google", Advertising, "serves the images and videos of ads from Google's ad platform"),
+    t("adnxs-simple.com", "Xandr ad exchange", "Microsoft", Advertising, "runs real-time auctions that share your visit with many advertisers bidding to show you an ad"),
+    t("indexww.com", "Index Exchange", "Index Exchange", Advertising, "runs ad auctions that share your visit with advertisers"),
+    t("ads.yahoo.com", "Yahoo Ads", "Yahoo", Advertising, "serves and measures Yahoo ads, recognising you across sites"),
+    t("analytics.yahoo.com", "Yahoo Dot tag", "Yahoo", Advertising, "tells Yahoo which pages you visit, to target and measure its ads"),
+    t("advertising.com", "Yahoo Ads", "Yahoo", Advertising, "serves and measures Yahoo ads, recognising you across sites"),
+    t("an.yandex.ru", "Yandex Advertising Network", "Yandex", Advertising, "serves Yandex ads, chosen using what Yandex knows about you"),
+    t("3lift.com", "TripleLift", "TripleLift", Advertising, "runs ad auctions that share your visit with advertisers"),
+    t("triplelift.com", "TripleLift", "TripleLift", Advertising, "runs ad auctions that share your visit with advertisers"),
+    t("sharethrough.com", "Sharethrough", "Sharethrough", Advertising, "runs ad auctions that share your visit with advertisers"),
+    t("yieldmo.com", "Yieldmo", "Yieldmo", Advertising, "runs ad auctions that share your visit with advertisers"),
+    t("33across.com", "33Across", "33Across", Advertising, "runs ad auctions and gives your browser an ID that advertisers share"),
+    t("smartadserver.com", "Equativ (Smart AdServer)", "Equativ", Advertising, "serves ads and runs auctions that share your visit with advertisers"),
+    t("teads.tv", "Teads", "Teads", Advertising, "serves video ads inside articles, and measures whether you watched them"),
+    t("media.net", "Media.net", "Media.net", Advertising, "serves contextual ads and runs auctions that share your visit with advertisers"),
+    t("contextweb.com", "PulsePoint", "PulsePoint", Advertising, "runs ad auctions that share your visit with advertisers"),
+    t("lijit.com", "Sovrn", "Sovrn", Advertising, "runs ad auctions that share your visit with advertisers"),
+    t("sovrn.com", "Sovrn", "Sovrn", Advertising, "runs ad auctions that share your visit with advertisers"),
+    t("adform.net", "Adform", "Adform", Advertising, "serves and measures ads, recognising you across sites"),
+    t("bidswitch.net", "BidSwitch", "IPONWEB (Criteo)", Advertising, "passes your visit between ad exchanges and the advertisers bidding on it"),
+    t("mathtag.com", "MediaMath", "MediaMath", Advertising, "buys ads for advertisers, recognising you across sites with its own ID"),
+    t("everesttech.net", "Adobe Advertising", "Adobe", Advertising, "buys and measures ads for advertisers, recognising you across sites"),
+    t("serving-sys.com", "Amazon Ad Server (Sizmek)", "Amazon", Advertising, "serves and measures ads for advertisers"),
+    t("flashtalking.com", "Flashtalking", "Mediaocean", Advertising, "serves and measures ads for advertisers"),
+    t("adroll.com", "AdRoll", "NextRoll", Advertising, "follows the pages you look at so ads for this site can follow you to other sites (retargeting)"),
+    t("rfihub.com", "Zeta Global", "Zeta Global", Advertising, "buys ads for advertisers, recognising you across sites with its own ID"),
+    t("revcontent.com", "Revcontent", "Revcontent", Advertising, "shows \"recommended\" sponsored links, chosen from a profile of what you read"),
+    t("mgid.com", "MGID", "MGID", Advertising, "shows \"recommended\" sponsored links, chosen from a profile of what you read"),
+    t("bounceexchange.com", "Wunderkind", "Wunderkind", Advertising, "tracks what you do on the site to show you pop-ups and send you marketing emails"),
+    t("bouncex.net", "Wunderkind", "Wunderkind", Advertising, "tracks what you do on the site to show you pop-ups and send you marketing emails"),
+    t("q.quora.com", "Quora Pixel", "Quora", Advertising, "tells Quora which pages you visit, to target and measure ads on Quora"),
+    t("pixels.spotify.com", "Spotify Pixel", "Spotify", Advertising, "tells Spotify which pages you visit, to measure its ads"),
+    t("vk.com/rtrg", "VK Pixel", "VK", Advertising, "tells VK which pages you visit, to target ads on VK"),
+    t("adjust.com", "Adjust", "Adjust (AppLovin)", Advertising, "tracks which ad brought you here, for the advertiser"),
+    t("kochava.com", "Kochava", "Kochava", Advertising, "tracks which ad brought you here, for the advertiser"),
+    t("singular.net", "Singular", "Singular", Advertising, "tracks which ad brought you here, for the advertiser"),
+    // Ad verification.
+    t("moatads.com", "Moat", "Oracle", Advertising, "measures whether you saw the ads on this page, and whether you're a real person"),
+    t("doubleverify.com", "DoubleVerify", "DoubleVerify", Advertising, "measures whether you saw the ads on this page, and whether you're a real person"),
+    t("adsafeprotected.com", "Integral Ad Science", "Integral Ad Science", Advertising, "measures whether you saw the ads on this page, and whether you're a real person"),
+    // Data brokers and shared IDs.
+    t("bluekai.com", "Oracle BlueKai", "Oracle", Identity, "collects data about your browsing to sell audience profiles to advertisers"),
+    t("agkn.com", "Neustar (TransUnion)", "TransUnion", Identity, "links your browser to an identity profile that advertisers buy"),
+    t("tapad.com", "Tapad", "Experian", Identity, "links your browser to your other devices, so advertisers can recognise you on all of them"),
+    t("krxd.net", "Salesforce Audience Studio (Krux)", "Salesforce", Identity, "builds an audience profile of you for the site's advertising"),
+    t("exelator.com", "Nielsen eXelate", "Nielsen", Identity, "collects data about your browsing to sell audience profiles to advertisers"),
+    t("liadm.com", "LiveIntent", "LiveIntent", Identity, "gives your browser an ID tied to your email address, which advertisers share"),
+    t("pippio.com", "LiveRamp", "LiveRamp", Identity, "links your browser to an identity profile that advertisers share"),
+    t("adsymptotic.com", "Drawbridge", "LinkedIn (Microsoft)", Identity, "links your browser to your other devices, so advertisers can recognise you on all of them"),
+    t("zeotap.com", "Zeotap", "Zeotap", Identity, "links your browser to an identity profile that advertisers share"),
+    t("permutive.com", "Permutive", "Permutive", Identity, "builds an audience profile of you in your browser for the site's ads"),
+    t("permutive.app", "Permutive", "Permutive", Identity, "builds an audience profile of you in your browser for the site's ads"),
+    // Affiliate links.
+    t("awin1.com", "Awin", "Awin", Affiliate, "records which affiliate link brought you here, so its owner is paid commission"),
+    t("anrdoezrs.net", "CJ Affiliate", "Publicis", Affiliate, "records which affiliate link brought you here, so its owner is paid commission"),
+    t("linksynergy.com", "Rakuten Advertising", "Rakuten", Affiliate, "records which affiliate link brought you here, so its owner is paid commission"),
+    t("shareasale.com", "ShareASale", "Awin", Affiliate, "records which affiliate link brought you here, so its owner is paid commission"),
+    t("skimresources.com", "Skimlinks", "Connexity", Affiliate, "turns ordinary links on the page into affiliate links, and records what you click"),
+    t("viglink.com", "Sovrn Commerce (VigLink)", "Sovrn", Affiliate, "turns ordinary links on the page into affiliate links, and records what you click"),
+    // More analytics.
+    t("imrworldwide.com", "Nielsen Digital Measurement", "Nielsen", Analytics, "measures audiences across sites for advertisers"),
+    t("gemius.pl", "Gemius", "Gemius", Analytics, "measures audiences across sites for advertisers"),
+    t("hm.baidu.com", "Baidu Tongji", "Baidu", Analytics, "records which pages you view and where you came from"),
+    t("cnzz.com", "Umeng (CNZZ)", "Alibaba", Analytics, "records which pages you view and where you came from"),
+    t("top-fwz1.mail.ru", "Top.Mail.Ru", "VK", Analytics, "counts your visits and measures audiences for advertisers"),
+    t("mc.yandex.com", "Yandex Metrica", "Yandex", SessionReplay, "records your visit, which it can replay, including clicks and scrolling"),
+    t("stats.wp.com", "WordPress.com Stats (Jetpack)", "Automattic", Analytics, "counts your visit for the site's WordPress.com statistics"),
+    t("pixel.wp.com", "WordPress.com Stats (Jetpack)", "Automattic", Analytics, "counts your visit for the site's WordPress.com statistics"),
+    t("parsely.com", "Parse.ly", "Automattic", Analytics, "measures what you read and for how long"),
+    t("parse.ly", "Parse.ly", "Automattic", Analytics, "measures what you read and for how long"),
+    t("statcounter.com", "StatCounter", "StatCounter", Analytics, "records which pages you view and where you came from"),
+    t("getclicky.com", "Clicky", "Clicky", Analytics, "records which pages you view, under an ID for you"),
+    t("kissmetrics.com", "Kissmetrics", "Kissmetrics", Analytics, "records what you do, under an ID for you"),
+    t("matomo.cloud", "Matomo Cloud", "InnoCraft", Analytics, "records your visit for the site's own analytics"),
+    t("googleoptimize.com", "Google Optimize", "Google", Analytics, "puts you in A/B tests and measures what you do"),
+    t("visualwebsiteoptimizer.com", "VWO", "Wingify", Analytics, "puts you in A/B tests and can record your visit"),
+    t("vwo.com", "VWO", "Wingify", Analytics, "puts you in A/B tests and can record your visit"),
+    t("abtasty.com", "AB Tasty", "AB Tasty", Analytics, "puts you in A/B tests and measures what you do"),
+    t("launchdarkly.com", "LaunchDarkly", "LaunchDarkly", Analytics, "turns site features on or off for you, and reports which you saw"),
+    t("posthog.com", "PostHog", "PostHog", Analytics, "records what you click and do, and can record your visit to replay it"),
+    t("rudderstack.com", "RudderStack", "RudderStack", Analytics, "collects what you do and passes it on to the site's other analytics and ad tools"),
+    t("mparticle.com", "mParticle", "Rokt", Analytics, "collects what you do and passes it on to the site's other analytics and ad tools"),
+    t("heap-api.com", "Heap", "Contentsquare", Analytics, "records every click and page view, under an ID for you"),
+    t("qualtrics.com", "Qualtrics", "Qualtrics", Analytics, "shows surveys and records how you use the site"),
+    t("piano.io", "Piano", "Piano", Analytics, "measures what you read, and decides whether to show you a paywall"),
+    t("tinypass.com", "Piano", "Piano", Analytics, "measures what you read, and decides whether to show you a paywall"),
+    t("cxense.com", "Piano (Cxense)", "Piano", Analytics, "builds a profile of what you read, for recommendations and ads"),
+    t("simpleanalyticscdn.com", "Simple Analytics", "Simple Analytics", Analytics, "counts visits without cookies or a personal ID"),
+    t("usefathom.com", "Fathom Analytics", "Fathom", Analytics, "counts visits without cookies or a personal ID"),
+    t("goatcounter.com", "GoatCounter", "GoatCounter", Analytics, "counts visits without cookies or a personal ID"),
+    // Marketing automation: visits tied to your email address.
+    t("hs-scripts.com", "HubSpot", "HubSpot", Analytics, "loads HubSpot's tracking code, which records your visits and can tie them to your email address"),
+    t("hscollectedforms.net", "HubSpot forms", "HubSpot", Analytics, "collects what you type into the site's forms for its marketing"),
+    t("hsforms.net", "HubSpot forms", "HubSpot", Analytics, "shows a form and records your visit for the site's marketing"),
+    t("marketo.net", "Marketo", "Adobe", Analytics, "records your visits for the site's marketing, tied to your email address once you fill in a form"),
+    t("mktoresp.com", "Marketo", "Adobe", Analytics, "records your visits for the site's marketing, tied to your email address once you fill in a form"),
+    t("pardot.com", "Salesforce Pardot", "Salesforce", Analytics, "records your visits for the site's marketing, tied to your email address once you fill in a form"),
+    t("eloqua.com", "Oracle Eloqua", "Oracle", Analytics, "records your visits for the site's marketing, tied to your email address once you fill in a form"),
+    t("exacttarget.com", "Salesforce Marketing Cloud", "Salesforce", Analytics, "records what you look at for the site's marketing emails"),
+    t("igodigital.com", "Salesforce Marketing Cloud", "Salesforce", Analytics, "records what you look at for the site's marketing emails"),
+    t("klaviyo.com", "Klaviyo", "Klaviyo", Analytics, "records what you look at for the site's marketing emails and texts"),
+    t("list-manage.com", "Mailchimp", "Intuit", Analytics, "handles mailing-list sign-ups and tracks visits from the site's emails"),
+    t("chimpstatic.com", "Mailchimp", "Intuit", Analytics, "loads Mailchimp's code for sign-up forms and tracking visits from emails"),
+    // Session recording.
+    t("crazyegg.com", "Crazy Egg", "Crazy Egg", SessionReplay, "records your clicks and scrolling for heatmaps and replays"),
+    t("luckyorange.com", "Lucky Orange", "Lucky Orange", SessionReplay, "records your visit so the site can replay it"),
+    t("luckyorange.net", "Lucky Orange", "Lucky Orange", SessionReplay, "records your visit so the site can replay it"),
+    t("smartlook.com", "Smartlook", "Cisco", SessionReplay, "records your visit so the site can replay it"),
+    t("smartlook.cloud", "Smartlook", "Cisco", SessionReplay, "records your visit so the site can replay it"),
+    t("inspectlet.com", "Inspectlet", "Inspectlet", SessionReplay, "records your visit, including what you type, so the site can replay it"),
+    t("contentsquare.net", "Contentsquare", "Contentsquare", SessionReplay, "records your clicks, scrolling and mouse movements so the site can replay your visit"),
+    t("quantummetric.com", "Quantum Metric", "Quantum Metric", SessionReplay, "records your visit so the site can replay it"),
+    // Monitoring.
+    t("js-agent.newrelic.com", "New Relic", "New Relic", Monitoring, "measures how fast the page loads for you and reports errors"),
+    t("sentry-cdn.com", "Sentry", "Sentry", Monitoring, "reports errors in the page's code, with details of your browser"),
+    t("datadoghq-browser-agent.com", "Datadog", "Datadog", Monitoring, "measures the page's speed and errors, and can record sessions"),
+    t("bugsnag.com", "Bugsnag", "SmartBear", Monitoring, "reports errors in the page's code, with details of your browser"),
+    t("rollbar.com", "Rollbar", "Rollbar", Monitoring, "reports errors in the page's code, with details of your browser"),
+    t("raygun.io", "Raygun", "Raygun", Monitoring, "reports errors and page speed, with details of your browser"),
+    t("akstat.io", "Akamai mPulse", "Akamai", Monitoring, "measures how fast the page loads for you"),
+    t("speedcurve.com", "SpeedCurve", "SpeedCurve", Monitoring, "measures how fast the page loads for you"),
+    // Tag managers.
+    t("tiqcdn.com", "Tealium", "Tealium", TagManager, "loads whatever tracking scripts the site set up there"),
+    t("tealiumiq.com", "Tealium", "Tealium", TagManager, "collects what you do and passes it on to the site's analytics and ad tools"),
+    t("ensighten.com", "Ensighten", "Ensighten", TagManager, "loads whatever tracking scripts the site set up there"),
+    t("adobedtm.com", "Adobe Experience Platform tags", "Adobe", TagManager, "loads whatever tracking scripts the site set up there, often Adobe Analytics"),
+    // Bot detection and fraud checks (fingerprinting).
+    t("recaptcha.net", "reCAPTCHA", "Google", BotDetection, "checks you're not a bot by examining your browser and how you move, click and type"),
+    t("hcaptcha.com", "hCaptcha", "Intuition Machines", BotDetection, "checks you're not a bot by examining your browser and asking you to pick pictures"),
+    t("challenges.cloudflare.com", "Cloudflare Turnstile", "Cloudflare", BotDetection, "checks you're not a bot by examining your browser"),
+    t("perimeterx.net", "HUMAN (PerimeterX)", "HUMAN", BotDetection, "checks you're not a bot from your browser's details and behaviour"),
+    t("px-cdn.net", "HUMAN (PerimeterX)", "HUMAN", BotDetection, "checks you're not a bot from your browser's details and behaviour"),
+    t("px-cloud.net", "HUMAN (PerimeterX)", "HUMAN", BotDetection, "checks you're not a bot from your browser's details and behaviour"),
+    t("datadome.co", "DataDome", "DataDome", BotDetection, "checks you're not a bot from your browser's details and behaviour"),
+    t("arkoselabs.com", "Arkose Labs", "Arkose Labs", BotDetection, "checks you're not a bot, with puzzles and your browser's details"),
+    t("online-metrix.net", "ThreatMetrix", "LexisNexis Risk Solutions", Fingerprinting, "identifies your device from many details of your browser, for fraud checks shared between companies"),
+    t("iovation.com", "iovation", "TransUnion", Fingerprinting, "identifies your device from details of your browser, for fraud checks shared between companies"),
+    t("sift.com", "Sift", "Sift", Fingerprinting, "identifies your device and watches what you do, for fraud checks"),
+    t("siftscience.com", "Sift", "Sift", Fingerprinting, "identifies your device and watches what you do, for fraud checks"),
+    t("fpcdn.io", "Fingerprint", "Fingerprint", Fingerprinting, "identifies your browser from its characteristics, so it can recognise you without cookies"),
+    t("fpjscdn.net", "Fingerprint", "Fingerprint", Fingerprinting, "identifies your browser from its characteristics, so it can recognise you without cookies"),
+    t("fingerprintjs.com", "Fingerprint", "Fingerprint", Fingerprinting, "identifies your browser from its characteristics, so it can recognise you without cookies"),
+    // Social and embeds.
+    t("addthis.com", "AddThis", "Oracle", Social, "shows share buttons, and collects data about your visit for advertisers"),
+    t("addtoany.com", "AddToAny", "AddToAny", Social, "shows share buttons"),
+    t("instagram.com", "Instagram", "Meta", Social, "shows an embedded post, and lets Meta see that you visited this page"),
+    t("platform.linkedin.com", "LinkedIn embeds", "LinkedIn (Microsoft)", Social, "shows LinkedIn buttons or posts, and lets LinkedIn see that you visited this page"),
+    t("tiktok.com", "TikTok", "TikTok (ByteDance)", Social, "shows an embedded video, and lets TikTok see that you visited this page"),
+    t("player.vimeo.com", "Vimeo", "Vimeo", Content, "plays an embedded video; Vimeo sees that you visited this page"),
+    t("open.spotify.com", "Spotify", "Spotify", Content, "plays embedded music; Spotify sees that you visited this page"),
+    t("w.soundcloud.com", "SoundCloud", "SoundCloud", Content, "plays embedded audio; SoundCloud sees that you visited this page"),
+    t("maps.googleapis.com", "Google Maps", "Google", Content, "shows a map; Google sees your IP address and which page asked"),
+    t("maps.google.com", "Google Maps", "Google", Content, "shows a map; Google sees your IP address and which page asked"),
+    t("gravatar.com", "Gravatar", "Automattic", Content, "shows profile pictures, found by a code made from each person's email address"),
+    t("ajax.googleapis.com", "Google Hosted Libraries", "Google", Content, "serves code libraries; Google sees your IP address and when you visited"),
+    t("cdnjs.cloudflare.com", "cdnjs", "Cloudflare", Content, "serves code libraries; Cloudflare sees your IP address and when you visited"),
+    t("cdn.jsdelivr.net", "jsDelivr", "jsDelivr", Content, "serves code libraries; it sees your IP address and when you visited"),
+    t("unpkg.com", "unpkg", "unpkg", Content, "serves code libraries; it sees your IP address and when you visited"),
+    t("use.typekit.net", "Adobe Fonts", "Adobe", Content, "serves this page's fonts and counts page views for the font licence"),
+    t("p.typekit.net", "Adobe Fonts", "Adobe", Content, "counts page views for the font licence"),
+    t("kit.fontawesome.com", "Font Awesome", "Fonticons", Content, "serves the page's icons; it sees your IP address and which site asked"),
+    // Chat and support widgets.
+    t("intercom.io", "Intercom", "Intercom", Content, "shows a chat window, and records your visits for the site's support and marketing"),
+    t("intercomcdn.com", "Intercom", "Intercom", Content, "shows a chat window, and records your visits for the site's support and marketing"),
+    t("drift.com", "Drift", "Salesloft", Content, "shows a chat window, and records your visits for the site's sales team"),
+    t("zdassets.com", "Zendesk", "Zendesk", Content, "shows a help or chat window"),
+    t("tawk.to", "tawk.to", "tawk.to", Content, "shows a chat window, and records your visits for the site"),
+    t("crisp.chat", "Crisp", "Crisp", Content, "shows a chat window, and records your visits for the site"),
+    t("onesignal.com", "OneSignal", "OneSignal", Content, "asks to send you notifications, and tracks whether you opened them"),
+    // Cookie banners.
+    t("consensu.org", "IAB consent framework", "IAB Europe", Consent, "shows the cookie banner and passes what you chose on to the site's ad partners"),
+    t("usercentrics.eu", "Usercentrics", "Usercentrics", Consent, "shows the cookie banner and remembers what you chose"),
+    t("trustarc.com", "TrustArc", "TrustArc", Consent, "shows the cookie banner and remembers what you chose"),
+    t("didomi.io", "Didomi", "Didomi", Consent, "shows the cookie banner and remembers what you chose"),
+    t("privacy-mgmt.com", "Sourcepoint", "Sourcepoint", Consent, "shows the cookie banner and remembers what you chose"),
+    t("cookieyes.com", "CookieYes", "CookieYes", Consent, "shows the cookie banner and remembers what you chose"),
+    t("iubenda.com", "iubenda", "iubenda", Consent, "shows the cookie banner and remembers what you chose"),
+    t("termly.io", "Termly", "Termly", Consent, "shows the cookie banner and remembers what you chose"),
 ];
 
 /// Cookies whose purpose is publicly documented by their makers.
@@ -168,6 +356,53 @@ const COOKIES: &[(&str, &str)] = &[
     ("_clck", "Microsoft Clarity's ID for you"),
     ("uuid2", "Xandr's ad ID for you"),
     ("demdex", "Adobe's ID for you"),
+    ("_gcl_aw", "the Google ad you clicked"),
+    ("__gads", "Google AdSense's ID for you"),
+    ("__gpi", "Google AdSense's ID for you"),
+    (
+        "test_cookie",
+        "Google's check that cookies work, before its ad ID",
+    ),
+    ("ANID", "Google's ad ID"),
+    ("_pin_unauth", "Pinterest Tag's ID for you"),
+    ("_scid", "Snap Pixel's ID for you"),
+    ("_rdt_uuid", "Reddit Pixel's ID for you"),
+    ("personalization_id", "X's ad ID for you"),
+    ("li_gc", "LinkedIn's record of your cookie choice"),
+    ("lidc", "LinkedIn's server choice"),
+    ("AnalyticsSyncHistory", "LinkedIn's ad ID syncing"),
+    ("_hjid", "Hotjar's ID for you"),
+    ("_clsk", "Microsoft Clarity's session"),
+    ("ajs_anonymous_id", "Segment's ID for you"),
+    ("ajs_user_id", "Segment's ID for you, once you're signed in"),
+    ("mp_", "Mixpanel's ID for you"),
+    ("amp_", "Amplitude's ID for you"),
+    ("_hjFirstSeen", "Hotjar's note that this is your first visit"),
+    (
+        "hubspotutk",
+        "HubSpot's ID for you, tied to your email once you fill in a form",
+    ),
+    ("__hstc", "HubSpot's record of your visits"),
+    (
+        "_mkto_trk",
+        "Marketo's ID for you, tied to your email once you fill in a form",
+    ),
+    ("_ym_uid", "Yandex Metrica's ID for you"),
+    ("yandexuid", "Yandex's ID for you"),
+    ("tuuid", "an ad exchange's ID for you"),
+    ("TDID", "The Trade Desk's ID for you"),
+    ("TapAd_DID", "Tapad's cross-device ID for you"),
+    ("bku", "Oracle BlueKai's ID for you"),
+    ("IDSYNC", "Yahoo's ad ID syncing"),
+    ("criteo_write_test", "Criteo's check that it can set cookies"),
+    ("cto_bundle", "Criteo's ID for you"),
+    ("__qca", "Quantcast's ID for you"),
+    ("OptanonConsent", "your choices in the OneTrust cookie banner"),
+    ("CookieConsent", "your choices in the Cookiebot cookie banner"),
+    (
+        "euconsent-v2",
+        "your cookie choices, shared with the site's ad partners",
+    ),
 ];
 
 /// Click and campaign parameters, which Brickle strips from links.
@@ -185,8 +420,71 @@ const PARAMS: &[(&str, &str)] = &[
     ("yclid", "which Yandex ad you clicked"),
     ("mc_eid", "your address in a Mailchimp mailing list"),
     ("_hsenc", "you as a recipient of a HubSpot email"),
+    ("_hsmi", "which HubSpot email you clicked"),
+    ("mkt_tok", "you as a recipient of a Marketo email"),
+    ("oly_enc_id", "you as a recipient of an Omeda email"),
+    ("vero_id", "you as a recipient of a Vero email"),
+    ("_kx", "you as a recipient of a Klaviyo email"),
+    ("s_cid", "which Adobe campaign brought you here"),
+    ("epik", "which Pinterest ad you clicked"),
+    ("sccid", "which Snapchat ad you clicked"),
+    ("rdt_cid", "which Reddit ad you clicked"),
+    ("irclickid", "which affiliate link you clicked (Impact)"),
     ("utm_", "which campaign, email or link brought you here"),
 ];
+
+/// Details of the browser that fingerprinting scripts collect, as the
+/// script runtime reports reading them, with what each tells.
+pub const FINGERPRINT: &[(&str, &str)] = &[
+    ("navigator.userAgent", "browser and version"),
+    ("navigator.appVersion", "browser and version"),
+    ("navigator.platform", "operating system"),
+    ("navigator.oscpu", "operating system"),
+    ("navigator.language", "languages"),
+    ("navigator.languages", "languages"),
+    ("navigator.hardwareConcurrency", "number of processor cores"),
+    ("navigator.maxTouchPoints", "touch screen"),
+    ("navigator.plugins", "plugins"),
+    ("navigator.mimeTypes", "plugins"),
+    ("navigator.webdriver", "whether it's run by a program"),
+    ("navigator.doNotTrack", "Do Not Track setting"),
+    ("navigator.pdfViewerEnabled", "PDF viewer"),
+    ("navigator.vendor", "browser maker"),
+    ("navigator.productSub", "browser maker"),
+    ("screen.width", "screen size"),
+    ("screen.height", "screen size"),
+    ("screen.availWidth", "screen size"),
+    ("screen.availHeight", "screen size"),
+    ("screen.colorDepth", "colour depth"),
+    ("screen.pixelDepth", "colour depth"),
+    ("timezone", "time zone"),
+    ("devicePixelRatio", "pixel density"),
+];
+
+/// Distinct details read before it looks like fingerprinting rather than
+/// a site checking one thing (like your language).
+const FINGERPRINT_MIN: usize = 6;
+
+/// A line for the request panel when a page's scripts read enough details
+/// of the browser to look like fingerprinting. `read` holds names from
+/// [`FINGERPRINT`].
+pub fn fingerprinting<'a>(read: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let mut what: Vec<&str> = Vec::new();
+    for name in read {
+        if let Some((_, label)) = FINGERPRINT.iter().find(|(n, _)| *n == name) {
+            if !what.contains(label) {
+                what.push(label);
+            }
+        }
+    }
+    (what.len() >= FINGERPRINT_MIN).then(|| {
+        format!(
+            "This page's scripts read your {}: together, details like these can recognise you \
+             without cookies (fingerprinting). Brickle gives every copy of itself the same answers",
+            what.join(", ")
+        )
+    })
+}
 
 fn host_of(url: &str) -> String {
     crate::filter::host_of(url)
@@ -283,9 +581,11 @@ pub fn explain(e: &LogEntry, page_url: &str) -> Vec<String> {
     }
     let mut named: Vec<String> = Vec::new();
     for c in e.cookies_sent.iter().chain(&e.cookies_set) {
+        // Names ending in `_` (and long ones) also name the cookies that
+        // start with them (`_ga_ABC123`, `mp_<token>_mixpanel`).
         let known = COOKIES
             .iter()
-            .find(|(n, _)| c == n || (n.len() > 4 && c.starts_with(n)));
+            .find(|(n, _)| c == n || ((n.len() > 4 || n.ends_with('_')) && c.starts_with(n)));
         if let Some((name, what)) = known {
             let line = format!("{name} is {what}");
             if !named.contains(&line) {
@@ -295,6 +595,44 @@ pub fn explain(e: &LogEntry, page_url: &str) -> Vec<String> {
     }
     if !named.is_empty() {
         out.push(format!("Cookies: {}", named.join("; ")));
+    }
+
+    // Code from another site runs with the page's own powers.
+    if third_party && sent && e.dest == crate::net::Dest::Script {
+        out.push(format!(
+            "Code from another site ({}) running in this page: it can read and change anything on it \
+             (Brickle stops it sending to other sites)",
+            crate::cookies::site(&e.url)
+        ));
+    }
+    let refused: Vec<&str> = e
+        .cookies_refused
+        .iter()
+        .filter_map(|c| c.strip_suffix(" (third-party)"))
+        .take(6)
+        .collect();
+    if !refused.is_empty() {
+        out.push(format!(
+            "Tried to set cookies ({}) that would recognise you on other sites; Brickle doesn't keep \
+             cookies from other sites, so they were thrown away",
+            refused
+                .iter()
+                .map(|c| format!("`{c}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if e.upgraded {
+        out.push("Asked for without encryption: Brickle switched it to HTTPS, so others on your network can't read or change it".into());
+    }
+    if e.insecure {
+        out.push(
+            "Loaded without encryption (you allowed it): others on your network can read and change it"
+                .into(),
+        );
+    }
+    if e.cors_blocked {
+        out.push("The other site didn't let this page read its reply, so Brickle kept the reply from the page's scripts".into());
     }
 
     // A tiny image with lots of data in its address is a tracking pixel.
@@ -399,6 +737,102 @@ mod tests {
             Outcome::Loaded { status: 200 },
         );
         assert!(explain(&plain, "https://site.example/").is_empty());
+    }
+
+    #[test]
+    fn the_tables_are_well_formed() {
+        let mut seen = std::collections::HashSet::new();
+        for (i, t) in TRACKERS.iter().enumerate() {
+            assert!(seen.insert(t.at), "{} twice", t.at);
+            assert_eq!(t.at, t.at.to_ascii_lowercase(), "{}", t.at);
+            assert!(!t.what.ends_with('.') && !t.what.is_empty(), "{}", t.at);
+            // A host-wide entry must come after any with a path on that host.
+            if !t.at.contains('/') {
+                for later in &TRACKERS[i + 1..] {
+                    if let Some((host, _)) = later.at.split_once('/') {
+                        assert!(
+                            !(host == t.at || host.ends_with(&format!(".{}", t.at))),
+                            "{} shadows {}",
+                            t.at,
+                            later.at
+                        );
+                    }
+                }
+            }
+        }
+        let mut names = std::collections::HashSet::new();
+        for (n, _) in COOKIES {
+            assert!(names.insert(*n), "cookie {n} twice");
+        }
+        for (n, _) in FINGERPRINT {
+            assert!(
+                n.starts_with("navigator.") || n.starts_with("screen.") || !n.contains('.'),
+                "{n}"
+            );
+        }
+    }
+
+    #[test]
+    fn more_of_what_requests_did() {
+        let mut e = entry(
+            "https://cdn.thirdparty.example/lib.js",
+            Dest::Script,
+            Outcome::Loaded { status: 200 },
+        );
+        e.cookies_refused = vec!["uid (third-party)".into(), "x (expired)".into()];
+        e.upgraded = true;
+        let all = explain(&e, "https://news.example/").join("\n");
+        assert!(
+            all.contains("Code from another site (thirdparty.example)"),
+            "{all}"
+        );
+        assert!(all.contains("Tried to set cookies (`uid`)"), "{all}");
+        assert!(!all.contains("`x`"), "only third-party refusals: {all}");
+        assert!(all.contains("switched it to HTTPS"), "{all}");
+        let own = entry(
+            "https://news.example/app.js",
+            Dest::Script,
+            Outcome::Loaded { status: 200 },
+        );
+        assert!(
+            explain(&own, "https://news.example/").is_empty(),
+            "the site's own code"
+        );
+        // Prefix cookie names.
+        let mut c = entry(
+            "https://shop.example/",
+            Dest::Document,
+            Outcome::Loaded { status: 200 },
+        );
+        c.cookies_sent = vec!["mp_0123abcd_mixpanel".into(), "amp_6e403e".into()];
+        let all = explain(&c, "https://shop.example/").join("\n");
+        assert!(all.contains("Mixpanel") && all.contains("Amplitude"), "{all}");
+        // A tracker that isn't a domain on its own.
+        let t = tracker("https://www.google.com/recaptcha/api.js").unwrap();
+        assert_eq!(t.kind, Kind::BotDetection);
+        assert!(tracker("https://www.google.com/search?q=x").is_none());
+    }
+
+    #[test]
+    fn fingerprinting_needs_many_details() {
+        assert_eq!(
+            fingerprinting(["navigator.language", "navigator.languages"]),
+            None
+        );
+        assert_eq!(fingerprinting(["screen.width", "screen.height", "bogus"]), None);
+        let line = fingerprinting([
+            "navigator.userAgent",
+            "navigator.platform",
+            "navigator.hardwareConcurrency",
+            "screen.width",
+            "screen.height",
+            "timezone",
+            "navigator.plugins",
+        ])
+        .unwrap();
+        assert!(line.contains("screen size, time zone, plugins"), "{line}");
+        assert!(line.contains("fingerprinting"), "{line}");
+        assert!(!line.contains("screen size, screen size"), "{line}");
     }
 
     #[test]

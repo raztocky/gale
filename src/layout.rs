@@ -585,6 +585,7 @@ pub fn layout_tree_with_images<'a>(
     images: &HashMap<u32, Decoded>,
 ) -> LayoutBox<'a> {
     let viewport_w = viewport.0;
+    VIEWPORT_H.with(|v| v.set(viewport.1));
     let mut b = build_layout_tree(root);
     if !images.is_empty() {
         attach_images(&mut b, images);
@@ -609,6 +610,124 @@ pub fn layout_tree_with_images<'a>(
     b.lay_out_contained(icb, Some(icb));
     apply_relative(&mut b, icb);
     b
+}
+
+thread_local! {
+    /// The window's height for the layout under way (0 if unknown).
+    static VIEWPORT_H: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
+}
+
+/// Does a scrolling box this tall (border box) grow to fit its content
+/// instead? Pages that scroll a box filling the window, rather than the
+/// window itself, then scroll like any other page.
+fn grows_to_fit(h: f32) -> bool {
+    let vh = VIEWPORT_H.with(|v| v.get());
+    vh > 0.0 && h >= vh * 0.75
+}
+
+/// Most boxes you can scroll inside, per page.
+pub const MAX_SCROLLERS: usize = 4096;
+
+/// A box you can scroll inside, after [`apply_scrolling`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScrollBox {
+    /// Its [`box_addr`].
+    pub addr: usize,
+    pub uid: u32,
+    /// Its padding box, where the scrolled content shows.
+    pub rect: Rect,
+    /// How far it's scrolled, and how far it can be.
+    pub x: f32,
+    pub y: f32,
+    pub max_x: f32,
+    pub max_y: f32,
+}
+
+/// Scroll each `overflow: auto | scroll` box whose content doesn't fit by
+/// its offset in `offsets` (by node, clamped to how far it can scroll),
+/// moving what's inside it. Returns those boxes, outer ones first.
+pub fn apply_scrolling(root: &mut LayoutBox, offsets: &HashMap<u32, (f32, f32)>) -> Vec<ScrollBox> {
+    fn walk(b: &mut LayoutBox, offsets: &HashMap<u32, (f32, f32)>, out: &mut Vec<ScrollBox>) {
+        let scrolls = matches!(b.kind, BoxKind::Block(n) if n.style.scrolls && n.style.overflow_clip);
+        if scrolls && b.uid != 0 && out.len() < MAX_SCROLLERS {
+            let p = b.dims.padding_box();
+            let (mut right, mut bottom) = (p.x, p.y);
+            for c in &b.children {
+                extent(c, &mut right, &mut bottom);
+            }
+            let max_x = (right + b.dims.padding.r - (p.x + p.w)).max(0.0);
+            let max_y = (bottom + b.dims.padding.b - (p.y + p.h)).max(0.0);
+            if max_x >= 1.0 || max_y >= 1.0 {
+                let (x, y) = offsets.get(&b.uid).copied().unwrap_or((0.0, 0.0));
+                let (x, y) = (x.clamp(0.0, max_x).round(), y.clamp(0.0, max_y).round());
+                if x != 0.0 || y != 0.0 {
+                    for c in &mut b.children {
+                        shift(c, -x, -y);
+                    }
+                }
+                out.push(ScrollBox {
+                    addr: box_addr(b),
+                    uid: b.uid,
+                    rect: p,
+                    x,
+                    y,
+                    max_x,
+                    max_y,
+                });
+            }
+        }
+        for c in &mut b.children {
+            walk(c, offsets, out);
+        }
+    }
+    /// How far right and down what a scrolling box holds reaches: boxes
+    /// inside it, and text, but not what a clipping box inside clips away.
+    fn extent(b: &LayoutBox, right: &mut f32, bottom: &mut f32) {
+        if b.position() == Position::Fixed {
+            return;
+        }
+        match &b.kind {
+            BoxKind::Block(n) => {
+                let bb = b.dims.border_box();
+                *right = right.max(bb.x + bb.w);
+                *bottom = bottom.max(bb.y + bb.h);
+                if n.style.overflow_clip {
+                    return;
+                }
+            }
+            BoxKind::Anonymous { frags, .. } => {
+                for f in frags {
+                    let descent = font::vmetrics(font::index(&f.style), f.style.font_size).1;
+                    *right = right.max(f.x + f.w);
+                    *bottom = bottom.max(f.baseline + descent);
+                }
+            }
+        }
+        for c in &b.children {
+            extent(c, right, bottom);
+        }
+    }
+    /// Move a box and what's in it, except fixed boxes (they stay put in
+    /// the window).
+    fn shift(b: &mut LayoutBox, dx: f32, dy: f32) {
+        if b.position() == Position::Fixed {
+            return;
+        }
+        b.dims.content.x += dx;
+        b.dims.content.y += dy;
+        if let BoxKind::Anonymous { frags, .. } = &mut b.kind {
+            for f in frags {
+                f.x += dx;
+                f.baseline += dy;
+            }
+        }
+        for c in &mut b.children {
+            shift(c, dx, dy);
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, offsets, &mut out);
+    out
 }
 
 /// Shift `position: relative` boxes by their offsets, once everything else
@@ -839,11 +958,21 @@ impl<'a> LayoutBox<'a> {
         let d = &mut self.dims;
         let vz = d.padding.t + d.padding.b + d.border.t + d.border.b;
         if let Some(h) = content_height(s.height, &s, vz, cb_h) {
-            // A box meant to scroll can't here: it grows to fit instead.
-            d.content.h = if s.scrolls { d.content.h.max(h) } else { h };
+            // A scrolling box about the window's height grows to fit, so the
+            // page scrolls (keys and the scrollbar only scroll the page).
+            d.content.h = if s.scrolls && grows_to_fit(h + vz) {
+                d.content.h.max(h)
+            } else {
+                h
+            };
         } else if let Some(h) = ratio_height(&s, d) {
             // Content may make it taller, unless it's clipped.
             d.content.h = if s.overflow_clip { h } else { d.content.h.max(h) };
+        }
+        if let Some(h) = content_height(s.max_height, &s, vz, cb_h) {
+            if !(s.scrolls && grows_to_fit(h + vz)) {
+                d.content.h = d.content.h.min(h);
+            }
         }
         if let Some(h) = content_height(s.min_height, &s, vz, cb_h) {
             d.content.h = d.content.h.max(h);
@@ -4326,11 +4455,25 @@ mod modern_layout_tests {
         assert!(close(html.dims.border_box().h, 800.0), "{:?}", html.dims);
         let b = boxes(
             "",
+            &format!("<div style='height:700px;overflow:auto'>{tall}</div>"),
+            WIN,
+            "div",
+        );
+        assert!(b[0].h >= 2000.0, "about the window's height: grows {:?}", b[0]);
+        let b = boxes(
+            "",
             &format!("<div style='height:100px;overflow:auto'>{tall}</div>"),
             WIN,
             "div",
         );
-        assert!(b[0].h >= 2000.0, "{:?}", b[0]);
+        assert!(close(b[0].h, 100.0), "a small one scrolls inside: {:?}", b[0]);
+        let b = boxes(
+            "",
+            &format!("<div style='max-height:100px;overflow:auto'>{tall}</div>"),
+            WIN,
+            "div",
+        );
+        assert!(close(b[0].h, 100.0), "max-height: {:?}", b[0]);
         let b = boxes(
             "",
             &format!("<div style='height:100px;overflow:hidden'>{tall}</div>"),

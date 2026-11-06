@@ -8,7 +8,7 @@ use brickle::layout::{Edges, Rect};
 use brickle::lineedit::LineEdit;
 use brickle::net;
 use brickle::network::{Action, LogEntry, Network, Outcome};
-use brickle::page::{Key as PageKey, Rendered};
+use brickle::page::{self, Key as PageKey, Rendered};
 use brickle::paint::{self, Canvas, DisplayList, GlyphBitmap, GlyphCache, Layer, TileCache, TilePainter};
 use brickle::select::{self, Bands, FindText, Pos};
 use brickle::tab::{Input, Tab};
@@ -402,6 +402,8 @@ struct Info {
     log: Vec<LogEntry>,
     interstitial: Option<Action>,
     resubmit: Option<Submission>,
+    /// A note about the whole page for the request panel (fingerprinting).
+    note: Option<String>,
 }
 
 impl Info {
@@ -413,6 +415,7 @@ impl Info {
             log: tab.log.clone(),
             interstitial: tab.interstitial.clone(),
             resubmit: tab.resubmit.clone(),
+            note: brickle::explain::fingerprinting(tab.read.iter().copied()),
         }
     }
 }
@@ -581,6 +584,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         log: vec![],
         interstitial: None,
         resubmit: None,
+        note: None,
     };
     // Painted tiles of the current page; rebuilt when the page changes.
     // Tiles are painted on their own threads, never on this one.
@@ -598,6 +602,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         links: vec![],
         texts: vec![],
         layers: vec![],
+        scrollers: vec![],
         title: None,
     };
     // In flight: the URL being loaded (None for a re-layout).
@@ -1379,16 +1384,45 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         // Mouse
         let mouse = window.get_mouse_pos(MouseMode::Discard);
         let over_panel = ui.panel && mouse.is_some_and(|(mx, my)| mx >= page_w && my > bar);
-        if let Some((_, dy)) = window.get_scroll_wheel() {
+        if let Some((dx, dy)) = window.get_scroll_wheel() {
             // About three lines a notch (X11 reports 1 per notch), more
             // with bigger text.
             if over_panel {
-                let rows = panel_rows(&info.log, &info.url, (w as f32 - page_w) / k);
-                let total = rows.last().map_or(0.0, |r| r.y + r.h);
+                let rows = panel_rows(
+                    &info.log,
+                    &info.url,
+                    info.note.as_deref(),
+                    (w as f32 - page_w) / k,
+                );
+                let total = rows.rows.last().map_or(rows.note_h, |r| r.y + r.h);
                 let room = view_h / k - PANEL_HEAD;
                 ui.panel_scroll = (ui.panel_scroll - dy * WHEEL_STEP).clamp(0.0, (total - room).max(0.0));
             } else {
-                scroll -= dy * WHEEL_STEP * ui.text_scale;
+                // A box under the pointer that can scroll that way takes it
+                // first (Shift turns the wheel sideways).
+                let step = WHEEL_STEP * ui.text_scale;
+                let (mut sx, mut sy) = (-dx * step, -dy * step);
+                if shift && sx == 0.0 {
+                    (sx, sy) = (sy, 0.0);
+                }
+                let inner = mouse
+                    .filter(|&(_, my)| my > bar && tab.is_some() && info.interstitial.is_none())
+                    .and_then(|(mx, my)| {
+                        let (px, py) = ix.page_point(mx, my, scroll);
+                        page::scroller_at(&rendered.scrollers, px, py, scroll, sx, sy)
+                    });
+                if let Some(sc) = inner {
+                    let uid = sc.uid;
+                    match pending_input.last_mut() {
+                        Some(Input::Scroll { uid: u, dx, dy }) if *u == uid => {
+                            *dx += sx;
+                            *dy += sy;
+                        }
+                        _ => pending_input.push(Input::Scroll { uid, dx: sx, dy: sy }),
+                    }
+                } else {
+                    scroll -= dy * step;
+                }
             }
             dirty = true;
         }
@@ -1410,7 +1444,14 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             // The pointer in interface units, for the bars and panels.
             let (lx, ly) = (mx / k, my / k);
             let row = if over_panel {
-                panel_row(&info.log, &info.url, ly, ui.panel_scroll, (w as f32 - page_w) / k)
+                panel_row(
+                    &info.log,
+                    &info.url,
+                    info.note.as_deref(),
+                    ly,
+                    ui.panel_scroll,
+                    (w as f32 - page_w) / k,
+                )
             } else {
                 None
             };
@@ -2025,6 +2066,29 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     canvas.fill(r, SELECTION, bar);
                 }
             }
+            // Thumbs on the boxes you can scroll inside.
+            for sc in &rendered.scrollers {
+                for t in box_thumbs(sc, sc.at(scroll)) {
+                    if t.y + t.h < scroll || t.y > scroll + view_h {
+                        continue;
+                    }
+                    let t = Rect {
+                        y: t.y - scroll + bar,
+                        w: t.w.min(page_w - t.x),
+                        ..t
+                    };
+                    canvas.fill(
+                        t,
+                        Color {
+                            r: 0,
+                            g: 0,
+                            b: 0,
+                            a: 90,
+                        },
+                        bar,
+                    );
+                }
+            }
             // The bars and panels, in interface units and colours.
             canvas.scale = k;
             canvas.dark = DARK_UI.load(Ordering::Relaxed);
@@ -2076,8 +2140,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 let n = net.try_lock().ok();
                 draw_panel(
                     &mut canvas,
-                    &info.url,
-                    &info.log,
+                    &info,
                     n.as_deref(),
                     ui.panel_scroll,
                     page_w / k,
@@ -2192,6 +2255,7 @@ impl Parked {
                 log: vec![],
                 interstitial: None,
                 resubmit: None,
+                note: None,
             },
             rendered: blank_rendered(),
             history: vec![],
@@ -2261,6 +2325,7 @@ fn blank_rendered() -> Rendered {
         links: vec![],
         texts: vec![],
         layers: vec![],
+        scrollers: vec![],
         title: None,
     }
 }
@@ -2412,6 +2477,35 @@ fn scrollbar_thumb(scroll: f32, max_scroll: f32, view_h: f32, k: f32) -> Option<
         .max(24.0 * k)
         .min(view_h);
     Some(((scroll / max_scroll).clamp(0.0, 1.0) * (view_h - h), h))
+}
+
+/// Scrollbar thumbs for a box you can scroll inside, shown at `r` (page
+/// space): along its right edge, and its bottom if it scrolls sideways.
+fn box_thumbs(sc: &page::Scroller, r: Rect) -> Vec<Rect> {
+    let mut out = Vec::new();
+    let thumb = |len: f32, max: f32, at: f32| {
+        let t = (len * len / (len + max)).max(16.0).min(len);
+        ((at / max).clamp(0.0, 1.0) * (len - t), t)
+    };
+    if sc.max_y > 0.0 && r.h > 8.0 && r.w > 8.0 {
+        let (y, h) = thumb(r.h, sc.max_y, sc.y);
+        out.push(Rect {
+            x: r.x + r.w - 6.0,
+            y: r.y + y,
+            w: 4.0,
+            h,
+        });
+    }
+    if sc.max_x > 0.0 && r.h > 8.0 && r.w > 8.0 {
+        let (x, w) = thumb(r.w, sc.max_x, sc.x);
+        out.push(Rect {
+            x: r.x + x,
+            y: r.y + r.h - 6.0,
+            w,
+            h: 4.0,
+        });
+    }
+    out
 }
 
 /// The scroll position that puts the thumb's top at `top`.
@@ -2768,13 +2862,20 @@ fn site_button_at(x0: f32, mx: f32, my: f32) -> Option<SiteButton> {
         .map(|(_, b)| b)
 }
 
-fn panel_row(log: &[LogEntry], page_url: &str, my: f32, panel_scroll: f32, pw: f32) -> Option<usize> {
+fn panel_row(
+    log: &[LogEntry],
+    page_url: &str,
+    note: Option<&str>,
+    my: f32,
+    panel_scroll: f32,
+    pw: f32,
+) -> Option<usize> {
     let y = my - bars() - PANEL_HEAD + panel_scroll;
     if y < 0.0 {
         return None;
     }
-    let rows = panel_rows(log, page_url, pw);
-    rows.iter().position(|r| y >= r.y && y < r.y + r.h)
+    let rows = panel_rows(log, page_url, note, pw);
+    rows.rows.iter().position(|r| y >= r.y && y < r.y + r.h)
 }
 
 /// A request row in the panel, laid out: the address and notes wrapped
@@ -2791,30 +2892,46 @@ struct PanelRow {
     why: Vec<String>,
 }
 
+/// The panel's list, laid out: a note about the whole page (if any), then
+/// a row per request (their `y` is below the note).
+#[derive(Clone, Default)]
+struct PanelRows {
+    note: Vec<String>,
+    note_h: f32,
+    rows: Vec<PanelRow>,
+}
+
 thread_local! {
-    static PANEL_ROWS: std::cell::RefCell<(u64, std::rc::Rc<Vec<PanelRow>>)> = Default::default();
+    static PANEL_ROWS: std::cell::RefCell<(u64, std::rc::Rc<PanelRows>)> = Default::default();
 }
 
 /// The panel's rows for `log` at width `pw` (cached: laid out again only
 /// when the log or the width changes).
-fn panel_rows(log: &[LogEntry], page_url: &str, pw: f32) -> std::rc::Rc<Vec<PanelRow>> {
+fn panel_rows(log: &[LogEntry], page_url: &str, note: Option<&str>, pw: f32) -> std::rc::Rc<PanelRows> {
     use std::hash::{Hash, Hasher};
     let described: Vec<(&str, String)> = log.iter().map(describe).collect();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     pw.to_bits().hash(&mut hasher);
     page_url.hash(&mut hasher);
+    note.hash(&mut hasher);
     for (e, (status, notes)) in log.iter().zip(&described) {
         (&e.url, status, notes).hash(&mut hasher);
     }
     let key = hasher.finish();
     if let Some(rows) = PANEL_ROWS.with(|c| {
         let c = c.borrow();
-        (c.0 == key && !c.1.is_empty()).then(|| c.1.clone())
+        (c.0 == key && (!c.1.rows.is_empty() || !c.1.note.is_empty())).then(|| c.1.clone())
     }) {
         return rows;
     }
+    let note_lines = note.map_or(vec![], |n| wrap(n, pw - 28.0, pw - 28.0, BOLD, 10.5, true));
+    let note_h = if note_lines.is_empty() {
+        0.0
+    } else {
+        ROW_PAD * 2.0 + ROW_LINE * note_lines.len() as f32
+    };
     let mut rows = Vec::with_capacity(log.len());
-    let mut y = 0.0;
+    let mut y = note_h;
     for (e, (status, notes)) in log.iter().zip(described) {
         let head = format!("{status} · {}", dest_kind(e.dest));
         let hw = font::measure(BOLD, 11.0, &head) + 8.0;
@@ -2848,7 +2965,11 @@ fn panel_rows(log: &[LogEntry], page_url: &str, pw: f32) -> std::rc::Rc<Vec<Pane
         });
         y += h;
     }
-    let rows = std::rc::Rc::new(rows);
+    let rows = std::rc::Rc::new(PanelRows {
+        note: note_lines,
+        note_h,
+        rows,
+    });
     PANEL_ROWS.with(|c| *c.borrow_mut() = (key, rows.clone()));
     rows
 }
@@ -3126,13 +3247,13 @@ fn draw_chrome(
 
 fn draw_panel(
     c: &mut Canvas,
-    page_url: &str,
-    log: &[LogEntry],
+    info: &Info,
     net: Option<&Network>,
     panel_scroll: f32,
     x0: f32,
     cache: &mut GlyphCache,
 ) {
+    let (page_url, note, log) = (info.url.as_str(), info.note.as_deref(), &info.log[..]);
     let (w, h) = (c.size().0, c.size().1);
     let pw = w - x0;
     c.fill(
@@ -3261,8 +3382,35 @@ fn draw_panel(
     );
 
     let clip = bars() + PANEL_HEAD;
-    let rows = panel_rows(log, page_url, pw);
-    for (e, r) in log.iter().zip(rows.iter()) {
+    let layout = panel_rows(log, page_url, note, pw);
+    if !layout.note.is_empty() {
+        let y = clip - panel_scroll;
+        c.fill(
+            Rect {
+                x: x0,
+                y,
+                w: pw,
+                h: layout.note_h - 1.0,
+            },
+            Color::rgb(0xfe, 0xf3, 0xc7),
+            clip,
+        );
+        for (i, l) in layout.note.iter().enumerate() {
+            let base = y + ROW_PAD + 11.0 + i as f32 * ROW_LINE;
+            text(
+                c,
+                x0 + 14.0,
+                base,
+                l,
+                BOLD,
+                10.5,
+                Color::rgb(0x78, 0x35, 0x0f),
+                cache,
+                clip,
+            );
+        }
+    }
+    for (e, r) in log.iter().zip(layout.rows.iter()) {
         let y = clip + r.y - panel_scroll;
         if y + r.h < clip || y > h {
             continue;
@@ -3857,15 +4005,24 @@ mod menu_tests {
             Some((90.0, TOP_H + 10.0)),
             &mut cache,
         );
-        draw_panel(
-            &mut c,
-            "https://shop.example/",
-            &log,
-            None,
-            0.0,
-            w - pw,
-            &mut cache,
-        );
+        let info = Info {
+            url: "https://shop.example/".into(),
+            opener: None,
+            title: String::new(),
+            log: log.clone(),
+            interstitial: None,
+            resubmit: None,
+            note: brickle::explain::fingerprinting([
+                "navigator.platform",
+                "navigator.languages",
+                "navigator.hardwareConcurrency",
+                "screen.width",
+                "screen.colorDepth",
+                "timezone",
+                "devicePixelRatio",
+            ]),
+        };
+        draw_panel(&mut c, &info, None, 0.0, w - pw, &mut cache);
         c.write_png(&std::env::var("PANEL_PNG").unwrap_or("panel.png".into()))
             .unwrap();
     }

@@ -438,6 +438,8 @@ struct State {
     dom: Dom,
     url: String,
     console: Vec<String>,
+    /// Details of the browser scripts read ([`crate::explain::FINGERPRINT`]).
+    read: std::collections::BTreeSet<&'static str>,
     /// A navigation a script asked for (`location.href = ...`).
     navigate: Option<String>,
     /// Script elements inserted by scripts, waiting to be loaded.
@@ -801,6 +803,16 @@ fn n_log(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
     Ok(JsValue::undefined())
 }
 
+/// A script read a detail of the browser that fingerprinting scripts
+/// collect (only known names are kept).
+fn n_read(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let name = arg_str(a, 0, c)?;
+    if let Some((n, _)) = crate::explain::FINGERPRINT.iter().find(|(n, _)| *n == name) {
+        with(|s| s.read.insert(n));
+    }
+    Ok(JsValue::undefined())
+}
+
 fn n_navigate(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
     let target = arg_str(a, 0, c)?;
     with(|s| {
@@ -1006,6 +1018,7 @@ const NATIVES: &[(&str, Native, usize)] = &[
     ("connected", n_connected, 1),
     ("rect", n_rect, 1),
     ("log", n_log, 2),
+    ("read", n_read, 1),
     ("navigate", n_navigate, 1),
     ("setUrl", n_set_url, 1),
     ("url", n_url, 0),
@@ -1327,6 +1340,16 @@ impl Runtime {
 
     pub fn take_console(&mut self) -> Vec<String> {
         with(|s| std::mem::take(&mut s.console))
+    }
+
+    /// The details of the browser scripts read since last asked.
+    pub fn take_read(&mut self) -> Vec<String> {
+        with(|s| {
+            std::mem::take(&mut s.read)
+                .into_iter()
+                .map(String::from)
+                .collect()
+        })
     }
 
     pub fn take_navigate(&mut self) -> Option<String> {
@@ -1710,6 +1733,40 @@ mod tests {
         assert!(c.contains(&"[log] 1".to_string()), "{c:?}");
         assert!(c.contains(&"[log] 0 1000 700 1920".to_string()), "{c:?}");
         assert!(rt.take_requests().is_empty(), "sendBeacon sends nothing");
+    }
+
+    #[test]
+    fn reading_browser_details_is_noted() {
+        let (mut rt, _) = run(
+            "",
+            r#"
+            const fp = [navigator.platform, navigator.languages, navigator.hardwareConcurrency,
+                screen.width, screen.height, new Date().getTimezoneOffset(), devicePixelRatio];
+            console.log(navigator.cookieEnabled, typeof navigator.sendBeacon, fp.length);
+            "#,
+        );
+        assert!(rt.take_console().contains(&"[log] true function 7".to_string()));
+        let read = rt.take_read();
+        for name in [
+            "navigator.platform",
+            "navigator.hardwareConcurrency",
+            "screen.width",
+            "timezone",
+            "devicePixelRatio",
+        ] {
+            assert!(read.iter().any(|r| r == name), "{name} in {read:?}");
+        }
+        assert!(
+            !read.iter().any(|r| r.contains("cookieEnabled")),
+            "only watched details: {read:?}"
+        );
+        assert!(rt.take_read().is_empty(), "taken once");
+        // Scripts can't change what's reported.
+        let (mut rt, _) = run(
+            "",
+            "try { navigator.platform = 'x'; } catch (e) {} console.log(navigator.platform);",
+        );
+        assert!(rt.take_console().contains(&"[log] Linux x86_64".to_string()));
     }
 
     #[test]

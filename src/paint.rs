@@ -444,7 +444,7 @@ impl Layer {
 
 /// Fixed and sticky boxes, by address, as layer roots: every box inside one
 /// maps to the index of its outermost layer.
-fn layer_map(root: &LayoutBox) -> (HashMap<usize, usize>, Vec<(LayerKind, Rect)>) {
+pub fn layer_map(root: &LayoutBox) -> (HashMap<usize, usize>, Vec<(LayerKind, Rect)>) {
     fn walk(
         b: &LayoutBox,
         layer: Option<usize>,

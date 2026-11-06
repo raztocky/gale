@@ -178,6 +178,7 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                         title: p.title.clone(),
                         navigate: out.navigate.or_else(|| p.redirect.clone()),
                         console: out.console,
+                        read: out.read,
                     },
                 )?;
                 page = Some(p);
@@ -203,7 +204,10 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                 }
                 send(output, FromRenderer::Rendered(rendered))?;
             }
-            msg @ (ToRenderer::Click { .. } | ToRenderer::Type(_) | ToRenderer::Key(_)) => {
+            msg @ (ToRenderer::Click { .. }
+            | ToRenderer::Type(_)
+            | ToRenderer::Key(_)
+            | ToRenderer::Scroll { .. }) => {
                 let p = page.as_mut().ok_or("input before load")?;
                 let until = Instant::now() + js::EVENT_BUDGET;
                 let before = rt.as_ref().map(|r| r.version());
@@ -211,9 +215,10 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                     ToRenderer::Click { x, y } => p.click_at(rt.as_mut(), x, y, until),
                     ToRenderer::Type(t) => p.type_text(rt.as_mut(), &t),
                     ToRenderer::Key(k) => p.key(rt.as_mut(), k),
+                    ToRenderer::Scroll { uid, dx, dy } => p.scroll_box(uid, dx, dy),
                     _ => unreachable!(),
                 };
-                let (mut navigate, mut console) = (None, vec![]);
+                let (mut navigate, mut console, mut read) = (None, vec![], vec![]);
                 if let Some(rt) = rt.as_mut() {
                     // Handlers may have made requests or set timers.
                     let mut host = IpcHost {
@@ -241,6 +246,7 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                     cookies = host.cookies;
                     navigate = rt.take_navigate();
                     console = rt.take_console();
+                    read = rt.take_read();
                 }
                 send(
                     output,
@@ -252,6 +258,7 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                         submit: done.submit,
                         focus: done.focus,
                         copied: done.copied,
+                        read,
                     },
                 )?;
             }

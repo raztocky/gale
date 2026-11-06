@@ -33,6 +33,10 @@ pub struct Page {
     /// Boxes from the last layout and the node each is for, in paint
     /// order, for finding what a click hit.
     hits: RefCell<Vec<(Rect, u32)>>,
+    /// How far you've scrolled inside boxes, by node.
+    scrolled: RefCell<HashMap<u32, (f32, f32)>>,
+    /// The boxes you could scroll inside at the last layout.
+    scrollers: RefCell<Vec<Scroller>>,
     /// The page's editable DOM when it has no scripts (with scripts, the
     /// script runtime holds it). Typing and form controls change it.
     arena: Option<Dom>,
@@ -101,6 +105,8 @@ pub enum Key {
 #[derive(Debug, Default)]
 pub struct ScriptOutput {
     pub console: Vec<String>,
+    /// Details of the browser the scripts read ([`crate::explain::FINGERPRINT`]).
+    pub read: Vec<String>,
     /// A navigation a script asked for.
     pub navigate: Option<String>,
 }
@@ -120,6 +126,68 @@ pub struct Rendered {
     pub layers: Vec<paint::Layer>,
     /// The page's title, drawn for the tab bar (see [`paint::text_mask`]).
     pub title: Option<paint::GlyphBitmap>,
+    /// Boxes you can scroll inside, outer ones first.
+    pub scrollers: Vec<Scroller>,
+}
+
+/// A box you can scroll inside: the wheel over it scrolls it (by
+/// [`Page::scroll_box`]) before the page.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Scroller {
+    pub uid: u32,
+    /// Where it shows on the page (its padding box, minus what's clipped
+    /// away), as laid out.
+    pub rect: Rect,
+    /// How far it's scrolled, and how far it can be.
+    pub x: f32,
+    pub y: f32,
+    pub max_x: f32,
+    pub max_y: f32,
+    /// The fixed or sticky layer it's in, which moves it as the page scrolls.
+    pub layer: Option<paint::LayerKind>,
+}
+
+impl Scroller {
+    /// Where it shows at page scroll `scroll`.
+    pub fn at(&self, scroll: f32) -> Rect {
+        let dy = self.layer.map_or(0.0, |kind| {
+            paint::Layer {
+                kind,
+                bounds: Rect::default(),
+                start: 0,
+                end: 0,
+            }
+            .shift(scroll)
+        });
+        Rect {
+            y: self.rect.y + dy,
+            ..self.rect
+        }
+    }
+
+    /// Can it scroll by (dx, dy) at all?
+    pub fn can_scroll(&self, dx: f32, dy: f32) -> bool {
+        (dx < 0.0 && self.x > 0.0)
+            || (dx > 0.0 && self.x < self.max_x)
+            || (dy < 0.0 && self.y > 0.0)
+            || (dy > 0.0 && self.y < self.max_y)
+    }
+}
+
+/// The innermost box at `(x, y)` (page space, at page scroll `scroll`) that
+/// can scroll by `(dx, dy)`.
+pub fn scroller_at(
+    scrollers: &[Scroller],
+    x: f32,
+    y: f32,
+    scroll: f32,
+    dx: f32,
+    dy: f32,
+) -> Option<&Scroller> {
+    scrollers
+        .iter()
+        .rev()
+        .find(|s| s.at(scroll).contains(x, y) && s.can_scroll(dx, dy))
 }
 
 /// Fetches a subresource (absolute URL) for the page. In the sandboxed
@@ -279,6 +347,7 @@ impl Page {
                 page.set_tree(tree, &mut |u, d| host.fetch(u, d));
                 let out = ScriptOutput {
                     console: vec![format!("[brickle] {e}")],
+                    read: vec![],
                     navigate: None,
                 };
                 return (page, None, out);
@@ -319,6 +388,7 @@ impl Page {
         page.from_server = Some(from_server);
         let out = ScriptOutput {
             console: rt.take_console(),
+            read: rt.take_read(),
             navigate: rt.take_navigate(),
         };
         (page, Some(rt), out)
@@ -342,6 +412,8 @@ impl Page {
             scripting,
             sheet_cache: HashMap::new(),
             hits: RefCell::new(Vec::new()),
+            scrolled: RefCell::new(HashMap::new()),
+            scrollers: RefCell::new(Vec::new()),
             arena: None,
             focus: None,
             caret: forms::Caret::default(),
@@ -822,7 +894,8 @@ impl Page {
         );
         let images = self.images_by_node(&tree);
         let styled = style::style_tree(&tree, &ctx);
-        let root = layout::layout_tree_with_images(&styled, (width, viewport_h), &images);
+        let mut root = layout::layout_tree_with_images(&styled, (width, viewport_h), &images);
+        let scroll_boxes = layout::apply_scrolling(&mut root, &self.scrolled.borrow());
 
         // The root's (or body's) background paints the whole canvas.
         let mut background = styled.style.background;
@@ -872,15 +945,42 @@ impl Page {
         };
         collect_text(
             &root,
-            &Seen::new(&order, page, clips),
+            &Seen::new(&order, page, clips.clone()),
             background,
             &mut texts,
             &mut 0,
         );
         // Tall enough to scroll to everything drawn, including positioned
         // boxes and text overflowing its box.
+        // Clipped content doesn't count, or the page would scroll on past
+        // what a box scrolls inside.
         let mb = root.dims.margin_box();
-        let height = order.iter().fold(mb.y + mb.h, |h, b| h.max(content_bottom(b)));
+        let height = order.iter().fold(mb.y + mb.h, |h, b| {
+            let bottom = content_bottom(b);
+            h.max(clip_of(b).map_or(bottom, |c| bottom.min(c.y + c.h)))
+        });
+        let (in_layer, kinds) = paint::layer_map(&root);
+        let scrollers: Vec<Scroller> = scroll_boxes
+            .iter()
+            .filter_map(|sb| {
+                let rect = match clips.get(&sb.addr) {
+                    Some(c) => c.intersect(sb.rect),
+                    None => sb.rect,
+                };
+                (rect.w > 0.0 && rect.h > 0.0).then(|| Scroller {
+                    uid: sb.uid,
+                    rect,
+                    x: sb.x,
+                    y: sb.y,
+                    max_x: sb.max_x,
+                    max_y: sb.max_y,
+                    layer: in_layer.get(&sb.addr).map(|&i| kinds[i].0),
+                })
+            })
+            .collect();
+        // Offsets past the end (the content got shorter) are pulled back.
+        *self.scrolled.borrow_mut() = scroll_boxes.iter().map(|sb| (sb.uid, (sb.x, sb.y))).collect();
+        *self.scrollers.borrow_mut() = scrollers.clone();
         Rendered {
             list,
             atlas,
@@ -892,6 +992,34 @@ impl Page {
             title: (self.title_px > 0.0)
                 .then(|| paint::text_mask(&self.title, 0, self.title_px, paint::MAX_TITLE_W))
                 .flatten(),
+            scrollers,
+        }
+    }
+
+    /// Scroll inside the box for node `uid` by (dx, dy), as far as it goes.
+    /// `changed` says it moved (then render again).
+    pub fn scroll_box(&mut self, uid: u32, dx: f32, dy: f32) -> Interaction {
+        let Some(s) = self.scrollers.borrow().iter().find(|s| s.uid == uid).copied() else {
+            return Interaction::default();
+        };
+        let (dx, dy) = (
+            if dx.is_finite() { dx } else { 0.0 },
+            if dy.is_finite() { dy } else { 0.0 },
+        );
+        let to = (
+            (s.x + dx).clamp(0.0, s.max_x).round(),
+            (s.y + dy).clamp(0.0, s.max_y).round(),
+        );
+        let changed = to != (s.x, s.y);
+        if changed {
+            self.scrolled.borrow_mut().insert(uid, to);
+            for sc in self.scrollers.borrow_mut().iter_mut().filter(|sc| sc.uid == uid) {
+                (sc.x, sc.y) = to;
+            }
+        }
+        Interaction {
+            changed,
+            ..Interaction::default()
         }
     }
 }
@@ -2095,6 +2223,81 @@ mod layer_tests {
         assert_eq!(l.shift(500.0), 500.0);
         // Its text isn't offered for selection (it moves with scrolling).
         assert!(r.texts.iter().all(|t| t.text != "menu"));
+    }
+
+    #[test]
+    fn boxes_scroll_inside() {
+        let mut page = Page::trusted(
+            "about:test",
+            "<body style='margin:0'><div id=a style='height:100px;overflow:auto'>\
+             <a href=/top>top</a><p style='height:300px;margin:0'></p><a href=/end>end</a></div>\
+             <pre style='width:100px;overflow-x:auto;margin:0'>a long line that does not fit in the box</pre></body>",
+        );
+        let r = page.render(800.0, 600.0);
+        assert_eq!(r.scrollers.len(), 2, "{:?}", r.scrollers);
+        let s = r.scrollers[0];
+        assert!(
+            (s.rect.h - 100.0).abs() < 0.5 && s.max_y > 200.0 && s.y == 0.0,
+            "{s:?}"
+        );
+        assert!(
+            r.scrollers[1].max_x > 50.0 && r.scrollers[1].max_y == 0.0,
+            "{:?}",
+            r.scrollers[1]
+        );
+        assert!(
+            r.height < 200.0,
+            "what's scrolled away doesn't lengthen the page: {}",
+            r.height
+        );
+        let link = |r: &Rendered, href: &str| r.links.iter().find(|(_, h)| h == href).map(|(rect, _)| *rect);
+        assert!(
+            link(&r, "/top").is_some() && link(&r, "/end").is_none(),
+            "the end is clipped away"
+        );
+
+        // Scrolling moves the content and stops at the end.
+        assert!(page.scroll_box(s.uid, 0.0, 10_000.0).changed);
+        let r = page.render(800.0, 600.0);
+        assert!(
+            (r.scrollers[0].y - s.max_y.round()).abs() < 0.5,
+            "{:?}",
+            r.scrollers[0]
+        );
+        assert!(
+            link(&r, "/top").is_none() && link(&r, "/end").is_some(),
+            "{:?}",
+            r.links
+        );
+        let end = link(&r, "/end").unwrap();
+        assert!(end.y < 100.0, "the end shows in the box: {end:?}");
+        assert!(!page.scroll_box(s.uid, 0.0, 50.0).changed, "already at the end");
+        assert!(
+            !page.scroll_box(s.uid, 0.0, f32::NAN).changed,
+            "nonsense is ignored"
+        );
+        assert!(!page.scroll_box(12345, 0.0, 50.0).changed, "no such box");
+        assert!(page.scroll_box(s.uid, 0.0, -1e9).changed);
+
+        // The wheel finds the innermost box that can still move that way.
+        let r = page.render(800.0, 600.0);
+        assert_eq!(r.scrollers[0].y, 0.0);
+        assert!(
+            scroller_at(&r.scrollers, 10.0, 50.0, 0.0, 0.0, -40.0).is_none(),
+            "already at the top"
+        );
+        assert_eq!(
+            scroller_at(&r.scrollers, 10.0, 50.0, 0.0, 0.0, 40.0).map(|s| s.uid),
+            Some(s.uid)
+        );
+        assert!(
+            scroller_at(&r.scrollers, 10.0, 50.0, 0.0, 40.0, 0.0).is_none(),
+            "it doesn't scroll sideways"
+        );
+        assert!(
+            scroller_at(&r.scrollers, 10.0, 500.0, 0.0, 0.0, 40.0).is_none(),
+            "not over it"
+        );
     }
 
     #[test]

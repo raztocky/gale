@@ -10,10 +10,11 @@ use crate::css::Color;
 use crate::forms::Submission;
 use crate::image::{Bitmap, MAX_DRAW_SIDE};
 use crate::layout::Rect;
+use crate::layout::MAX_SCROLLERS;
 use crate::net::{Credentials, Dest, Mode, Redirect, ScriptRequest};
 use crate::network::ScriptResponse;
 use crate::page::Key;
-use crate::page::{Rendered, MAX_LINKS, MAX_TEXT_CHARS, MAX_TEXT_RUNS};
+use crate::page::{Rendered, Scroller, MAX_LINKS, MAX_TEXT_CHARS, MAX_TEXT_RUNS};
 use crate::paint::{
     DisplayCommand, GlyphBitmap, Layer, LayerKind, PlacedGlyph, MAX_ATLAS_BYTES, MAX_FRAME_IMAGE_BYTES,
     MAX_GLYPH_SIDE, MAX_LAYERS, MAX_TITLE_H, MAX_TITLE_W,
@@ -32,6 +33,8 @@ const MAX_COMMANDS: usize = 500_000;
 const MAX_GLYPHS: usize = 4_000_000;
 /// Console lines a renderer may report per message.
 const MAX_CONSOLE: usize = 200;
+/// Most names in a message's `read` (there are fewer to read).
+const MAX_READ: usize = 64;
 /// Headers in one script request or response.
 const MAX_HEADERS: usize = 64;
 
@@ -70,6 +73,12 @@ pub enum ToRenderer {
     Type(String),
     /// You pressed a key with a field focused.
     Key(Key),
+    /// You scrolled inside the box for this node.
+    Scroll {
+        uid: u32,
+        dx: f32,
+        dy: f32,
+    },
     Render {
         width: f32,
         height: f32,
@@ -99,6 +108,9 @@ pub enum FromRenderer {
         /// A navigation a script asked for (the browser applies its checks).
         navigate: Option<String>,
         console: Vec<String>,
+        /// Details of the browser the page's scripts read
+        /// ([`crate::explain::FINGERPRINT`]).
+        read: Vec<String>,
     },
     Rendered(Rendered),
     Dom(String),
@@ -123,6 +135,8 @@ pub enum FromRenderer {
         /// Text copied or cut from a field (the browser only takes it
         /// after you pressed Ctrl+C or Ctrl+X).
         copied: Option<String>,
+        /// As in `Loaded`.
+        read: Vec<String>,
     },
 }
 
@@ -485,6 +499,12 @@ impl ToRenderer {
                 e.f32(*title_px);
             }
             ToRenderer::Dom => e.u8(4),
+            ToRenderer::Scroll { uid, dx, dy } => {
+                e.u8(11);
+                e.u32(*uid);
+                e.f32(*dx);
+                e.f32(*dy);
+            }
             ToRenderer::ImageReply(r) => {
                 e.u8(10);
                 match r {
@@ -571,6 +591,11 @@ impl ToRenderer {
                 title_px: d.f32()?,
             },
             4 => ToRenderer::Dom,
+            11 => ToRenderer::Scroll {
+                uid: d.u32()?,
+                dx: d.f32()?,
+                dy: d.f32()?,
+            },
             10 => match d.u8()? {
                 1 => {
                     let n = d.u32()? as usize;
@@ -609,11 +634,13 @@ impl FromRenderer {
                 title,
                 navigate,
                 console,
+                read,
             } => {
                 e.u8(2);
                 e.str(title);
                 e.opt_str(navigate);
                 e.strs(console);
+                e.strs(read);
             }
             FromRenderer::Request { url, req } => {
                 e.u8(6);
@@ -650,6 +677,7 @@ impl FromRenderer {
                 submit,
                 focus,
                 copied,
+                read,
             } => {
                 e.u8(5);
                 e.u8(*prevented as u8);
@@ -668,6 +696,7 @@ impl FromRenderer {
                 }
                 e.u8(*focus as u8);
                 e.opt_str(copied);
+                e.strs(read);
             }
             FromRenderer::Rendered(r) => {
                 e.u8(3);
@@ -744,6 +773,24 @@ impl FromRenderer {
                     e.u32(l.start as u32);
                     e.u32(l.end as u32);
                 }
+                e.u32(r.scrollers.len() as u32);
+                for s in &r.scrollers {
+                    e.u32(s.uid);
+                    e.rect(s.rect);
+                    for v in [s.x, s.y, s.max_x, s.max_y] {
+                        e.f32(v);
+                    }
+                    match s.layer {
+                        None => e.u8(0),
+                        Some(LayerKind::Fixed) => e.u8(1),
+                        Some(LayerKind::Sticky { top, y0, max_dy }) => {
+                            e.u8(2);
+                            e.f32(top);
+                            e.f32(y0);
+                            e.f32(max_dy);
+                        }
+                    }
+                }
                 // The title bitmap, if any, goes last, flagged after.
                 e.u32((r.atlas.len() + r.title.is_some() as usize) as u32);
                 for g in r.atlas.iter().chain(&r.title) {
@@ -782,6 +829,7 @@ impl FromRenderer {
                 title: d.str()?,
                 navigate: d.opt_str()?,
                 console: d.strs(MAX_CONSOLE)?,
+                read: d.strs(MAX_READ)?,
             },
             6 => FromRenderer::Request {
                 url: d.str()?,
@@ -828,6 +876,7 @@ impl FromRenderer {
                 },
                 focus: d.bool()?,
                 copied: d.opt_str()?,
+                read: d.strs(MAX_READ)?,
             },
             3 => {
                 let height = d.f32()?.max(0.0);
@@ -957,6 +1006,45 @@ impl FromRenderer {
                         end,
                     });
                 }
+                // Boxes you can scroll inside: scrolled no further than
+                // they can be.
+                let n = d.count(37)?;
+                if n > MAX_SCROLLERS {
+                    return Err("too many scrolling boxes".into());
+                }
+                let mut scrollers = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let uid = d.u32()?;
+                    let rect = d.rect()?;
+                    let (x, y, max_x, max_y) = (d.f32()?, d.f32()?, d.f32()?, d.f32()?);
+                    let layer = match d.u8()? {
+                        0 => None,
+                        1 => Some(LayerKind::Fixed),
+                        2 => Some(LayerKind::Sticky {
+                            top: d.f32()?,
+                            y0: d.f32()?,
+                            max_dy: d.f32()?,
+                        }),
+                        k => return Err(format!("unknown layer kind {k}")),
+                    };
+                    let sane = |v: f32| v.is_finite() && (0.0..=MAX_COORD).contains(&v);
+                    if ![rect.w, rect.h, max_x, max_y].into_iter().all(sane)
+                        || ![rect.x, rect.y].iter().all(|v| v.abs() <= MAX_COORD)
+                        || !(0.0..=max_x).contains(&x)
+                        || !(0.0..=max_y).contains(&y)
+                    {
+                        return Err("scrolling box out of range".into());
+                    }
+                    scrollers.push(Scroller {
+                        uid,
+                        rect,
+                        x,
+                        y,
+                        max_x,
+                        max_y,
+                        layer,
+                    });
+                }
                 let n = d.count(4)?;
                 let mut atlas = Vec::with_capacity(n);
                 let mut atlas_bytes = 0usize;
@@ -1004,6 +1092,7 @@ impl FromRenderer {
                     texts,
                     layers,
                     title,
+                    scrollers,
                 })
             }
             4 => FromRenderer::Dom(d.str()?),
@@ -1094,6 +1183,20 @@ mod tests {
                 start: 0,
                 end: 1,
             }],
+            scrollers: vec![Scroller {
+                uid: 3,
+                rect: Rect {
+                    x: 0.0,
+                    y: 60.0,
+                    w: 100.0,
+                    h: 30.0,
+                },
+                x: 0.0,
+                y: 12.0,
+                max_x: 0.0,
+                max_y: 40.0,
+                layer: Some(LayerKind::Fixed),
+            }],
             title: Some(GlyphBitmap {
                 w: 3,
                 h: 1,
@@ -1127,6 +1230,7 @@ mod tests {
                 title: "T".into(),
                 navigate: Some("https://b/".into()),
                 console: vec!["[log] hi".into()],
+                read: vec!["navigator.platform".into()],
             },
             FromRenderer::Request {
                 url: "https://a/api".into(),
@@ -1149,6 +1253,7 @@ mod tests {
                 submit: None,
                 focus: true,
                 copied: Some("copied text".into()),
+                read: vec![],
             },
             FromRenderer::Clicked {
                 prevented: false,
@@ -1163,6 +1268,7 @@ mod tests {
                 }),
                 focus: false,
                 copied: None,
+                read: vec!["screen.width".into()],
             },
             FromRenderer::Rendered(sample()),
             FromRenderer::Dom("<html>".into()),
@@ -1220,6 +1326,11 @@ mod tests {
                 title_px: 15.0,
             },
             ToRenderer::Dom,
+            ToRenderer::Scroll {
+                uid: 7,
+                dx: 0.0,
+                dy: -48.0,
+            },
         ];
         for m in msgs {
             assert_eq!(ToRenderer::decode(&m.encode()).unwrap(), m);
@@ -1289,6 +1400,25 @@ mod tests {
             }),
             "backwards"
         );
+    }
+
+    #[test]
+    fn scrolling_boxes_are_checked() {
+        let bad = |f: &dyn Fn(&mut Scroller)| {
+            let mut r = sample();
+            f(&mut r.scrollers[0]);
+            FromRenderer::decode(&FromRenderer::Rendered(r).encode()).is_err()
+        };
+        assert!(!bad(&|_| {}));
+        assert!(bad(&|s| s.y = 41.0), "scrolled past its end");
+        assert!(bad(&|s| s.y = -1.0), "scrolled before its start");
+        assert!(bad(&|s| s.max_y = f32::NAN));
+        assert!(bad(&|s| s.rect.w = -5.0));
+        assert!(bad(&|s| s.rect.x = f32::INFINITY));
+        assert!(bad(&|s| s.max_x = 1e9), "too far");
+        let mut r = sample();
+        r.scrollers = vec![r.scrollers[0]; MAX_SCROLLERS + 1];
+        assert!(FromRenderer::decode(&FromRenderer::Rendered(r).encode()).is_err());
     }
 
     #[test]

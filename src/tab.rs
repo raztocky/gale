@@ -92,6 +92,9 @@ pub struct Tab {
     pub scripts: bool,
     /// What the page's scripts wrote to the console.
     pub console: Vec<String>,
+    /// Details of your browser the page's scripts read, of those
+    /// fingerprinting scripts collect ([`crate::explain::FINGERPRINT`]).
+    pub read: std::collections::BTreeSet<&'static str>,
     /// A navigation the page's scripts asked for while loading.
     pub script_navigate: Option<String>,
     /// Your text size, used when rendering.
@@ -143,6 +146,12 @@ pub enum Input {
     Click(f32, f32),
     Type(String),
     Key(Key),
+    /// Scroll inside the box for a node by (dx, dy).
+    Scroll {
+        uid: u32,
+        dx: f32,
+        dy: f32,
+    },
 }
 
 /// What the renderer reported when a page loaded.
@@ -150,6 +159,7 @@ struct Loaded {
     title: String,
     navigate: Option<String>,
     console: Vec<String>,
+    read: Vec<String>,
 }
 
 enum Backend {
@@ -159,6 +169,16 @@ enum Backend {
 }
 
 impl Tab {
+    /// Keep the names the renderer says scripts read, if they're ones
+    /// Brickle watches (it's only told, so it only believes known names).
+    fn note_read(&mut self, read: Vec<String>) {
+        for name in read {
+            if let Some((n, _)) = crate::explain::FINGERPRINT.iter().find(|(n, _)| *n == name) {
+                self.read.insert(n);
+            }
+        }
+    }
+
     /// Navigate to `url`. `from` is the page that linked here, if any.
     pub fn open(net: &mut Network, url: &str, from: Option<&str>, sandbox: bool) -> Tab {
         Tab::open_sized(net, url, from, sandbox, DEFAULT_VIEWPORT)
@@ -210,6 +230,7 @@ impl Tab {
                     interstitial: Some(action),
                     scripts: false,
                     console: vec![],
+                    read: Default::default(),
                     script_navigate: None,
                     backend: Backend::InProcess(Box::new(page)),
                     text_scale: 1.0,
@@ -259,6 +280,7 @@ impl Tab {
             interstitial: None,
             scripts,
             console: vec![],
+            read: Default::default(),
             script_navigate: None,
             backend: Backend::Failed(String::new()),
             text_scale: 1.0,
@@ -293,6 +315,7 @@ impl Tab {
                 tab.title = loaded.title;
                 tab.script_navigate = loaded.navigate;
                 tab.console.extend(loaded.console);
+                tab.note_read(loaded.read);
                 tab.backend = Backend::Sandboxed(r);
             }
             Err(e) => tab.backend = Backend::Failed(e),
@@ -319,6 +342,7 @@ impl Tab {
                     Input::Click(x, y) => page.click_at(None, x, y, until),
                     Input::Type(t) => page.type_text(None, &t),
                     Input::Key(k) => page.key(None, k),
+                    Input::Scroll { uid, dx, dy } => page.scroll_box(uid, dx, dy),
                 };
                 return Click {
                     prevented: done.prevented,
@@ -340,6 +364,7 @@ impl Tab {
             Input::Click(x, y) => ToRenderer::Click { x, y },
             Input::Type(t) => ToRenderer::Type(t),
             Input::Key(k) => ToRenderer::Key(k),
+            Input::Scroll { uid, dx, dy } => ToRenderer::Scroll { uid, dx, dy },
         };
         let result = r.send(msg).and_then(|_| {
             match r.serve(Instant::now() + RENDERER_TIMEOUT, SCRIPT_BYTES, &mut host)? {
@@ -351,6 +376,7 @@ impl Tab {
                     submit,
                     focus,
                     copied,
+                    read,
                 } => Ok((
                     Click {
                         prevented,
@@ -361,14 +387,16 @@ impl Tab {
                         copied: accept_copied(copied, copy_key),
                     },
                     console,
+                    read,
                 )),
                 _ => Err(r.kill("renderer sent an unexpected message and was killed")),
             }
         });
         match result {
-            Ok((click, console)) => {
+            Ok((click, console, read)) => {
                 let room = MAX_CONSOLE.saturating_sub(self.console.len());
                 self.console.extend(console.into_iter().take(room));
+                self.note_read(read);
                 click
             }
             Err(e) => {
@@ -570,10 +598,12 @@ impl Renderer {
                 title,
                 navigate,
                 console,
+                read,
             } => Ok(Loaded {
                 title,
                 navigate,
                 console,
+                read,
             }),
             _ => Err(self.kill("renderer sent an unexpected message and was killed")),
         }
@@ -783,6 +813,7 @@ except BrokenPipeError:
             title: "t".into(),
             navigate: None,
             console: vec![],
+            read: vec![],
         })
     }
 

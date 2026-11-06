@@ -45,8 +45,11 @@ Every request a page makes is listed in the **request panel** (F12 or Ctrl+Shift
 denied by you, plus any tracking parameters removed and any HTTPS upgrade. It also says, in plain
 words, what the request was for: which company a known tracker belongs to and what it does, what
 the request carried (your cookies, this page's address, ID-like values) or would have, had it not
-been blocked, and which filter list blocked it. That comes from a table built into Brickle; nothing
-is looked up online, and it only describes what Brickle can see. Click a row to block
+been blocked, and which filter list blocked it. On sites where you allowed JavaScript, a note at the
+top says when the page's scripts read enough details of your browser (screen size, time zone,
+processor cores…) to look like fingerprinting; Brickle gives those the same answers in every copy.
+That comes from a table built into Brickle; nothing is looked up online, and it only describes what
+Brickle can see. Click a row to block
 that host, or to unblock it. Your choices are saved as filter rules in
 `~/.config/brickle/rules.txt` and always take priority over the filter lists.
 `brickle requests URL` prints the same list in the terminal, and `brickle filters update` prints

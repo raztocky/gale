@@ -33,6 +33,10 @@ Planned work, roughly in priority order. Items marked *discuss* need a decision 
 - [x] Replace fontdue: it depends on `ttf-parser`, which is now unmaintained (RUSTSEC-2026-0192).
       A rasterizer on Google's maintained fontations stack (`skrifa` outlines) would also line up
       with HarfRust, which uses the same font-reading crates
+- [x] Scrolling inside `overflow: auto/scroll` boxes with the wheel (`Shift` for sideways), and `max-height`
+- [ ] Scrolling inside boxes with the keyboard, and by dragging their scrollbar; `element.scrollTop` for scripts
+- [x] Request panel: notes when a page's scripts read enough browser details to look like fingerprinting
+- [ ] Request panel: more trackers from a public list, once its licence is checked
 
 ## Performance / robustness
 - [x] Paint pages into tiles once and scroll by copying pixels

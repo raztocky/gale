@@ -225,6 +225,7 @@ pub struct ComputedStyle {
     /// padding and border.
     pub border_box: bool,
     pub min_height: Len,
+    pub max_height: Len,
     pub max_width: Len,
     pub visible: bool,
     pub flex_row: bool,
@@ -241,8 +242,9 @@ pub struct ComputedStyle {
     /// `Auto` takes the item's width (or height), else its content's size.
     pub flex_basis: Len,
     pub order: i32,
-    /// `overflow: auto | scroll`. Brickle doesn't scroll inside boxes, so
-    /// these grow to fit their content instead (the page scrolls).
+    /// `overflow: auto | scroll`: you can scroll inside the box (see
+    /// `layout::apply_scrolling`), unless it's about as tall as the window,
+    /// when it grows to fit its content and the page scrolls instead.
     pub scrolls: bool,
     /// The root element, and whether its `overflow` was set (then `body`'s
     /// isn't the window's).
@@ -281,9 +283,8 @@ pub struct ComputedStyle {
     /// `overflow` other than `visible`, or `display: flow-root`: the box
     /// contains its floats and doesn't wrap around outside ones.
     pub contain_floats: bool,
-    /// `overflow` other than `visible`: a real browser clips the content to
-    /// the padding box. (Brickle doesn't clip painting yet, but text outside
-    /// isn't offered for copying.)
+    /// `overflow` other than `visible`: the content is clipped to the
+    /// padding box.
     pub overflow_clip: bool,
     pub position: Position,
     /// `top`, `right`, `bottom`, `left`.
@@ -327,6 +328,7 @@ impl ComputedStyle {
             border_box: false,
             height: Len::Auto,
             min_height: Len::Auto,
+            max_height: Len::Auto,
             max_width: Len::Auto,
             visible: true,
             flex_row: true,
@@ -1652,6 +1654,7 @@ fn compute(
             "width" => s.width = ctxv.len(first, fs),
             "height" => s.height = ctxv.len(first, fs),
             "min-height" => s.min_height = ctxv.len(first, fs),
+            "max-height" => s.max_height = ctxv.len(first, fs),
             "max-width" => s.max_width = ctxv.len(first, fs),
             _ => {
                 for (i, side) in ["top", "right", "bottom", "left"].iter().enumerate() {

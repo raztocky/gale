@@ -774,7 +774,21 @@
     clear() { this._m.clear(); }
   }
 
-  const navigator = {
+  // Details that fingerprinting scripts collect: reading one is reported
+  // (dom.read), so the request panel can say what the page looked at.
+  function watched(prefix, o) {
+    const out = {};
+    for (const k of Object.keys(o)) {
+      const v = o[k];
+      if (typeof v === 'function') { out[k] = v; continue; }
+      Object.defineProperty(out, k, {
+        get() { dom.read(prefix + k); return v; }, enumerable: true, configurable: false,
+      });
+    }
+    return Object.freeze(out);
+  }
+
+  const navigator = watched('navigator.', {
     userAgent: dom.ua,
     appVersion: '5.0 (X11)',
     appName: 'Netscape',
@@ -800,8 +814,7 @@
     sendBeacon: () => false, // a tracking API: never sends
     clipboard: undefined,
     serviceWorker: undefined,
-  };
-  Object.freeze(navigator);
+  });
 
   const performance = {
     now: () => clock,
@@ -1114,10 +1127,24 @@
     }
   }
 
-  const screen = Object.freeze({
+  const screen = watched('screen.', {
     width: 1920, height: 1080, availWidth: 1920, availHeight: 1080, colorDepth: 24, pixelDepth: 24,
     orientation: { type: 'landscape-primary', angle: 0, addEventListener() {} },
   });
+  {
+    const tz = Date.prototype.getTimezoneOffset;
+    Object.defineProperty(Date.prototype, 'getTimezoneOffset', {
+      value: function getTimezoneOffset() { dom.read('timezone'); return tz.call(this); },
+      writable: true, configurable: true,
+    });
+    if (typeof Intl === 'object' && Intl.DateTimeFormat) {
+      const ro = Intl.DateTimeFormat.prototype.resolvedOptions;
+      Object.defineProperty(Intl.DateTimeFormat.prototype, 'resolvedOptions', {
+        value: function resolvedOptions() { dom.read('timezone'); return ro.call(this); },
+        writable: true, configurable: true,
+      });
+    }
+  }
 
   function matchMedia(q) {
     q = str(q);
@@ -1225,13 +1252,16 @@
     scrollTo() {}, scrollBy() {}, scroll() {},
     getSelection: () => document.getSelection(),
     isSecureContext: true, origin: undefined, name: '', closed: false, opener: null, frameElement: null,
-    devicePixelRatio: 1, scrollX: 0, scrollY: 0, pageXOffset: 0, pageYOffset: 0,
+    scrollX: 0, scrollY: 0, pageXOffset: 0, pageYOffset: 0,
     reportError,
   };
   for (const [k, v] of Object.entries(defs)) {
     Object.defineProperty(G, k, { value: v, writable: true, configurable: true, enumerable: false });
   }
   Object.defineProperty(G, 'origin', { get: () => location.origin, configurable: true });
+  Object.defineProperty(G, 'devicePixelRatio', {
+    get: () => { dom.read('devicePixelRatio'); return 1; }, configurable: true,
+  });
   for (const [k, i] of [['innerWidth', 0], ['outerWidth', 0], ['innerHeight', 1], ['outerHeight', 1]])
     Object.defineProperty(G, k, { get: () => viewport[i], configurable: true });
   Object.assign(G, eventTargetMethods);
