@@ -34,7 +34,8 @@ Planned work, roughly in priority order. Items marked *discuss* need a decision 
       A rasterizer on Google's maintained fontations stack (`skrifa` outlines) would also line up
       with HarfRust, which uses the same font-reading crates
 - [x] Scrolling inside `overflow: auto/scroll` boxes with the wheel (`Shift` for sideways), and `max-height`
-- [ ] Scrolling inside boxes with the keyboard, and by dragging their scrollbar; `element.scrollTop` for scripts
+- [x] Scrolling inside boxes with the keyboard, and by dragging their scrollbar; `scrollTop`, `scrollTo()`, `scrollIntoView()` and `scroll` events for scripts
+- [ ] Lay out on demand when a script asks for sizes before the first layout
 - [x] Request panel: notes when a page's scripts read enough browser details to look like fingerprinting
 - [ ] Request panel: more trackers from a public list, once its licence is checked
 

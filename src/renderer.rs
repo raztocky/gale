@@ -172,6 +172,11 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                     return Err(e);
                 }
                 cookies = host.cookies;
+                // Boxes scripts scrolled while loading (applied when laid out).
+                let mut new_rt = new_rt;
+                if let Some(rt) = new_rt.as_mut() {
+                    p.apply_script_scrolls(rt);
+                }
                 send(
                     output,
                     FromRenderer::Loaded {
@@ -201,6 +206,7 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                 let rendered = p.render(width, height.clamp(1.0, 16_000.0));
                 if let Some(rt) = rt.as_mut() {
                     rt.set_boxes(p.boxes());
+                    rt.set_scrollers(p.scroll_info());
                 }
                 send(output, FromRenderer::Rendered(rendered))?;
             }
@@ -215,7 +221,7 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                     ToRenderer::Click { x, y } => p.click_at(rt.as_mut(), x, y, until),
                     ToRenderer::Type(t) => p.type_text(rt.as_mut(), &t),
                     ToRenderer::Key(k) => p.key(rt.as_mut(), k),
-                    ToRenderer::Scroll { uid, dx, dy } => p.scroll_box(uid, dx, dy),
+                    ToRenderer::Scroll { uid, dx, dy } => p.scroll_box(rt.as_mut(), uid, dx, dy),
                     _ => unreachable!(),
                 };
                 let (mut navigate, mut console, mut read) = (None, vec![], vec![]);
@@ -244,6 +250,9 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                         return Err(e);
                     }
                     cookies = host.cookies;
+                    if p.apply_script_scrolls(rt) {
+                        done.changed = true;
+                    }
                     navigate = rt.take_navigate();
                     console = rt.take_console();
                     read = rt.take_read();

@@ -342,7 +342,7 @@ impl Tab {
                     Input::Click(x, y) => page.click_at(None, x, y, until),
                     Input::Type(t) => page.type_text(None, &t),
                     Input::Key(k) => page.key(None, k),
-                    Input::Scroll { uid, dx, dy } => page.scroll_box(uid, dx, dy),
+                    Input::Scroll { uid, dx, dy } => page.scroll_box(None, uid, dx, dy),
                 };
                 return Click {
                     prevented: done.prevented,

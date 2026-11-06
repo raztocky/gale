@@ -446,6 +446,12 @@ struct State {
     pending_scripts: Vec<u32>,
     /// Boxes from the last layout, for `getBoundingClientRect`.
     boxes: Vec<(u32, Rect)>,
+    /// Boxes you can scroll inside: offset x, y, how far each can scroll,
+    /// and padding-box width and height (`Page::scroll_info`).
+    scrollers: Vec<(u32, [f32; 6])>,
+    /// `scrollTop`/`scrollLeft`/`scrollTo()` asked for: (node, x, y), a
+    /// coordinate left as it was when `None`.
+    scroll_sets: Vec<(u32, Option<f32>, Option<f32>)>,
     /// Requests scripts made, waiting to be sent to the browser.
     requests: Vec<(u32, String, ScriptRequest)>,
     next_request: u32,
@@ -796,6 +802,50 @@ fn n_rect(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
     Ok(JsArray::from_iter([r.x, r.y, r.w, r.h].map(|v| JsValue::from(v as f64)), c).into())
 }
 
+/// A box's scroll state: `[x, y, maxX, maxY, width, height]`, or null if
+/// it doesn't scroll.
+fn n_scroll(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let id = arg_id(a, 0, c)?;
+    Ok(
+        match with(|s| s.scrollers.iter().find(|(u, _)| *u == id).map(|(_, v)| *v)) {
+            Some(v) => JsArray::from_iter(v.map(|v| JsValue::from(v as f64)), c).into(),
+            None => JsValue::null(),
+        },
+    )
+}
+
+/// Scroll a box to (x, y); NaN leaves that coordinate as it is.
+fn n_set_scroll(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let id = arg_id(a, 0, c)?;
+    let coord = |i: usize, c: &mut Context| -> JsResult<Option<f32>> {
+        let v = a.get_or_undefined(i).to_number(c)?;
+        Ok(v.is_finite().then_some(v.clamp(0.0, 1e7) as f32))
+    };
+    let (x, y) = (coord(1, c)?, coord(2, c)?);
+    with(|s| {
+        // Later ones replace earlier ones for the same box.
+        if let Some(e) = s.scroll_sets.iter_mut().find(|e| e.0 == id) {
+            e.1 = x.or(e.1);
+            e.2 = y.or(e.2);
+        } else if s.scroll_sets.len() < MAX_SCROLL_SETS {
+            s.scroll_sets.push((id, x, y));
+        }
+        // Reading it back gives the new offset, as far as it can go.
+        if let Some((_, v)) = s.scrollers.iter_mut().find(|(u, _)| *u == id) {
+            if let Some(x) = x {
+                v[0] = x.min(v[2]).round();
+            }
+            if let Some(y) = y {
+                v[1] = y.min(v[3]).round();
+            }
+        }
+    });
+    Ok(JsValue::undefined())
+}
+
+/// Most boxes scrolled by scripts between two looks by the page.
+const MAX_SCROLL_SETS: usize = 4096;
+
 fn n_log(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
     let level = arg_str(a, 0, c)?;
     let msg = arg_str(a, 1, c)?;
@@ -1018,6 +1068,8 @@ const NATIVES: &[(&str, Native, usize)] = &[
     ("connected", n_connected, 1),
     ("rect", n_rect, 1),
     ("log", n_log, 2),
+    ("scroll", n_scroll, 1),
+    ("setScroll", n_set_scroll, 3),
     ("read", n_read, 1),
     ("navigate", n_navigate, 1),
     ("setUrl", n_set_url, 1),
@@ -1336,6 +1388,15 @@ impl Runtime {
 
     pub fn set_boxes(&mut self, boxes: Vec<(u32, Rect)>) {
         with(|s| s.boxes = boxes);
+    }
+
+    pub fn set_scrollers(&mut self, scrollers: Vec<(u32, [f32; 6])>) {
+        with(|s| s.scrollers = scrollers);
+    }
+
+    /// The scrolling scripts asked for since last asked.
+    pub fn take_scroll_sets(&mut self) -> Vec<(u32, Option<f32>, Option<f32>)> {
+        with(|s| std::mem::take(&mut s.scroll_sets))
     }
 
     pub fn take_console(&mut self) -> Vec<String> {

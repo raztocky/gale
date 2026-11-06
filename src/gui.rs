@@ -677,6 +677,10 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
     let mut press: Option<(f32, f32)> = None;
     // Dragging the scrollbar: where on the thumb you grabbed it.
     let mut scroll_drag: Option<f32> = None;
+    // Dragging a box's scrollbar, and the box you last clicked in (keys
+    // scroll it), with the page it was on.
+    let mut box_drag: Option<BoxDrag> = None;
+    let mut key_box: Option<(u32, String)> = None;
     // Dragging the requests panel's left edge to resize it.
     let mut panel_drag = false;
     // The page as it was painted before its latest change, shown until the
@@ -1281,6 +1285,45 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     continue; // typed as a character, not a scroll
                 }
             }
+            // A box under the pointer, or the one you clicked in, scrolls
+            // first while it can.
+            let line = 40.0 * ui.text_scale;
+            let box_key = match key {
+                Key::Down => Some((0.0, 1.0, 0)),
+                Key::Up => Some((0.0, -1.0, 0)),
+                Key::Right if !alt && !ctrl => Some((1.0, 0.0, 0)),
+                Key::Left if !alt && !ctrl => Some((-1.0, 0.0, 0)),
+                Key::Space if shift => Some((0.0, -1.0, 1)),
+                Key::PageDown | Key::Space => Some((0.0, 1.0, 1)),
+                Key::PageUp => Some((0.0, -1.0, 1)),
+                Key::Home if !ctrl => Some((0.0, -1.0, 2)),
+                Key::End if !ctrl => Some((0.0, 1.0, 2)),
+                _ => None,
+            };
+            if let (Some((dx, dy, how)), true) = (box_key, tab.is_some() && info.interstitial.is_none()) {
+                let pointer = window
+                    .get_mouse_pos(MouseMode::Discard)
+                    .filter(|&(mx, my)| my > bar && mx < page_w)
+                    .map(|(mx, my)| (mx, my - bar + scroll));
+                let clicked = key_box
+                    .as_ref()
+                    .filter(|(_, u)| *u == info.url)
+                    .map(|(id, _)| *id);
+                if let Some(uid) = box_for_key(&rendered.scrollers, pointer, clicked, scroll, (dx, dy)) {
+                    let h = rendered
+                        .scrollers
+                        .iter()
+                        .find(|s| s.uid == uid)
+                        .map_or(0.0, |s| s.rect.h);
+                    let amount = match how {
+                        0 => line,
+                        1 => (h * 0.9).max(line),
+                        _ => 1e7,
+                    };
+                    queue_box_scroll(&mut pending_input, uid, dx * amount, dy * amount);
+                    continue;
+                }
+            }
             let before = scroll;
             match key {
                 Key::Down => scroll += 40.0 * ui.text_scale,
@@ -1405,21 +1448,14 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 if shift && sx == 0.0 {
                     (sx, sy) = (sy, 0.0);
                 }
+                // (Boxes are compared in page space, layers moved for scrolling.)
                 let inner = mouse
                     .filter(|&(_, my)| my > bar && tab.is_some() && info.interstitial.is_none())
                     .and_then(|(mx, my)| {
-                        let (px, py) = ix.page_point(mx, my, scroll);
-                        page::scroller_at(&rendered.scrollers, px, py, scroll, sx, sy)
+                        page::scroller_at(&rendered.scrollers, mx, my - bar + scroll, scroll, sx, sy)
                     });
                 if let Some(sc) = inner {
-                    let uid = sc.uid;
-                    match pending_input.last_mut() {
-                        Some(Input::Scroll { uid: u, dx, dy }) if *u == uid => {
-                            *dx += sx;
-                            *dy += sy;
-                        }
-                        _ => pending_input.push(Input::Scroll { uid, dx: sx, dy: sy }),
-                    }
+                    queue_box_scroll(&mut pending_input, sc.uid, sx, sy);
                 } else {
                     scroll -= dy * step;
                 }
@@ -1703,7 +1739,32 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     let grab = if (y..y + h).contains(&at) { at - y } else { h / 2.0 };
                     scroll_drag = Some(grab);
                     scroll = scroll_for_thumb(at - grab, max_scroll, view_h, h);
+                } else if let Some(b) = (my > bar && mx < page_w)
+                    .then(|| box_bar_at(&rendered.scrollers, mx, my - bar + scroll, scroll))
+                    .flatten()
+                {
+                    // A box's scrollbar: drag its thumb (pressing beside
+                    // the thumb jumps there first).
+                    let along = if b.vertical { my - bar + scroll } else { mx };
+                    let mut d = BoxDrag::grab(&b, along);
+                    let to = d.target(along);
+                    if to != d.sent {
+                        let delta = to - d.sent;
+                        let (dx, dy) = if d.vertical { (0.0, delta) } else { (delta, 0.0) };
+                        queue_box_scroll(&mut pending_input, d.uid, dx, dy);
+                        d.sent = to;
+                    }
+                    box_drag = Some(d);
+                    key_box = Some((b.uid, info.url.clone()));
                 } else if my > bar {
+                    // Keys scroll the box you clicked in.
+                    let (px, py) = (mx, my - bar + scroll);
+                    key_box = rendered
+                        .scrollers
+                        .iter()
+                        .rev()
+                        .find(|s| s.at(scroll).contains(px, py))
+                        .map(|s| (s.uid, info.url.clone()));
                     // The page gets the click when you let go (below), so
                     // that dragging can select text instead.
                     press = Some((mx, my));
@@ -1744,6 +1805,23 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     PANEL_W.store(pw.to_bits(), Ordering::Relaxed);
                     dirty = true;
                 }
+            }
+        }
+        if let Some(d) = box_drag.as_mut() {
+            match (down, mouse) {
+                (true, Some((mx, my))) => {
+                    let along = if d.vertical { my - bar + scroll } else { mx };
+                    let to = d.target(along);
+                    if to != d.sent {
+                        let delta = to - d.sent;
+                        let (dx, dy) = if d.vertical { (0.0, delta) } else { (delta, 0.0) };
+                        queue_box_scroll(&mut pending_input, d.uid, dx, dy);
+                        d.sent = to;
+                        dirty = true;
+                    }
+                }
+                (true, None) => {}
+                _ => box_drag = None,
             }
         }
         if let Some(grab) = scroll_drag {
@@ -2068,7 +2146,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             }
             // Thumbs on the boxes you can scroll inside.
             for sc in &rendered.scrollers {
-                for t in box_thumbs(sc, sc.at(scroll)) {
+                for t in box_bars(sc, sc.at(scroll)).iter().map(|b| b.thumb) {
                     if t.y + t.h < scroll || t.y > scroll + view_h {
                         continue;
                     }
@@ -2479,33 +2557,169 @@ fn scrollbar_thumb(scroll: f32, max_scroll: f32, view_h: f32, k: f32) -> Option<
     Some(((scroll / max_scroll).clamp(0.0, 1.0) * (view_h - h), h))
 }
 
-/// Scrollbar thumbs for a box you can scroll inside, shown at `r` (page
+/// A scrollbar of a box you can scroll inside, in page space: the strip
+/// along its edge you can grab, and the thumb in it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BoxBar {
+    uid: u32,
+    vertical: bool,
+    track: Rect,
+    thumb: Rect,
+    /// How far the box scrolls this way, and how far it has.
+    max: f32,
+    at: f32,
+}
+
+/// The scrollbars of a box you can scroll inside, shown at `r` (page
 /// space): along its right edge, and its bottom if it scrolls sideways.
-fn box_thumbs(sc: &page::Scroller, r: Rect) -> Vec<Rect> {
+fn box_bars(sc: &page::Scroller, r: Rect) -> Vec<BoxBar> {
     let mut out = Vec::new();
+    if r.h <= 8.0 || r.w <= 8.0 {
+        return out;
+    }
     let thumb = |len: f32, max: f32, at: f32| {
         let t = (len * len / (len + max)).max(16.0).min(len);
         ((at / max).clamp(0.0, 1.0) * (len - t), t)
     };
-    if sc.max_y > 0.0 && r.h > 8.0 && r.w > 8.0 {
+    if sc.max_y > 0.0 {
         let (y, h) = thumb(r.h, sc.max_y, sc.y);
-        out.push(Rect {
-            x: r.x + r.w - 6.0,
-            y: r.y + y,
-            w: 4.0,
-            h,
+        out.push(BoxBar {
+            uid: sc.uid,
+            vertical: true,
+            track: Rect {
+                x: r.x + r.w - 10.0,
+                y: r.y,
+                w: 10.0,
+                h: r.h,
+            },
+            thumb: Rect {
+                x: r.x + r.w - 6.0,
+                y: r.y + y,
+                w: 4.0,
+                h,
+            },
+            max: sc.max_y,
+            at: sc.y,
         });
     }
-    if sc.max_x > 0.0 && r.h > 8.0 && r.w > 8.0 {
+    if sc.max_x > 0.0 {
         let (x, w) = thumb(r.w, sc.max_x, sc.x);
-        out.push(Rect {
-            x: r.x + x,
-            y: r.y + r.h - 6.0,
-            w,
-            h: 4.0,
+        out.push(BoxBar {
+            uid: sc.uid,
+            vertical: false,
+            track: Rect {
+                x: r.x,
+                y: r.y + r.h - 10.0,
+                w: r.w,
+                h: 10.0,
+            },
+            thumb: Rect {
+                x: r.x + x,
+                y: r.y + r.h - 6.0,
+                w,
+                h: 4.0,
+            },
+            max: sc.max_x,
+            at: sc.x,
         });
     }
     out
+}
+
+/// The scrollbar of a box at page point (x, y), innermost first.
+fn box_bar_at(scrollers: &[page::Scroller], x: f32, y: f32, scroll: f32) -> Option<BoxBar> {
+    scrollers
+        .iter()
+        .rev()
+        .flat_map(|sc| box_bars(sc, sc.at(scroll)))
+        .find(|b| b.track.contains(x, y))
+}
+
+/// Dragging a box's scrollbar thumb.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BoxDrag {
+    uid: u32,
+    vertical: bool,
+    /// Where along the thumb you hold it.
+    grab: f32,
+    track_start: f32,
+    track_len: f32,
+    thumb_len: f32,
+    max: f32,
+    /// The offset last asked for.
+    sent: f32,
+}
+
+impl BoxDrag {
+    /// Grab `b` at `along` (page space, along its axis): by the thumb where
+    /// you hold it, or by its middle if you pressed beside it.
+    fn grab(b: &BoxBar, along: f32) -> BoxDrag {
+        let (start, len) = if b.vertical {
+            (b.thumb.y, b.thumb.h)
+        } else {
+            (b.thumb.x, b.thumb.w)
+        };
+        let (track_start, track_len) = if b.vertical {
+            (b.track.y, b.track.h)
+        } else {
+            (b.track.x, b.track.w)
+        };
+        BoxDrag {
+            uid: b.uid,
+            vertical: b.vertical,
+            grab: if (start..start + len).contains(&along) {
+                along - start
+            } else {
+                len / 2.0
+            },
+            track_start,
+            track_len,
+            thumb_len: len,
+            max: b.max,
+            sent: b.at,
+        }
+    }
+
+    /// The offset for the pointer at `along`.
+    fn target(&self, along: f32) -> f32 {
+        let room = self.track_len - self.thumb_len;
+        if room <= 0.0 {
+            return self.sent;
+        }
+        (((along - self.grab - self.track_start) / room).clamp(0.0, 1.0) * self.max).round()
+    }
+}
+
+/// Queue scrolling inside a box, joined with the last such request for it.
+fn queue_box_scroll(pending: &mut Vec<Input>, uid: u32, dx: f32, dy: f32) {
+    match pending.last_mut() {
+        Some(Input::Scroll { uid: u, dx: x, dy: y }) if *u == uid => {
+            *x += dx;
+            *y += dy;
+        }
+        _ => pending.push(Input::Scroll { uid, dx, dy }),
+    }
+}
+
+/// The box a key scrolls by (dx, dy) (a sign; `page` scrolls by most of
+/// the box, `end` all the way): the one under the pointer, else the one you
+/// last clicked in, if it can still move that way.
+fn box_for_key(
+    scrollers: &[page::Scroller],
+    pointer: Option<(f32, f32)>,
+    clicked: Option<u32>,
+    scroll: f32,
+    dir: (f32, f32),
+) -> Option<u32> {
+    pointer
+        .and_then(|(x, y)| page::scroller_at(scrollers, x, y, scroll, dir.0, dir.1))
+        .or_else(|| {
+            scrollers
+                .iter()
+                .rev()
+                .find(|s| Some(s.uid) == clicked && s.can_scroll(dir.0, dir.1))
+        })
+        .map(|s| s.uid)
 }
 
 /// The scroll position that puts the thumb's top at `top`.
@@ -3802,6 +4016,86 @@ mod menu_tests {
         // Past MAX_LIVE_BACKGROUND, the longest-unused go first.
         let many: Vec<_> = (0..9).map(|i| (Duration::from_secs(i), true)).collect();
         assert_eq!(tabs_to_discard(&many), [6, 7, 8]);
+    }
+
+    #[test]
+    fn box_scrollbars_drag_and_keys() {
+        let sc = page::Scroller {
+            uid: 9,
+            rect: Rect {
+                x: 100.0,
+                y: 200.0,
+                w: 300.0,
+                h: 100.0,
+            },
+            x: 0.0,
+            y: 0.0,
+            max_x: 0.0,
+            max_y: 300.0,
+            layer: None,
+        };
+        let bars = box_bars(&sc, sc.at(0.0));
+        assert_eq!(bars.len(), 1, "only up and down");
+        let b = bars[0];
+        assert!(b.vertical && b.track.x == 390.0 && b.thumb.h == 25.0, "{b:?}");
+        assert_eq!(box_bar_at(&[sc], 395.0, 250.0, 0.0), Some(b));
+        assert_eq!(
+            box_bar_at(&[sc], 300.0, 250.0, 0.0),
+            None,
+            "inside, not on the bar"
+        );
+
+        // Held by the thumb, it follows the pointer; it stops at the ends.
+        let mut d = BoxDrag::grab(&b, 205.0);
+        assert_eq!(d.grab, 5.0);
+        assert_eq!(d.target(205.0), 0.0);
+        assert_eq!(d.target(205.0 + 37.5), 150.0, "half way down the track");
+        assert_eq!(d.target(1000.0), 300.0);
+        assert_eq!(d.target(-50.0), 0.0);
+        // Pressed below the thumb: it jumps to put its middle there.
+        d = BoxDrag::grab(&b, 300.0 - 12.5);
+        assert_eq!(d.grab, 12.5);
+        assert_eq!(d.target(300.0 - 12.5), 300.0);
+
+        // Keys: the box under the pointer, else the one you clicked in.
+        let at = Some((150.0, 250.0));
+        assert_eq!(box_for_key(&[sc], at, None, 0.0, (0.0, 1.0)), Some(9));
+        assert_eq!(
+            box_for_key(&[sc], at, None, 0.0, (0.0, -1.0)),
+            None,
+            "already at the top"
+        );
+        assert_eq!(
+            box_for_key(&[sc], at, None, 0.0, (1.0, 0.0)),
+            None,
+            "doesn't scroll sideways"
+        );
+        assert_eq!(
+            box_for_key(&[sc], Some((5.0, 5.0)), Some(9), 0.0, (0.0, 1.0)),
+            Some(9)
+        );
+        assert_eq!(box_for_key(&[sc], Some((5.0, 5.0)), None, 0.0, (0.0, 1.0)), None);
+
+        // Requests for one box join up.
+        let mut q = vec![];
+        queue_box_scroll(&mut q, 9, 0.0, 40.0);
+        queue_box_scroll(&mut q, 9, 0.0, 40.0);
+        queue_box_scroll(&mut q, 3, 10.0, 0.0);
+        assert_eq!(
+            q,
+            vec![
+                Input::Scroll {
+                    uid: 9,
+                    dx: 0.0,
+                    dy: 80.0
+                },
+                Input::Scroll {
+                    uid: 3,
+                    dx: 10.0,
+                    dy: 0.0
+                }
+            ]
+        );
     }
 
     #[test]

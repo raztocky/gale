@@ -33,10 +33,12 @@ pub struct Page {
     /// Boxes from the last layout and the node each is for, in paint
     /// order, for finding what a click hit.
     hits: RefCell<Vec<(Rect, u32)>>,
+    /// The same boxes unclipped, by node, for scripts.
+    script_boxes: RefCell<Vec<(u32, Rect)>>,
     /// How far you've scrolled inside boxes, by node.
     scrolled: RefCell<HashMap<u32, (f32, f32)>>,
     /// The boxes you could scroll inside at the last layout.
-    scrollers: RefCell<Vec<Scroller>>,
+    scrollers: RefCell<Vec<layout::ScrollBox>>,
     /// The page's editable DOM when it has no scripts (with scripts, the
     /// script runtime holds it). Typing and form controls change it.
     arena: Option<Dom>,
@@ -412,6 +414,7 @@ impl Page {
             scripting,
             sheet_cache: HashMap::new(),
             hits: RefCell::new(Vec::new()),
+            script_boxes: RefCell::new(Vec::new()),
             scrolled: RefCell::new(HashMap::new()),
             scrollers: RefCell::new(Vec::new()),
             arena: None,
@@ -865,7 +868,7 @@ impl Page {
 
     /// Boxes of the last layout, by node, for scripts' `getBoundingClientRect`.
     pub fn boxes(&self) -> Vec<(u32, Rect)> {
-        self.hits.borrow().iter().map(|(r, u)| (*u, *r)).collect()
+        self.script_boxes.borrow().clone()
     }
 
     /// Parse a document we generated ourselves (error pages); no subresources.
@@ -934,6 +937,13 @@ impl Page {
             collect_hits(b, clip_of(b), &mut hits);
         }
         *self.hits.borrow_mut() = hits;
+        // Scripts see each box whole, even where it's clipped or scrolled
+        // out of view.
+        let mut whole = Vec::new();
+        for b in &order {
+            collect_hits(b, None, &mut whole);
+        }
+        *self.script_boxes.borrow_mut() = whole.into_iter().map(|(r, u)| (u, r)).collect();
         let mut texts = Vec::new();
         // Text pushed off the left, top or right is hidden; the page scrolls
         // down, so nothing below it is.
@@ -980,7 +990,7 @@ impl Page {
             .collect();
         // Offsets past the end (the content got shorter) are pulled back.
         *self.scrolled.borrow_mut() = scroll_boxes.iter().map(|sb| (sb.uid, (sb.x, sb.y))).collect();
-        *self.scrollers.borrow_mut() = scrollers.clone();
+        *self.scrollers.borrow_mut() = scroll_boxes;
         Rendered {
             list,
             atlas,
@@ -996,9 +1006,54 @@ impl Page {
         }
     }
 
+    /// The boxes you can scroll inside, for scripts: node, offset, how far
+    /// each can scroll, and the size of its padding box.
+    pub fn scroll_info(&self) -> Vec<(u32, [f32; 6])> {
+        self.scrollers
+            .borrow()
+            .iter()
+            .map(|s| {
+                (
+                    s.uid,
+                    [s.x, s.y, s.max_x, s.max_y, s.rect.w, s.rect.h].map(f32::round),
+                )
+            })
+            .collect()
+    }
+
+    /// Apply the `scrollTop`/`scrollLeft`/`scrollTo()` scripts asked for.
+    /// True if a box moved (render again). A box that doesn't scroll (yet)
+    /// keeps the offset for when it does, as far as it can go then.
+    pub fn apply_script_scrolls(&mut self, rt: &mut Runtime) -> bool {
+        let mut changed = false;
+        for (uid, x, y) in rt.take_scroll_sets() {
+            let known = self.scrollers.borrow().iter().find(|s| s.uid == uid).copied();
+            let mut scrolled = self.scrolled.borrow_mut();
+            let cur = scrolled.get(&uid).copied().unwrap_or((0.0, 0.0));
+            let clean = |v: Option<f32>, cur: f32, max: f32| {
+                v.filter(|v| v.is_finite())
+                    .map_or(cur, |v| v.clamp(0.0, max).round())
+            };
+            let (mx, my) = known.map_or((f32::MAX, f32::MAX), |s| (s.max_x, s.max_y));
+            let to = (clean(x, cur.0, mx), clean(y, cur.1, my));
+            if to != cur {
+                scrolled.insert(uid, to);
+                if let Some(s) = self.scrollers.borrow_mut().iter_mut().find(|s| s.uid == uid) {
+                    (s.x, s.y) = to;
+                }
+                changed |= known.is_some();
+            }
+        }
+        if changed {
+            rt.set_scrollers(self.scroll_info());
+        }
+        changed
+    }
+
     /// Scroll inside the box for node `uid` by (dx, dy), as far as it goes.
-    /// `changed` says it moved (then render again).
-    pub fn scroll_box(&mut self, uid: u32, dx: f32, dy: f32) -> Interaction {
+    /// `changed` says it moved (then render again); its scripts get a
+    /// `scroll` event.
+    pub fn scroll_box(&mut self, rt: Option<&mut Runtime>, uid: u32, dx: f32, dy: f32) -> Interaction {
         let Some(s) = self.scrollers.borrow().iter().find(|s| s.uid == uid).copied() else {
             return Interaction::default();
         };
@@ -1015,6 +1070,10 @@ impl Page {
             self.scrolled.borrow_mut().insert(uid, to);
             for sc in self.scrollers.borrow_mut().iter_mut().filter(|sc| sc.uid == uid) {
                 (sc.x, sc.y) = to;
+            }
+            if let Some(rt) = rt {
+                rt.set_scrollers(self.scroll_info());
+                rt.fire(uid, "scroll", false, false);
             }
         }
         Interaction {
@@ -2257,7 +2316,7 @@ mod layer_tests {
         );
 
         // Scrolling moves the content and stops at the end.
-        assert!(page.scroll_box(s.uid, 0.0, 10_000.0).changed);
+        assert!(page.scroll_box(None, s.uid, 0.0, 10_000.0).changed);
         let r = page.render(800.0, 600.0);
         assert!(
             (r.scrollers[0].y - s.max_y.round()).abs() < 0.5,
@@ -2271,13 +2330,16 @@ mod layer_tests {
         );
         let end = link(&r, "/end").unwrap();
         assert!(end.y < 100.0, "the end shows in the box: {end:?}");
-        assert!(!page.scroll_box(s.uid, 0.0, 50.0).changed, "already at the end");
         assert!(
-            !page.scroll_box(s.uid, 0.0, f32::NAN).changed,
+            !page.scroll_box(None, s.uid, 0.0, 50.0).changed,
+            "already at the end"
+        );
+        assert!(
+            !page.scroll_box(None, s.uid, 0.0, f32::NAN).changed,
             "nonsense is ignored"
         );
-        assert!(!page.scroll_box(12345, 0.0, 50.0).changed, "no such box");
-        assert!(page.scroll_box(s.uid, 0.0, -1e9).changed);
+        assert!(!page.scroll_box(None, 12345, 0.0, 50.0).changed, "no such box");
+        assert!(page.scroll_box(None, s.uid, 0.0, -1e9).changed);
 
         // The wheel finds the innermost box that can still move that way.
         let r = page.render(800.0, 600.0);
@@ -2449,5 +2511,90 @@ mod csp_tests {
         ] {
             assert!(t.contains(want), "{want}: {t}");
         }
+    }
+}
+
+#[cfg(test)]
+mod script_scroll_tests {
+    use super::*;
+
+    struct NoNet;
+    impl Host for NoNet {
+        fn fetch(&mut self, _: &str, _: Dest) -> Result<String, String> {
+            Err("no network".into())
+        }
+        fn request(&mut self, _: &str, _: ScriptRequest) -> Result<ScriptResponse, String> {
+            Err("no network".into())
+        }
+        fn set_cookie(&mut self, _: &str) {}
+        fn cookies(&mut self) -> String {
+            String::new()
+        }
+    }
+
+    fn log(rt: &mut Runtime, expr: &str) -> String {
+        rt.run_script(&format!("console.log('OUT ' + ({expr}))"), 0, "t");
+        rt.take_console()
+            .into_iter()
+            .find_map(|l| l.strip_prefix("[log] OUT ").map(str::to_string))
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn scripts_read_and_scroll_boxes() {
+        let html = "<body style='margin:0'><div id=box style='height:100px;overflow:auto'>\
+                    <p style='height:300px;margin:0'></p><p id=last style='margin:0'>last</p></div>\
+                    <script>const b = document.getElementById('box');\
+                    b.addEventListener('scroll', () => console.log('scrolled ' + b.scrollTop));</script>";
+        let (mut page, rt, _) =
+            Page::load_with_scripts("https://site.example/", html, "", (800.0, 600.0), &[], &mut NoNet);
+        let mut rt = rt.expect("scripts run");
+        page.apply_script_scrolls(&mut rt);
+        page.render(800.0, 600.0);
+        rt.set_scrollers(page.scroll_info());
+        // A chat scrolling to its newest message.
+        log(&mut rt, "b.scrollTop = b.scrollHeight");
+        assert!(page.apply_script_scrolls(&mut rt));
+        let r = page.render(800.0, 600.0);
+        let s = r.scrollers[0];
+        assert!(s.max_y > 200.0 && s.y == s.max_y.round(), "{s:?}");
+        assert_eq!(log(&mut rt, "b.scrollTop"), format!("{}", s.y));
+        assert_eq!(log(&mut rt, "b.clientHeight"), "100");
+        assert_eq!(
+            log(&mut rt, "b.scrollHeight"),
+            format!("{}", 100.0 + s.max_y.round())
+        );
+
+        // scrollTo, scrollBy, clamping, and reading back at once.
+        assert_eq!(log(&mut rt, "(b.scrollTo(0, 10), b.scrollTop)"), "10");
+        assert_eq!(log(&mut rt, "(b.scrollBy({top: 5}), b.scrollTop)"), "15");
+        assert_eq!(log(&mut rt, "(b.scrollTop = -50, b.scrollTop)"), "0");
+        assert!(
+            page.apply_script_scrolls(&mut rt),
+            "moved from the end to the top"
+        );
+        assert_eq!(page.render(800.0, 600.0).scrollers[0].y, 0.0);
+        assert!(!page.apply_script_scrolls(&mut rt), "nothing more asked");
+
+        // scrollIntoView in the nearest scrolling box.
+        rt.set_boxes(page.boxes());
+        rt.set_scrollers(page.scroll_info());
+        log(&mut rt, "document.getElementById('last').scrollIntoView()");
+        assert!(page.apply_script_scrolls(&mut rt));
+        let y = page.render(800.0, 600.0).scrollers[0].y;
+        assert!(y > 200.0, "{y}");
+
+        // You scrolling it fires `scroll`; boxes that don't scroll read 0.
+        let uid = s.uid;
+        assert!(page.scroll_box(Some(&mut rt), uid, 0.0, -40.0).changed);
+        assert!(
+            rt.take_console().iter().any(|l| l.starts_with("[log] scrolled ")),
+            "scroll event"
+        );
+        assert_eq!(log(&mut rt, "document.body.scrollTop"), "0");
+        assert_eq!(
+            log(&mut rt, "(document.body.scrollTop = 99, document.body.scrollTop)"),
+            "0"
+        );
     }
 }

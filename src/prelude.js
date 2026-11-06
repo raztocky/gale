@@ -469,13 +469,42 @@
     get offsetLeft() { return dom.rect(idOf(this))[0]; }
     get offsetTop() { return dom.rect(idOf(this))[1]; }
     get offsetParent() { return this.parentElement; }
-    get clientWidth() { return this.offsetWidth; }
-    get clientHeight() { return this.offsetHeight; }
-    get scrollWidth() { return this.offsetWidth; }
-    get scrollHeight() { return this.offsetHeight; }
-    get scrollTop() { return 0; } set scrollTop(v) {}
-    get scrollLeft() { return 0; } set scrollLeft(v) {}
-    scrollIntoView() {} scrollTo() {} scroll() {} focus() {} blur() {}
+    // Boxes you can scroll inside: dom.scroll gives [x, y, maxX, maxY,
+    // width, height], or null for a box that doesn't scroll.
+    get clientWidth() { const s = dom.scroll(idOf(this)); return s ? s[4] : this.offsetWidth; }
+    get clientHeight() { const s = dom.scroll(idOf(this)); return s ? s[5] : this.offsetHeight; }
+    get scrollWidth() { const s = dom.scroll(idOf(this)); return s ? s[4] + s[2] : this.offsetWidth; }
+    get scrollHeight() { const s = dom.scroll(idOf(this)); return s ? s[5] + s[3] : this.offsetHeight; }
+    get scrollTop() { const s = dom.scroll(idOf(this)); return s ? s[1] : 0; }
+    set scrollTop(v) { dom.setScroll(idOf(this), NaN, +v); }
+    get scrollLeft() { const s = dom.scroll(idOf(this)); return s ? s[0] : 0; }
+    set scrollLeft(v) { dom.setScroll(idOf(this), +v, NaN); }
+    get scrollTopMax() { const s = dom.scroll(idOf(this)); return s ? s[3] : 0; }
+    get scrollLeftMax() { const s = dom.scroll(idOf(this)); return s ? s[2] : 0; }
+    scrollTo(x, y) {
+      if (x && typeof x === 'object') dom.setScroll(idOf(this), x.left ?? NaN, x.top ?? NaN);
+      else dom.setScroll(idOf(this), +x, +y);
+    }
+    scroll(x, y) { this.scrollTo(x, y); }
+    scrollBy(x, y) {
+      const o = x && typeof x === 'object' ? x : { left: x, top: y };
+      this.scrollTo({ left: this.scrollLeft + (+o.left || 0), top: this.scrollTop + (+o.top || 0) });
+    }
+    // Brings the element into view in the nearest box that scrolls (the
+    // window's own scrolling is yours, not the page's).
+    scrollIntoView(arg) {
+      const end = arg === false || (arg && typeof arg === 'object' && arg.block === 'end');
+      const [, y, , h] = dom.rect(idOf(this));
+      for (let p = this.parentElement; p; p = p.parentElement) {
+        const s = dom.scroll(idOf(p));
+        if (!s) continue;
+        const top = dom.rect(idOf(p))[1] + (p.offsetHeight - s[5]) / 2;
+        const at = y - top + s[1];
+        p.scrollTop = end ? at + h - s[5] : at;
+        return;
+      }
+    }
+    focus() {} blur() {}
     click() {
       const ev = new MouseEvent('click', { bubbles: true, cancelable: true });
       dispatchOn(this, ev);
