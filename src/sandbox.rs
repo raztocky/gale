@@ -21,12 +21,13 @@
 pub struct Report {
     pub landlock: &'static str,
     pub seccomp: bool,
+    pub resource_limits: bool,
     pub namespaces: String,
 }
 
 #[cfg(target_os = "linux")]
 pub fn enter() -> Result<Report, String> {
-    linux::enter()
+    linux::enter(4 * 1024 * 1024 * 1024, 120)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -45,17 +46,14 @@ mod linux {
     };
     use std::collections::BTreeMap;
 
-    const MEMORY_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
-    const CPU_SECONDS: u64 = 120;
-
-    pub fn enter() -> Result<Report, String> {
+    pub fn enter(memory_limit: u64, cpu_seconds: u64) -> Result<Report, String> {
         // Touch the bundled fonts now so nothing lazily allocates or reads
         // after the filters are on.
         crate::font::preload();
 
         let set = |r: Resource, v: u64| r.set(v, v).map_err(|e| format!("setrlimit {r:?}: {e}"));
-        set(Resource::AS, MEMORY_LIMIT)?;
-        set(Resource::CPU, CPU_SECONDS)?;
+        set(Resource::AS, memory_limit)?;
+        set(Resource::CPU, cpu_seconds)?;
         set(Resource::CORE, 0)?;
 
         // Namespaces must come first: unshare needs a single-threaded process
@@ -66,6 +64,7 @@ mod linux {
         Ok(Report {
             landlock,
             seccomp: true,
+            resource_limits: true,
             namespaces,
         })
     }
@@ -313,5 +312,122 @@ pub fn probe(name: &str) -> bool {
         // (and a renderer that grows past it fails there, not the browser).
         "allocate past the memory limit" => Vec::<u8>::new().try_reserve_exact(8 << 30).is_err(),
         _ => false,
+    }
+}
+
+static REQUIREMENTS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static STATUS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub fn configure(layers: &str) -> Result<(), String> {
+    for layer in layers.split(',') {
+        if !matches!(layer, "seccomp" | "namespaces" | "landlock" | "rlimits") {
+            return Err(format!("unknown sandbox layer: {layer}"));
+        }
+    }
+    REQUIREMENTS
+        .set(layers.to_string())
+        .map_err(|_| "sandbox policy already set".to_string())
+}
+pub fn requirements() -> Option<&'static str> {
+    REQUIREMENTS.get().map(String::as_str)
+}
+
+impl Report {
+    pub fn require(&self, layers: &str) -> Result<(), String> {
+        for layer in layers.split(',') {
+            let active = match layer {
+                "seccomp" => self.seccomp,
+                "rlimits" => self.resource_limits,
+                "namespaces" => self.namespaces == "network and IPC isolated (own user namespace)",
+                "landlock" => self.landlock == "fully enforced",
+                _ => false,
+            };
+            if !active {
+                return Err(format!("required sandbox layer unavailable: {layer}"));
+            }
+        }
+        Ok(())
+    }
+    pub fn summary(&self) -> String {
+        format!(
+            "seccomp: {}; rlimits: {}; namespaces: {}; Landlock: {}",
+            self.seccomp, self.resource_limits, self.namespaces, self.landlock
+        )
+    }
+}
+
+pub fn validate_child(report: &Report) -> Result<(), String> {
+    if let Some(layers) =
+        std::env::args().find_map(|a| a.strip_prefix("--require-sandbox=").map(str::to_string))
+    {
+        report.require(&layers)?;
+    }
+    Ok(())
+}
+
+/// Probe a fresh child, never restrict the browser itself. No network I/O.
+pub fn inspect() -> Result<(), String> {
+    let out = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
+        .arg("--sandbox-probe")
+        .env_clear()
+        .output()
+        .map_err(|e| e.to_string())?;
+    let summary = String::from_utf8_lossy(&out.stdout).trim().replace('\n', "; ");
+    if !out.status.success() {
+        return Err(format!("sandbox unavailable: {summary}"));
+    }
+    if let Some(layers) = requirements() {
+        // Enforce in the actual renderer too; this probe supplies early feedback.
+        let out = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
+            .args(["--sandbox-probe", &format!("--require-sandbox={layers}")])
+            .env_clear()
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err(format!(
+                "strict sandbox unavailable: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+    }
+    eprintln!("brickle sandbox: {summary}");
+    let _ = STATUS.set(summary);
+    Ok(())
+}
+pub fn status() -> &'static str {
+    STATUS
+        .get()
+        .map(String::as_str)
+        .unwrap_or("disabled or not inspected")
+}
+
+#[cfg(target_os = "linux")]
+pub fn enter_decoder() -> Result<Report, String> {
+    linux::enter(512 * 1024 * 1024, 2)
+}
+#[cfg(not(target_os = "linux"))]
+pub fn enter_decoder() -> Result<Report, String> {
+    enter()
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+    #[test]
+    fn selected_layers_fail_closed() {
+        let mut r = Report {
+            landlock: "partially enforced",
+            seccomp: true,
+            namespaces: "unavailable".into(),
+            resource_limits: true,
+        };
+        assert!(r.require("seccomp,rlimits").is_ok());
+        for layer in ["namespaces", "landlock", "bogus"] {
+            assert!(r.require(layer).is_err(), "{layer}");
+        }
+        r.seccomp = false;
+        assert!(r.require("seccomp").is_err());
+        r.resource_limits = false;
+        assert!(r.require("rlimits").is_err());
     }
 }

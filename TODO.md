@@ -62,8 +62,9 @@ what's next:
 - [x] `fetch`'s `mode` and `redirect`, enforced by the browser.
 - [x] Content Security Policy for scripts (`script-src`, `-elem`, `-attr`, `connect-src`, `default-src`), checked at every redirect hop.
 - [x] Subresource Integrity for scripts; `nosniff` for scripts and stylesheets.
-- [ ] Subresource Integrity for stylesheets.
-- [ ] CSP for other resources (`img-src`, `style-src`, `frame-src`…), `upgrade-insecure-requests`.
+- [x] Subresource Integrity for stylesheets, including cache reuse and cross-origin CORS.
+- [x] CSP for images and styles (`img-src`, `style-src`, `-elem`, `-attr`), with default fallbacks and redirect checks.
+- [ ] Other CSP directives (`frame-src`, `form-action`, `base-uri`…), `upgrade-insecure-requests`.
 - [x] Scripts can't send to other sites (requests, or files they put on the page) unless you allow it.
 - [x] `document.cookie` for non-HttpOnly cookies, answered by the browser.
 - [ ] JavaScript modules (`type=module`, `import`).

@@ -531,6 +531,9 @@ pub fn update(log: &mut dyn FnMut(&str)) -> Result<(), String> {
 }
 
 /// For `brickle filters status`: how old the downloaded data is.
+pub fn available() -> bool {
+    store().is_some()
+}
 pub fn status() -> String {
     let manifest = dir().and_then(|d| std::fs::read_to_string(d.join(MANIFEST)).ok());
     let generated = manifest
@@ -543,7 +546,10 @@ pub fn status() -> String {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs());
-            let hours = now.saturating_sub(t) / 3600;
+            let Some(seconds) = now.checked_sub(t) else {
+                return "Revocation data (CRLite): unknown age (clock mismatch)".into();
+            };
+            let hours = seconds / 3600;
             format!(
                 "Revocation data (CRLite): {} old{}",
                 if hours < 48 {
@@ -552,7 +558,7 @@ pub fn status() -> String {
                     format!("{} days", hours / 24)
                 },
                 if hours > 24 * 7 {
-                    "; certificates revoked since then aren't caught"
+                    "; stale; certificates revoked since then aren't caught"
                 } else {
                     ""
                 }

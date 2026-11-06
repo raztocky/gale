@@ -415,7 +415,14 @@ impl Info {
             log: tab.log.clone(),
             interstitial: tab.interstitial.clone(),
             resubmit: tab.resubmit.clone(),
-            note: brickle::explain::fingerprinting(tab.read.iter().copied()),
+            note: Some(format!(
+                "Sandbox probe: {}{}; {}",
+                brickle::sandbox::status(),
+                brickle::explain::fingerprinting(tab.read.iter().copied())
+                    .map(|n| format!("; {n}"))
+                    .unwrap_or_default(),
+                brickle::security::brief()
+            )),
         }
     }
 }
@@ -449,6 +456,7 @@ enum Job {
 }
 
 struct Done {
+    generation: net::Cancel,
     tab: Tab,
     /// None if the page didn't change.
     rendered: Option<Rendered>,
@@ -461,16 +469,16 @@ struct Done {
 type TabId = u64;
 
 /// The window's ends of the loader's channels.
-type Loader = (Sender<(TabId, Job)>, Receiver<(TabId, Done)>);
+type Loader = (Sender<(TabId, net::Cancel, Job)>, Receiver<(TabId, Done)>);
 
 fn spawn_loader(net: Arc<Mutex<Network>>, sandboxed: bool, scale: Arc<AtomicU32>) -> Loader {
-    let (job_tx, job_rx) = mpsc::channel::<(TabId, Job)>();
+    let (job_tx, job_rx) = mpsc::channel::<(TabId, net::Cancel, Job)>();
     let (done_tx, done_rx) = mpsc::channel::<(TabId, Done)>();
     std::thread::Builder::new()
         .name("brickle-loader".into())
         .stack_size(256 * 1024 * 1024)
         .spawn(move || {
-            for (id, job) in job_rx {
+            for (id, generation, job) in job_rx {
                 let text_scale = f32::from_bits(scale.load(Ordering::Relaxed));
                 let done = match job {
                     Job::Open {
@@ -502,6 +510,7 @@ fn spawn_loader(net: Arc<Mutex<Network>>, sandboxed: bool, scale: Arc<AtomicU32>
                         tab.title_px = tab_title_px();
                         let rendered = Some(tab.render(w, h));
                         Done {
+                            generation: generation.clone(),
                             tab,
                             rendered,
                             new_page: true,
@@ -509,10 +518,12 @@ fn spawn_loader(net: Arc<Mutex<Network>>, sandboxed: bool, scale: Arc<AtomicU32>
                         }
                     }
                     Job::Render { mut tab, w, h } => {
+                        tab.set_cancel(generation.clone());
                         tab.text_scale = text_scale;
                         tab.title_px = tab_title_px();
                         let rendered = Some(tab.render(w, h));
                         Done {
+                            generation: generation.clone(),
                             tab: *tab,
                             rendered,
                             new_page: false,
@@ -526,14 +537,17 @@ fn spawn_loader(net: Arc<Mutex<Network>>, sandboxed: bool, scale: Arc<AtomicU32>
                         w,
                         h,
                     } => {
+                        tab.set_cancel(generation.clone());
                         let click = {
                             let mut n = net.lock().unwrap_or_else(|e| e.into_inner());
+                            n.cancel = generation.clone();
                             tab.interact(&mut n, input)
                         };
                         tab.text_scale = text_scale;
                         tab.title_px = tab_title_px();
                         let rendered = click.changed.then(|| tab.render(w, h));
                         Done {
+                            generation: generation.clone(),
                             tab: *tab,
                             rendered,
                             new_page: false,
@@ -714,6 +728,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
     let mut stop = net::Cancel::new();
     let _ = jobs.send((
         cur_id,
+        stop.clone(),
         Job::Open {
             url: start.to_string(),
             from: None,
@@ -808,6 +823,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 let cancel = net::Cancel::new();
                 let _ = jobs.send((
                     id,
+                    cancel.clone(),
                     Job::Open {
                         url: url.clone(),
                         from: $from,
@@ -864,9 +880,13 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 }
                 continue;
             }
+            if !stop.same_document(&done.generation) {
+                continue;
+            }
             let was_open = matches!(busy, Some(Some(_)));
             busy = None;
-            if discard && was_open {
+            if !stop.accepts(&done.generation) || (discard && was_open) {
+                stop = net::Cancel::new();
                 discard = false;
                 continue; // stopped: keep showing the old page
             }
@@ -955,6 +975,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 stop = net::Cancel::new();
                 let _ = jobs.send((
                     cur_id,
+                    stop.clone(),
                     Job::Open {
                         url: url.clone(),
                         from,
@@ -972,6 +993,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 if let Some(t) = tab.take() {
                     let _ = jobs.send((
                         cur_id,
+                        stop.clone(),
                         Job::Input {
                             tab: Box::new(t),
                             input,
@@ -987,6 +1009,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 if let Some(t) = tab.take() {
                     let _ = jobs.send((
                         cur_id,
+                        stop.clone(),
                         Job::Render {
                             tab: Box::new(t),
                             w: page_w,
@@ -1371,11 +1394,15 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 Key::F5 => reload = true,
                 Key::F12 => ui.panel = !ui.panel,
                 Key::E if ctrl && shift => ui.panel = !ui.panel,
-                Key::Escape if matches!(busy, Some(Some(_))) => {
+                Key::Escape if busy.is_some() => {
                     // Kills the renderer and abandons network requests, so
                     // the loader is free again almost at once.
                     stop.cancel();
                     discard = true;
+                    pending_input.clear();
+                    script_nav = None;
+                    clicked_link = None;
+                    submitted = None;
                     queued = None;
                     ui.address.set(&info.url);
                     ui.flash = Some("Stopped".into());
@@ -1502,8 +1529,11 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                         "Keep this site's cookies when Brickle closes (to stay logged in)".to_string()
                     }
                     SiteButton::ForgetCookies => "Delete this site's cookies now".to_string(),
+                    SiteButton::RememberJs => {
+                        "Save or revoke JavaScript permission for this origin after closing".to_string()
+                    }
                     SiteButton::ToggleJs => {
-                        "Run this site's JavaScript (sandboxed; scripts get no network access)".to_string()
+                        "Allow JavaScript for this origin until Brickle closes; requests still follow browser policy".to_string()
                     }
                 })
             } else if let Some(i) = row {
@@ -1706,9 +1736,22 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                             let _ = n.cookies.save();
                             format!("Deleted {count} cookie(s) for {site}")
                         }
+                        (Ok(mut n), SiteButton::RememberJs) => {
+                            let on = !n.scripts_persistent(&info.url);
+                            match n.set_scripts_allowed(&info.url, on) {
+                                Ok(origin) => {
+                                    reload = true;
+                                    format!(
+                                        "{} saved JavaScript permission for {origin}",
+                                        if on { "Added" } else { "Revoked" }
+                                    )
+                                }
+                                Err(e) => e,
+                            }
+                        }
                         (Ok(mut n), SiteButton::ToggleJs) => {
                             let on = !n.scripts_allowed(&info.url);
-                            match n.set_scripts_allowed(&info.url, on) {
+                            match n.set_scripts_session(&info.url, on) {
                                 Ok(site) => {
                                     reload = true;
                                     format!("JavaScript {} for {site}", if on { "on" } else { "off" })
@@ -1872,6 +1915,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                         if let Some(t) = tab.take() {
                             let _ = jobs.send((
                                 cur_id,
+                                stop.clone(),
                                 Job::Input {
                                     tab: Box::new(t),
                                     input: {
@@ -2079,7 +2123,14 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 queued = Some((url, from));
             }
         }
-        if queued.is_some() && matches!(busy, Some(Some(_))) {
+        if queued.is_some() {
+            pending_input.clear();
+            script_nav = None;
+            clicked_link = None;
+            page_focus = false;
+            box_drag = None;
+        }
+        if queued.is_some() && busy.is_some() {
             stop.cancel();
             discard = true; // superseded by the newer navigation
         }
@@ -2355,10 +2406,14 @@ impl Parked {
     }
 
     /// A loader result for this tab while it's in the background.
-    fn finish(&mut self, done: Done, jobs: &Sender<(TabId, Job)>) {
+    fn finish(&mut self, done: Done, jobs: &Sender<(TabId, net::Cancel, Job)>) {
+        if !self.stop.same_document(&done.generation) {
+            return;
+        }
         let was_open = matches!(self.busy, Some(Some(_)));
         self.busy = None;
-        if self.discard && was_open {
+        if !self.stop.accepts(&done.generation) || (self.discard && was_open) {
+            self.stop = net::Cancel::new();
             self.discard = false;
             return;
         }
@@ -2378,6 +2433,7 @@ impl Parked {
                 let from = Some(self.info.url.clone());
                 let _ = jobs.send((
                     self.id,
+                    self.stop.clone(),
                     Job::Open {
                         url: to.clone(),
                         from,
@@ -3052,10 +3108,11 @@ enum SiteButton {
     KeepCookies,
     ForgetCookies,
     ToggleJs,
+    RememberJs,
 }
 
 /// Per-site controls at the top of the request panel.
-fn site_buttons(x0: f32) -> [(Rect, SiteButton); 3] {
+fn site_buttons(x0: f32) -> [(Rect, SiteButton); 4] {
     let r = |x: f32, y: f32, w: f32| Rect {
         x: x0 + x,
         y: bars() + y,
@@ -3065,7 +3122,8 @@ fn site_buttons(x0: f32) -> [(Rect, SiteButton); 3] {
     [
         (r(100.0, 54.0, 140.0), SiteButton::KeepCookies),
         (r(246.0, 54.0, 60.0), SiteButton::ForgetCookies),
-        (r(100.0, 82.0, 206.0), SiteButton::ToggleJs),
+        (r(100.0, 82.0, 132.0), SiteButton::ToggleJs),
+        (r(236.0, 82.0, 70.0), SiteButton::RememberJs),
     ]
 }
 
@@ -3551,8 +3609,10 @@ fn draw_panel(
                 SiteButton::KeepCookies if kept => ("Kept after closing ✓", true),
                 SiteButton::KeepCookies => ("Keep after closing", false),
                 SiteButton::ForgetCookies => ("Forget", false),
-                SiteButton::ToggleJs if js => ("On for this site ✓", true),
-                SiteButton::ToggleJs => ("Off · allow on this site", false),
+                SiteButton::RememberJs if n.scripts_persistent(page_url) => ("Saved ✓", true),
+                SiteButton::RememberJs => ("Save", false),
+                SiteButton::ToggleJs if js => (n.script_permission(page_url), true),
+                SiteButton::ToggleJs => ("Off · allow this session", false),
             };
             let (bg, fg) = if on {
                 (GREEN, Color::WHITE)
@@ -4319,5 +4379,40 @@ mod menu_tests {
         draw_panel(&mut c, &info, None, 0.0, w - pw, &mut cache);
         c.write_png(&std::env::var("PANEL_PNG").unwrap_or("panel.png".into()))
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use super::*;
+    #[test]
+    fn background_old_script_dom_and_layout_cannot_replace_document() {
+        let old = net::Cancel::new();
+        let current = net::Cancel::new();
+        let mut parked = Parked::loading(1, "https://new.example/", current);
+        let mut n = Network::empty();
+        let mut old_tab = Tab::with_html(&mut n, "https://old.example/", None, "<title>old</title>", false);
+        old_tab.script_navigate = Some("https://old.example/redirect".into());
+        let (tx, rx) = mpsc::channel();
+        let mut old_render = blank_rendered();
+        old_render.height = 999.0;
+        parked.finish(
+            Done {
+                generation: old,
+                tab: old_tab,
+                rendered: Some(old_render),
+                new_page: true,
+                click: None,
+            },
+            &tx,
+        );
+        assert_eq!(parked.info.url, "https://new.example/");
+        assert_eq!(parked.rendered.height, 0.0);
+        assert!(parked.tab.is_none());
+        assert!(rx.try_recv().is_err(), "old scripts cannot queue a redirect");
+        assert!(
+            parked.busy.is_some(),
+            "stale reply cannot finish the current load"
+        );
     }
 }

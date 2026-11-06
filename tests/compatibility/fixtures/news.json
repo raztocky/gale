@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "name": "news",
+  "entry": "https://compat.example/",
+  "title_contains": [
+    "News fixture"
+  ],
+  "text_contains": [
+    "Readable news with advertising blocked",
+    "Article paragraph 17",
+    "article remains available"
+  ],
+  "min_text_chars": 200,
+  "resources": [
+    {
+      "url": "https://compat.example/",
+      "status": 200,
+      "headers": [
+        [
+          "content-type",
+          "text/html"
+        ],
+        [
+          "content-security-policy",
+          "default-src 'self'; img-src https:; script-src 'none'"
+        ]
+      ],
+      "body": "PCFkb2N0eXBlIGh0bWw+PGh0bWw+PGhlYWQ+PHRpdGxlPk5ld3MgZml4dHVyZTwvdGl0bGU+PGxpbmsgcmVsPSdzdHlsZXNoZWV0JyBocmVmPScvc3R5bGUuY3NzJz48L2hlYWQ+PGJvZHk+PGhlYWRlcj48YSBocmVmPScvJz5Mb2NhbCBuZXdzPC9hPiB8IDxhIGhyZWY9Jy93b3JsZCc+V29ybGQ8L2E+IHwgPGEgaHJlZj0nL3RlY2hub2xvZ3knPlRlY2hub2xvZ3k8L2E+PC9oZWFkZXI+PGRpdiBjbGFzcz0nYXJ0aWNsZSc+PGgxPlJlYWRhYmxlIG5ld3Mgd2l0aCBhZHZlcnRpc2luZyBibG9ja2VkPC9oMT48aW1nIHNyYz0nL3Bob3RvLnN2Zyc+PGltZyBzcmM9J2h0dHBzOi8vYWRzLmNvbXBhdC10cmFja2VyLmV4YW1wbGUvcGl4ZWwuc3ZnJz48c2NyaXB0PmRvY3VtZW50LmJvZHkudGV4dENvbnRlbnQ9J3NjcmlwdHMgbXVzdCBzdGF5IG9mZic7PC9zY3JpcHQ+PHNjcmlwdCBzcmM9J2h0dHBzOi8vdW5yZWNvcmRlZC5leGFtcGxlL2FkLmpzJz48L3NjcmlwdD48bm9zY3JpcHQ+PHA+VGhlIGFydGljbGUgcmVtYWlucyBhdmFpbGFibGUgd2l0aG91dCBzY3JpcHRzLjwvcD48L25vc2NyaXB0PjxwPkFydGljbGUgcGFyYWdyYXBoIDE6IFRoaXMgc3ludGhldGljIHN0b3J5IGV4ZXJjaXNlcyBoZWFkaW5ncywgd3JhcHBpbmcsIGltYWdlcyBhbmQgb3JkaW5hcnkgbmF2aWdhdGlvbiB3aXRob3V0IHJlcHJvZHVjaW5nIGEgcHVibGlzaGVyJ3MgYXJ0aWNsZS48L3A+PHA+QXJ0aWNsZSBwYXJhZ3JhcGggMjogVGhpcyBzeW50aGV0aWMgc3RvcnkgZXhlcmNpc2VzIGhlYWRpbmdzLCB3cmFwcGluZywgaW1hZ2VzIGFuZCBvcmRpbmFyeSBuYXZpZ2F0aW9uIHdpdGhvdXQgcmVwcm9kdWNpbmcgYSBwdWJsaXNoZXIncyBhcnRpY2xlLjwvcD48cD5BcnRpY2xlIHBhcmFncmFwaCAzOiBUaGlzIHN5bnRoZXRpYyBzdG9yeSBleGVyY2lzZXMgaGVhZGluZ3MsIHdyYXBwaW5nLCBpbWFnZXMgYW5kIG9yZGluYXJ5IG5hdmlnYXRpb24gd2l0aG91dCByZXByb2R1Y2luZyBhIHB1Ymxpc2hlcidzIGFydGljbGUuPC9wPjxwPkFydGljbGUgcGFyYWdyYXBoIDQ6IFRoaXMgc3ludGhldGljIHN0b3J5IGV4ZXJjaXNlcyBoZWFkaW5ncywgd3JhcHBpbmcsIGltYWdlcyBhbmQgb3JkaW5hcnkgbmF2aWdhdGlvbiB3aXRob3V0IHJlcHJvZHVjaW5nIGEgcHVibGlzaGVyJ3MgYXJ0aWNsZS48L3A+PHA+QXJ0aWNsZSBwYXJhZ3JhcGggNTogVGhpcyBzeW50aGV0aWMgc3RvcnkgZXhlcmNpc2VzIGhlYWRpbmdzLCB3cmFwcGluZywgaW1hZ2VzIGFuZCBvcmRpbmFyeSBuYXZpZ2F0aW9uIHdpdGhvdXQgcmVwcm9kdWNpbmcgYSBwdWJsaXNoZXIncyBhcnRpY2xlLjwvcD48cD5BcnRpY2xlIHBhcmFncmFwaCA2OiBUaGlzIHN5bnRoZXRpYyBzdG9yeSBleGVyY2lzZXMgaGVhZGluZ3MsIHdyYXBwaW5nLCBpbWFnZXMgYW5kIG9yZGluYXJ5IG5hdmlnYXRpb24gd2l0aG91dCByZXByb2R1Y2luZyBhIHB1Ymxpc2hlcidzIGFydGljbGUuPC9wPjxwPkFydGljbGUgcGFyYWdyYXBoIDc6IFRoaXMgc3ludGhldGljIHN0b3J5IGV4ZXJjaXNlcyBoZWFkaW5ncywgd3JhcHBpbmcsIGltYWdlcyBhbmQgb3JkaW5hcnkgbmF2aWdhdGlvbiB3aXRob3V0IHJlcHJvZHVjaW5nIGEgcHVibGlzaGVyJ3MgYXJ0aWNsZS48L3A+PHA+QXJ0aWNsZSBwYXJhZ3JhcGggODogVGhpcyBzeW50aGV0aWMgc3RvcnkgZXhlcmNpc2VzIGhlYWRpbmdzLCB3cmFwcGluZywgaW1hZ2VzIGFuZCBvcmRpbmFyeSBuYXZpZ2F0aW9uIHdpdGhvdXQgcmVwcm9kdWNpbmcgYSBwdWJsaXNoZXIncyBhcnRpY2xlLjwvcD48cD5BcnRpY2xlIHBhcmFncmFwaCA5OiBUaGlzIHN5bnRoZXRpYyBzdG9yeSBleGVyY2lzZXMgaGVhZGluZ3MsIHdyYXBwaW5nLCBpbWFnZXMgYW5kIG9yZGluYXJ5IG5hdmlnYXRpb24gd2l0aG91dCByZXByb2R1Y2luZyBhIHB1Ymxpc2hlcidzIGFydGljbGUuPC9wPjxwPkFydGljbGUgcGFyYWdyYXBoIDEwOiBUaGlzIHN5bnRoZXRpYyBzdG9yeSBleGVyY2lzZXMgaGVhZGluZ3MsIHdyYXBwaW5nLCBpbWFnZXMgYW5kIG9yZGluYXJ5IG5hdmlnYXRpb24gd2l0aG91dCByZXByb2R1Y2luZyBhIHB1Ymxpc2hlcidzIGFydGljbGUuPC9wPjxwPkFydGljbGUgcGFyYWdyYXBoIDExOiBUaGlzIHN5bnRoZXRpYyBzdG9yeSBleGVyY2lzZXMgaGVhZGluZ3MsIHdyYXBwaW5nLCBpbWFnZXMgYW5kIG9yZGluYXJ5IG5hdmlnYXRpb24gd2l0aG91dCByZXByb2R1Y2luZyBhIHB1Ymxpc2hlcidzIGFydGljbGUuPC9wPjxwPkFydGljbGUgcGFyYWdyYXBoIDEyOiBUaGlzIHN5bnRoZXRpYyBzdG9yeSBleGVyY2lzZXMgaGVhZGluZ3MsIHdyYXBwaW5nLCBpbWFnZXMgYW5kIG9yZGluYXJ5IG5hdmlnYXRpb24gd2l0aG91dCByZXByb2R1Y2luZyBhIHB1Ymxpc2hlcidzIGFydGljbGUuPC9wPjxwPkFydGljbGUgcGFyYWdyYXBoIDEzOiBUaGlzIHN5bnRoZXRpYyBzdG9yeSBleGVyY2lzZXMgaGVhZGluZ3MsIHdyYXBwaW5nLCBpbWFnZXMgYW5kIG9yZGluYXJ5IG5hdmlnYXRpb24gd2l0aG91dCByZXByb2R1Y2luZyBhIHB1Ymxpc2hlcidzIGFydGljbGUuPC9wPjxwPkFydGljbGUgcGFyYWdyYXBoIDE0OiBUaGlzIHN5bnRoZXRpYyBzdG9yeSBleGVyY2lzZXMgaGVhZGluZ3MsIHdyYXBwaW5nLCBpbWFnZXMgYW5kIG9yZGluYXJ5IG5hdmlnYXRpb24gd2l0aG91dCByZXByb2R1Y2luZyBhIHB1Ymxpc2hlcidzIGFydGljbGUuPC9wPjxwPkFydGljbGUgcGFyYWdyYXBoIDE1OiBUaGlzIHN5bnRoZXRpYyBzdG9yeSBleGVyY2lzZXMgaGVhZGluZ3MsIHdyYXBwaW5nLCBpbWFnZXMgYW5kIG9yZGluYXJ5IG5hdmlnYXRpb24gd2l0aG91dCByZXByb2R1Y2luZyBhIHB1Ymxpc2hlcidzIGFydGljbGUuPC9wPjxwPkFydGljbGUgcGFyYWdyYXBoIDE2OiBUaGlzIHN5bnRoZXRpYyBzdG9yeSBleGVyY2lzZXMgaGVhZGluZ3MsIHdyYXBwaW5nLCBpbWFnZXMgYW5kIG9yZGluYXJ5IG5hdmlnYXRpb24gd2l0aG91dCByZXByb2R1Y2luZyBhIHB1Ymxpc2hlcidzIGFydGljbGUuPC9wPjxwPkFydGljbGUgcGFyYWdyYXBoIDE3OiBUaGlzIHN5bnRoZXRpYyBzdG9yeSBleGVyY2lzZXMgaGVhZGluZ3MsIHdyYXBwaW5nLCBpbWFnZXMgYW5kIG9yZGluYXJ5IG5hdmlnYXRpb24gd2l0aG91dCByZXByb2R1Y2luZyBhIHB1Ymxpc2hlcidzIGFydGljbGUuPC9wPjwvZGl2PjwvYm9keT48L2h0bWw+",
+      "sha256": "a6efe69a9d21f0af0322e6f3241a2ed524385f3bf5ff599ef2bf743541fb046b"
+    },
+    {
+      "url": "https://compat.example/style.css",
+      "status": 200,
+      "headers": [
+        [
+          "content-type",
+          "text/css"
+        ]
+      ],
+      "body": "Ym9keXtmb250LWZhbWlseTpzYW5zLXNlcmlmO21hcmdpbjoxMnB4O2NvbG9yOiMyMjI7YmFja2dyb3VuZDojZmZmfWF7Y29sb3I6IzE3NGE4OH10YWJsZXt3aWR0aDoxMDAlfXRke3BhZGRpbmc6NXB4O3ZlcnRpY2FsLWFsaWduOnRvcH0ucXVvdGV7Ym9yZGVyOjFweCBzb2xpZCAjYWFhO3BhZGRpbmc6OHB4fS5hcnRpY2xle21heC13aWR0aDo2MjBweH1pbWd7bWF4LXdpZHRoOjEwMCV9",
+      "sha256": "5b96aa3c109831ec25c912216f5973253ac828f05eaec2384b2c954d762fd457"
+    },
+    {
+      "url": "https://compat.example/photo.svg",
+      "status": 200,
+      "headers": [
+        [
+          "content-type",
+          "image/svg+xml"
+        ]
+      ],
+      "body": "PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHdpZHRoPSczMicgaGVpZ2h0PSczMic+PHJlY3Qgd2lkdGg9JzMyJyBoZWlnaHQ9JzMyJyBmaWxsPScjYmY3OTNjJy8+PC9zdmc+",
+      "sha256": "f833f3c92c890dc7368015601bc32791237aa2f7bb1553faf36b1de52dfe31fa"
+    },
+    {
+      "url": "https://ads.compat-tracker.example/pixel.svg",
+      "status": 200,
+      "headers": [
+        [
+          "content-type",
+          "image/svg+xml"
+        ]
+      ],
+      "body": "PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHdpZHRoPSczMicgaGVpZ2h0PSczMic+PHJlY3Qgd2lkdGg9JzMyJyBoZWlnaHQ9JzMyJyBmaWxsPScjYmY3OTNjJy8+PC9zdmc+",
+      "sha256": "f833f3c92c890dc7368015601bc32791237aa2f7bb1553faf36b1de52dfe31fa"
+    }
+  ],
+  "filters": "||ads.compat-tracker.example^\n",
+  "never_requested": [
+    "https://ads.compat-tracker.example/pixel.svg",
+    "https://unrecorded.example/ad.js"
+  ],
+  "require_filter_block": true,
+  "provenance": "Original synthetic fixture, inspired by link boards/forums/news layouts; no copied publisher content"
+}

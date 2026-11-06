@@ -4,9 +4,11 @@
 //! script injected into a page is held to what the page's own authors
 //! allowed.
 //!
-//! Enforced, in the renderer where scripts run: `script-src`,
+//! Script execution is enforced in the renderer; image/style sources and
+//! redirects are also checked by the browser. Supported script directives: `script-src`,
 //! `script-src-elem`, `script-src-attr` and `connect-src`, with `default-src`
-//! standing in for any of them that's missing. Sources: `'none'`, `'self'`,
+//! standing in for any of them that's missing. Image/style support also covers
+//! `img-src`, `style-src`, `style-src-elem` and `style-src-attr`. Sources: `'none'`, `'self'`,
 //! `*`, schemes (`https:`), hosts (`*.example.com:443/path`),
 //! `'unsafe-inline'`, `'unsafe-eval'`, `'unsafe-hashes'`, `'strict-dynamic'`,
 //! nonces and SHA-256/384/512 hashes. Several policies all have to agree.
@@ -21,12 +23,13 @@ use std::collections::HashMap;
 const MAX_POLICIES: usize = 16;
 const MAX_DIRECTIVES: usize = 64;
 pub const MAX_SOURCES: usize = 256;
-/// Longer sources are dropped (a list only gets stricter without one).
+/// Oversized sources fail closed: dropping a nonce could re-enable unsafe-inline.
 pub const MAX_SOURCE_LEN: usize = 2048;
 
 #[derive(Debug, Clone, Default)]
 pub struct Csp {
     policies: Vec<HashMap<String, Vec<String>>>,
+    overflow: bool,
     /// The page's scheme, host and port.
     page: Option<(String, String, u16)>,
 }
@@ -42,6 +45,7 @@ impl Csp {
     pub fn new(page_url: &str) -> Csp {
         Csp {
             policies: Vec::new(),
+            overflow: false,
             page: parts(page_url),
         }
     }
@@ -49,22 +53,28 @@ impl Csp {
     /// Add the policies in a `Content-Security-Policy` header (or meta)
     /// value: commas separate policies, semicolons directives.
     pub fn add(&mut self, value: &str) {
-        for policy in value.split(',') {
+        for policy in value.split(',').filter(|p| !p.trim().is_empty()) {
             if self.policies.len() >= MAX_POLICIES {
+                self.overflow = true;
                 return;
             }
             let mut dirs: HashMap<String, Vec<String>> = HashMap::new();
-            for d in policy.split(';').take(MAX_DIRECTIVES) {
+            for (i, d) in policy.split(';').filter(|d| !d.trim().is_empty()).enumerate() {
+                if i >= MAX_DIRECTIVES {
+                    self.overflow = true;
+                    break;
+                }
                 let mut words = d.split_ascii_whitespace();
                 let Some(name) = words.next() else { continue };
-                // The first of a repeated directive wins.
-                dirs.entry(name.to_ascii_lowercase()).or_insert_with(|| {
-                    words
-                        .filter(|w| w.len() <= MAX_SOURCE_LEN)
-                        .take(MAX_SOURCES)
-                        .map(str::to_string)
-                        .collect()
-                });
+                let mut sources = Vec::new();
+                for word in words {
+                    if sources.len() >= MAX_SOURCES || word.len() > MAX_SOURCE_LEN {
+                        self.overflow = true;
+                        break;
+                    }
+                    sources.push(word.to_string());
+                }
+                dirs.entry(name.to_ascii_lowercase()).or_insert(sources);
             }
             if !dirs.is_empty() {
                 self.policies.push(dirs);
@@ -72,8 +82,66 @@ impl Csp {
         }
     }
 
+    pub fn from_headers(url: &str, headers: &[String]) -> Self {
+        let mut c = Self::new(url);
+        for h in headers {
+            c.add(h);
+        }
+        c
+    }
+    pub fn add_meta(&mut self, tree: &crate::dom::Node) {
+        let mut metas = Vec::new();
+        tree.walk(&mut metas, &|n| {
+            n.element().is_some_and(|e| {
+                e.tag == "meta"
+                    && e.attrs
+                        .get("http-equiv")
+                        .is_some_and(|h| h.trim().eq_ignore_ascii_case("content-security-policy"))
+            })
+        });
+        for m in metas {
+            if let Some(v) = m.element().and_then(|e| e.attrs.get("content")) {
+                self.add(v);
+            }
+        }
+    }
+    pub fn resource_sources(&self, dest: crate::net::Dest) -> Vec<Vec<String>> {
+        let names: &[&str] = match dest {
+            crate::net::Dest::Image => &["img-src", "default-src"],
+            _ => &["style-src-elem", "style-src", "default-src"],
+        };
+        self.lists(names, |_| true)
+    }
+    pub fn resource(&self, dest: crate::net::Dest, url: &str) -> bool {
+        self.resource_sources(dest)
+            .iter()
+            .all(|l| self.url_matches(l, url, false))
+    }
+    pub fn style_inline(&self, nonce: Option<&str>, code: &str, attribute: bool) -> bool {
+        let names: &[&str] = if attribute {
+            &["style-src-attr", "style-src", "default-src"]
+        } else {
+            &["style-src-elem", "style-src", "default-src"]
+        };
+        self.all(names, |list| {
+            inline_allowed(list)
+                || (!attribute && nonce.is_some_and(|n| !n.is_empty() && has_nonce(list, n)))
+                || ((!attribute || has(list, "'unsafe-hashes'")) && hash_matches(list, code))
+        })
+    }
+    pub fn style_link(&self, nonce: Option<&str>, url: &str) -> bool {
+        self.all(&["style-src-elem", "style-src", "default-src"], |list| {
+            nonce.is_some_and(|n| !n.is_empty() && has_nonce(list, n)) || self.url_matches(list, url, false)
+        })
+    }
+    pub fn style_sources(&self, nonce: Option<&str>) -> Vec<Vec<String>> {
+        self.lists(&["style-src-elem", "style-src", "default-src"], |l| {
+            !nonce.is_some_and(|n| !n.is_empty() && has_nonce(l, n))
+        })
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.policies.is_empty()
+        !self.overflow && self.policies.is_empty()
     }
 
     /// May a `<script>` run? `src` for an external one, else its `code`.
@@ -139,6 +207,9 @@ impl Csp {
     }
 
     fn lists(&self, names: &[&str], keep: impl Fn(&[String]) -> bool) -> Vec<Vec<String>> {
+        if self.overflow {
+            return vec![vec!["'none'".into()]];
+        }
         self.policies
             .iter()
             .filter_map(|p| names.iter().find_map(|n| p.get(*n)))
@@ -150,12 +221,13 @@ impl Csp {
     /// Every policy allows it: the first of `names` each has decides, and
     /// one with none of them doesn't restrict this.
     fn all(&self, names: &[&str], allows: impl Fn(&[String]) -> bool) -> bool {
-        self.policies.iter().all(|p| {
-            names
-                .iter()
-                .find_map(|n| p.get(*n))
-                .is_none_or(|list| allows(list))
-        })
+        !self.overflow
+            && self.policies.iter().all(|p| {
+                names
+                    .iter()
+                    .find_map(|n| p.get(*n))
+                    .is_none_or(|list| allows(list))
+            })
     }
 
     /// `redirected`: `url` is where a redirect led, which only has to match
@@ -203,7 +275,10 @@ impl Csp {
                 None => page.map_or(matches!(scheme, "http" | "https"), |p| scheme_ok(&p.0)),
             };
             let (hostport, path) = match rest.find('/') {
-                Some(i) => (&rest[..i], Some(&rest[i..])),
+                Some(i) => {
+                    let original = tok.split_once("://").map_or(tok.as_str(), |(_, r)| r);
+                    (&rest[..i], Some(&original[i..]))
+                }
                 None => (rest, None),
             };
             let (h, p) = match hostport.rsplit_once(':') {
@@ -242,6 +317,10 @@ pub const MAX_LISTS: usize = MAX_POLICIES;
 /// May a request the page at `page_url` made, under `lists` (from
 /// [`Csp::connect_sources`] or [`Csp::script_sources`]), follow a redirect
 /// to `url`? Checked by the browser, which follows redirects.
+pub fn request_allowed(page_url: &str, lists: &[Vec<String>], url: &str) -> bool {
+    let csp = Csp::new(page_url);
+    lists.iter().all(|l| csp.url_matches(l, url, false))
+}
 pub fn redirect_allowed(page_url: &str, lists: &[Vec<String>], url: &str) -> bool {
     let csp = Csp::new(page_url);
     lists.iter().all(|list| csp.url_matches(list, url, true))
@@ -251,6 +330,9 @@ pub fn redirect_allowed(page_url: &str, lists: &[Vec<String>], url: &str) -> boo
 /// Integrity)? Only the strongest algorithm listed counts, any of its
 /// hashes may match, and a value with no hash Brickle knows allows it.
 pub fn integrity_matches(integrity: &str, code: &str) -> bool {
+    integrity_matches_bytes(integrity, code.as_bytes())
+}
+pub fn integrity_matches_bytes(integrity: &str, bytes: &[u8]) -> bool {
     let rank = |t: &str| match t.get(..7).map(str::to_ascii_lowercase).as_deref() {
         Some("sha256-") => 1,
         Some("sha384-") => 2,
@@ -270,7 +352,7 @@ pub fn integrity_matches(integrity: &str, code: &str) -> bool {
     tokens
         .iter()
         .filter(|t| rank(t) == best)
-        .any(|t| hash_matches(&[format!("'{t}'")], code))
+        .any(|t| hash_matches_bytes(&[format!("'{t}'")], bytes))
 }
 
 fn has(list: &[String], keyword: &str) -> bool {
@@ -302,6 +384,9 @@ fn inline_allowed(list: &[String]) -> bool {
 
 /// Does `code`'s hash appear in the list?
 fn hash_matches(list: &[String], code: &str) -> bool {
+    hash_matches_bytes(list, code.as_bytes())
+}
+fn hash_matches_bytes(list: &[String], bytes: &[u8]) -> bool {
     use ring::digest;
     list.iter().any(|t| {
         let lower = t.to_ascii_lowercase();
@@ -317,7 +402,7 @@ fn hash_matches(list: &[String], code: &str) -> bool {
         let Some(want) = t.get(8..t.len().saturating_sub(1)).filter(|_| t.ends_with('\'')) else {
             return false;
         };
-        let got = base64(digest::digest(alg, code.as_bytes()).as_ref());
+        let got = base64(digest::digest(alg, bytes).as_ref());
         // base64 or base64url, padded or not.
         let norm = |s: &str| -> String {
             s.trim_end_matches('=')

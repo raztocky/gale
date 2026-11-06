@@ -81,3 +81,89 @@ pipeline. The `image` fuzz target feeds arbitrary bytes to the image decoders an
 ## Supported versions
 
 Only the latest commit on `main`.
+
+## Decoder containment and sandbox requirements
+
+With sandboxing enabled, each image (including inline `data:` images) is
+parsed in a fresh decoder process. The browser brokers the bytes, validates
+returned dimensions and exact RGBA length, and never runs the image parser.
+The decoder installs the renderer's syscall/filesystem restrictions before
+reading input, with a 512 MiB address-space limit and two CPU seconds. The
+browser additionally enforces a three-second wall deadline, cancellation,
+an 8 MiB input cap and a 2048-by-2048 output cap. It kills and reaps failed
+workers, leaving the image blank while subsequent images can load. These
+budgets can reject large or unusually expensive legitimate images. The
+explicit `--no-sandbox` development backend retains in-process decoding.
+
+Startup prints the sandbox probe's layer status; the request panel also
+shows it. This reports a fresh local probe, rather than a claim supplied by
+the page renderer. Individual children still enforce the configured policy.
+Use `--strict-sandbox` to require seccomp, resource limits, namespaces and
+fully enforced Landlock. Use, for example,
+`--strict-sandbox=seccomp,rlimits` to require selected layers. Missing required
+layers fail closed before a page opens; strict mode cannot accompany
+`--no-sandbox`. Partial Landlock does not satisfy a full Landlock requirement.
+No security status probe sends a network request.
+
+## Document transitions
+
+Loader work and replies carry a browser-owned document identity, shared
+with its cancellation token. Foreground and background tabs reject replies
+from another document, and Stop permanently invalidates that identity.
+Rejected replies cannot update the title, DOM/layout, clipboard or script
+navigation. New navigation also drops pending input from the old document.
+Render/input exchanges bind cancellation to their current document token.
+The tile painter independently checks its existing generation IDs; completed
+tiles from older scenes are discarded. None of these identities are assigned
+or authorized by page scripts.
+
+Regression coverage is in `tests/hardening.rs` and the decoder, sandbox,
+network, GUI and painter unit tests. The slow SVG fixture is a synthetic fuzz
+input, with no external resources fetched. It exercises skipping an expensive
+inline image while the next image still paints. These tests check specific
+boundaries and do not establish complete browser security.
+
+
+## Resource policy and stylesheet integrity
+
+Image and style policies apply with JavaScript off as well as on. Headers and initial
+meta policies intersect, with `default-src` fallbacks. Inline style elements support
+nonces/hashes, and style attributes require inline permission (or `unsafe-hashes` plus
+a matching hash). The renderer strips denied attributes from its displayed tree and
+holds the initial policy across DOM refreshes. Meta policies are conservatively applied
+to the whole static document, including content preceding a meta element; sequential
+HTML-parser timing is not implemented. Unsupported CSP directives remain in TODO.md.
+
+External images, CSS backgrounds and stylesheets have every redirect checked. The
+browser independently retains header policies for these resource types: an omitted
+renderer source list cannot remove them. Nonce-authorized stylesheet links carry the
+nonce separately. Stylesheet integrity is checked against decompressed response bytes
+before text conversion, and the renderer checks before applying or caching CSS. Cache
+keys include integrity metadata, so another link with a different hash cannot reuse an
+unchecked sheet. Cross-origin integrity stylesheets require CORS and omit cookies;
+existing redirect, mixed-content and request authorization still apply. Stylesheet text
+is currently UTF-8 only; invalid UTF-8 is refused rather than verified after lossy conversion.
+Data-URL stylesheets are checked before application too. Failed checks send no reports. Policy/header/source count or size overflow fails closed;
+restrictions are never silently dropped to fit a limit.
+
+## Security inventory and local audit records
+
+`brickle security status` is read-only and offline. It reports build time/revision,
+lockfile SHA-256, local filter file ages (stale after seven days), validated CRLite
+availability and age, and saved exceptions. Build age over thirty days is flagged;
+this is a maintenance reminder, not a remote latest-version or vulnerability check.
+Filter mtimes describe local files, not verified upstream publication dates.
+
+Dependency audit status defaults to **unknown**. An optional manually supplied local
+record at the data directory's `security-audit.json` can record a completed audit:
+
+```json
+{"lock_sha256":"SHA256_OF_BUILT_CARGO_LOCK","checked_at":0,"advisory_db_updated_at":0,"vulnerabilities":0}
+```
+
+The timestamps are Unix seconds. Only records for this binary's embedded lockfile,
+with valid clock ordering, are displayed. Audit and database ages over seven days are
+marked stale. This is a local operator record, not a signed attestation or an audit
+performed by Brickle. Creating/rebuilding the browser does not create an audit record
+or imply that an old advisory database is current. Downloads and browser/dependency
+updates remain explicitly user-initiated; there is no background update or telemetry.

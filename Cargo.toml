@@ -26,7 +26,7 @@ psl = "2.1.246"
 flate2 = "1.1.10"
 ruzstd = "0.9.1"
 unicode-linebreak = "0.1.5"
-# Image decoders (pure Rust). Images are only ever decoded in the sandboxed renderer.
+# Image decoders (pure Rust). Images are decoded in disposable sandboxed workers (unless --no-sandbox).
 zune-jpeg = "0.5.15"
 gif = { version = "0.14.2", default-features = false, features = ["std"] }
 image-webp = "0.2.4"

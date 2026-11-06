@@ -14,6 +14,7 @@ USAGE:
   brickle render URL|FILE [-o out.png] [-w WIDTH]   render a full page to PNG
   brickle dom URL|FILE                              print the parsed DOM tree
   brickle requests URL|FILE                         list every request a page makes
+  brickle security status                           local security-data ages and saved exceptions
   brickle filters update                            download the filter lists and certificate
                                                     revocation data (prints each request)
   brickle filters status                            show installed filter lists
@@ -26,6 +27,8 @@ USAGE:
   brickle sandbox-test                              check the renderer sandbox works here
 
 OPTIONS:
+  --strict-sandbox[=seccomp,rlimits,namespaces,landlock]
+                 require all or selected sandbox layers; refuse unavailable layers
   --no-sandbox   parse pages in the browser process instead of a sandboxed
                  renderer (for debugging; less safe)
   --no-filters   don't load filter lists or your rules (for debugging)
@@ -78,9 +81,18 @@ fn main() {
         return;
     }
 
+    if args.first().map(String::as_str) == Some("--image-decoder") {
+        with_big_stack(|| match brickle::decoder::serve() {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("image decoder: {e}");
+                3
+            }
+        });
+    }
     if args.first().map(String::as_str) == Some("--renderer") {
         // Lock the process down *before* touching any untrusted input.
-        if let Err(e) = sandbox::enter() {
+        if let Err(e) = sandbox::enter().and_then(|r| sandbox::validate_child(&r)) {
             eprintln!("brickle renderer: can't enter sandbox: {e}");
             std::process::exit(3);
         }
@@ -95,7 +107,11 @@ fn main() {
 
     if args.first().map(String::as_str) == Some("--sandbox-probe") {
         // One probe per process: see sandbox::PROBES.
-        let name = args.get(1).cloned().unwrap_or_default();
+        let name = args
+            .get(1)
+            .filter(|a| !a.starts_with("--require-sandbox="))
+            .cloned()
+            .unwrap_or_default();
         let report = match sandbox::enter() {
             Ok(r) => r,
             Err(e) => {
@@ -103,9 +119,13 @@ fn main() {
                 std::process::exit(3);
             }
         };
+        if let Err(e) = sandbox::validate_child(&report) {
+            eprintln!("{e}");
+            std::process::exit(3);
+        }
         if name.is_empty() {
             println!(
-                "namespaces: {}\nlandlock: {}\nseccomp: {}",
+                "namespaces: {}\nlandlock: {}\nrlimits: on\nseccomp: {}",
                 report.namespaces,
                 report.landlock,
                 if report.seccomp { "on" } else { "off" }
@@ -122,6 +142,30 @@ fn main() {
     }
 
     let sandboxed = !args.iter().any(|a| a == "--no-sandbox");
+    let strict = args.iter().find_map(|a| {
+        if a == "--strict-sandbox" {
+            Some("seccomp,rlimits,namespaces,landlock".to_string())
+        } else {
+            a.strip_prefix("--strict-sandbox=").map(str::to_string)
+        }
+    });
+    if let Some(layers) = strict {
+        if !sandboxed {
+            eprintln!("strict sandbox requires sandboxing");
+            std::process::exit(2);
+        }
+        if let Err(e) = sandbox::configure(&layers) {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    }
+    args.retain(|a| !a.starts_with("--strict-sandbox"));
+    if sandboxed {
+        if let Err(e) = sandbox::inspect() {
+            eprintln!("{e}");
+            std::process::exit(3);
+        }
+    }
     let filters = !args.iter().any(|a| a == "--no-filters");
     let panel = args.iter().any(|a| a == "--panel");
     let js = args.iter().any(|a| a == "--js");
@@ -191,6 +235,13 @@ fn run(args: Vec<String>, sandboxed: bool, filters: bool, panel: bool, js: bool)
             Ok(())
         }
         Some("render") => render(&args[1..], sandboxed, filters),
+        Some("compat-probe") => compat_probe(&args[1..], sandboxed, filters),
+        Some("security") if args.get(1).map(String::as_str) == Some("status") => {
+            for line in brickle::security::report() {
+                println!("{line}");
+            }
+            Ok(())
+        }
         Some("sandbox-test") => {
             // Each probe runs in a fresh sandboxed process; this one stays
             // unrestricted.
@@ -245,7 +296,7 @@ fn js_cmd(args: &[String]) -> Result<(), String> {
             if sites.is_empty() {
                 println!("JavaScript is off everywhere. `brickle js allow SITE` turns it on for a site.");
             } else {
-                println!("JavaScript is on for:");
+                println!("JavaScript saved for these origins (persists after closing):");
                 for s in sites {
                     println!("  {s}");
                 }
@@ -253,7 +304,10 @@ fn js_cmd(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         (Some("allow"), Some(site)) => {
-            println!("JavaScript on for {}", n.set_scripts_allowed(site, true)?);
+            println!(
+                "JavaScript saved for origin {}",
+                n.set_scripts_allowed(site, true)?
+            );
             Ok(())
         }
         (Some("block"), Some(site)) => {
@@ -486,4 +540,50 @@ fn open_window(input: &str, sandboxed: bool, net: Network, panel: bool) -> Resul
 #[cfg(not(feature = "gui"))]
 fn open_window(_: &str, _: bool, _: Network, _: bool) -> Result<(), String> {
     Err(format!("built without the `gui` feature\n\n{USAGE}"))
+}
+
+/// Machine-readable compatibility diagnostic. Does not follow meta navigation or links.
+/// The runner supplies a disposable profile and a local capture-only proxy.
+fn compat_probe(args: &[String], sandboxed: bool, filters: bool) -> Result<(), String> {
+    if !sandboxed {
+        return Err("compatibility probe requires the renderer sandbox".into());
+    }
+    if args.len() != 2 {
+        return Err("compat-probe needs URL and PNG output path".into());
+    }
+    let start = std::time::Instant::now();
+    let mut net = network(filters);
+    if !net.js_sites().is_empty() {
+        return Err("compatibility probe requires a profile without saved JavaScript grants".into());
+    }
+    net.js_everywhere = false;
+    let mut tab = open_tab(&mut net, &args[0], true);
+    let rendered = tab.render(800.0, 768.0);
+    let text = rendered
+        .texts
+        .iter()
+        .map(|t| t.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let failed = tab.interstitial.is_some() || text.contains("Couldn't load this page");
+    let document_status = tab
+        .log
+        .iter()
+        .rev()
+        .find(|r| r.dest == net::Dest::Document)
+        .and_then(|r| match r.outcome {
+            Outcome::Loaded { status } => Some(status),
+            Outcome::Local => Some(200),
+            _ => None,
+        });
+    let height = (rendered.height.ceil() as usize).clamp(1, 4096);
+    let mut canvas = paint::Canvas::new(800, height, rendered.background);
+    canvas.paint(&rendered.list, &rendered.atlas, 0.0, 0.0);
+    canvas.write_png(&args[1]).map_err(|e| e.to_string())?;
+    let requests:Vec<_>=tab.log.iter().map(|r|serde_json::json!({"url":r.url,"dest":format!("{:?}",r.dest),"outcome":format!("{:?}",r.outcome),"sent":r.was_sent()})).collect();
+    println!(
+        "{}",
+        serde_json::json!({"title":tab.title,"url":tab.url,"text":text,"links":rendered.links.len(),"page_height":rendered.height,"scripts":tab.scripts,"failed":failed,"document_status":document_status,"requests":requests,"elapsed_ms":start.elapsed().as_millis(),"proposed_navigation":tab.script_navigate})
+    );
+    Ok(())
 }

@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "name": "forum",
+  "entry": "https://compat.example/",
+  "title_contains": [
+    "Forum fixture"
+  ],
+  "text_contains": [
+    "Offline forum discussion",
+    "Discussion post 12"
+  ],
+  "min_text_chars": 200,
+  "resources": [
+    {
+      "url": "https://compat.example/",
+      "status": 200,
+      "headers": [
+        [
+          "content-type",
+          "text/html"
+        ],
+        [
+          "content-security-policy",
+          "default-src 'self'; img-src https:; script-src 'none'"
+        ]
+      ],
+      "body": "PCFkb2N0eXBlIGh0bWw+PGh0bWw+PGhlYWQ+PHRpdGxlPkZvcnVtIGZpeHR1cmU8L3RpdGxlPjxsaW5rIHJlbD0nc3R5bGVzaGVldCcgaHJlZj0nL3N0eWxlLmNzcyc+PC9oZWFkPjxib2R5PjxhIGhyZWY9Jy8nPkZvcnVtIGluZGV4PC9hPiB8IDxhIGhyZWY9Jy90aHJlYWRzJz5UaHJlYWRzPC9hPjxoMT5PZmZsaW5lIGZvcnVtIGRpc2N1c3Npb248L2gxPjx0YWJsZT48dHI+PHRkPjxpbWcgc3JjPScvYXZhdGFyLnN2Zyc+TWVtYmVyIDE8L3RkPjx0ZD48ZGl2IGNsYXNzPSdxdW90ZSc+UXVvdGVkIGVhcmxpZXIgcG9zdCBhYm91dCBhIHNtYWxsIGJyb3dzZXIuPC9kaXY+PHA+RGlzY3Vzc2lvbiBwb3N0IDE6IHBsYWluIHRleHQsIGxpbmtzIGFuZCBsb25nIHNjcm9sbGluZyBwYWdlcyBzaG91bGQgcmVtYWluIHJlYWRhYmxlLjwvcD48YSBocmVmPScvcG9zdC8xJz5QZXJtYWxpbms8L2E+PC90ZD48L3RyPjwvdGFibGU+PHRhYmxlPjx0cj48dGQ+PGltZyBzcmM9Jy9hdmF0YXIuc3ZnJz5NZW1iZXIgMjwvdGQ+PHRkPjxkaXYgY2xhc3M9J3F1b3RlJz5RdW90ZWQgZWFybGllciBwb3N0IGFib3V0IGEgc21hbGwgYnJvd3Nlci48L2Rpdj48cD5EaXNjdXNzaW9uIHBvc3QgMjogcGxhaW4gdGV4dCwgbGlua3MgYW5kIGxvbmcgc2Nyb2xsaW5nIHBhZ2VzIHNob3VsZCByZW1haW4gcmVhZGFibGUuPC9wPjxhIGhyZWY9Jy9wb3N0LzInPlBlcm1hbGluazwvYT48L3RkPjwvdHI+PC90YWJsZT48dGFibGU+PHRyPjx0ZD48aW1nIHNyYz0nL2F2YXRhci5zdmcnPk1lbWJlciAzPC90ZD48dGQ+PGRpdiBjbGFzcz0ncXVvdGUnPlF1b3RlZCBlYXJsaWVyIHBvc3QgYWJvdXQgYSBzbWFsbCBicm93c2VyLjwvZGl2PjxwPkRpc2N1c3Npb24gcG9zdCAzOiBwbGFpbiB0ZXh0LCBsaW5rcyBhbmQgbG9uZyBzY3JvbGxpbmcgcGFnZXMgc2hvdWxkIHJlbWFpbiByZWFkYWJsZS48L3A+PGEgaHJlZj0nL3Bvc3QvMyc+UGVybWFsaW5rPC9hPjwvdGQ+PC90cj48L3RhYmxlPjx0YWJsZT48dHI+PHRkPjxpbWcgc3JjPScvYXZhdGFyLnN2Zyc+TWVtYmVyIDQ8L3RkPjx0ZD48ZGl2IGNsYXNzPSdxdW90ZSc+UXVvdGVkIGVhcmxpZXIgcG9zdCBhYm91dCBhIHNtYWxsIGJyb3dzZXIuPC9kaXY+PHA+RGlzY3Vzc2lvbiBwb3N0IDQ6IHBsYWluIHRleHQsIGxpbmtzIGFuZCBsb25nIHNjcm9sbGluZyBwYWdlcyBzaG91bGQgcmVtYWluIHJlYWRhYmxlLjwvcD48YSBocmVmPScvcG9zdC80Jz5QZXJtYWxpbms8L2E+PC90ZD48L3RyPjwvdGFibGU+PHRhYmxlPjx0cj48dGQ+PGltZyBzcmM9Jy9hdmF0YXIuc3ZnJz5NZW1iZXIgNTwvdGQ+PHRkPjxkaXYgY2xhc3M9J3F1b3RlJz5RdW90ZWQgZWFybGllciBwb3N0IGFib3V0IGEgc21hbGwgYnJvd3Nlci48L2Rpdj48cD5EaXNjdXNzaW9uIHBvc3QgNTogcGxhaW4gdGV4dCwgbGlua3MgYW5kIGxvbmcgc2Nyb2xsaW5nIHBhZ2VzIHNob3VsZCByZW1haW4gcmVhZGFibGUuPC9wPjxhIGhyZWY9Jy9wb3N0LzUnPlBlcm1hbGluazwvYT48L3RkPjwvdHI+PC90YWJsZT48dGFibGU+PHRyPjx0ZD48aW1nIHNyYz0nL2F2YXRhci5zdmcnPk1lbWJlciA2PC90ZD48dGQ+PGRpdiBjbGFzcz0ncXVvdGUnPlF1b3RlZCBlYXJsaWVyIHBvc3QgYWJvdXQgYSBzbWFsbCBicm93c2VyLjwvZGl2PjxwPkRpc2N1c3Npb24gcG9zdCA2OiBwbGFpbiB0ZXh0LCBsaW5rcyBhbmQgbG9uZyBzY3JvbGxpbmcgcGFnZXMgc2hvdWxkIHJlbWFpbiByZWFkYWJsZS48L3A+PGEgaHJlZj0nL3Bvc3QvNic+UGVybWFsaW5rPC9hPjwvdGQ+PC90cj48L3RhYmxlPjx0YWJsZT48dHI+PHRkPjxpbWcgc3JjPScvYXZhdGFyLnN2Zyc+TWVtYmVyIDc8L3RkPjx0ZD48ZGl2IGNsYXNzPSdxdW90ZSc+UXVvdGVkIGVhcmxpZXIgcG9zdCBhYm91dCBhIHNtYWxsIGJyb3dzZXIuPC9kaXY+PHA+RGlzY3Vzc2lvbiBwb3N0IDc6IHBsYWluIHRleHQsIGxpbmtzIGFuZCBsb25nIHNjcm9sbGluZyBwYWdlcyBzaG91bGQgcmVtYWluIHJlYWRhYmxlLjwvcD48YSBocmVmPScvcG9zdC83Jz5QZXJtYWxpbms8L2E+PC90ZD48L3RyPjwvdGFibGU+PHRhYmxlPjx0cj48dGQ+PGltZyBzcmM9Jy9hdmF0YXIuc3ZnJz5NZW1iZXIgODwvdGQ+PHRkPjxkaXYgY2xhc3M9J3F1b3RlJz5RdW90ZWQgZWFybGllciBwb3N0IGFib3V0IGEgc21hbGwgYnJvd3Nlci48L2Rpdj48cD5EaXNjdXNzaW9uIHBvc3QgODogcGxhaW4gdGV4dCwgbGlua3MgYW5kIGxvbmcgc2Nyb2xsaW5nIHBhZ2VzIHNob3VsZCByZW1haW4gcmVhZGFibGUuPC9wPjxhIGhyZWY9Jy9wb3N0LzgnPlBlcm1hbGluazwvYT48L3RkPjwvdHI+PC90YWJsZT48dGFibGU+PHRyPjx0ZD48aW1nIHNyYz0nL2F2YXRhci5zdmcnPk1lbWJlciA5PC90ZD48dGQ+PGRpdiBjbGFzcz0ncXVvdGUnPlF1b3RlZCBlYXJsaWVyIHBvc3QgYWJvdXQgYSBzbWFsbCBicm93c2VyLjwvZGl2PjxwPkRpc2N1c3Npb24gcG9zdCA5OiBwbGFpbiB0ZXh0LCBsaW5rcyBhbmQgbG9uZyBzY3JvbGxpbmcgcGFnZXMgc2hvdWxkIHJlbWFpbiByZWFkYWJsZS48L3A+PGEgaHJlZj0nL3Bvc3QvOSc+UGVybWFsaW5rPC9hPjwvdGQ+PC90cj48L3RhYmxlPjx0YWJsZT48dHI+PHRkPjxpbWcgc3JjPScvYXZhdGFyLnN2Zyc+TWVtYmVyIDEwPC90ZD48dGQ+PGRpdiBjbGFzcz0ncXVvdGUnPlF1b3RlZCBlYXJsaWVyIHBvc3QgYWJvdXQgYSBzbWFsbCBicm93c2VyLjwvZGl2PjxwPkRpc2N1c3Npb24gcG9zdCAxMDogcGxhaW4gdGV4dCwgbGlua3MgYW5kIGxvbmcgc2Nyb2xsaW5nIHBhZ2VzIHNob3VsZCByZW1haW4gcmVhZGFibGUuPC9wPjxhIGhyZWY9Jy9wb3N0LzEwJz5QZXJtYWxpbms8L2E+PC90ZD48L3RyPjwvdGFibGU+PHRhYmxlPjx0cj48dGQ+PGltZyBzcmM9Jy9hdmF0YXIuc3ZnJz5NZW1iZXIgMTE8L3RkPjx0ZD48ZGl2IGNsYXNzPSdxdW90ZSc+UXVvdGVkIGVhcmxpZXIgcG9zdCBhYm91dCBhIHNtYWxsIGJyb3dzZXIuPC9kaXY+PHA+RGlzY3Vzc2lvbiBwb3N0IDExOiBwbGFpbiB0ZXh0LCBsaW5rcyBhbmQgbG9uZyBzY3JvbGxpbmcgcGFnZXMgc2hvdWxkIHJlbWFpbiByZWFkYWJsZS48L3A+PGEgaHJlZj0nL3Bvc3QvMTEnPlBlcm1hbGluazwvYT48L3RkPjwvdHI+PC90YWJsZT48dGFibGU+PHRyPjx0ZD48aW1nIHNyYz0nL2F2YXRhci5zdmcnPk1lbWJlciAxMjwvdGQ+PHRkPjxkaXYgY2xhc3M9J3F1b3RlJz5RdW90ZWQgZWFybGllciBwb3N0IGFib3V0IGEgc21hbGwgYnJvd3Nlci48L2Rpdj48cD5EaXNjdXNzaW9uIHBvc3QgMTI6IHBsYWluIHRleHQsIGxpbmtzIGFuZCBsb25nIHNjcm9sbGluZyBwYWdlcyBzaG91bGQgcmVtYWluIHJlYWRhYmxlLjwvcD48YSBocmVmPScvcG9zdC8xMic+UGVybWFsaW5rPC9hPjwvdGQ+PC90cj48L3RhYmxlPjwvYm9keT48L2h0bWw+",
+      "sha256": "a5e0b77ab81a69a9efd0fa2b4854d161767755c1602ce8618454a8d705757c8e"
+    },
+    {
+      "url": "https://compat.example/style.css",
+      "status": 200,
+      "headers": [
+        [
+          "content-type",
+          "text/css"
+        ]
+      ],
+      "body": "Ym9keXtmb250LWZhbWlseTpzYW5zLXNlcmlmO21hcmdpbjoxMnB4O2NvbG9yOiMyMjI7YmFja2dyb3VuZDojZmZmfWF7Y29sb3I6IzE3NGE4OH10YWJsZXt3aWR0aDoxMDAlfXRke3BhZGRpbmc6NXB4O3ZlcnRpY2FsLWFsaWduOnRvcH0ucXVvdGV7Ym9yZGVyOjFweCBzb2xpZCAjYWFhO3BhZGRpbmc6OHB4fS5hcnRpY2xle21heC13aWR0aDo2MjBweH1pbWd7bWF4LXdpZHRoOjEwMCV9",
+      "sha256": "5b96aa3c109831ec25c912216f5973253ac828f05eaec2384b2c954d762fd457"
+    },
+    {
+      "url": "https://compat.example/avatar.svg",
+      "status": 200,
+      "headers": [
+        [
+          "content-type",
+          "image/svg+xml"
+        ]
+      ],
+      "body": "PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHdpZHRoPSczMicgaGVpZ2h0PSczMic+PHJlY3Qgd2lkdGg9JzMyJyBoZWlnaHQ9JzMyJyBmaWxsPScjYmY3OTNjJy8+PC9zdmc+",
+      "sha256": "f833f3c92c890dc7368015601bc32791237aa2f7bb1553faf36b1de52dfe31fa"
+    }
+  ],
+  "filters": "||ads.compat-tracker.example^\n",
+  "never_requested": [
+    "https://ads.compat-tracker.example/pixel.svg",
+    "https://unrecorded.example/ad.js"
+  ],
+  "require_filter_block": false,
+  "provenance": "Original synthetic fixture, inspired by link boards/forums/news layouts; no copied publisher content"
+}

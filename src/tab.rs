@@ -25,7 +25,7 @@ const LOAD_EXTRA: Duration = Duration::from_secs(10);
 /// Most subresource requests a renderer may make for one page. The network
 /// service refuses anything past its own budget; a renderer that keeps
 /// asking anyway is misbehaving.
-const MAX_FETCHES: usize = MAX_STYLESHEETS + crate::js::MAX_SCRIPTS + crate::network::MAX_IMAGES + 8;
+const MAX_FETCHES: usize = MAX_STYLESHEETS + crate::js::MAX_SCRIPTS + crate::network::MAX_IMAGES * 2 + 8;
 /// Longest a page with JavaScript may take to load before Brickle gives up
 /// on its scripts and shows it without them.
 const SCRIPT_LOAD_LIMIT: Duration = Duration::from_secs(15);
@@ -40,23 +40,51 @@ const MAX_MESSAGES: usize = 2000;
 struct NetHost<'a> {
     net: &'a mut Network,
     page: String,
+    policy: crate::csp::Csp,
 }
 
 impl Host for NetHost<'_> {
+    fn stylesheet(
+        &mut self,
+        url: &str,
+        integrity: &str,
+        csp: &[Vec<String>],
+        added: bool,
+        nonce: Option<&str>,
+    ) -> Result<String, String> {
+        let mut lists = self.policy.style_sources(nonce);
+        lists.extend_from_slice(csp);
+        self.net
+            .stylesheet_file(&self.page, url, integrity, added, &lists)
+    }
+    fn image_policy(&mut self, url: &str, added: bool, csp: &[Vec<String>]) -> Result<Vec<u8>, String> {
+        let mut lists = self.policy.resource_sources(Dest::Image);
+        lists.extend_from_slice(csp);
+        self.net.image_policy(&self.page, url, added, &lists)
+    }
+
     fn fetch(&mut self, url: &str, dest: Dest) -> Result<String, String> {
-        self.net.subresource(&self.page, url, dest)
+        if dest == Dest::Stylesheet {
+            self.stylesheet(url, "", &[], false, None)
+        } else {
+            self.net.subresource(&self.page, url, dest)
+        }
     }
     fn fetch_added(&mut self, url: &str, dest: Dest) -> Result<String, String> {
-        self.net.subresource_added(&self.page, url, dest)
+        if dest == Dest::Stylesheet {
+            self.stylesheet(url, "", &[], true, None)
+        } else {
+            self.net.subresource_added(&self.page, url, dest)
+        }
     }
     fn fetch_script(&mut self, url: &str, added: bool, csp: &[Vec<String>]) -> Result<String, String> {
         self.net.script_file(&self.page, url, added, csp)
     }
     fn image(&mut self, url: &str) -> Result<Vec<u8>, String> {
-        self.net.image(&self.page, url, false)
+        self.image_policy(url, false, &[])
     }
     fn image_added(&mut self, url: &str) -> Result<Vec<u8>, String> {
-        self.net.image(&self.page, url, true)
+        self.image_policy(url, true, &[])
     }
     fn request(&mut self, url: &str, req: ScriptRequest) -> Result<ScriptResponse, String> {
         self.net.script_request(&self.page, url, req)
@@ -106,6 +134,7 @@ pub struct Tab {
     /// sending the form again (a POST that wasn't redirected).
     pub resubmit: Option<Submission>,
     backend: Backend,
+    policy: crate::csp::Csp,
 }
 
 /// What a click on a page did.
@@ -169,6 +198,13 @@ enum Backend {
 }
 
 impl Tab {
+    /// Bind future renderer exchanges to the UI's current document token.
+    pub fn set_cancel(&mut self, cancel: Cancel) {
+        if let Backend::Sandboxed(renderer) = &mut self.backend {
+            renderer.cancel = cancel;
+        }
+    }
+
     /// Keep the names the renderer says scripts read, if they're ones
     /// Brickle watches (it's only told, so it only believes known names).
     fn note_read(&mut self, read: Vec<String>) {
@@ -223,7 +259,7 @@ impl Tab {
                 // Our own trusted HTML: no renderer or subresources needed.
                 let page = Page::trusted(&url, &html);
                 Tab {
-                    url,
+                    url: url.clone(),
                     opener: from.map(str::to_string),
                     title: page.title.clone(),
                     log: net.take_log(),
@@ -232,6 +268,7 @@ impl Tab {
                     console: vec![],
                     read: Default::default(),
                     script_navigate: None,
+                    policy: crate::csp::Csp::new(&url),
                     backend: Backend::InProcess(Box::new(page)),
                     text_scale: 1.0,
                     title_px: 0.0,
@@ -283,16 +320,21 @@ impl Tab {
             read: Default::default(),
             script_navigate: None,
             backend: Backend::Failed(String::new()),
+            policy: crate::csp::Csp::from_headers(url, csp),
             text_scale: 1.0,
             title_px: 0.0,
             resubmit: None,
         };
         let blocker_css = net.cosmetic_css(url);
         if !sandbox {
-            let page_url = url.to_string();
-            let mut fetch = |target: &str, dest: Dest| net.subresource(&page_url, target, dest);
-            let mut page = Page::parse(url, html, &blocker_css, &mut fetch);
-            page.load_images(&mut |u, _| net.image(&page_url, u, false));
+            let mut host = NetHost {
+                net,
+                page: url.to_string(),
+                policy: crate::csp::Csp::from_headers(url, csp),
+            };
+            let mut page = Page::parse_with_policy(url, html, &blocker_css, csp, &mut host);
+            let sources = page.image_sources();
+            page.load_images(&mut |u, added| host.image_policy(u, added, &sources));
             tab.title = page.title.clone();
             tab.backend = Backend::InProcess(Box::new(page));
             tab.log = net.take_log();
@@ -358,6 +400,7 @@ impl Tab {
         let mut host = NetHost {
             net,
             page: self.url.clone(),
+            policy: self.policy.clone(),
         };
         let copy_key = matches!(input, Input::Key(Key::Copy | Key::Cut));
         let msg = match input {
@@ -489,6 +532,7 @@ fn load_sandboxed(
     let mut host = NetHost {
         net,
         page: url.to_string(),
+        policy: crate::csp::Csp::from_headers(url, csp),
     };
     let loaded = r.load(
         url,
@@ -526,6 +570,9 @@ impl Renderer {
         let exe = std::env::current_exe().map_err(|e| format!("can't find own executable: {e}"))?;
         let mut cmd = Command::new(exe);
         cmd.arg("--renderer");
+        if let Some(layers) = crate::sandbox::requirements() {
+            cmd.arg(format!("--require-sandbox={layers}"));
+        }
         Renderer::spawn_command(cmd, cancel)
     }
 
@@ -618,25 +665,40 @@ impl Renderer {
         host: &mut dyn Host,
     ) -> Result<FromRenderer, String> {
         let mut budget = budget;
+        let mut image_budget = 64 * 1024 * 1024;
         let (mut fetches, mut messages) = (0, 0);
         loop {
             messages += 1;
             if messages > MAX_MESSAGES {
                 return Err(self.kill("renderer sent too many messages and was killed"));
             }
-            match self.recv(deadline, &mut budget)? {
+            match self.recv_budgets(deadline, &mut budget, &mut image_budget)? {
+                FromRenderer::Decode(bytes) if fetches < MAX_FETCHES => {
+                    fetches += 1;
+                    let r = crate::decoder::decode_worker(bytes, &self.cancel, deadline);
+                    self.send(ToRenderer::ImageReply(r))?;
+                }
+                FromRenderer::Decode(_) => return Err(self.kill("too many image decodes")),
+                FromRenderer::Stylesheet {
+                    url,
+                    integrity,
+                    csp,
+                    added,
+                    nonce,
+                } if fetches < MAX_FETCHES => {
+                    fetches += 1;
+                    let r = host.stylesheet(&url, &integrity, &csp, added, nonce.as_deref());
+                    self.send(ToRenderer::FetchReply(r))?;
+                }
+                FromRenderer::Stylesheet { .. } => return Err(self.kill("too many stylesheets")),
                 FromRenderer::Fetch {
                     url,
                     dest: Dest::Image,
                     added,
-                    ..
+                    csp,
                 } if fetches < MAX_FETCHES => {
                     fetches += 1;
-                    let r = if added {
-                        host.image_added(&url)
-                    } else {
-                        host.image(&url)
-                    };
+                    let r = host.image_policy(&url, added, &csp);
                     self.send(ToRenderer::ImageReply(r))?
                 }
                 FromRenderer::Fetch {
@@ -715,6 +777,15 @@ impl Renderer {
     /// Wait for the next message, until `deadline`. Each frame is charged to
     /// `budget`.
     fn recv(&mut self, deadline: Instant, budget: &mut usize) -> Result<FromRenderer, String> {
+        self.recv_budgets(deadline, budget, &mut 0)
+    }
+
+    fn recv_budgets(
+        &mut self,
+        deadline: Instant,
+        budget: &mut usize,
+        image_budget: &mut usize,
+    ) -> Result<FromRenderer, String> {
         let frame = loop {
             if self.cancel.is_cancelled() {
                 return Err(self.kill("stopped"));
@@ -729,6 +800,11 @@ impl Renderer {
                 Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => return Err(self.kill("renderer exited")),
             }
+        };
+        let budget = if frame.first() == Some(&20) {
+            image_budget
+        } else {
+            budget
         };
         if frame.len() > *budget {
             return Err(self.kill("renderer sent more data than allowed and was killed"));
@@ -778,6 +854,8 @@ try:
         elif k == 'flood':
             f = frame(bytes.fromhex(v))
             while True: out.write(f); out.flush()
+        elif k == 'decode':
+            b = bytes(int(v)); out.write(frame(bytes([20]) + struct.pack('<I', len(b)) + b)); out.flush()
         elif k == 'zeros': out.write(bytes(int(v))); out.flush()
         elif k == 'read': read_frame()
         elif k == 'sleep': time.sleep(float(v))
@@ -1042,6 +1120,21 @@ except BrokenPipeError:
     }
 
     #[test]
+    fn image_payload_uses_its_own_budget() {
+        let s = vec![
+            "read".into(),
+            format!("decode:{}", LOAD_BYTES + 1),
+            "read".into(),
+            format!("send:{}", loaded()),
+            "sleep:5".into(),
+        ];
+        let Some(mut r) = fake(&s, Cancel::new()) else {
+            panic!("python3 required for this test");
+        };
+        assert_eq!(load(&mut r, 5.0, &mut no_fetch).as_deref(), Ok("t"));
+    }
+
+    #[test]
     fn stop_kills_it_at_once() {
         let cancel = Cancel::new();
         let Some(mut r) = fake(&["read".to_string(), "sleep:30".into()], cancel.clone()) else {
@@ -1096,5 +1189,55 @@ except BrokenPipeError:
             Outcome::LocalNetwork | Outcome::MixedContent
         ));
         assert!(matches!(log[2].outcome, Outcome::Blocked { .. }));
+    }
+}
+
+#[cfg(test)]
+mod resource_policy_boundary_tests {
+    use super::*;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+    };
+    #[test]
+    fn browser_keeps_header_policy_when_renderer_omits_source_lists() {
+        for image in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://127.0.0.1:{}/x", listener.local_addr().unwrap().port());
+            let contacted = Arc::new(AtomicBool::new(false));
+            let seen = contacted.clone();
+            std::thread::spawn(move || {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    seen.store(true, Ordering::SeqCst);
+                    let mut input = [0; 2048];
+                    let _ = stream.read(&mut input);
+                    let body = "<svg xmlns='http://www.w3.org/2000/svg' width='2' height='2'/>";
+                    let kind = if image { "image/svg+xml" } else { "text/css" };
+                    let _=write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
+                }
+            });
+            let mut network = Network::empty();
+            let mut policy = crate::csp::Csp::new(&url);
+            policy.add("img-src 'none'; style-src 'none'");
+            let mut host = NetHost {
+                net: &mut network,
+                page: url.clone(),
+                policy,
+            };
+            if image {
+                assert!(host.image_policy(&url, false, &[]).is_err());
+            } else {
+                assert!(host.stylesheet(&url, "", &[], false, None).is_err());
+            }
+            assert!(!contacted.load(Ordering::SeqCst));
+            assert!(matches!(
+                network.take_log()[0].outcome,
+                crate::network::Outcome::NotAllowed
+            ));
+        }
     }
 }

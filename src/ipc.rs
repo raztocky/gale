@@ -93,6 +93,15 @@ pub enum ToRenderer {
 /// Renderer -> browser.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FromRenderer {
+    /// Decode bytes in a disposable worker, including data URLs.
+    Decode(Vec<u8>),
+    Stylesheet {
+        url: String,
+        integrity: String,
+        csp: Vec<Vec<String>>,
+        added: bool,
+        nonce: Option<String>,
+    },
     Fetch {
         url: String,
         dest: Dest,
@@ -614,6 +623,25 @@ impl FromRenderer {
     pub fn encode(&self) -> Vec<u8> {
         let mut e = Enc::default();
         match self {
+            FromRenderer::Stylesheet {
+                url,
+                integrity,
+                csp,
+                added,
+                nonce,
+            } => {
+                e.u8(21);
+                e.str(url);
+                e.str(integrity);
+                e.lists(csp);
+                e.u8(*added as u8);
+                e.opt_str(nonce);
+            }
+            FromRenderer::Decode(bytes) => {
+                e.u8(20);
+                e.u32(bytes.len() as u32);
+                e.0.extend_from_slice(bytes);
+            }
             FromRenderer::Fetch {
                 url,
                 dest,
@@ -812,6 +840,20 @@ impl FromRenderer {
     pub fn decode(buf: &[u8]) -> DecResult<FromRenderer> {
         let mut d = Dec { buf, pos: 0 };
         let msg = match d.u8()? {
+            21 => FromRenderer::Stylesheet {
+                url: d.str()?,
+                integrity: d.str()?,
+                csp: d.lists()?,
+                added: d.bool()?,
+                nonce: d.opt_str()?,
+            },
+            20 => {
+                let n = d.u32()? as usize;
+                if n > crate::decoder::MAX_INPUT {
+                    return Err("image input too large".into());
+                }
+                FromRenderer::Decode(d.take(n)?.to_vec())
+            }
             1 => FromRenderer::Fetch {
                 url: d.str()?,
                 // Only the kinds a page may ask for; everything else is a

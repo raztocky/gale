@@ -93,7 +93,7 @@ browser validates before painting.
 | `urlclean.rs` | Tracking-parameter stripping |
 | `explain.rs` | What a request was for, in plain words, for the request panel: known trackers, cookies and click IDs (built-in tables), what it carried, refused cookies, third-party code, which list blocked it, and scripts that read enough browser details to look like fingerprinting |
 | `bookmarks.rs` | Your bookmarks, in a local file; nothing is fetched for them |
-| `csp.rs` | Content Security Policy for pages' scripts (`script-src`, `connect-src` and friends), enforced in the renderer; never sends reports |
+| `csp.rs` | Content Security Policy for scripts, connections, images and styles; browser checks resource/redirect policies; never sends reports |
 | `tab.rs` | Browser side of a page: spawns and supervises the renderer, answers its fetch requests |
 | `renderer.rs` | The renderer process's message loop |
 | `ipc.rs` | Length-limited binary protocol between the two. The browser treats every renderer message as hostile |

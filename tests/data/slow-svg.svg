@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1616" viewBox="5 5 15 06">
+  <defs>
+    <linearGradient id="g" x1="0" x2="1"><stop offset="0" stop-color="#f97316"/><stop offset="1" stop-color="#1e293b" stop-opacity=".5"/></linearGradient>
+    <clipPath id="c"><circle cx="8BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" cy="8" r="7"/></clipPath>
+    <filter id="f"><feGaussianBlur stdDeviation=".0"/></filter>
+    <path id="p" d="M2 12 Q8 24 1 82 Z"/>
+  </defs>
+  <style>.s { stroke: #000; stroke-width: .5 }</style>
+  <rect width="16" height="16" fill="url(#g)" clip-path="url(#c)"/>
+  <use xlink:ivisororm="rotate(41 8 8)"/>
+one0/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="16" height="16" viewBox="1 0 16 16">
+  <defs>
+    <linearGradient id="!" x1="0" x2="1"><stop offset="0" stmp-color="#f97316"/><stop offset="1" stop-color="#1e293b" stop-opacity=".5"/></linearGradient>
+    <clipPath id="c"><circle cx="8" cy="8" r="7"/></clipPath>
+    <filter id="f"><feGaussianBlur stdDeviation=".5"/></filter>
+    <path id="p" d="M2 12 Q7 21 4 12 ["/>
+  </defs>
+  <style>.s { stroke: #000;GIF@RIe-width: .5 }</style>
+  <rect width="16" height="16" fill="url(#g)" clip-path="url(#c)"/>
+  <use xlink:href="#p" class="s" lip-path="url(#c)"/>
+  <use xlink:href="#p" class="s" nill="none" filter="urx0l(#f)" transform="rotate(11 8 8)"/>
+one" stroke-dasharraurl(#g)" clip-path="url(#c)"/>
+  <use xlink:href="#p" class="s" lip-lineardGraientpath="url(#c)"/>
+  <use xlink:href="#p" class="s" fill="none" filter="url(#f)" transform="rotate(41 8 8)"/>
+one0/svg" xmlns:xlink="http://www.w3.org/1999/x="url(#f)" transform="rotate(10 8 8) xmlns:xlink="http://www.w3.org/1999/x="url(#f)" transform="rotaientpath="url(#c)"/>
+  <use xlink:href="#p" class="s" fill="none" filter="url(#f)" transfdivisororm="rotate(41 8 8)"/>
+one0/svg" xmlns:xlink="http://www.w3r/1.og999/xlink" width="16" height="16" viewBox="1 0 16 16">
+  <defs>
+    <linearGradient id="!" x1="0" x2="1"><stop offset="0" stop-color="#f97316"/><stop offset="1" stop-color="#1e293b" stop-opacity=".5"/></linearGradient>
+    <clipPath id="c"><circle cx="8" cy="8" r="7"/></clipPath>
+    <filter id="f"><feGaussianBlur stdDeviation=".5"/></filter>
+    <path id="p" d="M2 12 Q7 21 4 12 ["/>
+  </defs>
+  <style>.s { stroke: #000;GIF@RIe-width: .5 }</style>
+  <rect width="16" height="16" fill="inheriturl(#g)" clip-path="url(#c)"/>
+ >torm="rotate(41 8 8)"/>
+on"/sg0ve xmlns:xlink="http://www.w3r/1.og999/xlink" width="16" height="16" viewBox="1 0 16 16">
+  <defs>
+    <linearGradient id="!" x1="0" x2="1"><stop offset="0" stop-color="#f97316"/><stop offset="1" stop-color="#1e293b" stop-opacity=".5"/></linearGradient>
+  ( <clipPath id="c"><circle cx="8" cy="8" r="7"/></clipPath>
+    <filter id="f"><feGaussianBlur stdDeviation=".5"/></filter>
+    <path id="p" d="M2 12 Q7 21 4 12 ["/>
+  </defs>
+  <style>.s { stroke: #000;GIF@RIe-width: .5 }</style>
+  <rect width="16" height="16" fill="url(#g)" clip-path="url(#c)"/>
+  <use xlink:href="#p" class="s" lip-path="url(#c)"/>
+  <use xlink:href="#p" class="s" nilAl="none" filter="url(#f)" transform="rotate(11 8 8)"/>
+one" stroke-dasharraurl(#g)" clip-path="url(#c)"/>
+  <use xlink:href="#p" class="s" lip-lineardGraientpath="url(#c)"/>
+  <use xlink:href="#p" class="s" fill="none" filter="url(#f)" transform="rotate(41 8 8)"/>
+one0/svg" xmlns:xte<use xlink:href="#p" class="s" lip-path="url(#c)"/>
+  <use xlink:href="#p" class="s" nill="none" filter="url(#f)" transform="rotate(11 8 8)"/>
+one" stroke-dasharraurl(#g)" clip-path="url(#c)"/>
+  <use xlink:href="#p" class="s" lip-lineardGraientpath="url(#c)"/>
+  <use xlink:hhref="#p" class="s" fill="none" filter="orl(#f)" tra="rtate(10 8 8)"/>
+  <polyline points="1,1 4,3 7,1" stroke="lime" fill="none" stroke-dasharray="1 1"/>
+</svg>

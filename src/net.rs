@@ -90,6 +90,14 @@ impl std::fmt::Display for NetError {
 pub struct Cancel(Arc<AtomicBool>);
 
 impl Cancel {
+    /// A fresh token identifies a new document. Stop invalidates it permanently.
+    pub fn same_document(&self, other: &Cancel) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+    pub fn accepts(&self, result: &Cancel) -> bool {
+        self.same_document(result) && !self.is_cancelled()
+    }
+
     pub fn new() -> Cancel {
         Cancel::default()
     }
@@ -972,7 +980,11 @@ fn http_get_timeout(
         } else {
             String::from_utf8_lossy(&bytes).into_owned()
         },
-        bytes: if image { bytes } else { vec![] },
+        bytes: if image || dest == Dest::Stylesheet {
+            bytes
+        } else {
+            vec![]
+        },
     })
 }
 
@@ -1531,5 +1543,27 @@ mod tests {
             "https://xn--pple-43d.com"
         );
         assert_eq!(display_parts("http://a.com:8080/p?q=1").1, "/p?q=1");
+    }
+}
+
+#[cfg(test)]
+mod document_generation_tests {
+    use super::Cancel;
+    #[test]
+    fn stale_or_stopped_document_results_are_rejected() {
+        let old = Cancel::new();
+        let queued = old.clone();
+        let replacement = Cancel::new();
+        assert!(old.accepts(&queued));
+        assert!(
+            !replacement.accepts(&queued),
+            "old DOM, scripts and tiles must not replace a new document"
+        );
+        old.cancel();
+        assert!(
+            !old.accepts(&queued),
+            "Stop must invalidate already completed replies too"
+        );
+        assert!(replacement.accepts(&replacement.clone()));
     }
 }

@@ -36,6 +36,7 @@ struct IpcHost<'a, R: Read, W: Write> {
     cookies: String,
     /// A protocol error: once set, everything fails and `serve` reports it.
     broken: Option<String>,
+    policy: crate::csp::Csp,
 }
 
 impl<R: Read, W: Write> IpcHost<'_, R, W> {
@@ -66,12 +67,27 @@ impl<R: Read, W: Write> IpcHost<'_, R, W> {
         }
     }
 
+    fn decoded(&mut self, url: &str, added: bool) -> Result<crate::image::Decoded, String> {
+        let bytes = match crate::page::data_url(url) {
+            Some(b) => b?,
+            None if url.starts_with("data:") => return Err("unsupported data address".into()),
+            None => self.picture(url, added)?,
+        };
+        match self.ask(FromRenderer::Decode(bytes))? {
+            ToRenderer::ImageReply(r) => crate::decoder::unpack(&r?),
+            _ => {
+                self.broken = Some("expected decoded image".into());
+                Err("protocol error".into())
+            }
+        }
+    }
+
     fn picture(&mut self, url: &str, added: bool) -> Result<Vec<u8>, String> {
         match self.ask(FromRenderer::Fetch {
             url: url.to_string(),
             dest: Dest::Image,
             added,
-            csp: vec![],
+            csp: self.policy.resource_sources(Dest::Image),
         })? {
             ToRenderer::ImageReply(r) => r,
             _ => {
@@ -83,6 +99,29 @@ impl<R: Read, W: Write> IpcHost<'_, R, W> {
 }
 
 impl<R: Read, W: Write> Host for IpcHost<'_, R, W> {
+    fn stylesheet(
+        &mut self,
+        url: &str,
+        integrity: &str,
+        csp: &[Vec<String>],
+        added: bool,
+        nonce: Option<&str>,
+    ) -> Result<String, String> {
+        match self.ask(FromRenderer::Stylesheet {
+            url: url.into(),
+            integrity: integrity.into(),
+            csp: csp.to_vec(),
+            added,
+            nonce: nonce.map(str::to_string),
+        })? {
+            ToRenderer::FetchReply(r) => r,
+            _ => {
+                self.broken = Some("expected stylesheet".into());
+                Err("protocol error".into())
+            }
+        }
+    }
+
     fn fetch(&mut self, url: &str, dest: Dest) -> Result<String, String> {
         self.file(url, dest, false, &[])
     }
@@ -137,6 +176,7 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
     // The page's scripts, if it has any (only for sites you allowed).
     let mut rt: Option<Runtime> = None;
     let mut cookies = String::new();
+    let mut policy = crate::csp::Csp::new("");
     while let Some(msg) = recv(input)? {
         match msg {
             ToRenderer::Load {
@@ -149,25 +189,22 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                 csp,
             } => {
                 cookies = start_cookies;
+                policy = crate::csp::Csp::from_headers(&url, &csp);
+                policy.add_meta(&crate::html::parse(&html));
                 let mut host = IpcHost {
                     input: &mut *input,
                     output: &mut *output,
                     cookies: cookies.clone(),
                     broken: None,
+                    policy: policy.clone(),
                 };
                 let (mut p, new_rt, out) = if scripts {
                     Page::load_with_scripts(&url, &html, &blocker_css, viewport, &csp, &mut host)
                 } else {
-                    let p = Page::parse(&url, &html, &blocker_css, &mut |u, d| host.fetch(u, d));
+                    let p = Page::parse_with_policy(&url, &html, &blocker_css, &csp, &mut host);
                     (p, None, ScriptOutput::default())
                 };
-                p.load_images(&mut |u, added| {
-                    if added {
-                        host.image_added(u)
-                    } else {
-                        host.image(u)
-                    }
-                });
+                p.load_images_decoded(&mut |u, added| host.decoded(u, added));
                 if let Some(e) = host.broken {
                     return Err(e);
                 }
@@ -232,19 +269,14 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                         output: &mut *output,
                         cookies: cookies.clone(),
                         broken: None,
+                        policy: policy.clone(),
                     };
                     pump(rt, &mut host, until);
                     if Some(rt.version()) != before {
                         p.refresh(rt);
                         done.changed = true;
                         // Scripts may have added images.
-                        p.load_images(&mut |u, added| {
-                            if added {
-                                host.image_added(u)
-                            } else {
-                                host.image(u)
-                            }
-                        });
+                        p.load_images_decoded(&mut |u, added| host.decoded(u, added));
                     }
                     if let Some(e) = host.broken {
                         return Err(e);

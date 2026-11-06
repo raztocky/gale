@@ -1473,3 +1473,24 @@ mod dark_tests {
         assert_eq!(half.a, 90, "alpha kept");
     }
 }
+
+#[cfg(test)]
+mod stale_tile_test {
+    use super::*;
+    #[test]
+    fn completed_tile_from_old_document_is_dropped() {
+        let mut current = TileCache::new(&Vec::new(), &[], 4, 800.0, Color::WHITE);
+        current.pending.insert(0);
+        let (tx, done) = std::sync::mpsc::channel();
+        tx.send((current.generation.wrapping_sub(1), 0, vec![0; 4 * TILE_H]))
+            .unwrap();
+        let (jobs, _rx) = std::sync::mpsc::channel();
+        let painter = TilePainter {
+            jobs,
+            done,
+            current: Arc::new(std::sync::atomic::AtomicU64::new(current.generation)),
+        };
+        assert!(!current.collect(&painter));
+        assert!(current.pending.contains(&0));
+    }
+}

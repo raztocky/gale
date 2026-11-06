@@ -2,7 +2,7 @@
 //! SVG (shapes and text in Brickle's own fonts; no embedded images, nothing
 //! external).
 //!
-//! Images are only ever decoded in the sandboxed renderer: decoders are a
+//! With sandboxing enabled, images are decoded in disposable sandboxed workers: decoders are a
 //! classic place for memory-safety bugs, and image bytes come straight from
 //! websites. The browser only ever receives finished RGBA pixels, which it
 //! checks before painting.

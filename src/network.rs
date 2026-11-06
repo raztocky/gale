@@ -197,6 +197,7 @@ pub struct Network {
     image_bytes: usize,
     /// Sites where you allowed JavaScript (`~/.config/brickle/js-sites.txt`).
     js_sites: HashSet<String>,
+    js_session: std::collections::HashMap<String, bool>,
     js_path: Option<PathBuf>,
     /// `--js`: allow JavaScript everywhere for this run.
     pub js_everywhere: bool,
@@ -248,6 +249,7 @@ impl Network {
             page_images: 0,
             image_bytes: 0,
             js_sites: HashSet::new(),
+            js_session: std::collections::HashMap::new(),
             js_path: None,
             js_everywhere: false,
             deadline: std::time::Instant::now() + PAGE_TIME_BUDGET,
@@ -307,7 +309,7 @@ impl Network {
                     .lines()
                     .map(str::trim)
                     .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                    .map(cookies::site)
+                    .filter_map(|s| permission_origin(s).ok())
                     .collect();
             }
             n.js_path = Some(path);
@@ -318,8 +320,12 @@ impl Network {
     /// May pages on this URL run JavaScript? Off unless you allowed the
     /// site (or ran with `--js`). Only web pages ever run scripts.
     pub fn scripts_allowed(&self, url: &str) -> bool {
-        matches!(net::scheme(url).as_str(), "http" | "https")
-            && (self.js_everywhere || self.js_sites.contains(&cookies::site(url)))
+        permission_origin(url).is_ok_and(|o| {
+            self.js_session
+                .get(&o)
+                .copied()
+                .unwrap_or(self.js_everywhere || self.js_sites.contains(&o))
+        })
     }
 
     pub fn js_sites(&self) -> Vec<String> {
@@ -330,29 +336,54 @@ impl Network {
 
     /// Allow or stop allowing JavaScript on a site, and save the list.
     pub fn set_scripts_allowed(&mut self, site_or_url: &str, allow: bool) -> Result<String, String> {
-        let site = cookies::site(site_or_url);
-        if site.is_empty() {
-            return Err("not a website".into());
-        }
+        let origin = permission_origin(site_or_url)?;
+        let mut sites = self.js_sites.clone();
         if allow {
-            self.js_sites.insert(site.clone());
+            sites.insert(origin.clone());
         } else {
-            self.js_sites.remove(&site);
+            sites.remove(&origin);
         }
         if let Some(path) = &self.js_path {
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
             }
-            let mut text = String::from(
-                "# Sites where Brickle runs JavaScript (one per line). Everywhere else it's off.\n",
+            let mut sorted: Vec<_> = sites.iter().cloned().collect();
+            sorted.sort();
+            let text = format!(
+                "# Saved JavaScript origins (scheme, host, port). Session grants are never saved.\n{}\n",
+                sorted.join("\n")
             );
-            for s in self.js_sites() {
-                text.push_str(&s);
-                text.push('\n');
-            }
-            std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+            let tmp = path.with_extension("tmp");
+            std::fs::write(&tmp, text)
+                .and_then(|_| std::fs::rename(&tmp, path))
+                .map_err(|e| e.to_string())?;
         }
-        Ok(site)
+        self.js_sites = sites;
+        self.js_session.remove(&origin);
+        if !allow {
+            self.js_session.insert(origin.clone(), false);
+        }
+        Ok(origin)
+    }
+    pub fn set_scripts_session(&mut self, url: &str, allow: bool) -> Result<String, String> {
+        let origin = permission_origin(url)?;
+        self.js_session.insert(origin.clone(), allow);
+        Ok(origin)
+    }
+    pub fn scripts_persistent(&self, url: &str) -> bool {
+        permission_origin(url).is_ok_and(|o| self.js_sites.contains(&o))
+    }
+    pub fn script_permission(&self, url: &str) -> &'static str {
+        let Ok(origin) = permission_origin(url) else {
+            return "Off";
+        };
+        match self.js_session.get(&origin) {
+            Some(true) => "On this session",
+            Some(false) => "Off this session",
+            None if self.js_everywhere => "On this run (--js)",
+            None if self.js_sites.contains(&origin) => "On (saved origin)",
+            _ => "Off",
+        }
     }
 
     pub fn set_user_rules(&mut self, rules: Vec<String>) {
@@ -452,12 +483,21 @@ impl Network {
                 url, body, headers, ..
             } => {
                 self.page_bytes = body.len();
-                let csp = headers
+                let mut csp: Vec<String> = headers
                     .into_iter()
-                    .filter(|(k, v)| k == "content-security-policy" && v.len() <= MAX_CSP_HEADER)
-                    .map(|(_, v)| v)
-                    .take(MAX_CSP_HEADERS)
+                    .filter(|(k, _)| k == "content-security-policy")
+                    .map(|(_, v)| {
+                        if v.len() > MAX_CSP_HEADER {
+                            "default-src 'none'".into()
+                        } else {
+                            v
+                        }
+                    })
+                    .take(MAX_CSP_HEADERS + 1)
                     .collect();
+                if csp.len() > MAX_CSP_HEADERS {
+                    csp = vec!["default-src 'none'".into()];
+                }
                 Nav::Page { url, html: body, csp }
             }
             Fetch::LocalNetwork { host, url } => Nav::Interstitial {
@@ -555,7 +595,7 @@ impl Network {
     /// Fetch a stylesheet for the page at `page_url`. The page URL comes from
     /// the browser's own state, never from the renderer.
     pub fn subresource(&mut self, page_url: &str, url: &str, dest: Dest) -> Result<String, String> {
-        self.subresource_from(page_url, url, dest, false, &[])
+        self.subresource_from(page_url, url, dest, false, &[], "")
     }
 
     /// An external script for the page; `csp` holds the source lists from
@@ -572,7 +612,7 @@ impl Network {
         if added {
             self.script_added(page_url, url, Dest::Script)?;
         }
-        self.subresource_from(page_url, url, Dest::Script, added, csp)
+        self.subresource_from(page_url, url, Dest::Script, added, csp, "")
     }
 
     /// A stylesheet or script a page's script put on the page: it may only
@@ -580,7 +620,21 @@ impl Network {
     /// it redirects.
     pub fn subresource_added(&mut self, page_url: &str, url: &str, dest: Dest) -> Result<String, String> {
         self.script_added(page_url, url, dest)?;
-        self.subresource_from(page_url, url, dest, true, &[])
+        self.subresource_from(page_url, url, dest, true, &[], "")
+    }
+
+    pub fn stylesheet_file(
+        &mut self,
+        page: &str,
+        url: &str,
+        integrity: &str,
+        added: bool,
+        csp: &[Vec<String>],
+    ) -> Result<String, String> {
+        if added {
+            self.script_added(page, url, Dest::Stylesheet)?;
+        }
+        self.subresource_from(page, url, Dest::Stylesheet, added, csp, integrity)
     }
 
     fn subresource_from(
@@ -590,6 +644,7 @@ impl Network {
         dest: Dest,
         added: bool,
         csp: &[Vec<String>],
+        integrity: &str,
     ) -> Result<String, String> {
         let why = match dest {
             Dest::Stylesheet => {
@@ -624,9 +679,18 @@ impl Network {
             self.record(url, dest, Outcome::OverLimit, vec![]);
             return Err(format!("{why}, skipped {url}"));
         }
-        match self.fetch_with(url, Some(page_url), dest, None, added, csp) {
+        let sri_request = ScriptRequest {
+            credentials: Credentials::SameOrigin,
+            ..ScriptRequest::default()
+        };
+        let sri = !integrity.is_empty();
+        match self.fetch_with(url, Some(page_url), dest, sri.then_some(&sri_request), added, csp) {
             Fetch::Done {
-                body, headers, url, ..
+                body,
+                bytes,
+                headers,
+                url,
+                ..
             } => {
                 self.page_bytes += body.len();
                 if let Some(why) = sniff_refused(dest, &headers) {
@@ -634,6 +698,20 @@ impl Network {
                         e.outcome = Outcome::NotAllowed;
                     }
                     return Err(format!("{url}: {why}"));
+                }
+                if sri
+                    && (!crate::csp::integrity_matches_bytes(integrity, &bytes)
+                        || (!same_origin(page_url, &url)
+                            && !cors_allows(&headers, &origin_of(page_url), false)))
+                {
+                    if let Some(e) = self.log.last_mut() {
+                        e.outcome = Outcome::NotAllowed;
+                    }
+                    return Err("stylesheet integrity or CORS check failed".into());
+                }
+                // Stylesheet text is UTF-8; reject lossy conversion rather than hash different bytes.
+                if dest == Dest::Stylesheet && !bytes.is_empty() && std::str::from_utf8(&bytes).is_err() {
+                    return Err("stylesheet is not UTF-8".into());
                 }
                 Ok(body)
             }
@@ -678,6 +756,15 @@ impl Network {
     /// of the page). Only its bytes come back: it is decoded in the renderer.
     /// `added`: a script put it on the page (see [`Network::script_added`]).
     pub fn image(&mut self, page_url: &str, url: &str, added: bool) -> Result<Vec<u8>, String> {
+        self.image_policy(page_url, url, added, &[])
+    }
+    pub fn image_policy(
+        &mut self,
+        page_url: &str,
+        url: &str,
+        added: bool,
+        csp: &[Vec<String>],
+    ) -> Result<Vec<u8>, String> {
         if added {
             self.script_added(page_url, url, Dest::Image)?;
         }
@@ -695,7 +782,7 @@ impl Network {
             self.record(url, Dest::Image, Outcome::OverLimit, vec![]);
             return Err(format!("{why}, skipped {url}"));
         }
-        match self.fetch_with(url, Some(page_url), Dest::Image, None, added, &[]) {
+        match self.fetch_with(url, Some(page_url), Dest::Image, None, added, csp) {
             Fetch::OpaqueRedirect => Err(format!("{url} redirected")),
             Fetch::Done { bytes, status, .. } if (200..300).contains(&status) => {
                 self.image_bytes += bytes.len();
@@ -1041,7 +1128,7 @@ impl Network {
         let mut was_cross = false;
         let mut url = url.to_string();
         let mut from = initiator.map(str::to_string);
-        for _ in 0..=MAX_REDIRECTS {
+        for hop in 0..=MAX_REDIRECTS {
             // 0. One parse, by the one URL parser; every check below sees
             //    its serialization. Credentials are dropped.
             let Some((parsed, had_credentials)) = net::canonical(&url) else {
@@ -1049,6 +1136,10 @@ impl Network {
                 return Fetch::Stopped(format!("Not a valid address: {url}"));
             };
             url = parsed.into();
+            if hop == 0 && page.is_some_and(|p| !crate::csp::request_allowed(p, csp, &url)) {
+                self.record(&url, dest, Outcome::NotAllowed, vec![]);
+                return Fetch::Stopped("Content Security Policy blocked this resource".into());
+            }
 
             // 1. Strip tracking parameters.
             let extra = self.filters.removeparam(&url, page, fdest);
@@ -1071,8 +1162,15 @@ impl Network {
             }
             if net::scheme(&url) == "file" {
                 self.record(&url, dest, Outcome::Local, stripped);
-                let read = if dest == Dest::Image {
-                    net::read_file_bytes(&url).map(|b| (String::new(), b))
+                let read = if matches!(dest, Dest::Image | Dest::Stylesheet) {
+                    net::read_file_bytes(&url).map(|b| {
+                        let text = if dest == Dest::Stylesheet {
+                            String::from_utf8_lossy(&b).into_owned()
+                        } else {
+                            String::new()
+                        };
+                        (text, b)
+                    })
                 } else {
                     net::read_file(&url).map(|s| (s, vec![]))
                 };
@@ -1661,6 +1759,24 @@ fn interstitial(title: &str, body: &str, proceed: &str) -> String {
          &nbsp; <a href='brickle:proceed' style='color: #555'>{proceed}</a></p></div></body>",
         t = esc(title)
     )
+}
+
+fn permission_origin(input: &str) -> Result<String, String> {
+    let input = input.trim();
+    let value = if input.contains("://") {
+        input.to_string()
+    } else {
+        format!("https://{input}")
+    };
+    let u = url::Url::parse(&value).map_err(|_| "not a website".to_string())?;
+    if !matches!(u.scheme(), "http" | "https")
+        || u.host_str().is_none()
+        || !u.username().is_empty()
+        || u.password().is_some()
+    {
+        return Err("not a website origin".into());
+    }
+    Ok(u.origin().ascii_serialization())
 }
 
 #[cfg(test)]

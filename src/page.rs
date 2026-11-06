@@ -30,6 +30,7 @@ pub struct Page {
     pub scripting: bool,
     /// External stylesheets fetched so far, by URL.
     sheet_cache: HashMap<String, Stylesheet>,
+    policy: crate::csp::Csp,
     /// Boxes from the last layout and the node each is for, in paint
     /// order, for finding what a click hit.
     hits: RefCell<Vec<(Rect, u32)>>,
@@ -196,6 +197,7 @@ pub fn scroller_at(
 /// renderer this asks the browser process, which applies the security policy.
 pub type Fetcher<'f> = dyn FnMut(&str, Dest) -> Result<String, String> + 'f;
 /// Fetches an image's bytes; told whether a script put it on the page.
+type StyleFetcher<'f> = dyn FnMut(&str, &str, &[Vec<String>], Option<&str>) -> Result<String, String> + 'f;
 pub type ImageFetcher<'f> = dyn FnMut(&str, bool) -> Result<Vec<u8>, String> + 'f;
 
 /// The browser's side of a page while its scripts run: everything that
@@ -220,6 +222,31 @@ pub trait Host {
             self.fetch_added(url, Dest::Script)
         } else {
             self.fetch(url, Dest::Script)
+        }
+    }
+    fn stylesheet(
+        &mut self,
+        url: &str,
+        integrity: &str,
+        _csp: &[Vec<String>],
+        added: bool,
+        _nonce: Option<&str>,
+    ) -> Result<String, String> {
+        let text = if added {
+            self.fetch_added(url, Dest::Stylesheet)
+        } else {
+            self.fetch(url, Dest::Stylesheet)
+        }?;
+        if !crate::csp::integrity_matches(integrity, &text) {
+            return Err("stylesheet integrity mismatch".into());
+        }
+        Ok(text)
+    }
+    fn image_policy(&mut self, url: &str, added: bool, _csp: &[Vec<String>]) -> Result<Vec<u8>, String> {
+        if added {
+            self.image_added(url)
+        } else {
+            self.image(url)
         }
     }
     /// An image's bytes.
@@ -299,7 +326,27 @@ impl Page {
     pub fn parse(url: &str, src: &str, blocker_css: &str, fetch: &mut Fetcher) -> Page {
         let mut page = Page::empty(url, blocker_css, false);
         let arena = Dom::from_tree(&html::parse(src));
-        page.set_tree(arena.to_tree(), fetch);
+        page.policy.add_meta(&arena.to_tree());
+        page.set_tree(arena.to_tree(), &mut |u, _, _, _| fetch(u, Dest::Stylesheet));
+        page.arena = Some(arena);
+        page
+    }
+
+    pub fn parse_with_policy(
+        url: &str,
+        src: &str,
+        blocker_css: &str,
+        headers: &[String],
+        host: &mut dyn Host,
+    ) -> Page {
+        let tree = html::parse(src);
+        let mut page = Page::empty(url, blocker_css, false);
+        page.policy = crate::csp::Csp::from_headers(url, headers);
+        page.policy.add_meta(&tree);
+        let arena = Dom::from_tree(&tree);
+        page.set_tree(arena.to_tree(), &mut |u, i, c, n| {
+            host.stylesheet(u, i, c, false, n)
+        });
         page.arena = Some(arena);
         page
     }
@@ -339,14 +386,16 @@ impl Page {
         // The server's own stylesheets, fetched before scripts can change
         // anything, and every file the document refers to.
         let mut first = Page::empty(url, blocker_css, true);
-        first.set_tree(tree.clone(), &mut |u, d| host.fetch(u, d));
+        first.policy = policy.clone();
+        first.set_tree(tree.clone(), &mut |u, i, c, n| host.stylesheet(u, i, c, false, n));
         let from_server = first.files();
         let mut rt = match Runtime::new(&tree, url, viewport) {
             Ok(rt) => rt,
             Err(e) => {
                 let mut page = Page::empty(url, blocker_css, false);
+                page.policy = policy.clone();
                 page.sheet_cache = first.sheet_cache;
-                page.set_tree(tree, &mut |u, d| host.fetch(u, d));
+                page.set_tree(tree, &mut |u, i, c, n| host.stylesheet(u, i, c, false, n));
                 let out = ScriptOutput {
                     console: vec![format!("[brickle] {e}")],
                     read: vec![],
@@ -356,7 +405,7 @@ impl Page {
             }
         };
         rt.set_cookies(host.cookies());
-        rt.set_csp(policy);
+        rt.set_csp(policy.clone());
         let until = Instant::now() + js::LOAD_BUDGET;
         let mut loader = ScriptLoader {
             fetched: 0,
@@ -379,13 +428,10 @@ impl Page {
         }
         loader.run_pending(&mut rt, host);
         let mut page = Page::empty(url, blocker_css, true);
+        page.policy = policy;
         page.sheet_cache = first.sheet_cache;
-        page.set_tree(rt.tree(), &mut |u, d| {
-            if from_server.contains(u) {
-                host.fetch(u, d)
-            } else {
-                host.fetch_added(u, d)
-            }
+        page.set_tree(rt.tree(), &mut |u, i, c, n| {
+            host.stylesheet(u, i, c, !from_server.contains(u), n)
         });
         page.from_server = Some(from_server);
         let out = ScriptOutput {
@@ -400,7 +446,7 @@ impl Page {
     /// fuzzing).
     pub fn from_tree(url: &str, tree: Node) -> Page {
         let mut page = Page::empty(url, "", true);
-        page.set_tree(tree, &mut |_, _| Err("subresources disabled".into()));
+        page.set_tree(tree, &mut |_, _, _, _| Err("subresources disabled".into()));
         page
     }
 
@@ -413,6 +459,7 @@ impl Page {
             blocker: css::parse(blocker_css),
             scripting,
             sheet_cache: HashMap::new(),
+            policy: crate::csp::Csp::new(url),
             hits: RefCell::new(Vec::new()),
             script_boxes: RefCell::new(Vec::new()),
             scrolled: RefCell::new(HashMap::new()),
@@ -431,9 +478,25 @@ impl Page {
     }
 
     /// Fetch and decode the document's images not tried yet. Decoding
-    /// happens here, in the (sandboxed) renderer; `fetch` asks the browser.
+    /// uses the local decoder only in the explicit in-process backend.
+    /// The sandboxed renderer uses `load_images_decoded` and disposable workers.
     /// `fetch` is told whether a script put the image there.
+    pub fn image_sources(&self) -> Vec<Vec<String>> {
+        self.policy.resource_sources(Dest::Image)
+    }
+
     pub fn load_images(&mut self, fetch: &mut ImageFetcher) {
+        self.load_images_decoded(&mut |url, added| {
+            let bytes = match data_url(url) {
+                Some(b) => b,
+                None if url.starts_with("data:") => Err("unsupported data: address".into()),
+                None => fetch(url, added),
+            }?;
+            image::decode(&bytes)
+        });
+    }
+
+    pub fn load_images_decoded(&mut self, fetch: &mut dyn FnMut(&str, bool) -> Result<Decoded, String>) {
         let mut imgs = Vec::new();
         self.dom.walk(&mut imgs, &|n| n.tag() == Some("img"));
         let mut urls: Vec<String> = imgs
@@ -443,18 +506,17 @@ impl Page {
         // CSS background images, after the page's own images.
         urls.extend(self.background_urls());
         for url in urls {
-            if self.images.contains_key(&url) || self.images.len() >= crate::network::MAX_IMAGES {
+            if !self.policy.resource(Dest::Image, &url)
+                || self.images.contains_key(&url)
+                || self.images.len() >= crate::network::MAX_IMAGES
+            {
                 continue;
             }
-            let bytes = match data_url(&url) {
-                Some(b) => b,
-                None if url.starts_with("data:") => Err("unsupported data: address".into()),
-                None => fetch(&url, self.from_server.as_ref().is_some_and(|s| !s.contains(&url))),
-            };
-            let decoded = bytes.ok().and_then(|b| {
-                // A decoder bug must not take the page down with it.
-                std::panic::catch_unwind(|| image::decode(&b)).ok()?.ok()
-            });
+            let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                fetch(&url, self.from_server.as_ref().is_some_and(|s| !s.contains(&url)))
+            }))
+            .ok()
+            .and_then(Result::ok);
             let decoded = decoded.filter(|d| {
                 let n = d.bitmap.rgba.len();
                 if self.image_bytes + n > MAX_IMAGE_MEMORY {
@@ -531,7 +593,8 @@ impl Page {
 
     /// Use `dom` as the page's document: collect its stylesheets (fetching
     /// external ones not seen before) and title.
-    fn set_tree(&mut self, dom: Node, fetch: &mut Fetcher) {
+    fn set_tree(&mut self, mut dom: Node, fetch: &mut StyleFetcher) {
+        strip_inline_styles(&mut dom, &self.policy);
         let mut sheets = Vec::new();
         let mut found = Vec::new();
         let scripting = self.scripting;
@@ -539,7 +602,13 @@ impl Page {
         for n in found {
             let Some(e) = n.element() else { continue };
             if e.tag == "style" {
-                sheets.push(css::parse(&n.text_content()));
+                if self.policy.style_inline(
+                    e.attrs.get("nonce").map(String::as_str),
+                    &n.text_content(),
+                    false,
+                ) {
+                    sheets.push(css::parse(&n.text_content()));
+                }
             } else if e
                 .attrs
                 .get("rel")
@@ -555,13 +624,24 @@ impl Page {
                         continue;
                     }
                     let abs = net::resolve(&self.url, href);
-                    if let Some(s) = self.sheet_cache.get(&abs) {
+                    let nonce = e.attrs.get("nonce").map(String::as_str);
+                    if !self.policy.style_link(nonce, &abs) {
+                        continue;
+                    }
+                    let integrity = e.attrs.get("integrity").map_or("", String::as_str);
+                    let key = format!("{abs}\n{integrity}");
+                    if let Some(s) = self.sheet_cache.get(&key) {
                         sheets.push(s.clone());
-                    } else if let Ok(text) = data_css(&abs).unwrap_or_else(|| fetch(&abs, Dest::Stylesheet)) {
+                    } else if let Ok(text) = data_css(&abs)
+                        .unwrap_or_else(|| fetch(&abs, integrity, &self.policy.style_sources(nonce), nonce))
+                    {
+                        if !crate::csp::integrity_matches(integrity, &text) {
+                            continue;
+                        }
                         // Failures are shown in the request log.
                         let mut s = css::parse(&text);
                         css::resolve_urls(&mut s, &abs);
-                        self.sheet_cache.insert(abs, s.clone());
+                        self.sheet_cache.insert(key, s.clone());
                         sheets.push(s);
                     }
                 }
@@ -586,7 +666,7 @@ impl Page {
     /// After scripts changed the DOM (in response to an event): take the new
     /// tree. Stylesheets not fetched while loading aren't fetched now.
     pub fn refresh(&mut self, rt: &Runtime) {
-        self.set_tree(rt.tree(), &mut |_, _| Err("page already loaded".into()));
+        self.set_tree(rt.tree(), &mut |_, _, _, _| Err("page already loaded".into()));
     }
 
     /// Run `f` on the page's editable DOM: the script runtime's, or the
@@ -611,7 +691,7 @@ impl Page {
                 None => return,
             },
         };
-        self.set_tree(tree, &mut |_, _| Err("page already loaded".into()));
+        self.set_tree(tree, &mut |_, _, _, _| Err("page already loaded".into()));
     }
 
     /// Submit `form` (as if by `submitter`): scripts first get a `submit`
@@ -1273,7 +1353,7 @@ fn image_source(base: &str, e: &crate::dom::ElementData) -> Option<String> {
 
 /// The bytes of a `data:image/...` address (decoded here, no request):
 /// base64, or for SVG also percent-encoded text.
-fn data_url(url: &str) -> Option<Result<Vec<u8>, String>> {
+pub(crate) fn data_url(url: &str) -> Option<Result<Vec<u8>, String>> {
     let rest = url
         .get(..5)
         .filter(|p| p.eq_ignore_ascii_case("data:"))
@@ -1906,7 +1986,7 @@ mod text_tests {
         }
         // With scripts on, `<noscript>` is skipped.
         let mut p = Page::empty("https://a.test/", "", true);
-        p.set_tree(html::parse(ddg), &mut |_, _| Err("no".into()));
+        p.set_tree(html::parse(ddg), &mut |_, _, _, _| Err("no".into()));
         assert_eq!(p.redirect, None);
     }
 
@@ -2596,5 +2676,19 @@ mod script_scroll_tests {
             log(&mut rt, "(document.body.scrollTop = 99, document.body.scrollTop)"),
             "0"
         );
+    }
+}
+
+fn strip_inline_styles(node: &mut Node, policy: &crate::csp::Csp) {
+    if let crate::dom::NodeType::Element(e) = &mut node.node_type {
+        if e.attrs
+            .get("style")
+            .is_some_and(|s| !policy.style_inline(None, s, true))
+        {
+            e.attrs.remove("style");
+        }
+    }
+    for child in &mut node.children {
+        strip_inline_styles(child, policy);
     }
 }

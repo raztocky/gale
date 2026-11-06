@@ -181,13 +181,18 @@ Brickle stores no other site data: no local storage, no cache.
 *Enforced by:* `cookies_first_party_only_and_session_only` in `tests/privacy.rs`, and the tests
 in `src/cookies.rs`.
 
-## 9. JavaScript: off unless you allow a site
+## 9. JavaScript: off unless you allow an origin
 
 - **Off by default.** Pages' scripts aren't downloaded or run. `<noscript>` content is shown
   instead.
-- **Allowed per site.** Use the "JavaScript" button in the request panel, or
-  `brickle js allow SITE`. The list is `~/.config/brickle/js-sites.txt`. `--js` allows it
-  everywhere for one run.
+- **Temporary by default, limited to an origin.** The JavaScript button allows or blocks
+  the exact scheme, host and port for this session. A separate **Save** button persists a
+  grant, visibly labeled **Saved**. `brickle js allow URL` also saves that origin;
+  `brickle js block URL` revokes it. The saved list is `~/.config/brickle/js-sites.txt`.
+  A bare hostname means its HTTPS origin. Old hostname-only entries are narrowed to
+  that HTTPS origin; HTTP and subdomain grants may need to be allowed again. Session
+  denials override saved grants without deleting them. `--js` allows all origins for
+  one run, with explicit session denials still respected.
 - **Scripts' requests go through the browser.** `fetch` and `XMLHttpRequest` work, but the
   browser makes every request, with the same checks as for anything else: they're listed in the
   request panel (as "xhr"), and your rules, the blocker (including `$xmlhttprequest` rules),
@@ -285,7 +290,7 @@ field.
 
 - `~/.config/brickle/rules.txt`: the block and allow rules you make in the request panel.
 - `~/.local/share/brickle/filters/`: downloaded filter lists.
-- `~/.config/brickle/js-sites.txt`: the sites where you allowed JavaScript.
+- `~/.config/brickle/js-sites.txt`: the exact origins where you saved JavaScript permission.
 - `~/.config/brickle/keep-cookies.txt` and `~/.local/share/brickle/cookies.txt`: the sites whose
   cookies you keep, and those cookies.
 - `~/.config/brickle/text-size`, `interface-size` and `interface-theme`: your text and interface
@@ -296,3 +301,13 @@ field.
 
 There is no history file. Back/forward history, and the closed tabs `Ctrl+Shift+T` can reopen,
 exist only in memory while the window is open.
+
+## Local security status
+
+`brickle security status` reads local build identity, the embedded dependency-lock hash,
+filter-file ages, CRLite availability/age, and saved JavaScript/cookie exceptions. It does
+not contact an update service or advisory database. Browser build age and dependency-lock
+identity do not establish that software is current or free of vulnerabilities. Missing,
+future-dated or mismatched audit metadata is reported as unknown. The request panel shows
+a startup snapshot; rerun the command or restart after manually updating security data.
+Only `brickle filters update` downloads the lists and CRLite data, at your request.

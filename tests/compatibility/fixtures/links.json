@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "name": "links",
+  "entry": "https://compat.example/",
+  "title_contains": [
+    "Link board fixture"
+  ],
+  "text_contains": [
+    "Link board",
+    "Synthetic browser engineering story"
+  ],
+  "min_text_chars": 200,
+  "resources": [
+    {
+      "url": "https://compat.example/",
+      "status": 200,
+      "headers": [
+        [
+          "content-type",
+          "text/html"
+        ],
+        [
+          "content-security-policy",
+          "default-src 'self'; img-src https:; script-src 'none'"
+        ]
+      ],
+      "body": "PCFkb2N0eXBlIGh0bWw+PGh0bWw+PGhlYWQ+PHRpdGxlPkxpbmsgYm9hcmQgZml4dHVyZTwvdGl0bGU+PGxpbmsgcmVsPSdzdHlsZXNoZWV0JyBocmVmPScvc3R5bGUuY3NzJz48L2hlYWQ+PGJvZHk+PHRhYmxlPjx0cj48dGQ+PGEgaHJlZj0nLyc+TGluayBib2FyZDwvYT4gfCA8YSBocmVmPScvbmV3Jz5uZXc8L2E+IHwgPGEgaHJlZj0nL2NvbW1lbnRzJz5jb21tZW50czwvYT48L3RkPjwvdHI+PHRyPjx0ZD4xLjwvdGQ+PHRkPjxhIGhyZWY9Jy9zdG9yeS8xJz5TeW50aGV0aWMgYnJvd3NlciBlbmdpbmVlcmluZyBzdG9yeSAxPC9hPjxicj4zIHBvaW50cyB8IDxhIGhyZWY9Jy9pdGVtLzEnPmRpc2N1c3Npb24gY29tbWVudHM8L2E+PC90ZD48L3RyPjx0cj48dGQ+Mi48L3RkPjx0ZD48YSBocmVmPScvc3RvcnkvMic+U3ludGhldGljIGJyb3dzZXIgZW5naW5lZXJpbmcgc3RvcnkgMjwvYT48YnI+NiBwb2ludHMgfCA8YSBocmVmPScvaXRlbS8yJz5kaXNjdXNzaW9uIGNvbW1lbnRzPC9hPjwvdGQ+PC90cj48dHI+PHRkPjMuPC90ZD48dGQ+PGEgaHJlZj0nL3N0b3J5LzMnPlN5bnRoZXRpYyBicm93c2VyIGVuZ2luZWVyaW5nIHN0b3J5IDM8L2E+PGJyPjkgcG9pbnRzIHwgPGEgaHJlZj0nL2l0ZW0vMyc+ZGlzY3Vzc2lvbiBjb21tZW50czwvYT48L3RkPjwvdHI+PHRyPjx0ZD40LjwvdGQ+PHRkPjxhIGhyZWY9Jy9zdG9yeS80Jz5TeW50aGV0aWMgYnJvd3NlciBlbmdpbmVlcmluZyBzdG9yeSA0PC9hPjxicj4xMiBwb2ludHMgfCA8YSBocmVmPScvaXRlbS80Jz5kaXNjdXNzaW9uIGNvbW1lbnRzPC9hPjwvdGQ+PC90cj48dHI+PHRkPjUuPC90ZD48dGQ+PGEgaHJlZj0nL3N0b3J5LzUnPlN5bnRoZXRpYyBicm93c2VyIGVuZ2luZWVyaW5nIHN0b3J5IDU8L2E+PGJyPjE1IHBvaW50cyB8IDxhIGhyZWY9Jy9pdGVtLzUnPmRpc2N1c3Npb24gY29tbWVudHM8L2E+PC90ZD48L3RyPjx0cj48dGQ+Ni48L3RkPjx0ZD48YSBocmVmPScvc3RvcnkvNic+U3ludGhldGljIGJyb3dzZXIgZW5naW5lZXJpbmcgc3RvcnkgNjwvYT48YnI+MTggcG9pbnRzIHwgPGEgaHJlZj0nL2l0ZW0vNic+ZGlzY3Vzc2lvbiBjb21tZW50czwvYT48L3RkPjwvdHI+PHRyPjx0ZD43LjwvdGQ+PHRkPjxhIGhyZWY9Jy9zdG9yeS83Jz5TeW50aGV0aWMgYnJvd3NlciBlbmdpbmVlcmluZyBzdG9yeSA3PC9hPjxicj4yMSBwb2ludHMgfCA8YSBocmVmPScvaXRlbS83Jz5kaXNjdXNzaW9uIGNvbW1lbnRzPC9hPjwvdGQ+PC90cj48dHI+PHRkPjguPC90ZD48dGQ+PGEgaHJlZj0nL3N0b3J5LzgnPlN5bnRoZXRpYyBicm93c2VyIGVuZ2luZWVyaW5nIHN0b3J5IDg8L2E+PGJyPjI0IHBvaW50cyB8IDxhIGhyZWY9Jy9pdGVtLzgnPmRpc2N1c3Npb24gY29tbWVudHM8L2E+PC90ZD48L3RyPjx0cj48dGQ+OS48L3RkPjx0ZD48YSBocmVmPScvc3RvcnkvOSc+U3ludGhldGljIGJyb3dzZXIgZW5naW5lZXJpbmcgc3RvcnkgOTwvYT48YnI+MjcgcG9pbnRzIHwgPGEgaHJlZj0nL2l0ZW0vOSc+ZGlzY3Vzc2lvbiBjb21tZW50czwvYT48L3RkPjwvdHI+PHRyPjx0ZD4xMC48L3RkPjx0ZD48YSBocmVmPScvc3RvcnkvMTAnPlN5bnRoZXRpYyBicm93c2VyIGVuZ2luZWVyaW5nIHN0b3J5IDEwPC9hPjxicj4zMCBwb2ludHMgfCA8YSBocmVmPScvaXRlbS8xMCc+ZGlzY3Vzc2lvbiBjb21tZW50czwvYT48L3RkPjwvdHI+PHRyPjx0ZD4xMS48L3RkPjx0ZD48YSBocmVmPScvc3RvcnkvMTEnPlN5bnRoZXRpYyBicm93c2VyIGVuZ2luZWVyaW5nIHN0b3J5IDExPC9hPjxicj4zMyBwb2ludHMgfCA8YSBocmVmPScvaXRlbS8xMSc+ZGlzY3Vzc2lvbiBjb21tZW50czwvYT48L3RkPjwvdHI+PHRyPjx0ZD4xMi48L3RkPjx0ZD48YSBocmVmPScvc3RvcnkvMTInPlN5bnRoZXRpYyBicm93c2VyIGVuZ2luZWVyaW5nIHN0b3J5IDEyPC9hPjxicj4zNiBwb2ludHMgfCA8YSBocmVmPScvaXRlbS8xMic+ZGlzY3Vzc2lvbiBjb21tZW50czwvYT48L3RkPjwvdHI+PHRyPjx0ZD4xMy48L3RkPjx0ZD48YSBocmVmPScvc3RvcnkvMTMnPlN5bnRoZXRpYyBicm93c2VyIGVuZ2luZWVyaW5nIHN0b3J5IDEzPC9hPjxicj4zOSBwb2ludHMgfCA8YSBocmVmPScvaXRlbS8xMyc+ZGlzY3Vzc2lvbiBjb21tZW50czwvYT48L3RkPjwvdHI+PHRyPjx0ZD4xNC48L3RkPjx0ZD48YSBocmVmPScvc3RvcnkvMTQnPlN5bnRoZXRpYyBicm93c2VyIGVuZ2luZWVyaW5nIHN0b3J5IDE0PC9hPjxicj40MiBwb2ludHMgfCA8YSBocmVmPScvaXRlbS8xNCc+ZGlzY3Vzc2lvbiBjb21tZW50czwvYT48L3RkPjwvdHI+PHRyPjx0ZD4xNS48L3RkPjx0ZD48YSBocmVmPScvc3RvcnkvMTUnPlN5bnRoZXRpYyBicm93c2VyIGVuZ2luZWVyaW5nIHN0b3J5IDE1PC9hPjxicj40NSBwb2ludHMgfCA8YSBocmVmPScvaXRlbS8xNSc+ZGlzY3Vzc2lvbiBjb21tZW50czwvYT48L3RkPjwvdHI+PHRyPjx0ZD4xNi48L3RkPjx0ZD48YSBocmVmPScvc3RvcnkvMTYnPlN5bnRoZXRpYyBicm93c2VyIGVuZ2luZWVyaW5nIHN0b3J5IDE2PC9hPjxicj40OCBwb2ludHMgfCA8YSBocmVmPScvaXRlbS8xNic+ZGlzY3Vzc2lvbiBjb21tZW50czwvYT48L3RkPjwvdHI+PHRyPjx0ZD4xNy48L3RkPjx0ZD48YSBocmVmPScvc3RvcnkvMTcnPlN5bnRoZXRpYyBicm93c2VyIGVuZ2luZWVyaW5nIHN0b3J5IDE3PC9hPjxicj41MSBwb2ludHMgfCA8YSBocmVmPScvaXRlbS8xNyc+ZGlzY3Vzc2lvbiBjb21tZW50czwvYT48L3RkPjwvdHI+PC90YWJsZT48bm9zY3JpcHQ+UmVhZGFibGUgd2l0aG91dCBKYXZhU2NyaXB0Ljwvbm9zY3JpcHQ+PC9ib2R5PjwvaHRtbD4=",
+      "sha256": "abffe463a29dfaaddd8bfca77e8cc92819b5aee65d2be23472839dfe5f16c018"
+    },
+    {
+      "url": "https://compat.example/style.css",
+      "status": 200,
+      "headers": [
+        [
+          "content-type",
+          "text/css"
+        ]
+      ],
+      "body": "Ym9keXtmb250LWZhbWlseTpzYW5zLXNlcmlmO21hcmdpbjoxMnB4O2NvbG9yOiMyMjI7YmFja2dyb3VuZDojZmZmfWF7Y29sb3I6IzE3NGE4OH10YWJsZXt3aWR0aDoxMDAlfXRke3BhZGRpbmc6NXB4O3ZlcnRpY2FsLWFsaWduOnRvcH0ucXVvdGV7Ym9yZGVyOjFweCBzb2xpZCAjYWFhO3BhZGRpbmc6OHB4fS5hcnRpY2xle21heC13aWR0aDo2MjBweH1pbWd7bWF4LXdpZHRoOjEwMCV9",
+      "sha256": "5b96aa3c109831ec25c912216f5973253ac828f05eaec2384b2c954d762fd457"
+    }
+  ],
+  "filters": "||ads.compat-tracker.example^\n",
+  "never_requested": [
+    "https://ads.compat-tracker.example/pixel.svg",
+    "https://unrecorded.example/ad.js"
+  ],
+  "require_filter_block": false,
+  "provenance": "Original synthetic fixture, inspired by link boards/forums/news layouts; no copied publisher content"
+}

@@ -640,11 +640,8 @@ fn javascript_is_off_by_default_and_its_requests_follow_the_rules() {
     assert_eq!(paths(&seen), vec!["/", "/listed.png"]);
     seen.lock().unwrap().clear();
 
-    // Allowed for the site.
-    let allow = brickle(&home)
-        .args(["js", "allow", "127.0.0.1"])
-        .output()
-        .unwrap();
+    // Allowed for this exact origin (including this server's random port).
+    let allow = brickle(&home).args(["js", "allow", &url]).output().unwrap();
     assert!(allow.status.success());
     // Scripts can't send to other sites: not their requests, nor images
     // they put on the page. Images in the page as sent load as usual.
@@ -875,7 +872,7 @@ fn script_requests_are_checked_at_every_redirect() {
     });
     let url = format!("http://127.0.0.1:{port}/");
     assert!(brickle(&home)
-        .args(["js", "allow", "127.0.0.1"])
+        .args(["js", "allow", &url])
         .output()
         .unwrap()
         .status
@@ -975,7 +972,7 @@ fn the_servers_content_security_policy_is_enforced() {
     ]);
     let url = format!("http://127.0.0.1:{port}/");
     assert!(brickle(&home)
-        .args(["js", "allow", "127.0.0.1"])
+        .args(["js", "allow", &url])
         .output()
         .unwrap()
         .status
@@ -1067,7 +1064,7 @@ fn csp_holds_across_redirects_and_scripts_are_checked() {
     });
     let url = format!("http://127.0.0.1:{port}/");
     assert!(brickle(&home)
-        .args(["js", "allow", "127.0.0.1"])
+        .args(["js", "allow", &url])
         .output()
         .unwrap()
         .status
@@ -1310,4 +1307,172 @@ fn images_follow_the_rules() {
         .filter(|p| p[0] == 90 && p[1] == 90 && p[2] == 90)
         .count();
     assert!(grey >= 8, "the 4×2 image is painted ({grey} pixels)");
+}
+
+#[test]
+fn image_and_stylesheet_policies_hold_without_scripts_and_across_redirects() {
+    let home = temp_dir("resource-csp");
+    let (other, other_seen) = serve(vec![
+        ("/foreign.css", "text/css", "body{color:blue}".into()),
+        (
+            "/foreign.svg",
+            "image/svg+xml",
+            "<svg xmlns='http://www.w3.org/2000/svg' width='2' height='2'/>".into(),
+        ),
+    ]);
+    let (port,seen)=serve(vec![
+        ("/header","text/html\r\nContent-Security-Policy: img-src 'self'; style-src 'self'",format!("<link rel=stylesheet href='/ok.css'><link rel=stylesheet href='/go.css'><link rel=stylesheet href='http://127.0.0.1:{other}/foreign.css'><img src='/ok.svg'><img src='/go.svg'><img src='http://127.0.0.1:{other}/foreign.svg'>")),
+        ("/meta","text/html","<meta http-equiv='Content-Security-Policy' content=\"img-src 'self'; style-src 'self'\"><link rel=stylesheet href='/go.css'><img src='/go.svg'>".into()),
+        ("/ok.css","text/css","body{color:red}".into()),
+        ("/ok.svg","image/svg+xml","<svg xmlns='http://www.w3.org/2000/svg' width='2' height='2'/>".into()),
+        ("/go.css",Box::leak(format!("302 text/css\r\nLocation: http://127.0.0.1:{other}/foreign.css").into_boxed_str()),String::new()),
+        ("/go.svg",Box::leak(format!("307 image/svg+xml\r\nLocation: http://127.0.0.1:{other}/foreign.svg").into_boxed_str()),String::new()),
+    ]);
+    for path in ["/header", "/meta"] {
+        let url = format!("http://127.0.0.1:{port}{path}");
+        let out = brickle(&home)
+            .args(["requests", &url, "--no-filters"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+    let paths: Vec<_> = seen.lock().unwrap().iter().map(|r| r[0].clone()).collect();
+    assert!(
+        paths.iter().any(|p| p.contains("/ok.css")) && paths.iter().any(|p| p.contains("/ok.svg")),
+        "positive controls: {paths:?}"
+    );
+    assert!(
+        other_seen.lock().unwrap().is_empty(),
+        "blocked origin must receive no request"
+    );
+}
+
+#[test]
+fn stylesheet_integrity_uses_raw_bytes_and_cross_origin_cors_without_cookies() {
+    let home = temp_dir("style-sri");
+    let (other, seen) = serve(vec![
+        (
+            "/good.css",
+            "text/css\r\nAccess-Control-Allow-Origin: *",
+            "body{color:red}".into(),
+        ),
+        ("/closed.css", "text/css", "body{color:red}".into()),
+        (
+            "/bad.css",
+            "text/css\r\nAccess-Control-Allow-Origin: *",
+            "body{color:blue}".into(),
+        ),
+    ]);
+    // A hash over replacement text must not authenticate different wire bytes.
+    let hash = "sha256-FcQqt3aNlV7AZnGV4zkQRVeCeJOxbMPnQSx258L803E=";
+    let (port,_)=serve(vec![("/","text/html\r\nSet-Cookie: secret=synthetic; Path=/; SameSite=Lax",format!("<link rel=stylesheet href='http://127.0.0.1:{other}/good.css' integrity='{hash}'><link rel=stylesheet href='http://127.0.0.1:{other}/closed.css' integrity='{hash}'><link rel=stylesheet href='http://127.0.0.1:{other}/bad.css' integrity='{hash}'>"))]);
+    let url = format!("http://127.0.0.1:{port}/");
+    let out = brickle(&home)
+        .args(["requests", &url, "--no-filters"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("set cookies secret"),
+        "cookie storage positive control: {text}"
+    );
+    assert_eq!(
+        text.matches("stylesheet integrity or CORS check failed").count(),
+        0,
+        "refusals are recorded as not allowed, not untrusted response text"
+    );
+    let log: Vec<_> = text
+        .lines()
+        .filter(|l| {
+            l.contains("css") && (l.contains("good.css") || l.contains("bad.css") || l.contains("closed.css"))
+        })
+        .collect();
+    assert_eq!(log.len(), 3, "{text}");
+    assert!(
+        log.iter()
+            .find(|l| l.contains("good.css"))
+            .unwrap()
+            .starts_with("sent"),
+        "positive integrity/CORS control: {text}"
+    );
+    for name in ["closed.css", "bad.css"] {
+        assert!(
+            !log.iter().find(|l| l.contains(name)).unwrap().starts_with("sent"),
+            "{text}"
+        );
+    }
+    let requests = seen.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    for request in requests.iter() {
+        assert!(
+            !request
+                .iter()
+                .any(|h| h.to_ascii_lowercase().starts_with("cookie:")),
+            "cross-origin integrity request leaked cookies: {request:?}"
+        );
+    }
+}
+
+#[test]
+fn stylesheet_sri_hashes_response_bytes_before_utf8_replacement() {
+    let home = temp_dir("sri-raw-bytes");
+    // SHA-256 over the UTF-8 replacement rendering of an invalid 0xff byte.
+    let hash = "sha256-OeiF4MTXfYtxG7EM3r3r71vJ6Yuku6c55qw+yNUmyBc=";
+    let (port, _) = serve(vec![
+        (
+            "/",
+            "text/html",
+            format!("<link rel=stylesheet href='/raw.css' integrity='{hash}'>"),
+        ),
+        (
+            "/raw.css",
+            "text/css",
+            "hex:626f64797b636f6c6f723a7265647dff".into(),
+        ),
+    ]);
+    let url = format!("http://127.0.0.1:{port}/");
+    let out = brickle(&home)
+        .args(["requests", &url, "--no-filters"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().find(|l| l.contains("/raw.css")).unwrap();
+    assert!(
+        !line.starts_with("sent"),
+        "lossy string hashing bypassed integrity: {text}"
+    );
+}
+
+#[test]
+fn excess_csp_headers_do_not_drop_a_restrictive_policy() {
+    let home = temp_dir("csp-header-overflow");
+    let header = format!(
+        "text/html{}\r\nContent-Security-Policy: img-src 'none'",
+        "\r\nContent-Security-Policy: img-src *".repeat(8)
+    );
+    let (port, seen) = serve(vec![
+        (
+            "/",
+            Box::leak(header.into_boxed_str()),
+            "<img src='/blocked.svg'>".into(),
+        ),
+        (
+            "/blocked.svg",
+            "image/svg+xml",
+            "<svg xmlns='http://www.w3.org/2000/svg' width='2' height='2'/>".into(),
+        ),
+    ]);
+    let url = format!("http://127.0.0.1:{port}/");
+    let out = brickle(&home)
+        .args(["requests", &url, "--no-filters"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "excess restrictive policy was dropped"
+    );
 }
