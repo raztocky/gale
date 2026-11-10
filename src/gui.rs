@@ -415,14 +415,7 @@ impl Info {
             log: tab.log.clone(),
             interstitial: tab.interstitial.clone(),
             resubmit: tab.resubmit.clone(),
-            note: Some(format!(
-                "Sandbox probe: {}{}; {}",
-                brickle::sandbox::status(),
-                brickle::explain::fingerprinting(tab.read.iter().copied())
-                    .map(|n| format!("; {n}"))
-                    .unwrap_or_default(),
-                brickle::security::brief()
-            )),
+            note: brickle::explain::fingerprinting(tab.read.iter().copied()),
         }
     }
 }
@@ -888,7 +881,14 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             if !stop.accepts(&done.generation) || (discard && was_open) {
                 stop = net::Cancel::new();
                 discard = false;
-                continue; // stopped: keep showing the old page
+                // Stopped: keep showing the old page. A stopped click,
+                // keystroke or layout still hands back the page's tab
+                // (its renderer is gone; reloading starts it again).
+                if !done.new_page && tab.is_none() {
+                    tab = Some(done.tab);
+                    ui.flash = Some("Stopped. Reload to run the page again".into());
+                }
+                continue;
             }
             discard = false;
             if let Some((click, link)) = &done.click {
@@ -2415,6 +2415,9 @@ impl Parked {
         if !self.stop.accepts(&done.generation) || (self.discard && was_open) {
             self.stop = net::Cancel::new();
             self.discard = false;
+            if !done.new_page && self.tab.is_none() {
+                self.tab = Some(done.tab);
+            }
             return;
         }
         self.discard = false;
@@ -4414,5 +4417,34 @@ mod generation_tests {
             parked.busy.is_some(),
             "stale reply cannot finish the current load"
         );
+    }
+
+    #[test]
+    fn a_stopped_click_keeps_the_page() {
+        let stop = net::Cancel::new();
+        let mut parked = Parked::loading(1, "https://site.example/", stop.clone());
+        parked.busy = Some(None); // a click, not a page load
+        let mut n = Network::empty();
+        let t = Tab::with_html(
+            &mut n,
+            "https://site.example/",
+            None,
+            "<title>kept</title>",
+            false,
+        );
+        stop.cancel();
+        let (tx, _rx) = mpsc::channel();
+        parked.finish(
+            Done {
+                generation: stop,
+                tab: t,
+                rendered: None,
+                new_page: false,
+                click: None,
+            },
+            &tx,
+        );
+        assert!(parked.busy.is_none());
+        assert_eq!(parked.tab.as_ref().map(|t| t.title.as_str()), Some("kept"));
     }
 }
