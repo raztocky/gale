@@ -384,6 +384,7 @@ fn flatten_inline<'a>(node: &'a StyledNode<'a>, anon: &mut LayoutBox<'a>, bg: Co
                     Display::InlineBlock | Display::InlineFlex | Display::InlineTable | Display::TableCell
                 )
                 || e.tag == "img"
+                || e.tag == "svg"
             {
                 let mut ib = build_block(node, link.clone());
                 if e.tag == "img" && ib.children.is_empty() {
@@ -756,13 +757,21 @@ fn apply_relative(b: &mut LayoutBox, cb: Rect) {
 
 fn attach_images(b: &mut LayoutBox, images: &HashMap<u32, Decoded>) {
     if let BoxKind::Block(n) = b.kind {
-        if n.node.tag() == Some("img") {
+        let tag = n.node.tag();
+        if tag == Some("img") {
             if let Some(d) = images.get(&b.uid) {
                 // The image replaces the alt text.
                 b.image = Some(d.clone());
                 b.children.clear();
                 return;
             }
+        }
+        if tag == Some("svg") {
+            // Drawn as a whole, as an image; what's inside is never laid
+            // out as HTML.
+            b.image = images.get(&b.uid).cloned();
+            b.children.clear();
+            return;
         }
     }
     for c in &mut b.children {

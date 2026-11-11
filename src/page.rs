@@ -50,6 +50,9 @@ pub struct Page {
     open_select: Option<u32>,
     /// Images by URL: decoded, or `None` if they couldn't be loaded.
     images: HashMap<String, Option<Decoded>>,
+    /// Inline `<svg>` elements by node, as the `data:` addresses of their
+    /// SVG documents (keys of `images`).
+    inline_svgs: HashMap<u32, String>,
     /// Bytes of decoded pixels kept in `images`.
     image_bytes: usize,
     /// Your text size (see `StyleContext::text_scale`).
@@ -68,6 +71,8 @@ pub struct Page {
 
 /// Decoded image pixels a page may keep (the renderer has 4 GB in all).
 const MAX_IMAGE_MEMORY: usize = 512 * 1024 * 1024;
+/// Most different inline `<svg>` drawings decoded for a page.
+const MAX_INLINE_SVGS: usize = 300;
 
 /// What a click or keystroke on the page did.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -469,6 +474,7 @@ impl Page {
             caret: forms::Caret::default(),
             open_select: None,
             images: HashMap::new(),
+            inline_svgs: HashMap::new(),
             image_bytes: 0,
             text_scale: 1.0,
             title_px: 0.0,
@@ -504,7 +510,8 @@ impl Page {
             .filter_map(|n| n.element().and_then(|e| image_source(&self.url, e)))
             .collect();
         // CSS background images, after the page's own images.
-        urls.extend(self.background_urls());
+        let (backgrounds, svgs) = self.styled_scan();
+        urls.extend(backgrounds);
         for url in urls {
             if !self.policy.resource(Dest::Image, &url)
                 || self.images.contains_key(&url)
@@ -526,6 +533,32 @@ impl Page {
                 true
             });
             self.images.insert(url, decoded);
+        }
+        // Inline SVGs are part of the document: no request, and the page's
+        // image policy doesn't apply. They don't count against
+        // `MAX_IMAGES`, so a page's icons can't crowd out its pictures.
+        self.inline_svgs.clear();
+        let mut decoded_svgs = 0;
+        for (uid, url) in svgs {
+            if !self.images.contains_key(&url) {
+                if decoded_svgs >= MAX_INLINE_SVGS {
+                    continue;
+                }
+                decoded_svgs += 1;
+                let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fetch(&url, false)))
+                    .ok()
+                    .and_then(Result::ok)
+                    .filter(|d| {
+                        let n = d.bitmap.rgba.len();
+                        if self.image_bytes + n > MAX_IMAGE_MEMORY {
+                            return false;
+                        }
+                        self.image_bytes += n;
+                        true
+                    });
+                self.images.insert(url.clone(), decoded);
+            }
+            self.inline_svgs.insert(uid, url);
         }
     }
 
@@ -551,8 +584,9 @@ impl Page {
         out
     }
 
-    /// The `background-image`s the page's elements use, absolute.
-    fn background_urls(&self) -> Vec<String> {
+    /// The `background-image`s the page's elements use (absolute), and its
+    /// inline `<svg>` elements as SVG documents (by node).
+    fn styled_scan(&self) -> (Vec<String>, Vec<(u32, String)>) {
         let mut all = vec![(0u8, ua_sheet())];
         all.extend(self.sheets.iter().map(|s| (1u8, s)));
         let ctx = StyleContext {
@@ -561,34 +595,57 @@ impl Page {
             viewport: (1024.0, 768.0),
         };
         let styled = style::style_tree(&self.dom, &ctx);
-        fn walk(n: &style::StyledNode, base: &str, out: &mut Vec<String>) {
+        struct Found {
+            backgrounds: Vec<String>,
+            svgs: Vec<(u32, String)>,
+        }
+        fn walk(n: &style::StyledNode, base: &str, out: &mut Found) {
+            let shown = n.node.element().is_some() && n.style.display != style::Display::None;
             if let Some(u) = &n.style.background_image {
-                if n.node.element().is_some() && n.style.display != style::Display::None {
+                if shown {
                     let u = net::resolve(base, u);
-                    if !out.contains(&u) && out.len() < crate::network::MAX_IMAGES {
-                        out.push(u);
+                    if !out.backgrounds.contains(&u) && out.backgrounds.len() < crate::network::MAX_IMAGES {
+                        out.backgrounds.push(u);
                     }
                 }
+            }
+            if n.node.tag() == Some("svg") {
+                if shown && out.svgs.len() < MAX_INLINE_SVGS * 4 {
+                    if let Some(m) = crate::inline_svg::markup(n) {
+                        out.svgs.push((n.node.uid, crate::inline_svg::data_url(&m)));
+                    }
+                }
+                return; // an SVG inside is part of this one
             }
             for c in &n.children {
                 walk(c, base, out);
             }
         }
-        let mut out = Vec::new();
+        let mut out = Found {
+            backgrounds: Vec::new(),
+            svgs: Vec::new(),
+        };
         walk(&styled, &self.url, &mut out);
-        out
+        (out.backgrounds, out.svgs)
     }
 
     fn images_by_node(&self, tree: &Node) -> HashMap<u32, Decoded> {
         let mut imgs = Vec::new();
         tree.walk(&mut imgs, &|n| n.tag() == Some("img"));
-        imgs.iter()
+        let mut out: HashMap<u32, Decoded> = imgs
+            .iter()
             .filter_map(|n| {
                 let url = image_source(&self.url, n.element()?)?;
                 let d = self.images.get(&url)?.clone()?;
                 Some((n.uid, d))
             })
-            .collect()
+            .collect();
+        for (uid, url) in &self.inline_svgs {
+            if let Some(Some(d)) = self.images.get(url) {
+                out.insert(*uid, d.clone());
+            }
+        }
+        out
     }
 
     /// Use `dom` as the page's document: collect its stylesheets (fetching
@@ -1789,6 +1846,42 @@ mod image_tests {
             (40.0, 20.0),
             "height:auto overrides the attribute"
         );
+    }
+
+    /// Inline `<svg>` is drawn as an image: sized like one, coloured by the
+    /// page's CSS, with nothing fetched and its text not shown as HTML.
+    #[test]
+    fn inline_svg_is_drawn() {
+        let (page, asked) = load(
+            "<style>.h6{height:24px}.purple{fill:#7d2eff}</style>\
+             <svg id=a class='h6 purple' viewBox='0 0 86 24'><rect width='86' height='24'/></svg>\
+             <svg id=b width=16 height=16 viewBox='0 0 24 24' style='color:#00ff00'>\
+             <path fill='currentColor' d='M0 0h24v24H0z'/><text>label</text></svg>\
+             <svg id=c style='display:none'><rect width='5' height='5'/></svg>",
+        );
+        assert!(asked.is_empty(), "{asked:?}");
+        assert_eq!(
+            size_of(&page, "a"),
+            (86.0, 24.0),
+            "height from CSS, width from the viewBox"
+        );
+        assert_eq!(size_of(&page, "b"), (16.0, 16.0), "width and height attributes");
+        assert!(!page.dom.text_content().is_empty());
+        let r = page.render(800.0, 600.0);
+        let colours: Vec<[u8; 3]> = r
+            .list
+            .iter()
+            .filter_map(|c| match c {
+                DisplayCommand::Image { image, .. } => {
+                    let i = (image.h / 2 * image.w + image.w / 2) as usize * 4;
+                    Some([image.rgba[i], image.rgba[i + 1], image.rgba[i + 2]])
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(colours, [[0x7d, 0x2e, 0xff], [0, 255, 0]]);
+        let text: String = r.texts.iter().map(|t| t.text.as_str()).collect();
+        assert!(!text.contains("label"), "{text}");
     }
 
     #[test]

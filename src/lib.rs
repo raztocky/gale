@@ -16,6 +16,7 @@ pub mod forms;
 pub mod gradient;
 pub mod html;
 pub mod image;
+pub mod inline_svg;
 pub mod ipc;
 pub mod js;
 pub mod layout;

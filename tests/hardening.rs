@@ -16,8 +16,9 @@ fn decoder_worker_returns_validated_pixels() {
     let out = child.wait_with_output().unwrap();
     assert!(out.status.success(), "decoder worker must run without a display");
     let frame = brickle::ipc::read_frame(&mut &out.stdout[..]).unwrap().unwrap();
-    assert_eq!(&frame[..16], &[2, 0, 0, 0, 3, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0]);
-    assert_eq!(frame.len(), 16 + 2 * 3 * 4);
+    // Natural size 2×3; small SVGs are drawn at up to 4× for sharpness.
+    assert_eq!(&frame[..16], &[2, 0, 0, 0, 3, 0, 0, 0, 8, 0, 0, 0, 12, 0, 0, 0]);
+    assert_eq!(frame.len(), 16 + 8 * 12 * 4);
 }
 
 #[test]

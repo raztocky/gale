@@ -142,6 +142,8 @@ fn looks_like_svg(b: &[u8]) -> bool {
     t.starts_with("<svg") && t[4..].starts_with(|c: char| c.is_whitespace() || c == '>' || c == '/')
 }
 
+/// Small SVGs are drawn at least this many pixels across (see `decode_svg`).
+const SVG_SHARP_SIDE: u32 = 256;
 /// Largest SVG file read.
 const MAX_SVG_BYTES: usize = 4 * 1024 * 1024;
 /// Most XML nodes in an SVG.
@@ -412,7 +414,14 @@ fn decode_svg(bytes: &[u8]) -> Result<Decoded, String> {
         (size.width().ceil() as u32).clamp(1, MAX_SIDE),
         (size.height().ceil() as u32).clamp(1, MAX_SIDE),
     );
-    let (mut w, mut h) = fit(natural.0, natural.1, STORE_SIDE);
+    // Small drawings (icons, logos) are drawn with more pixels than their
+    // size, up to 4×, so they stay sharp when shown larger or zoomed.
+    let sharp = (SVG_SHARP_SIDE as f32 / natural.0.max(natural.1) as f32).clamp(1.0, 4.0);
+    let (mut w, mut h) = fit(
+        ((natural.0 as f32 * sharp) as u32).max(1),
+        ((natural.1 as f32 * sharp) as u32).max(1),
+        STORE_SIDE,
+    );
     // Each filter, clip, mask or see-through group is drawn on a layer of
     // its own, up to 25 times the canvas; many of them can take seconds
     // (found by fuzzing). Draw those smaller instead.
@@ -796,6 +805,15 @@ mod tests {
 
     const NS: &str = "xmlns='http://www.w3.org/2000/svg' xmlns:xlink='http://www.w3.org/1999/xlink'";
 
+    /// The pixel at the middle of natural-size pixel (x, y): small SVGs
+    /// are drawn with more pixels than their size.
+    fn at(d: &Decoded, x: u32, y: u32) -> [u8; 4] {
+        let bx = ((x as f32 + 0.5) * d.bitmap.w as f32 / d.natural.0 as f32) as usize;
+        let by = ((y as f32 + 0.5) * d.bitmap.h as f32 / d.natural.1 as f32) as usize;
+        let i = (by * d.bitmap.w as usize + bx) * 4;
+        d.bitmap.rgba[i..i + 4].try_into().unwrap()
+    }
+
     #[test]
     fn svg_shapes_are_drawn() {
         let svg = format!(
@@ -805,8 +823,13 @@ mod tests {
         assert_eq!(sniff(svg.as_bytes()), Some(Format::Svg));
         let d = decode(svg.as_bytes()).unwrap();
         assert_eq!(d.natural, (4, 2));
-        assert_eq!(&d.bitmap.rgba[0..4], &[255, 0, 0, 255]);
-        let blue = &d.bitmap.rgba[3 * 4..4 * 4];
+        assert_eq!(at(&d, 0, 0), [255, 0, 0, 255]);
+        assert_eq!(
+            (d.bitmap.w, d.bitmap.h),
+            (16, 8),
+            "drawn sharper than its size, up to 4×"
+        );
+        let blue = at(&d, 3, 0);
         assert_eq!((blue[0], blue[2]), (0, 255));
         assert!((120..=135).contains(&blue[3]), "{blue:?}");
         // Big drawings are drawn at the stored size, not enlarged later.
@@ -831,8 +854,8 @@ mod tests {
              <a href='https://example.com'><rect width='1' height='1' fill='lime'/></a></svg>"
         );
         let d = decode(svg.as_bytes()).unwrap();
-        assert_eq!(&d.bitmap.rgba[0..4], &[0, 255, 0, 255]);
-        assert_eq!(d.bitmap.rgba[3 * 4 + 3], 0, "nothing else drawn");
+        assert_eq!(at(&d, 0, 0), [0, 255, 0, 255]);
+        assert_eq!(at(&d, 1, 1)[3], 0, "nothing else drawn");
     }
 
     #[test]

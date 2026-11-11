@@ -7,7 +7,7 @@ Planned work, roughly in priority order. Items marked *discuss* need a decision 
 - [x] SVG images: text, in the bundled fonts
 - [ ] SVG images: drawing at the size shown rather than the SVG's own size
 - [x] Images: CSS `background-image`
-- [ ] Images: `<picture>`/`srcset` choice by size, animation, lazy loading, inline `<svg>` in HTML
+- [ ] Images: `<picture>`/`srcset` choice by size, animation, lazy loading
 - [x] Floats and positioning (`float`, `position: absolute/fixed/relative`)
 - [x] Real table layout
 - [x] Flexbox, CSS grid, `@media` queries, `aspect-ratio`, percentage heights

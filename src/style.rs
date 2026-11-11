@@ -278,6 +278,10 @@ pub struct ComputedStyle {
     /// Custom properties (`--name: value`), inherited, with any `var()`
     /// in them already substituted.
     pub vars: Rc<HashMap<String, Vec<Value>>>,
+    /// SVG `fill` and `stroke` as written (inherited), for drawing inline
+    /// `<svg>`; `currentColor` is resolved where the SVG is drawn.
+    pub fill: Option<Rc<str>>,
+    pub stroke: Option<Rc<str>>,
     pub float: Float,
     pub clear: Clear,
     /// `overflow` other than `visible`, or `display: flow-root`: the box
@@ -368,6 +372,8 @@ impl ComputedStyle {
             inset: [Len::Auto; 4],
             z_index: None,
             content: None,
+            fill: None,
+            stroke: None,
         }
     }
 
@@ -390,6 +396,8 @@ impl ComputedStyle {
         s.visible = self.visible;
         s.border_spacing = self.border_spacing;
         s.vars = self.vars.clone();
+        s.fill = self.fill.clone();
+        s.stroke = self.stroke.clone();
         s.border_collapse = self.border_collapse;
         s.display = Display::Inline;
         s
@@ -1066,7 +1074,10 @@ fn compute(
                 continue;
             }
             if (attr == "width" || attr == "height")
-                && !matches!(e.tag.as_str(), "img" | "table" | "td" | "th" | "tr" | "hr")
+                && !matches!(
+                    e.tag.as_str(),
+                    "img" | "svg" | "table" | "td" | "th" | "tr" | "hr"
+                )
             {
                 continue;
             }
@@ -1324,6 +1335,20 @@ fn compute(
                     // Columns only carry widths and backgrounds, which aren't supported yet.
                     "none" | "table-column" | "table-column-group" => Display::None,
                     _ => s.display,
+                }
+            }
+            "fill" | "stroke" if !vals.is_empty() => {
+                let text: String = vals
+                    .iter()
+                    .map(Value::to_css)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .replace(" , ", ", ");
+                let v = Some(Rc::from(text.as_str()));
+                if name == "fill" {
+                    s.fill = v;
+                } else {
+                    s.stroke = v;
                 }
             }
             "color" => {
