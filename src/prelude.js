@@ -28,6 +28,7 @@
     switch (dom.nodeType(id)) {
       case 9: return document;
       case 3: w = new Text(TOKEN); break;
+      case 8: w = new Comment(TOKEN); break;
       case 11: w = new DocumentFragment(TOKEN); break;
       default: w = new HTMLElement(TOKEN);
     }
@@ -192,6 +193,7 @@
     get nodeName() {
       switch (this.nodeType) {
         case 3: return '#text';
+        case 8: return '#comment';
         case 9: return '#document';
         case 11: return '#document-fragment';
         default: return dom.tag(idOf(this)).toUpperCase();
@@ -217,8 +219,8 @@
     get ownerDocument() { return this === document ? null : document; }
     get textContent() { return this.nodeType === 9 ? null : dom.textContent(idOf(this)); }
     set textContent(v) { dom.setTextContent(idOf(this), v === null ? '' : str(v)); }
-    get nodeValue() { return this.nodeType === 3 ? dom.textContent(idOf(this)) : null; }
-    set nodeValue(v) { if (this.nodeType === 3) dom.setTextContent(idOf(this), str(v)); }
+    get nodeValue() { const t = this.nodeType; return t === 3 || t === 8 ? dom.textContent(idOf(this)) : null; }
+    set nodeValue(v) { const t = this.nodeType; if (t === 3 || t === 8) dom.setTextContent(idOf(this), str(v)); }
     hasChildNodes() { return dom.children(idOf(this)).length > 0; }
     appendChild(c) { dom.insert(idOf(this), idOf(c), null); return c; }
     insertBefore(c, ref) { dom.insert(idOf(this), idOf(c), ref ? idOf(ref) : null); return c; }
@@ -631,7 +633,7 @@
     createElement(tag) { return wrap(dom.createElement(str(tag))); }
     createElementNS(ns, tag) { return this.createElement(str(tag).replace(/^.*:/, '')); }
     createTextNode(t) { return wrap(dom.createText(str(t))); }
-    createComment() { return wrap(dom.createText('')); }
+    createComment(t) { return wrap(dom.createComment(t === undefined ? '' : str(t))); }
     createDocumentFragment() { return wrap(dom.createElement('#fragment')); }
     createEvent() { return new Event(''); }
     createRange() {

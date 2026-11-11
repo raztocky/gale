@@ -1647,6 +1647,41 @@ mod form_script_tests {
         (page, rt.expect("scripts run"))
     }
 
+    /// React streams content in late as `<div hidden id=S:0>` and moves it
+    /// over the loading placeholder, which it finds by comment markers.
+    #[test]
+    fn scripts_see_comments_and_can_move_streamed_content() {
+        let (page, _rt) = load(
+            "<main><!--$?--><template id=B:0></template><p>Loading</p><!--/$--><i>after</i></main>\
+             <div hidden id=S:0><p>The story</p></div>\
+             <script>\
+             const b = document.getElementById('B:0'), s = document.getElementById('S:0');\
+             const start = b.previousSibling;\
+             if (start.nodeType !== 8 || start.data !== '$?' || start.nodeName !== '#comment') throw 'no marker';\
+             start.data = '$~';\
+             s.parentNode.removeChild(s);\
+             const parent = b.parentNode;\
+             let c = b;\
+             while (c) { const next = c.nextSibling;\
+               if (c.nodeType === 8 && c.data === '/$') break;\
+               parent.removeChild(c); c = next; }\
+             while (s.firstChild) parent.insertBefore(s.firstChild, c);\
+             start.data = '$';\
+             document.body.appendChild(document.createComment('made'));\
+             document.currentScript.remove();\
+             </script>",
+        );
+        let text = page.dom.text_content();
+        assert!(text.contains("The story"), "{text}");
+        assert!(!text.contains("Loading"), "{text}");
+        assert!(text.contains("after"));
+        // Comments are kept but never shown as text.
+        assert!(!text.contains('$') && !text.contains("made"), "{text}");
+        let mut out = String::new();
+        page.dom.dump(0, &mut out);
+        assert!(out.contains("<!--$-->") && out.contains("<!--made-->"), "{out}");
+    }
+
     #[test]
     fn scripts_see_typing_and_can_cancel_submission() {
         let (mut page, mut rt) = load(

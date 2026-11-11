@@ -73,6 +73,7 @@ enum Token {
     },
     End(String),
     Text(String),
+    Comment(String),
 }
 
 struct Tokenizer {
@@ -118,7 +119,15 @@ impl Tokenizer {
             if c == '<' {
                 let next = self.chars.get(self.pos + 1).copied().unwrap_or(' ');
                 if self.starts_with("<!--") {
+                    if !text.is_empty() {
+                        out.push(Token::Text(decode_entities(&std::mem::take(&mut text))));
+                    }
+                    // `<!-->` and `<!--->` are empty comments.
+                    let start = self.pos + 4;
+                    self.pos += 2;
                     self.skip_past("-->");
+                    let end = self.pos.saturating_sub(3).max(start).min(self.chars.len());
+                    out.push(Token::Comment(self.chars[start.min(end)..end].iter().collect()));
                     continue;
                 }
                 if next == '!' || next == '?' {
@@ -288,6 +297,12 @@ impl TreeBuilder {
                 } else if self.nodes < MAX_NODES {
                     self.nodes += 1;
                     parent.children.push(dom::text(t));
+                }
+            }
+            Token::Comment(c) => {
+                if self.nodes < MAX_NODES {
+                    self.nodes += 1;
+                    self.stack.last_mut().unwrap().children.push(dom::comment(c));
                 }
             }
             Token::Start {
@@ -462,6 +477,23 @@ fn named_entity(name: &str) -> Option<char> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn comments_are_kept_but_not_text() {
+        let d = parse("<p>a<!-- one -->b<!---->c<!-->d</p>");
+        let p = d.children[1].children[0].clone();
+        let kinds: Vec<String> = p
+            .children
+            .iter()
+            .map(|c| match &c.node_type {
+                crate::dom::NodeType::Text(t) => format!("t:{t}"),
+                crate::dom::NodeType::Comment(t) => format!("c:{t}"),
+                crate::dom::NodeType::Element(_) => "e".into(),
+            })
+            .collect();
+        assert_eq!(kinds, ["t:a", "c: one ", "t:b", "c:", "t:c", "c:", "t:d"]);
+        assert_eq!(p.text_content(), "abcd");
+    }
+
     use super::*;
 
     fn body(src: &str) -> String {

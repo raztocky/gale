@@ -680,6 +680,7 @@ impl<'a> StyledNode<'a> {
     pub fn display(&self) -> Display {
         match self.node.node_type {
             NodeType::Text(_) => Display::Inline,
+            NodeType::Comment(_) => Display::None,
             NodeType::Element(_) => self.style.display,
         }
     }
@@ -878,7 +879,7 @@ fn style_node<'a>(
     let id = *next_id;
     *next_id += 1;
     let style = match &node.node_type {
-        NodeType::Text(_) => text_style(parent),
+        NodeType::Text(_) | NodeType::Comment(_) => text_style(parent),
         NodeType::Element(e) => compute(
             e,
             parent,
@@ -941,6 +942,10 @@ fn style_node<'a>(
         let closed = e.tag == "details" && !e.attrs.contains_key("open");
         ancestors.push(e);
         for (i, c) in node.children.iter().enumerate() {
+            if let NodeType::Comment(_) = c.node_type {
+                *next_id += 1; // still numbered, as in `Flat`
+                continue;
+            }
             let styled = style_node(c, &style, ancestors, ctx, index, flat, next_id, false);
             if !closed || first_summary == Some(Some(i)) {
                 children.push(styled);

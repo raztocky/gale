@@ -234,7 +234,7 @@ fn run(args: Vec<String>, sandboxed: bool, filters: bool, panel: bool, js: bool)
             print!("{USAGE}");
             Ok(())
         }
-        Some("render") => render(&args[1..], sandboxed, filters),
+        Some("render") => render(&args[1..], sandboxed, network(filters)),
         Some("compat-probe") => compat_probe(&args[1..], sandboxed, filters),
         Some("security") if args.get(1).map(String::as_str) == Some("status") => {
             for line in brickle::security::report() {
@@ -494,7 +494,7 @@ fn print_log(log: &[LogEntry], page_url: &str) {
     );
 }
 
-fn render(args: &[String], sandboxed: bool, filters: bool) -> Result<(), String> {
+fn render(args: &[String], sandboxed: bool, mut net: Network) -> Result<(), String> {
     let mut url = None;
     let mut out = "out.png".to_string();
     let mut width = 1024.0f32;
@@ -512,7 +512,6 @@ fn render(args: &[String], sandboxed: bool, filters: bool) -> Result<(), String>
             u => url = Some(u.to_string()),
         }
     }
-    let mut net = network(filters);
     let mut tab = open_tab(&mut net, &url.ok_or(USAGE)?, sandboxed);
     // Follow the page's own redirects (scripts, `<meta http-equiv=refresh>`)
     // as the window does.

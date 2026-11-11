@@ -260,19 +260,28 @@ impl Dom {
         Ok(())
     }
 
+    /// A node's text: a comment's own text, or the text nodes inside.
     pub fn text_content(&self, id: u32, out: &mut String) {
         match &self.nodes[id as usize].data {
+            NodeType::Comment(c) => out.push_str(c),
+            _ => self.inner_text(id, out),
+        }
+    }
+
+    fn inner_text(&self, id: u32, out: &mut String) {
+        match &self.nodes[id as usize].data {
             NodeType::Text(t) => out.push_str(t),
+            NodeType::Comment(_) => {}
             NodeType::Element(_) => {
                 for &c in &self.nodes[id as usize].children {
-                    self.text_content(c, out);
+                    self.inner_text(c, out);
                 }
             }
         }
     }
 
     pub fn set_text_content(&mut self, id: u32, s: String) -> Result<(), &'static str> {
-        if let NodeType::Text(t) = &mut self.nodes[id as usize].data {
+        if let NodeType::Text(t) | NodeType::Comment(t) = &mut self.nodes[id as usize].data {
             *t = s;
             self.version += 1;
             return Ok(());
@@ -331,6 +340,11 @@ impl Dom {
                 } else {
                     out.push_str(&t.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;"));
                 }
+            }
+            NodeType::Comment(c) => {
+                out.push_str("<!--");
+                out.push_str(&c.replace("-->", "--&gt;"));
+                out.push_str("-->");
             }
             NodeType::Element(e) if e.tag.starts_with('#') => self.serialize_children(id, out),
             NodeType::Element(e) => {
@@ -565,6 +579,7 @@ fn n_node_type(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue>
     let id = arg_id(a, 0, c)?;
     Ok(with(|s| match &s.dom.nodes[id as usize].data {
         NodeType::Text(_) => 3,
+        NodeType::Comment(_) => 8,
         NodeType::Element(e) if e.tag == "#document" => 9,
         NodeType::Element(e) if e.tag == FRAGMENT_TAG => 11,
         NodeType::Element(_) => 1,
@@ -680,6 +695,12 @@ fn n_create_element(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsV
 fn n_create_text(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
     let text = arg_str(a, 0, c)?;
     let id = with(|s| s.dom.new_node(NodeType::Text(text))).map_err(dom_error)?;
+    Ok(id.into())
+}
+
+fn n_create_comment(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let text = arg_str(a, 0, c)?;
+    let id = with(|s| s.dom.new_node(NodeType::Comment(text))).map_err(dom_error)?;
     Ok(id.into())
 }
 
@@ -1056,6 +1077,7 @@ const NATIVES: &[(&str, Native, usize)] = &[
     ("attrNames", n_attr_names, 1),
     ("createElement", n_create_element, 1),
     ("createText", n_create_text, 1),
+    ("createComment", n_create_comment, 1),
     ("insert", n_insert, 3),
     ("remove", n_remove, 1),
     ("clone", n_clone, 2),

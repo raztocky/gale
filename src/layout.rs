@@ -366,6 +366,7 @@ fn flatten_inline<'a>(node: &'a StyledNode<'a>, anon: &mut LayoutBox<'a>, bg: Co
                 },
             );
         }
+        NodeType::Comment(_) => {}
         NodeType::Element(e) => {
             if node.display() == Display::None {
                 return;
@@ -551,6 +552,7 @@ fn build_cell<'a>(
 ) -> Option<LayoutBox<'a>> {
     match &child.node.node_type {
         NodeType::Text(t) if is_collapsible_ws(t) => None,
+        NodeType::Comment(_) => None,
         NodeType::Text(_) => {
             let mut a = LayoutBox::new(BoxKind::Anonymous {
                 items: Vec::new(),

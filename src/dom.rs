@@ -17,6 +17,9 @@ pub struct Node {
 pub enum NodeType {
     Text(String),
     Element(ElementData),
+    /// `<!-- … -->`: never drawn, but kept for scripts (React marks where
+    /// its streamed-in content goes with comments).
+    Comment(String),
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +50,14 @@ pub fn text(data: String) -> Node {
     Node {
         children: Vec::new(),
         node_type: NodeType::Text(data),
+        uid: 0,
+    }
+}
+
+pub fn comment(data: String) -> Node {
+    Node {
+        children: Vec::new(),
+        node_type: NodeType::Comment(data),
         uid: 0,
     }
 }
@@ -85,6 +96,7 @@ impl Node {
     pub fn text_content(&self) -> String {
         match &self.node_type {
             NodeType::Text(t) => t.clone(),
+            NodeType::Comment(_) => String::new(),
             NodeType::Element(_) => self.children.iter().map(|c| c.text_content()).collect(),
         }
     }
@@ -99,6 +111,7 @@ impl Node {
                     out.push_str(&format!("{pad}\"{t}\"\n"));
                 }
             }
+            NodeType::Comment(c) => out.push_str(&format!("{pad}<!--{c}-->\n")),
             NodeType::Element(e) => {
                 let mut attrs: Vec<_> = e.attrs.iter().collect();
                 attrs.sort();
