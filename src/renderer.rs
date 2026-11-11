@@ -253,6 +253,9 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
             | ToRenderer::Scroll { .. }) => {
                 let p = page.as_mut().ok_or("input before load")?;
                 let until = Instant::now() + js::EVENT_BUDGET;
+                if let Some(r) = rt.as_mut() {
+                    r.set_deadline(Some(until));
+                }
                 let before = rt.as_ref().map(|r| r.version());
                 let mut done = match msg {
                     ToRenderer::Click { x, y } => p.click_at(rt.as_mut(), x, y, until),
@@ -288,6 +291,9 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                     navigate = rt.take_navigate();
                     console = rt.take_console();
                     read = rt.take_read();
+                }
+                if let Some(r) = rt.as_mut() {
+                    r.set_deadline(None);
                 }
                 send(
                     output,

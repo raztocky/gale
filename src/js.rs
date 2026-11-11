@@ -484,6 +484,74 @@ struct State {
 
 thread_local! {
     static STATE: RefCell<State> = RefCell::new(State::default());
+    /// When the running scripts' time is up (see [`Runtime::set_deadline`]).
+    static DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    /// Whether the console says so yet.
+    static STOP_NOTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Most promise callbacks run in one go (a promise chain that never ends
+/// stops here even with no deadline).
+const MAX_JOBS: usize = 1_000_000;
+
+/// Promise callbacks (microtasks), run in order with the deadline checked
+/// between them: a framework starting up through a long promise chain
+/// stops when its time is up instead of running past the browser's hard
+/// limit. Brickle runs timers itself, so Boa's timer jobs are never used.
+#[derive(Default)]
+struct Jobs {
+    promise: RefCell<std::collections::VecDeque<boa_engine::job::PromiseJob>>,
+    generic: RefCell<std::collections::VecDeque<boa_engine::job::GenericJob>>,
+}
+
+impl boa_engine::job::JobExecutor for Jobs {
+    fn enqueue_job(self: Rc<Self>, job: boa_engine::job::Job, _: &mut Context) {
+        match job {
+            boa_engine::job::Job::PromiseJob(p) => self.promise.borrow_mut().push_back(p),
+            boa_engine::job::Job::GenericJob(g) => self.generic.borrow_mut().push_back(g),
+            _ => {}
+        }
+    }
+
+    fn run_jobs(self: Rc<Self>, context: &mut Context) -> JsResult<()> {
+        for _ in 0..MAX_JOBS {
+            if check_deadline().is_err() {
+                break;
+            }
+            let next = self.promise.borrow_mut().pop_front();
+            if let Some(job) = next {
+                let _ = job.call(context);
+                continue;
+            }
+            let next = self.generic.borrow_mut().pop_front();
+            match next {
+                Some(job) => {
+                    let _ = job.call(context);
+                }
+                None => return Ok(()),
+            }
+        }
+        // Out of time (or callbacks): the rest never run.
+        self.promise.borrow_mut().clear();
+        self.generic.borrow_mut().clear();
+        Ok(())
+    }
+}
+
+/// Every native call checks the deadline: a long task (a framework
+/// starting up) is stopped once its time is up, with an error the page
+/// can't catch, instead of running past the browser's hard limit and
+/// losing the whole renderer.
+fn check_deadline() -> JsResult<()> {
+    match DEADLINE.with(std::cell::Cell::get) {
+        Some(t) if Instant::now() >= t => {
+            if !STOP_NOTED.with(|n| n.replace(true)) {
+                with(|s| push_console(s, "[brickle] a script ran out of time and was stopped".into()));
+            }
+            Err(boa_engine::error::RuntimeLimitError::LoopIteration.into())
+        }
+        _ => Ok(()),
+    }
 }
 
 fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
@@ -1206,6 +1274,7 @@ impl Runtime {
         });
         let mut ctx = Context::builder()
             .host_hooks(Rc::new(Hooks))
+            .job_executor(Rc::new(Jobs::default()))
             .build()
             .map_err(|e| format!("can't start JavaScript: {e}"))?;
         {
@@ -1215,7 +1284,12 @@ impl Runtime {
         }
         let mut obj = ObjectInitializer::new(&mut ctx);
         for (name, f, len) in NATIVES {
-            obj.function(NativeFunction::from_fn_ptr(*f), js_string!(*name), *len);
+            let f: Native = *f;
+            let checked = NativeFunction::from_copy_closure(move |this, args, ctx| {
+                check_deadline()?;
+                f(this, args, ctx)
+            });
+            obj.function(checked, js_string!(*name), *len);
         }
         let (vw, vh) = rounded_viewport(viewport.0, viewport.1);
         obj.property(
@@ -1287,6 +1361,13 @@ impl Runtime {
             with(|s| push_console(s, format!("[error] {name}: {msg}")));
         }
         self.call(&f, &[JsValue::undefined(), (-1).into()]);
+    }
+
+    /// Stop scripts that are still running at `until` (None: no limit
+    /// beyond the loop and recursion limits).
+    pub fn set_deadline(&mut self, until: Option<Instant>) {
+        DEADLINE.with(|d| d.set(until));
+        STOP_NOTED.with(|n| n.set(false));
     }
 
     /// Run due timers, up to the batch limits or `until`.
@@ -1558,6 +1639,55 @@ mod tests {
         let mut out = String::new();
         rt.tree().dump(0, &mut out);
         (rt, out)
+    }
+
+    /// A page's Promise polyfill built on queueMicrotask (as Yahoo's is)
+    /// mustn't loop through Brickle's queueMicrotask forever.
+    #[test]
+    fn queue_microtask_survives_a_promise_polyfill() {
+        let (_, out) = run(
+            "<p id=p></p>",
+            "const Native = Promise;\
+             globalThis.Promise = function (f) { const p = new Native(f); return p; };\
+             Promise.resolve = (v) => { queueMicrotask(() => {}); return Native.resolve(v); };\
+             queueMicrotask(() => { document.getElementById('p').textContent = 'ran'; });",
+        );
+        assert!(out.contains("\"ran\""), "{out}");
+    }
+
+    /// Waiting for time to pass (as schedulers do) finishes: each look at
+    /// the clock moves it on a little.
+    #[test]
+    fn performance_now_moves_on() {
+        let (_, out) = run(
+            "<p id=p></p>",
+            "const end = performance.now() + 50; let n = 0;\
+             while (performance.now() < end) n++;\
+             document.getElementById('p').textContent = 'waited ' + (n > 0);",
+        );
+        assert!(out.contains("waited true"), "{out}");
+    }
+
+    /// A promise chain that never ends stops at the deadline, keeping what
+    /// the scripts did before it.
+    #[test]
+    fn endless_promise_chains_stop_at_the_deadline() {
+        let tree = crate::html::parse("<p id=p></p>");
+        let mut rt = Runtime::new(&tree, "https://example.com/", (1000.0, 700.0)).unwrap();
+        let start = Instant::now();
+        rt.set_deadline(Some(start + Duration::from_millis(300)));
+        rt.run_script(
+            "document.getElementById('p').textContent = 'before';\
+             (function f() { Promise.resolve().then(f); })();",
+            0,
+            "test",
+        );
+        rt.set_deadline(None);
+        assert!(start.elapsed() < Duration::from_secs(3), "{:?}", start.elapsed());
+        let mut out = String::new();
+        rt.tree().dump(0, &mut out);
+        assert!(out.contains("before"), "{out}");
+        assert!(rt.take_console().iter().any(|l| l.contains("ran out of time")));
     }
 
     #[test]

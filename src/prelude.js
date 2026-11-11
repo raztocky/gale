@@ -5,6 +5,10 @@
 (function (dom) {
   'use strict';
   const G = globalThis;
+  // The engine's own promises, kept before page scripts run: a page's
+  // Promise polyfill may itself be built on queueMicrotask.
+  const nativeResolved = Promise.resolve();
+  const nativeThen = Promise.prototype.then;
   const ids = new WeakMap();        // wrapper -> node id
   const wrappers = new Map();       // node id -> wrapper
   const listeners = new WeakMap();  // target -> Map(type -> [{fn, capture, once}])
@@ -766,6 +770,11 @@
   // A virtual clock: callbacks run in due order, in bounded batches driven
   // by the renderer, without real waiting.
   let clock = 0;
+  // Each look at the clock moves it on a little (no real time is shown),
+  // so code that waits for time to pass, like a framework's scheduler
+  // deciding when to yield, finishes instead of spinning forever.
+  const CLOCK_STEP = 0.05;
+  const now = () => (clock += CLOCK_STEP);
   let timerSeq = 0;
   const timers = new Map(); // id -> {due, fn, args, every}
   function addTimer(fn, ms, args, every) {
@@ -848,7 +857,7 @@
   });
 
   const performance = {
-    now: () => clock,
+    now,
     timeOrigin: Date.now(),
     mark() {}, measure() {}, clearMarks() {}, clearMeasures() {},
     getEntries: () => [], getEntriesByName: () => [], getEntriesByType: () => [],
@@ -1259,7 +1268,7 @@
     cancelAnimationFrame: (id) => { timers.delete(id); },
     requestIdleCallback: (fn) => addTimer(() => fn({ didTimeout: false, timeRemaining: () => 10 }), 1, [], false),
     cancelIdleCallback: (id) => { timers.delete(id); },
-    queueMicrotask: (fn) => { Promise.resolve().then(fn); },
+    queueMicrotask: (fn) => { nativeThen.call(nativeResolved, () => fn()); },
     fetch, Headers, Request, Response, AbortController, AbortSignal, FormData, TextEncoder, TextDecoder,
     btoa, atob,
     // Plain elements: setting src requests nothing until the image is put

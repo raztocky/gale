@@ -412,6 +412,7 @@ impl Page {
         rt.set_cookies(host.cookies());
         rt.set_csp(policy.clone());
         let until = Instant::now() + js::LOAD_BUDGET;
+        rt.set_deadline(Some(until));
         let mut loader = ScriptLoader {
             fetched: 0,
             until,
@@ -432,6 +433,7 @@ impl Page {
             pump(&mut rt, host, until);
         }
         loader.run_pending(&mut rt, host);
+        rt.set_deadline(None);
         let mut page = Page::empty(url, blocker_css, true);
         page.policy = policy;
         page.sheet_cache = first.sheet_cache;

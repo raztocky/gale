@@ -73,6 +73,10 @@ what's next:
   shared with CSS.
 - [ ] `MutationObserver` callbacks; `getComputedStyle` beyond inline styles.
 - [ ] Faster startup for the JS fuzzer (snapshot the prelude).
+- [ ] Big framework apps that don't finish starting in time with Boa (yahoo.com's React app
+  takes over 10 s; its feed stays as placeholders). The 32-script limit happens to keep it
+  from starting; a long script is now stopped at the time budget instead of the renderer
+  being killed.
 
 ## Forms
 
