@@ -572,7 +572,7 @@ const MAX_SELECTOR_NESTING: usize = 8;
 /// Most selectors in one list (a rule's, or a `:is()`'s).
 const MAX_SELECTOR_LIST: usize = 256;
 /// Most rules kept from one stylesheet.
-pub const MAX_RULES: usize = 5_000;
+pub const MAX_RULES: usize = 20_000;
 
 pub fn parse(source: &str) -> Stylesheet {
     let src = strip_comments(source);
@@ -635,6 +635,10 @@ impl Parser {
                 } else if c == '\\' {
                     self.pos += 1;
                 }
+            } else if c == '\\' {
+                // An escaped character (`\'` in a Tailwind class name) is
+                // never a quote, bracket or stop.
+                self.pos += 1;
             } else if c == '"' || c == '\'' {
                 quote = Some(c);
             } else if c == '(' || c == '[' {
@@ -655,7 +659,9 @@ impl Parser {
         let mut depth = 0;
         while let Some(c) = self.peek() {
             self.pos += 1;
-            if c == '{' {
+            if c == '\\' {
+                self.pos = (self.pos + 1).min(self.chars.len());
+            } else if c == '{' {
                 depth += 1;
             } else if c == '}' {
                 depth -= 1;
@@ -817,8 +823,13 @@ fn background_size(value: &str) -> Option<(String, String)> {
 pub fn split_selector_list(text: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let (mut depth, mut start, mut quote) = (0i32, 0, None);
+    let mut escaped = false;
     for (i, c) in text.char_indices() {
+        if std::mem::take(&mut escaped) {
+            continue;
+        }
         match (c, quote) {
+            ('\\', _) => escaped = true,
             ('"' | '\'', None) => quote = Some(c),
             (q, Some(open)) if q == open => quote = None,
             (_, Some(_)) => {}
@@ -1463,6 +1474,36 @@ fn named_color(name: &str) -> Option<Color> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tailwind escapes quotes and brackets in class names; an escaped
+    /// quote used to open a string that swallowed the rest of the sheet.
+    #[test]
+    fn escaped_quotes_in_selectors_dont_end_the_sheet() {
+        let sheet = parse(
+            ".bg-\\[url\\(\\'a\\.png\\'\\)\\]{background-image:url(a.png)}\
+             .x\\{y{color:red}\
+             @media (min-width:10px){.lg\\:block{display:block}}\
+             .after{color:blue}",
+        );
+        let classes: Vec<String> = sheet
+            .rules
+            .iter()
+            .flat_map(|r| {
+                r.selectors
+                    .iter()
+                    .flat_map(|s| s.parts.iter().flat_map(|p| p.0.classes.clone()))
+            })
+            .collect();
+        assert_eq!(classes, ["bg-[url('a.png')]", "x{y", "lg:block", "after"]);
+        assert_eq!(split_selector_list(".a\\,b, .c").len(), 2);
+    }
+
+    /// Big Tailwind sheets (yahoo.com's has about 6,000 rules) are read whole.
+    #[test]
+    fn big_sheets_are_read_whole() {
+        let css: String = (0..8000).map(|i| format!(".c{i}{{color:red}}")).collect();
+        assert_eq!(parse(&css).rules.len(), 8000);
+    }
 
     #[test]
     fn escaped_names() {

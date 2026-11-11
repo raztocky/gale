@@ -1764,7 +1764,7 @@ fn align(kw: &str) -> Option<Align> {
 /// Most custom properties per element, values per substituted property,
 /// and characters per `var()` expansion: nesting variables in variables
 /// can't make values blow up.
-const MAX_VARS: usize = 1024;
+const MAX_VARS: usize = 4096;
 const MAX_VAR_VALUES: usize = 1024;
 const MAX_VAR_TEXT: usize = 16 * 1024;
 
