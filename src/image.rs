@@ -231,6 +231,77 @@ fn svg_expanded_size(doc: &roxmltree::Document) -> Option<u64> {
     cost.get(&doc.root_element().id()).copied()
 }
 
+/// Most layer pixels an SVG may take to draw, counting each pass over a
+/// layer (a filter step counts as [`FILTER_STEP_PASSES`]): about a
+/// quarter of a second.
+const MAX_SVG_LAYER_WORK: u64 = 8 * STORE_SIDE as u64 * STORE_SIDE as u64;
+/// What one filter step costs, in plain passes over its layer: colour
+/// conversions, copies and the step itself (a blur alone is six).
+const FILTER_STEP_PASSES: u64 = 16;
+
+/// About how many layer pixels drawing `root` at scale `sx`×`sy` onto a
+/// `w`×`h` canvas takes. resvg gives each filter, clip, mask or
+/// see-through group a layer of its own, kept within twice the canvas size
+/// past each edge; a filter's layer is its whole filter region, drawn
+/// unrotated. Stops counting once well past the limit.
+fn svg_layer_work(root: &usvg::Group, sx: f32, sy: f32, w: u32, h: u32) -> u64 {
+    let (w, h) = (w as f32, h as f32);
+    let px = |a: f32, b: f32| ((a.max(0.0) + 4.0) * (b.max(0.0) + 4.0)) as u64;
+    let canvas_area = |r: usvg::Rect| -> u64 {
+        let l = (r.left() * sx).max(-2.0 * w);
+        let t = (r.top() * sy).max(-2.0 * h);
+        let rt = (r.right() * sx).min(3.0 * w);
+        let b = (r.bottom() * sy).min(3.0 * h);
+        px(rt - l, b - t)
+    };
+    // The limit box, turned to any angle, is no wider than this.
+    let reach = 5.0 * (w + h);
+    let cap = MAX_SVG_LAYER_WORK.saturating_mul(4);
+    let mut total = 0u64;
+    let mut stack = vec![root];
+    while let Some(g) = stack.pop() {
+        if total > cap {
+            break;
+        }
+        for n in g.children() {
+            if let usvg::Node::Group(c) = n {
+                stack.push(c);
+            }
+        }
+        if !g.should_isolate() {
+            continue;
+        }
+        let area = if g.filters().is_empty() {
+            canvas_area(g.abs_layer_bounding_box().to_rect())
+        } else {
+            let t = g.abs_transform();
+            let r = g.layer_bounding_box();
+            let rw = r.width() * t.sx.hypot(t.ky) * sx;
+            let rh = r.height() * t.kx.hypot(t.sy) * sy;
+            let fin = |v: f32| if v.is_finite() { v.min(reach) } else { reach };
+            px(fin(rw), fin(rh))
+        };
+        let mut passes: u64 = 2; // drawing the layer, then copying it down
+        for f in g.filters() {
+            passes += (f.primitives().len() as u64 + 1) * FILTER_STEP_PASSES;
+        }
+        let mut clip = g.clip_path();
+        while let Some(c) = clip {
+            passes += 2;
+            stack.push(c.root());
+            clip = c.clip_path();
+        }
+        let mut mask = g.mask();
+        while let Some(m) = mask {
+            passes += 3;
+            stack.push(m.root());
+            mask = m.mask();
+        }
+        total = total.saturating_add(area.saturating_mul(passes));
+    }
+    total
+}
+
 /// Brickle's fonts for SVG text (loaded on first use), and their ids by
 /// [`font::index_of`] index.
 type SvgFonts = (Arc<usvg::fontdb::Database>, Vec<Option<usvg::fontdb::ID>>);
@@ -341,7 +412,20 @@ fn decode_svg(bytes: &[u8]) -> Result<Decoded, String> {
         (size.width().ceil() as u32).clamp(1, MAX_SIDE),
         (size.height().ceil() as u32).clamp(1, MAX_SIDE),
     );
-    let (w, h) = fit(natural.0, natural.1, STORE_SIDE);
+    let (mut w, mut h) = fit(natural.0, natural.1, STORE_SIDE);
+    // Each filter, clip, mask or see-through group is drawn on a layer of
+    // its own, up to 25 times the canvas; many of them can take seconds
+    // (found by fuzzing). Draw those smaller instead.
+    // (Work shrinks a little slower than the area, so check again.)
+    for _ in 0..4 {
+        let work = svg_layer_work(root, w as f32 / size.width(), h as f32 / size.height(), w, h);
+        if work <= MAX_SVG_LAYER_WORK {
+            break;
+        }
+        let k = (MAX_SVG_LAYER_WORK as f64 / work as f64).sqrt() * 0.95;
+        w = ((w as f64 * k) as u32).max(1);
+        h = ((h as f64 * k) as u32).max(1);
+    }
     check_size(w, h)?;
     let mut pixmap = tiny_skia::Pixmap::new(w, h).ok_or("SVG: can't make a canvas")?;
     let transform = tiny_skia::Transform::from_scale(w as f32 / size.width(), h as f32 / size.height());
@@ -771,6 +855,40 @@ mod tests {
         // and an unknown family is serif, as in browsers.
         assert!(courier > arial, "{courier} vs {arial}");
         assert!(unknown > 20 && unknown != arial, "{unknown}");
+    }
+
+    #[test]
+    fn heavy_svg_filters_are_drawn_smaller() {
+        // Eight blurred copies of a tall path on a wide canvas: each blur
+        // works on a layer many times the canvas, which took over five
+        // seconds (found by fuzzing). It's drawn smaller instead.
+        let mut s = format!(
+            "<svg {NS} width='1616' viewBox='5 5 15 6'><defs><filter id='f'><feGaussianBlur stdDeviation='.5'/>\
+             </filter><path id='p' d='M2 12 Q8 24 1 82 Z'/></defs>"
+        );
+        for i in 0..8 {
+            s.push_str(&format!(
+                "<use href='#p' stroke='#000' filter='url(#f)' transform='rotate({} 8 8)'/>",
+                i * 10
+            ));
+        }
+        s.push_str("</svg>");
+        let start = std::time::Instant::now();
+        let d = decode(s.as_bytes()).unwrap();
+        let took = start.elapsed();
+        assert_eq!(d.natural, (1616, 647));
+        assert!(d.bitmap.w < 1616 / 2 && d.bitmap.w > 100, "{}", d.bitmap.w);
+        assert_eq!(d.bitmap.rgba.len(), d.bitmap.w as usize * d.bitmap.h as usize * 4);
+        // (Generous: debug builds are slow.)
+        assert!(took < std::time::Duration::from_secs(20), "{took:?}");
+        // An ordinary blurred drawing is drawn at full size.
+        let icon = format!(
+            "<svg {NS} width='512' height='512' viewBox='0 0 16 16'><defs><filter id='f'>\
+             <feGaussianBlur stdDeviation='.5'/></filter></defs>\
+             <circle cx='8' cy='8' r='6' filter='url(#f)'/><rect width='9' height='9' opacity='.5'/></svg>"
+        );
+        let d = decode(icon.as_bytes()).unwrap();
+        assert_eq!((d.bitmap.w, d.bitmap.h), (512, 512));
     }
 
     #[test]
