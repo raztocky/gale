@@ -318,6 +318,7 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                         focus: done.focus,
                         copied: done.copied,
                         read,
+                        invalid: done.invalid,
                     },
                 )?;
             }

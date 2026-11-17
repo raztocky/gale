@@ -146,6 +146,9 @@ pub enum FromRenderer {
         copied: Option<String>,
         /// As in `Loaded`.
         read: Vec<String>,
+        /// A form wasn't sent: what's wrong with a field (the browser
+        /// shows it, shortened, as plain text).
+        invalid: Option<String>,
     },
 }
 
@@ -706,6 +709,7 @@ impl FromRenderer {
                 focus,
                 copied,
                 read,
+                invalid,
             } => {
                 e.u8(5);
                 e.u8(*prevented as u8);
@@ -725,6 +729,7 @@ impl FromRenderer {
                 e.u8(*focus as u8);
                 e.opt_str(copied);
                 e.strs(read);
+                e.opt_str(invalid);
             }
             FromRenderer::Rendered(r) => {
                 e.u8(3);
@@ -919,6 +924,7 @@ impl FromRenderer {
                 focus: d.bool()?,
                 copied: d.opt_str()?,
                 read: d.strs(MAX_READ)?,
+                invalid: d.opt_str()?,
             },
             3 => {
                 let height = d.f32()?.max(0.0);
@@ -1296,6 +1302,7 @@ mod tests {
                 focus: true,
                 copied: Some("copied text".into()),
                 read: vec![],
+                invalid: Some("Please fill out this field.".into()),
             },
             FromRenderer::Clicked {
                 prevented: false,
@@ -1311,6 +1318,7 @@ mod tests {
                 focus: false,
                 copied: None,
                 read: vec!["screen.width".into()],
+                invalid: None,
             },
             FromRenderer::Rendered(sample()),
             FromRenderer::Dom("<html>".into()),

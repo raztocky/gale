@@ -902,6 +902,10 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                         "Couldn't reach the clipboard".into()
                     });
                 }
+                // Labelled as the form's: pages can write their own message.
+                if let Some(m) = &click.invalid {
+                    ui.flash = Some(format!("Form not sent: {m}"));
+                }
                 if let Some(sub) = &click.submit {
                     submitted = Some(sub.clone());
                 } else if let Some(to) = &click.navigate {

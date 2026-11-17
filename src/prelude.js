@@ -554,6 +554,8 @@
     submit() { if (this.localName === 'form') dom.submit(idOf(this), null); }
     requestSubmit(submitter) {
       if (this.localName !== 'form') return;
+      const skip = this.noValidate || (submitter && submitter.hasAttribute('formnovalidate'));
+      if (!skip && !this.reportValidity()) return;
       const ev = new Event('submit', { bubbles: true, cancelable: true });
       ev.submitter = submitter || null;
       if (dispatchOn(this, ev)) dom.submit(idOf(this), submitter ? idOf(submitter) : null);
@@ -568,10 +570,43 @@
     get text() { return this.textContent; }
     set text(v) { this.textContent = v; }
     get labels() { return []; }
-    get validity() { return { valid: true }; }
-    checkValidity() { return true; }
-    reportValidity() { return true; }
-    setCustomValidity() {}
+    // Form validation, answered by the renderer (src/validate.rs).
+    get validity() {
+      const r = dom.validity(idOf(this));
+      const keys = ['valueMissing', 'typeMismatch', 'patternMismatch', 'tooLong', 'tooShort',
+        'rangeUnderflow', 'rangeOverflow', 'stepMismatch', 'badInput', 'customError'];
+      const v = {};
+      keys.forEach((k, i) => { v[k] = r[i]; });
+      v.valid = r[11] === '';
+      return Object.freeze(v);
+    }
+    get willValidate() { return dom.validity(idOf(this))[10]; }
+    get validationMessage() { return dom.validity(idOf(this))[11]; }
+    setCustomValidity(message) { dom.setCustomValidity(idOf(this), str(message)); }
+    get noValidate() { return this.hasAttribute('novalidate'); }
+    set noValidate(v) { if (v) this.setAttribute('novalidate', ''); else this.removeAttribute('novalidate'); }
+    // Fires `invalid` at each bad field; true when all are fine.
+    checkValidity() {
+      const fields = this.localName === 'form' ? Array.from(this.elements) : [this];
+      let ok = true;
+      for (const f of fields) {
+        if (dom.validity(idOf(f))[11] !== '') {
+          ok = false;
+          dispatchOn(f, new Event('invalid', { cancelable: true }));
+        }
+      }
+      return ok;
+    }
+    // As checkValidity, and the first bad field gets the keyboard.
+    reportValidity() {
+      const ok = this.checkValidity();
+      if (!ok) {
+        const fields = this.localName === 'form' ? Array.from(this.elements) : [this];
+        const first = fields.find((f) => dom.validity(idOf(f))[11] !== '');
+        if (first && typeof first.focus === 'function') first.focus();
+      }
+      return ok;
+    }
   }
   for (const [n, a, k] of [['hidden', 'hidden', 'bool'], ['href', 'href', 'url'], ['src', 'src', 'url'],
     ['action', 'action', 'url'], ['alt'], ['type'], ['name'], ['rel'], ['target'], ['lang'], ['dir'],

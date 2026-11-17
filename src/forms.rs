@@ -63,11 +63,11 @@ pub fn control(e: &ElementData) -> Option<Control> {
     })
 }
 
-fn kind(dom: &Dom, id: u32) -> Option<Control> {
+pub(crate) fn kind(dom: &Dom, id: u32) -> Option<Control> {
     dom.element(id).and_then(control)
 }
 
-fn disabled(dom: &Dom, id: u32) -> bool {
+pub(crate) fn disabled(dom: &Dom, id: u32) -> bool {
     dom.element(id).is_some_and(|e| e.attrs.contains_key("disabled"))
 }
 
@@ -122,7 +122,7 @@ pub fn form_of(dom: &Dom, id: u32) -> Option<u32> {
 }
 
 /// Controls of a form, in document order.
-fn controls(dom: &Dom, form: u32) -> Vec<u32> {
+pub(crate) fn controls(dom: &Dom, form: u32) -> Vec<u32> {
     let mut all = Vec::new();
     dom.descendants(0, &mut all);
     all.into_iter()
@@ -252,6 +252,69 @@ pub fn activate(dom: &mut Dom, id: u32) -> Activation {
         },
         _ => Activation::Nothing,
     }
+}
+
+/// An `<input type=number>` (that you can change).
+pub fn is_number(dom: &Dom, id: u32) -> bool {
+    dom.element(id).is_some_and(|e| {
+        e.tag == "input"
+            && e.attrs
+                .get("type")
+                .is_some_and(|t| t.trim().eq_ignore_ascii_case("number"))
+            && !e.attrs.contains_key("readonly")
+    }) && !disabled(dom, id)
+}
+
+/// Step a number field up or down by its `step` (1 by default), staying
+/// within `min` and `max` and on the steps counted from `min`. Returns
+/// whether the value changed.
+pub fn step_number(dom: &mut Dom, id: u32, up: bool) -> bool {
+    let attr = |n: &str| {
+        dom.element(id)
+            .and_then(|e| e.attrs.get(n))
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+    };
+    let (min, max) = (attr("min"), attr("max"));
+    let step = crate::validate::step_of(dom, id).unwrap_or(1.0);
+    let base = min.unwrap_or(0.0);
+    let current = value(dom, id)
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite());
+    let mut next = match current {
+        // Onto the next step in that direction (off-step values snap).
+        Some(v) => {
+            let k = (v - base) / step;
+            let k = if up {
+                (k + 1e-9).floor() + 1.0
+            } else {
+                (k - 1e-9).ceil() - 1.0
+            };
+            base + k * step
+        }
+        None => min.filter(|_| up).or(max.filter(|_| !up)).unwrap_or(0.0),
+    };
+    if let Some(lo) = min {
+        next = next.max(lo);
+    }
+    if let Some(hi) = max {
+        next = next.min(hi);
+    }
+    let text = {
+        let r = (next * 1e9).round() / 1e9;
+        if r == r.trunc() && r.abs() < 1e15 {
+            format!("{}", r as i64)
+        } else {
+            format!("{r}")
+        }
+    };
+    if Some(next) == current {
+        return false;
+    }
+    set_value(dom, id, &text);
+    true
 }
 
 /// A click on (or in) a `<details>` element's summary opens or closes it.

@@ -89,7 +89,8 @@ selects (with a drop-down), buttons, labels, Tab between fields, Enter to submit
 - [x] Moving the caret, selecting text in a field, copy, cut and paste.
 - [ ] Placing the caret and selecting in a field with the mouse.
 - [ ] File uploads (`<input type=file>`).
-- [ ] Form validation (`required`, `pattern`), `<input type=number>` steppers, date pickers.
+- [x] Form validation before sending (`required`, `type=email`/`url`, `pattern`, `minlength`/`maxlength`, `min`/`max`/`step`, `novalidate`), with `checkValidity()`, `setCustomValidity()` and `validity` for scripts; arrow keys step number fields.
+- [ ] Date and colour pickers; `:invalid`/`:valid` in CSS.
 - [x] Ask before re-sending a POST on reload, back or forward (a page reached by a redirect after the POST reloads freely, as in Firefox).
 
 ## Tabs

@@ -274,6 +274,7 @@ dependencies = [
  "nix",
  "png",
  "psl",
+ "regress",
  "resvg",
  "ring",
  "rlimit",

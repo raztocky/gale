@@ -36,3 +36,4 @@ pub mod srcset;
 pub mod style;
 pub mod tab;
 pub mod urlclean;
+pub mod validate;

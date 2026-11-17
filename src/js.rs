@@ -486,6 +486,8 @@ struct State {
     viewport: (f32, f32),
     /// Computed styles by node, for the DOM version they were made for.
     computed: Option<(u64, ComputedMap)>,
+    /// `setCustomValidity()` messages, by form field.
+    custom_validity: std::collections::HashMap<u32, String>,
 }
 
 thread_local! {
@@ -932,6 +934,59 @@ fn n_computed(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> 
     })))
 }
 
+/// Longest `setCustomValidity()` message kept.
+const MAX_VALIDITY_MESSAGE: usize = 1024;
+
+fn n_set_custom_validity(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let id = arg_id(a, 0, c)?;
+    let mut msg = arg_str(a, 1, c)?;
+    if msg.len() > MAX_VALIDITY_MESSAGE {
+        let mut end = MAX_VALIDITY_MESSAGE;
+        while !msg.is_char_boundary(end) {
+            end -= 1;
+        }
+        msg.truncate(end);
+    }
+    with(|s| {
+        if msg.is_empty() {
+            s.custom_validity.remove(&id);
+        } else {
+            s.custom_validity.insert(id, msg);
+        }
+    });
+    Ok(JsValue::undefined())
+}
+
+/// A field's `ValidityState` flags, whether it's validated at all, and
+/// its message: `[valueMissing, typeMismatch, patternMismatch, tooLong,
+/// tooShort, rangeUnderflow, rangeOverflow, stepMismatch, badInput,
+/// customError, willValidate, message]`.
+fn n_validity(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let id = arg_id(a, 0, c)?;
+    let (v, will) = with(|s| {
+        (
+            crate::validate::validity(&s.dom, id, &s.custom_validity),
+            crate::validate::will_validate(&s.dom, id),
+        )
+    });
+    let flags = [
+        v.value_missing,
+        v.type_mismatch,
+        v.pattern_mismatch,
+        v.too_long,
+        v.too_short,
+        v.range_underflow,
+        v.range_overflow,
+        v.step_mismatch,
+        v.bad_input,
+        v.custom_error,
+        will,
+    ];
+    let mut items: Vec<JsValue> = flags.iter().map(|&f| JsValue::from(f)).collect();
+    items.push(js_string!(v.message).into());
+    Ok(JsArray::from_iter(items, c).into())
+}
+
 fn n_computed_names(_: &JsValue, _: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
     Ok(JsArray::from_iter(
         crate::computed::NAMES
@@ -1221,6 +1276,8 @@ const NATIVES: &[(&str, Native, usize)] = &[
     ("rect", n_rect, 1),
     ("computed", n_computed, 2),
     ("computedNames", n_computed_names, 0),
+    ("setCustomValidity", n_set_custom_validity, 2),
+    ("validity", n_validity, 1),
     ("log", n_log, 2),
     ("scroll", n_scroll, 1),
     ("setScroll", n_set_scroll, 3),
@@ -1552,6 +1609,11 @@ impl Runtime {
 
     pub fn url(&self) -> String {
         with(|s| s.url.clone())
+    }
+
+    /// Scripts' `setCustomValidity()` messages, by field.
+    pub fn custom_validity(&self) -> std::collections::HashMap<u32, String> {
+        with(|s| s.custom_validity.clone())
     }
 
     /// The page's stylesheets (not the browser's own), for

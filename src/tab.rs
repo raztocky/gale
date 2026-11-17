@@ -154,6 +154,36 @@ pub struct Click {
     /// Text copied or cut from a field, for the clipboard (only after a
     /// Copy or Cut key, and at most [`MAX_COPIED`] bytes).
     pub copied: Option<String>,
+    /// A form wasn't sent: what's wrong with a field, cleaned up and
+    /// shortened (a page can set its own message).
+    pub invalid: Option<String>,
+}
+
+/// Longest form-validation message shown.
+pub const MAX_INVALID: usize = 200;
+
+/// A validation message as the window shows it: one line of plain text,
+/// at most [`MAX_INVALID`] characters.
+fn accept_invalid(m: Option<String>) -> Option<String> {
+    let m = m?;
+    let line: String = crate::select::clean(&m)
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if line.is_empty() {
+        return None;
+    }
+    Some(if line.chars().count() > MAX_INVALID {
+        line.chars()
+            .take(MAX_INVALID - 1)
+            .chain(std::iter::once('…'))
+            .collect()
+    } else {
+        line
+    })
 }
 
 /// Most text a page may hand the clipboard from one Copy or Cut.
@@ -393,6 +423,7 @@ impl Tab {
                     submit: done.submit,
                     focus: done.focus,
                     copied: accept_copied(done.copied, copy_key),
+                    invalid: accept_invalid(done.invalid),
                 };
             }
             Backend::Sandboxed(r) => r,
@@ -420,6 +451,7 @@ impl Tab {
                     focus,
                     copied,
                     read,
+                    invalid,
                 } => Ok((
                     Click {
                         prevented,
@@ -428,6 +460,7 @@ impl Tab {
                         submit,
                         focus,
                         copied: accept_copied(copied, copy_key),
+                        invalid: accept_invalid(invalid),
                     },
                     console,
                     read,
@@ -836,6 +869,18 @@ mod hostile_renderer_tests {
         assert_eq!(accept_copied(text(), true).as_deref(), Some("rm -rf ~"));
         assert_eq!(accept_copied(text(), false), None, "after a click or typing");
         assert_eq!(accept_copied(Some("x".repeat(MAX_COPIED + 1)), true), None);
+    }
+
+    #[test]
+    fn validation_messages_are_one_short_line() {
+        assert_eq!(
+            accept_invalid(Some("Too\nshort\u{202e}!".into())).as_deref(),
+            Some("Too short!")
+        );
+        assert_eq!(accept_invalid(Some("  ".into())), None);
+        let long = accept_invalid(Some("x".repeat(500))).unwrap();
+        assert_eq!(long.chars().count(), MAX_INVALID);
+        assert!(long.ends_with('…'));
     }
 
     const FAKE: &str = r#"

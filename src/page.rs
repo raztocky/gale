@@ -90,6 +90,9 @@ pub struct Interaction {
     pub focus: bool,
     /// Text you copied or cut from a field, for the clipboard.
     pub copied: Option<String>,
+    /// A form wasn't sent because a field isn't filled in right: what's
+    /// wrong (that field now has the keyboard).
+    pub invalid: Option<String>,
 }
 
 /// A key that does something in a form control. `select` is Shift held
@@ -778,12 +781,51 @@ impl Page {
 
     /// Submit `form` (as if by `submitter`): scripts first get a `submit`
     /// event they can cancel.
+    /// Fields that aren't filled in right stop it first: they get
+    /// `invalid` events, the first one gets the keyboard, and `invalid`
+    /// says what's wrong.
     fn submit(
         &mut self,
         mut rt: Option<&mut Runtime>,
         form: u32,
         submitter: Option<u32>,
+        invalid: &mut Option<String>,
     ) -> Option<Submission> {
+        let custom = rt.as_deref().map(|r| r.custom_validity()).unwrap_or_default();
+        let bad = self
+            .with_dom(rt.as_deref_mut(), |d| {
+                crate::validate::invalid_fields(d, form, submitter, &custom)
+            })
+            .unwrap_or_default();
+        if let Some((first, message)) = bad.first().cloned() {
+            let mut report = true;
+            if let Some(rt) = rt.as_deref_mut() {
+                for (i, (field, _)) in bad.iter().enumerate() {
+                    // A script cancelling the first one shows its own message.
+                    if rt.fire(*field, "invalid", false, true) && i == 0 {
+                        report = false;
+                    }
+                }
+            }
+            if report {
+                let types = self
+                    .with_dom(rt.as_deref_mut(), |d| {
+                        forms::kind(d, first).is_some_and(|k| k.takes_typing())
+                    })
+                    .unwrap_or(false);
+                if types && self.focus != Some(first) {
+                    self.focus = Some(first);
+                    if let Some(c) = self.with_dom(rt.as_deref_mut(), |d| forms::Caret::at_end(d, first)) {
+                        self.caret = c;
+                    }
+                    if let Some(rt) = rt.as_deref_mut() {
+                        rt.fire(first, "focus", false, false);
+                    }
+                }
+                *invalid = Some(message);
+            }
+            return None;
+        }
         if let Some(rt) = rt.as_deref_mut() {
             if rt.fire(form, "submit", true, true) {
                 return None;
@@ -855,7 +897,7 @@ impl Page {
                     out.changed = true;
                 }
                 Some(Activation::Submit { form, submitter }) => {
-                    out.submit = self.submit(rt.as_deref_mut(), form, Some(submitter));
+                    out.submit = self.submit(rt.as_deref_mut(), form, Some(submitter), &mut out.invalid);
                 }
                 _ => {}
             }
@@ -912,6 +954,20 @@ impl Page {
                 change = self.with_dom(rt.as_deref_mut(), |d| forms::step_option(d, f, down)) == Some(true);
                 input = change;
             }
+            // A number field steps up and down.
+            (Key::Up { .. } | Key::Down { .. }, Some(f))
+                if self
+                    .with_dom(rt.as_deref_mut(), |d| forms::is_number(d, f))
+                    .unwrap_or(false) =>
+            {
+                let up = matches!(key, Key::Up { .. });
+                input = self.with_dom(rt.as_deref_mut(), |d| forms::step_number(d, f, up)) == Some(true);
+                if input {
+                    caret = self
+                        .with_dom(rt.as_deref_mut(), |d| forms::Caret::at_end(d, f))
+                        .unwrap_or(caret);
+                }
+            }
             (Key::Backspace { word } | Key::Delete { word }, Some(f)) => {
                 let forward = matches!(key, Key::Delete { .. });
                 input = self.with_dom(rt.as_deref_mut(), |d| {
@@ -929,7 +985,11 @@ impl Page {
                     if let Some(rt) = rt.as_deref_mut() {
                         rt.fire(f, "change", true, false);
                     }
-                    out.submit = self.submit(rt.as_deref_mut(), form, submitter);
+                    out.submit = self.submit(rt.as_deref_mut(), form, submitter, &mut out.invalid);
+                    // An invalid field may have taken the keyboard.
+                    if self.focus != Some(f) {
+                        caret = self.caret;
+                    }
                 }
             }
             (
@@ -1801,6 +1861,73 @@ mod form_script_tests {
         let mut out = String::new();
         page.dom.dump(0, &mut out);
         assert!(out.contains("<!--$-->") && out.contains("<!--made-->"), "{out}");
+    }
+
+    /// A form with a field not filled in right isn't sent: that field
+    /// gets the keyboard and you're told what's wrong; once it's right,
+    /// the form goes.
+    #[test]
+    fn invalid_forms_are_not_sent() {
+        let (mut page, mut rt) = load(
+            "<form action=/s><input name=a id=a required>\
+             <input name=n id=n type=number min=1 max=3 value=2>\
+             <input name=e id=e type=email></form><p id=log></p>\
+             <script>document.getElementById('a').addEventListener('invalid', () =>\
+               document.getElementById('log').textContent = 'invalid fired');</script>",
+        );
+        // Tab to the number field and press Enter: `a` is empty.
+        page.key(Some(&mut rt), Key::Tab);
+        page.key(Some(&mut rt), Key::Tab);
+        let r = page.key(Some(&mut rt), Key::Enter);
+        assert_eq!(r.submit, None);
+        assert_eq!(r.invalid.as_deref(), Some("Please fill out this field."));
+        assert!(page.dom.text_content().contains("invalid fired"));
+        // The keyboard moved to `a`.
+        page.type_text(Some(&mut rt), "hi");
+        assert!(page.dom.text_content().contains("invalid fired"));
+        let r = page.key(Some(&mut rt), Key::Enter);
+        assert!(r.invalid.is_none(), "{:?}", r.invalid);
+        assert!(r.submit.is_some_and(|s| s.url.contains("a=hi")));
+    }
+
+    #[test]
+    fn number_fields_step_with_the_arrow_keys() {
+        let (mut page, mut rt) = load("<input id=n type=number min=1 max=3 step=1 value=2><p id=v></p>");
+        page.key(Some(&mut rt), Key::Tab);
+        let value = |page: &mut Page, rt: &mut Runtime| {
+            page.with_dom(Some(rt), |d| forms::value(d, forms::by_id(d, "n").unwrap()))
+                .unwrap()
+        };
+        page.key(Some(&mut rt), Key::Up { select: false });
+        assert_eq!(value(&mut page, &mut rt), "3");
+        page.key(Some(&mut rt), Key::Up { select: false });
+        assert_eq!(value(&mut page, &mut rt), "3", "stays at max");
+        page.key(Some(&mut rt), Key::Down { select: false });
+        page.key(Some(&mut rt), Key::Down { select: false });
+        page.key(Some(&mut rt), Key::Down { select: false });
+        assert_eq!(value(&mut page, &mut rt), "1", "stays at min");
+    }
+
+    #[test]
+    fn scripts_check_validity() {
+        let (page, _rt) = load(
+            "<form id=f><input id=a required><input id=b></form><p id=out></p>\
+             <script>\
+             const a = document.getElementById('a'), b = document.getElementById('b'), f = document.getElementById('f');\
+             const parts = [a.validity.valid, a.validity.valueMissing, a.validationMessage, a.willValidate,\
+               f.checkValidity()];\
+             a.value = 'x'; b.setCustomValidity('Taken');\
+             parts.push(a.validity.valid, b.validity.customError, b.validationMessage, f.checkValidity());\
+             b.setCustomValidity(''); parts.push(f.checkValidity());\
+             document.getElementById('out').textContent = parts.join('|');\
+             document.currentScript.remove();\
+             </script>",
+        );
+        let text = page.dom.text_content();
+        assert!(
+            text.contains("false|true|Please fill out this field.|true|false|true|true|Taken|false|true"),
+            "{text}"
+        );
     }
 
     #[test]
