@@ -101,6 +101,9 @@ Limits, honestly:
   fingerprint. With it on, scripts see Firefox's `navigator` values, a fixed 1920x1080 screen,
   UTC as the time zone, and the window size rounded down to steps of 200x100 px (like Firefox's
   letterboxing). There's no canvas, WebGL, audio or font list to probe.
+- Which picture a page's `<picture>` or `srcset` gets requested is chosen for a fixed 1x pixel
+  density and that same rounded window size, so the file fetched doesn't reveal your screen's
+  pixel ratio or exact window width.
 - Fonts are the same for everyone. Brickle draws every page with its own bundled fonts and never
   reads the ones installed on your computer, and it doesn't download web fonts (`@font-face`), so
   neither which fonts you have nor which ones a page fetches can identify you. Pages asking for

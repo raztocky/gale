@@ -31,6 +31,7 @@ pub mod sandbox;
 pub mod security;
 pub mod select;
 pub mod selectors;
+pub mod srcset;
 pub mod style;
 pub mod tab;
 pub mod urlclean;

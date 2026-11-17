@@ -204,6 +204,12 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                     let p = Page::parse_with_policy(&url, &html, &blocker_css, &csp, &mut host);
                     (p, None, ScriptOutput::default())
                 };
+                if viewport.0.is_finite() && viewport.1.is_finite() && viewport.0 > 0.0 && viewport.1 > 0.0 {
+                    // Rounded as scripts see it, so which picture is
+                    // requested doesn't reveal the exact window size.
+                    let (w, h) = js::rounded_viewport(viewport.0, viewport.1);
+                    p.viewport = (w as f32, h as f32);
+                }
                 p.load_images_decoded(&mut |u, added| host.decoded(u, added));
                 if let Some(e) = host.broken {
                     return Err(e);

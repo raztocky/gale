@@ -57,6 +57,9 @@ pub struct Page {
     image_bytes: usize,
     /// Your text size (see `StyleContext::text_scale`).
     pub text_scale: f32,
+    /// The window's size, for choosing pictures (`<picture>`, `srcset`)
+    /// and the media queries that load background images.
+    pub viewport: (f32, f32),
     /// Size of the tab bar's text in px: [`Rendered::title`] is drawn at
     /// it (0 = not wanted).
     pub title_px: f32,
@@ -479,6 +482,7 @@ impl Page {
             inline_svgs: HashMap::new(),
             image_bytes: 0,
             text_scale: 1.0,
+            viewport: (1024.0, 768.0),
             title_px: 0.0,
             redirect: None,
             from_server: None,
@@ -505,11 +509,9 @@ impl Page {
     }
 
     pub fn load_images_decoded(&mut self, fetch: &mut dyn FnMut(&str, bool) -> Result<Decoded, String>) {
-        let mut imgs = Vec::new();
-        self.dom.walk(&mut imgs, &|n| n.tag() == Some("img"));
-        let mut urls: Vec<String> = imgs
-            .iter()
-            .filter_map(|n| n.element().and_then(|e| image_source(&self.url, e)))
+        let mut urls: Vec<String> = img_sources(&self.url, &self.dom, self.viewport)
+            .into_iter()
+            .map(|(_, u, _)| u)
             .collect();
         // CSS background images, after the page's own images.
         let (backgrounds, svgs) = self.styled_scan();
@@ -571,10 +573,14 @@ impl Page {
         let mut out = HashSet::new();
         let mut els = Vec::new();
         self.dom
-            .walk(&mut els, &|n| matches!(n.tag(), Some("img" | "link" | "script")));
+            .walk(&mut els, &|n| matches!(n.tag(), Some("link" | "script")));
+        out.extend(
+            img_sources(&self.url, &self.dom, self.viewport)
+                .into_iter()
+                .map(|(_, u, _)| u),
+        );
         for e in els.iter().filter_map(|n| n.element()) {
             let href = match e.tag.as_str() {
-                "img" => image_source(&self.url, e),
                 "link" => e.attrs.get("href").map(|h| net::resolve(&self.url, h)),
                 _ => e.attrs.get("src").map(|s| net::resolve(&self.url, s)),
             };
@@ -594,7 +600,7 @@ impl Page {
         let ctx = StyleContext {
             text_scale: 1.0,
             sheets: all,
-            viewport: (1024.0, 768.0),
+            viewport: self.viewport,
         };
         let styled = style::style_tree(&self.dom, &ctx);
         struct Found {
@@ -632,14 +638,16 @@ impl Page {
     }
 
     fn images_by_node(&self, tree: &Node) -> HashMap<u32, Decoded> {
-        let mut imgs = Vec::new();
-        tree.walk(&mut imgs, &|n| n.tag() == Some("img"));
-        let mut out: HashMap<u32, Decoded> = imgs
-            .iter()
-            .filter_map(|n| {
-                let url = image_source(&self.url, n.element()?)?;
-                let d = self.images.get(&url)?.clone()?;
-                Some((n.uid, d))
+        let mut out: HashMap<u32, Decoded> = img_sources(&self.url, tree, self.viewport)
+            .into_iter()
+            .filter_map(|(uid, url, density)| {
+                let mut d = self.images.get(&url)?.clone()?;
+                // A 2x picture is shown at half its pixel size.
+                if density != 1.0 {
+                    let scale = |v: u32| ((v as f32 / density).round() as u32).clamp(1, image::MAX_SIDE);
+                    d.natural = (scale(d.natural.0), scale(d.natural.1));
+                }
+                Some((uid, d))
             })
             .collect();
         for (uid, url) in &self.inline_svgs {
@@ -1391,23 +1399,34 @@ fn collect_text(b: &LayoutBox, seen: &Seen, mut under: Color, out: &mut Vec<Text
     }
 }
 
-/// The address an `<img>` shows: `src`, or else the first `srcset` entry.
-fn image_source(base: &str, e: &crate::dom::ElementData) -> Option<String> {
-    let src = e
-        .attrs
-        .get("src")
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            e.attrs
-                .get("srcset")
-                .and_then(|s| s.split(',').next())
-                .and_then(|c| c.split_whitespace().next())
-        })?;
-    if src.len() > 4 && src[..5].eq_ignore_ascii_case("data:") {
-        return Some(src.to_string());
+/// Every `<img>` in `tree` with the address it shows (absolute), chosen
+/// from its `<picture>`'s sources, `srcset` and `src` (see `srcset.rs`).
+/// Also gives each one's pixel density.
+fn img_sources(base: &str, tree: &Node, viewport: (f32, f32)) -> Vec<(u32, String, f32)> {
+    fn walk(n: &Node, base: &str, viewport: (f32, f32), out: &mut Vec<(u32, String, f32)>) {
+        let picture = n.tag() == Some("picture");
+        let mut sources: Vec<&crate::dom::ElementData> = Vec::new();
+        for c in &n.children {
+            match c.element() {
+                Some(e) if picture && e.tag == "source" => sources.push(e),
+                Some(e) if e.tag == "img" => {
+                    if let Some((src, density)) = crate::srcset::choose(e, &sources, viewport) {
+                        let url = if src.len() > 4 && src[..5].eq_ignore_ascii_case("data:") {
+                            src.to_string()
+                        } else {
+                            net::resolve(base, src)
+                        };
+                        out.push((c.uid, url, density));
+                    }
+                }
+                _ => {}
+            }
+            walk(c, base, viewport, out);
+        }
     }
-    Some(net::resolve(base, src))
+    let mut out = Vec::new();
+    walk(tree, base, viewport, &mut out);
+    out
 }
 
 /// The bytes of a `data:image/...` address (decoded here, no request):
@@ -1847,6 +1866,32 @@ mod image_tests {
             size_of(&page, "g"),
             (40.0, 20.0),
             "height:auto overrides the attribute"
+        );
+    }
+
+    /// A `<picture>` shows (and fetches) only the source it chooses.
+    #[test]
+    fn picture_fetches_only_its_choice() {
+        let (page, asked) = load(
+            "<picture><source type=image/avif srcset=/9x9.png>\
+             <source srcset='/20x10.png 1x, /40x20.png 2x'><img id=p src=/8x8.png></picture>\
+             <img id=w srcset='/30x30.png 300w, /90x90.png 900w' sizes='300px'>\
+             <img id=d srcset='/40x40.png 2x'>",
+        );
+        assert_eq!(
+            asked,
+            [
+                "https://example.com/20x10.png",
+                "https://example.com/30x30.png",
+                "https://example.com/40x40.png"
+            ]
+        );
+        assert_eq!(size_of(&page, "p"), (20.0, 10.0));
+        assert_eq!(size_of(&page, "w"), (30.0, 30.0));
+        assert_eq!(
+            size_of(&page, "d"),
+            (20.0, 20.0),
+            "a 2x picture at half its pixel size"
         );
     }
 
