@@ -480,6 +480,12 @@ struct State {
     csp: crate::csp::Csp,
     /// An inline handler the policy allowed, about to be compiled (once).
     approved_handler: Option<String>,
+    /// The page's stylesheets, for `getComputedStyle`.
+    sheets: Rc<Vec<css::Stylesheet>>,
+    /// The window's size, for media queries in them.
+    viewport: (f32, f32),
+    /// Computed styles by node, for the DOM version they were made for.
+    computed: Option<(u64, ComputedMap)>,
 }
 
 thread_local! {
@@ -880,6 +886,62 @@ fn n_connected(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue>
     Ok(with(|s| s.dom.connected(id)).into())
 }
 
+/// Computed styles by node.
+type ComputedMap = Rc<std::collections::HashMap<u32, Rc<crate::style::ComputedStyle>>>;
+
+/// Computed styles for the whole document as it is now (cached until the
+/// DOM changes).
+fn computed_styles(s: &mut State) -> ComputedMap {
+    if let Some((v, map)) = &s.computed {
+        if *v == s.dom.version {
+            return map.clone();
+        }
+    }
+    let tree = s.dom.to_tree();
+    let mut sheets = vec![(0u8, crate::page::ua_sheet())];
+    sheets.extend(s.sheets.iter().map(|sh| (1u8, sh)));
+    let ctx = crate::style::StyleContext {
+        text_scale: 1.0,
+        sheets,
+        viewport: s.viewport,
+    };
+    let styled = crate::style::style_tree(&tree, &ctx);
+    let mut map = std::collections::HashMap::new();
+    let mut stack = vec![&styled];
+    while let Some(n) = stack.pop() {
+        if n.node.element().is_some() {
+            map.entry(n.node.uid).or_insert_with(|| n.style.clone());
+        }
+        stack.extend(n.children.iter());
+    }
+    let map = Rc::new(map);
+    s.computed = Some((s.dom.version, map.clone()));
+    map
+}
+
+/// `getComputedStyle(el).name`: the CSS text, or null for a property
+/// Brickle doesn't compute (or a node that isn't a styled element).
+fn n_computed(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let id = arg_id(a, 0, c)?;
+    let name = arg_str(a, 1, c)?;
+    Ok(opt_str(with(|s| {
+        let map = computed_styles(s);
+        let style = map.get(&id)?;
+        let rect = s.boxes.iter().find(|(u, _)| *u == id).map(|(_, r)| *r);
+        crate::computed::value(style, &name, rect)
+    })))
+}
+
+fn n_computed_names(_: &JsValue, _: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    Ok(JsArray::from_iter(
+        crate::computed::NAMES
+            .iter()
+            .map(|n| JsValue::from(js_string!(*n))),
+        c,
+    )
+    .into())
+}
+
 fn n_rect(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
     let id = arg_id(a, 0, c)?;
     let r = with(|s| s.boxes.iter().find(|(u, _)| *u == id).map(|(_, r)| *r)).unwrap_or(Rect {
@@ -1157,6 +1219,8 @@ const NATIVES: &[(&str, Native, usize)] = &[
     ("byId", n_by_id, 1),
     ("connected", n_connected, 1),
     ("rect", n_rect, 1),
+    ("computed", n_computed, 2),
+    ("computedNames", n_computed_names, 0),
     ("log", n_log, 2),
     ("scroll", n_scroll, 1),
     ("setScroll", n_set_scroll, 3),
@@ -1269,6 +1333,7 @@ impl Runtime {
             *s = State {
                 dom: Dom::from_tree(tree),
                 url: url.to_string(),
+                viewport,
                 ..State::default()
             }
         });
@@ -1487,6 +1552,15 @@ impl Runtime {
 
     pub fn url(&self) -> String {
         with(|s| s.url.clone())
+    }
+
+    /// The page's stylesheets (not the browser's own), for
+    /// `getComputedStyle`.
+    pub fn set_sheets(&mut self, sheets: Vec<css::Stylesheet>) {
+        with(|s| {
+            s.sheets = Rc::new(sheets);
+            s.computed = None;
+        });
     }
 
     pub fn set_boxes(&mut self, boxes: Vec<(u32, Rect)>) {

@@ -177,6 +177,8 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
     let mut rt: Option<Runtime> = None;
     let mut cookies = String::new();
     let mut policy = crate::csp::Csp::new("");
+    // The stylesheets scripts last got for `getComputedStyle`.
+    let mut sheets_key = (usize::MAX, 0);
     while let Some(msg) = recv(input)? {
         match msg {
             ToRenderer::Load {
@@ -250,6 +252,10 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                 if let Some(rt) = rt.as_mut() {
                     rt.set_boxes(p.boxes());
                     rt.set_scrollers(p.scroll_info());
+                    if p.sheets_key() != sheets_key {
+                        sheets_key = p.sheets_key();
+                        rt.set_sheets(p.script_sheets());
+                    }
                 }
                 send(output, FromRenderer::Rendered(rendered))?;
             }

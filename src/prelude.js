@@ -1202,10 +1202,43 @@
       addEventListener() {}, removeEventListener() {}, dispatchEvent: () => true };
   }
 
-  function getComputedStyle(el) {
-    // Only inline styles are visible to scripts so far.
-    const s = el && el.style ? el.style : styleProxy({ getAttribute: () => '', setAttribute() {}, removeAttribute() {} });
-    return new Proxy(s, { get: (t, p) => (p === 'display' && el && el.hidden ? 'none' : t[p]) });
+  // getComputedStyle: the page's CSS as Brickle computed it, read live
+  // (values follow later changes to the element, as in browsers).
+  let computedNames = null;
+  function getComputedStyle(el, pseudo) {
+    const id = el instanceof Node && el.nodeType === 1 ? idOf(el) : -1;
+    const names = () => computedNames || (computedNames = Array.from(dom.computedNames()));
+    const pseudoEl = pseudo != null && str(pseudo) !== '';
+    const read = (name) => {
+      if (id < 0) return '';
+      if (pseudoEl) return name === 'content' ? 'none' : '';
+      const v = dom.computed(id, name);
+      return v === null ? '' : v;
+    };
+    const readOnly = () => {
+      throw Object.assign(new Error('getComputedStyle() results are read-only'), { name: 'NoModificationAllowedError' });
+    };
+    const api = {
+      getPropertyValue: (p) => read(str(p).trim().startsWith('--') ? str(p).trim() : str(p).trim().toLowerCase()),
+      getPropertyPriority: () => '',
+      item: (i) => names()[i] || '',
+      setProperty: readOnly,
+      removeProperty: readOnly,
+      [Symbol.iterator]: function* () { yield* names(); },
+    };
+    return new Proxy(api, {
+      get(t, p) {
+        if (typeof p !== 'string') return t[p];
+        if (p in api) return api[p];
+        if (p === 'length') return names().length;
+        if (p === 'cssText') return '';
+        if (p === 'parentRule') return null;
+        if (/^\d+$/.test(p)) return names()[Number(p)];
+        if (p === 'cssFloat') return read('float');
+        return read(p.startsWith('--') ? p : camelToKebab(p));
+      },
+      set(t, p) { if (typeof p === 'string') readOnly(); return true; },
+    });
   }
 
   const consoleObj = {};

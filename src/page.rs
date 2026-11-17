@@ -323,7 +323,7 @@ pub fn pump(rt: &mut Runtime, host: &mut dyn Host, until: Instant) {
     }
 }
 
-fn ua_sheet() -> &'static Stylesheet {
+pub(crate) fn ua_sheet() -> &'static Stylesheet {
     static UA: OnceLock<Stylesheet> = OnceLock::new();
     UA.get_or_init(|| css::parse(&format!("{}\n{}", style::UA_CSS, forms::UA_CSS)))
 }
@@ -412,6 +412,8 @@ impl Page {
                 return (page, None, out);
             }
         };
+        // `getComputedStyle` while the page loads sees the server's sheets.
+        rt.set_sheets(first.script_sheets());
         rt.set_cookies(host.cookies());
         rt.set_csp(policy.clone());
         let until = Instant::now() + js::LOAD_BUDGET;
@@ -493,6 +495,19 @@ impl Page {
     /// uses the local decoder only in the explicit in-process backend.
     /// The sandboxed renderer uses `load_images_decoded` and disposable workers.
     /// `fetch` is told whether a script put the image there.
+    /// The stylesheets scripts' `getComputedStyle` sees: the page's own,
+    /// then the filter lists' hiding rules.
+    pub fn script_sheets(&self) -> Vec<Stylesheet> {
+        let mut out = self.sheets.clone();
+        out.push(self.blocker.clone());
+        out
+    }
+
+    /// Changes whenever the page's stylesheets do (cheaply).
+    pub fn sheets_key(&self) -> (usize, usize) {
+        (self.sheets.len(), self.sheets.iter().map(|s| s.rules.len()).sum())
+    }
+
     pub fn image_sources(&self) -> Vec<Vec<String>> {
         self.policy.resource_sources(Dest::Image)
     }
@@ -1723,6 +1738,34 @@ mod form_script_tests {
             Page::load_with_scripts("https://example.com/", html, "", (800.0, 600.0), &[], &mut host);
         let _ = page.render(800.0, 600.0);
         (page, rt.expect("scripts run"))
+    }
+
+    /// `getComputedStyle` sees the page's stylesheets, inline styles and
+    /// the browser's own rules, and follows later changes.
+    #[test]
+    fn get_computed_style_uses_the_page_css() {
+        let (page, _rt) = load(
+            "<style>#a{color:red;display:flex;padding:5px} .h{display:none} :root{--gap: 8px}</style>\
+             <div id=a style='font-size:20px'>x</div><p id=b class=h></p><p id=out></p>\
+             <script>\
+             const a = document.getElementById('a'), cs = getComputedStyle(a);\
+             const parts = [cs.color, cs.display, cs.fontSize, cs.paddingTop,\
+               getComputedStyle(document.getElementById('b')).display,\
+               cs.getPropertyValue('padding-left'), cs.length > 0, cs.getPropertyValue('--gap'),\
+               getComputedStyle(document.body).display];\
+             a.style.display = 'block';\
+             parts.push(cs.display);\
+             let threw = false; try { cs.color = 'blue'; } catch (e) { threw = true; }\
+             parts.push(threw);\
+             document.getElementById('out').textContent = parts.join('|');\
+             document.currentScript.remove();\
+             </script>",
+        );
+        let text = page.dom.text_content();
+        assert!(
+            text.contains("rgb(255, 0, 0)|flex|20px|5px|none|5px|true|8px|block|block|true"),
+            "{text}"
+        );
     }
 
     /// React streams content in late as `<div hidden id=S:0>` and moves it
