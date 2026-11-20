@@ -97,9 +97,39 @@ pub enum VAlign {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TextAlign {
+    /// The side lines start on: left, or right in right-to-left text.
+    Start,
+    End,
     Left,
     Center,
     Right,
+}
+
+impl TextAlign {
+    /// Left, center or right, for text that runs right to left or not.
+    pub fn resolve(self, rtl: bool) -> TextAlign {
+        match (self, rtl) {
+            (TextAlign::Start, false) | (TextAlign::End, true) => TextAlign::Left,
+            (TextAlign::Start, true) | (TextAlign::End, false) => TextAlign::Right,
+            (a, _) => a,
+        }
+    }
+}
+
+/// `unicode-bidi`: how an element's text takes part in ordering
+/// right-to-left and left-to-right text.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UnicodeBidi {
+    Normal,
+    /// Its own level of direction, inside the text around it.
+    Embed,
+    /// Ordered on its own, then placed as one piece in the text around it.
+    Isolate,
+    /// Every character in the element's direction, whatever it is.
+    Override,
+    IsolateOverride,
+    /// Direction taken from its own text (HTML's `dir=auto`).
+    Plaintext,
 }
 
 /// Which bundled family stands in for a `font-family` name (lowercase);
@@ -209,6 +239,9 @@ pub struct ComputedStyle {
     pub family: Family,
     pub line_height: f32,
     pub text_align: TextAlign,
+    /// `direction: rtl`: text and lines run right to left.
+    pub rtl: bool,
+    pub unicode_bidi: UnicodeBidi,
     pub underline: bool,
     pub strike: bool,
     pub pre: bool,
@@ -501,7 +534,9 @@ impl ComputedStyle {
             italic: false,
             family: Family::Serif,
             line_height: 16.0 * 1.2,
-            text_align: TextAlign::Left,
+            text_align: TextAlign::Start,
+            rtl: false,
+            unicode_bidi: UnicodeBidi::Normal,
             underline: false,
             strike: false,
             pre: false,
@@ -576,6 +611,7 @@ impl ComputedStyle {
         s.family = self.family;
         s.line_height = self.line_height;
         s.text_align = self.text_align;
+        s.rtl = self.rtl;
         s.underline = self.underline;
         s.strike = self.strike;
         s.pre = self.pre;
@@ -1474,6 +1510,27 @@ fn compute(
             }
         }
     }
+    // `dir` sets the direction and keeps the element's text ordered apart
+    // from what's around it; `dir=auto` takes the direction from the text.
+    // `<bdi>` is ordered apart, `<bdo>` puts every character in its
+    // direction.
+    let dir = e.attrs.get("dir").map(|d| d.trim().to_ascii_lowercase());
+    match dir.as_deref() {
+        Some(d @ ("rtl" | "ltr")) => {
+            hint("direction", d);
+            hint(
+                "unicode-bidi",
+                if e.tag == "bdo" {
+                    "isolate-override"
+                } else {
+                    "isolate"
+                },
+            );
+        }
+        Some("auto") => hint("unicode-bidi", "plaintext"),
+        _ if e.tag == "bdi" => hint("unicode-bidi", "plaintext"),
+        _ => {}
+    }
     if e.attrs.contains_key("hidden") {
         presentational.push(Declaration {
             name: "display".into(),
@@ -1753,8 +1810,10 @@ fn compute(
             "text-align" => {
                 s.text_align = match kw {
                     "center" | "-webkit-center" => TextAlign::Center,
-                    "right" | "end" => TextAlign::Right,
-                    "left" | "start" | "justify" => TextAlign::Left,
+                    "right" | "-webkit-right" => TextAlign::Right,
+                    "left" | "-webkit-left" => TextAlign::Left,
+                    "end" => TextAlign::End,
+                    "start" | "justify" => TextAlign::Start,
                     _ => s.text_align,
                 }
             }
@@ -1772,6 +1831,22 @@ fn compute(
                 }
             }
             "text-transform" => s.uppercase = kw == "uppercase",
+            "direction" => match kw {
+                "rtl" => s.rtl = true,
+                "ltr" => s.rtl = false,
+                _ => {}
+            },
+            "unicode-bidi" => {
+                s.unicode_bidi = match kw {
+                    "normal" => UnicodeBidi::Normal,
+                    "embed" => UnicodeBidi::Embed,
+                    "isolate" | "-webkit-isolate" => UnicodeBidi::Isolate,
+                    "bidi-override" => UnicodeBidi::Override,
+                    "isolate-override" | "-webkit-isolate-override" => UnicodeBidi::IsolateOverride,
+                    "plaintext" | "-webkit-plaintext" => UnicodeBidi::Plaintext,
+                    _ => s.unicode_bidi,
+                }
+            }
             "white-space" => {
                 s.pre = matches!(kw, "pre" | "pre-wrap" | "pre-line" | "break-spaces");
                 s.nowrap = matches!(kw, "nowrap" | "pre");

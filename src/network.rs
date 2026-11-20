@@ -638,6 +638,21 @@ impl Network {
         self.subresource_from(page_url, url, Dest::Script, added, csp, "")
     }
 
+    /// A JavaScript module file for the page, `added` by a script or not
+    /// (see [`Dest::Module`]).
+    pub fn module_file(
+        &mut self,
+        page_url: &str,
+        url: &str,
+        added: bool,
+        csp: &[Vec<String>],
+    ) -> Result<String, String> {
+        if added {
+            self.script_added(page_url, url, Dest::Module)?;
+        }
+        self.subresource_from(page_url, url, Dest::Module, added, csp, "")
+    }
+
     /// A stylesheet or script a page's script put on the page: it may only
     /// come from the page's site (see [`Network::script_added`]), wherever
     /// it redirects.
@@ -674,13 +689,13 @@ impl Network {
                 self.page_stylesheets += 1;
                 (self.page_stylesheets > MAX_STYLESHEETS).then_some("too many stylesheets")
             }
-            Dest::Script if !self.scripts_allowed(page_url) => {
+            Dest::Script | Dest::Module if !self.scripts_allowed(page_url) => {
                 // Decided here, from the browser's own record of the page,
                 // whatever the renderer claims.
                 self.record(url, dest, Outcome::NotAllowed, vec![]);
                 return Err(format!("JavaScript is off for this site, skipped {url}"));
             }
-            Dest::Script => {
+            Dest::Script | Dest::Module => {
                 self.page_scripts += 1;
                 // Classic scripts and module files, each also limited by the renderer.
                 (self.page_scripts > crate::js::MAX_SCRIPTS + crate::js::MAX_MODULES)
@@ -705,11 +720,21 @@ impl Network {
             return Err(format!("{why}, skipped {url}"));
         }
         let sri_request = ScriptRequest {
+            method: "GET".into(),
             credentials: Credentials::SameOrigin,
             ..ScriptRequest::default()
         };
         let sri = !integrity.is_empty();
-        match self.fetch_with(url, Some(page_url), dest, sri.then_some(&sri_request), added, csp) {
+        // Modules are always fetched under CORS.
+        let cors = sri || dest == Dest::Module;
+        match self.fetch_with(
+            url,
+            Some(page_url),
+            dest,
+            cors.then_some(&sri_request),
+            added,
+            csp,
+        ) {
             Fetch::Done {
                 body,
                 bytes,
@@ -733,6 +758,19 @@ impl Network {
                         e.outcome = Outcome::NotAllowed;
                     }
                     return Err("stylesheet integrity or CORS check failed".into());
+                }
+                // A module from another origin is only used if that origin
+                // agrees to share it with this page.
+                if dest == Dest::Module
+                    && !same_origin(page_url, &url)
+                    && !cors_allows(&headers, &origin_of(page_url), false)
+                {
+                    if let Some(e) = self.log.last_mut() {
+                        e.outcome = Outcome::NotAllowed;
+                    }
+                    return Err(format!(
+                        "{url}: another site's module, which it doesn't share (CORS)"
+                    ));
                 }
                 // Stylesheet text is UTF-8; reject lossy conversion rather than hash different bytes.
                 if dest == Dest::Stylesheet && !bytes.is_empty() && std::str::from_utf8(&bytes).is_err() {
@@ -767,7 +805,7 @@ impl Network {
         let kind = match dest {
             Dest::Xhr => "xhr",
             Dest::Image => "image",
-            Dest::Script => "script",
+            Dest::Script | Dest::Module => "script",
             _ => "stylesheet",
         };
         let allow = format!("@@||{}^${kind},domain={site}", filter::host_of(url));
@@ -1549,7 +1587,7 @@ impl Network {
 fn filter_dest(dest: Dest) -> filter::Dest {
     match dest {
         Dest::Document => filter::Dest::Document,
-        Dest::Script => filter::Dest::Script,
+        Dest::Script | Dest::Module => filter::Dest::Script,
         Dest::Xhr => filter::Dest::Xhr,
         Dest::Image => filter::Dest::Image,
         _ => filter::Dest::Stylesheet,
@@ -1648,6 +1686,29 @@ fn cors_allows(headers: &[(String, String)], origin: &str, creds: bool) -> bool 
     }
 }
 
+/// One of the MIME types that mean JavaScript (its essence, lower case).
+fn is_javascript_type(essence: &str) -> bool {
+    matches!(
+        essence,
+        "application/ecmascript"
+            | "application/javascript"
+            | "application/x-ecmascript"
+            | "application/x-javascript"
+            | "text/ecmascript"
+            | "text/javascript"
+            | "text/javascript1.0"
+            | "text/javascript1.1"
+            | "text/javascript1.2"
+            | "text/javascript1.3"
+            | "text/javascript1.4"
+            | "text/javascript1.5"
+            | "text/jscript"
+            | "text/livescript"
+            | "text/x-ecmascript"
+            | "text/x-javascript"
+    )
+}
+
 /// `X-Content-Type-Options: nosniff` holds a server to the type it sent:
 /// a script must be a JavaScript type and a stylesheet `text/css`. Images,
 /// audio, video and CSV never run as scripts, nosniff or not (as in
@@ -1665,25 +1726,7 @@ fn sniff_refused(dest: Dest, headers: &[(String, String)]) -> Option<String> {
     let essence = ctype.split(';').next().unwrap_or("").trim().to_string();
     match dest {
         Dest::Script => {
-            let js = matches!(
-                essence.as_str(),
-                "application/ecmascript"
-                    | "application/javascript"
-                    | "application/x-ecmascript"
-                    | "application/x-javascript"
-                    | "text/ecmascript"
-                    | "text/javascript"
-                    | "text/javascript1.0"
-                    | "text/javascript1.1"
-                    | "text/javascript1.2"
-                    | "text/javascript1.3"
-                    | "text/javascript1.4"
-                    | "text/javascript1.5"
-                    | "text/jscript"
-                    | "text/livescript"
-                    | "text/x-ecmascript"
-                    | "text/x-javascript"
-            );
+            let js = is_javascript_type(&essence);
             let never = ["image/", "audio/", "video/"]
                 .iter()
                 .any(|p| essence.starts_with(p))
@@ -1695,6 +1738,11 @@ fn sniff_refused(dest: Dest, headers: &[(String, String)]) -> Option<String> {
                 )
             })
         }
+        // Modules must say they're JavaScript, nosniff or not.
+        Dest::Module if !is_javascript_type(&essence) => Some(format!(
+            "a {} file isn't a JavaScript module",
+            if essence.is_empty() { "untyped" } else { &essence }
+        )),
         Dest::Stylesheet if nosniff && essence != "text/css" => Some(format!(
             "a {} file isn't a stylesheet (nosniff)",
             if essence.is_empty() { "untyped" } else { &essence }
@@ -1877,6 +1925,11 @@ mod tests {
             }
             v
         };
+        // Modules must be served as JavaScript, nosniff or not.
+        assert!(sniff_refused(Dest::Module, &h("text/plain", false)).is_some());
+        assert!(sniff_refused(Dest::Module, &h("", false)).is_some());
+        assert!(sniff_refused(Dest::Module, &h("text/javascript; charset=utf-8", false)).is_none());
+        assert!(sniff_refused(Dest::Module, &h("application/x-javascript", false)).is_none());
         assert!(sniff_refused(Dest::Script, &h("text/plain", true)).is_some());
         assert!(sniff_refused(Dest::Script, &h("text/plain", false)).is_none());
         assert!(sniff_refused(Dest::Script, &h("text/javascript; charset=utf-8", true)).is_none());

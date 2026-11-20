@@ -161,6 +161,10 @@ impl Host for IpcHost {
         self.file(url, Dest::Script, added, csp)
     }
 
+    fn fetch_module(&mut self, url: &str, added: bool, csp: &[Vec<String>]) -> Result<String, String> {
+        self.file(url, Dest::Module, added, csp)
+    }
+
     fn image(&mut self, url: &str) -> Result<Vec<u8>, String> {
         self.picture(url, false)
     }
@@ -210,7 +214,7 @@ pub fn serve(input: impl Read + 'static, output: impl Write + 'static) -> Result
             broken: None,
             policy: crate::csp::Csp::new(""),
         };
-        host.file(url, Dest::Script, true, csp)
+        host.file(url, Dest::Module, true, csp)
     })));
     struct Forget;
     impl Drop for Forget {

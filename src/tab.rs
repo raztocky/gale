@@ -81,6 +81,9 @@ impl Host for NetHost<'_> {
     fn fetch_script(&mut self, url: &str, added: bool, csp: &[Vec<String>]) -> Result<String, String> {
         self.net.script_file(&self.page, url, added, csp)
     }
+    fn fetch_module(&mut self, url: &str, added: bool, csp: &[Vec<String>]) -> Result<String, String> {
+        self.net.module_file(&self.page, url, added, csp)
+    }
     fn image(&mut self, url: &str) -> Result<Vec<u8>, String> {
         self.image_policy(url, false, &[])
     }
@@ -903,6 +906,16 @@ impl Renderer {
                 } if fetches < MAX_FETCHES => {
                     fetches += 1;
                     let r = host.fetch_script(&url, added, &csp);
+                    self.send(ToRenderer::FetchReply(r))?
+                }
+                FromRenderer::Fetch {
+                    url,
+                    dest: Dest::Module,
+                    added,
+                    csp,
+                } if fetches < MAX_FETCHES => {
+                    fetches += 1;
+                    let r = host.fetch_module(&url, added, &csp);
                     self.send(ToRenderer::FetchReply(r))?
                 }
                 FromRenderer::Fetch { url, dest, added, .. } if fetches < MAX_FETCHES => {

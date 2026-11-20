@@ -215,7 +215,10 @@ in `src/cookies.rs`.
   as the server sent it load as usual. JavaScript modules follow the same line: files a module
   imports with an `import` written at its top load like the page's own scripts (they're fixed in
   the files before anything runs), while `import()` calls, which running code can point anywhere,
-  count as a script's requests and stay on the page's site unless you allowed more. These show in the request panel as "BLOCKED (script
+  count as a script's requests and stay on the page's site unless you allowed more. Modules are
+  also fetched as other browsers fetch them, under CORS: a module from another origin goes
+  without your cookies for it, and is only used if that origin says it may be shared with the
+  page; and a module file is only run if the server says it's JavaScript. These show in the request panel as "BLOCKED (script
   sending to another site)"; clicking one adds an allow rule for just that site and kind of
   request (`@@||api.other.example^$xhr,domain=example.com`), which also overrides the filter
   lists for it. A request that's redirected is checked again at every hop before anything is sent

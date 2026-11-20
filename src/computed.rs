@@ -34,6 +34,7 @@ pub const NAMES: &[&str] = &[
     "clear",
     "color",
     "column-gap",
+    "direction",
     "display",
     "flex-basis",
     "flex-direction",
@@ -195,8 +196,11 @@ pub fn value(s: &ComputedStyle, name: &str, rect: Option<Rect>) -> Option<String
         }
         .into(),
         "line-height" => px(s.line_height),
+        "direction" => if s.rtl { "rtl" } else { "ltr" }.into(),
         "text-align" => match s.text_align {
-            TextAlign::Left => "start",
+            TextAlign::Start => "start",
+            TextAlign::End => "end",
+            TextAlign::Left => "left",
             TextAlign::Center => "center",
             TextAlign::Right => "right",
         }

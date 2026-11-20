@@ -724,6 +724,7 @@ impl FromRenderer {
                 e.u8(match dest {
                     Dest::Script => 2,
                     Dest::Image => 3,
+                    Dest::Module => 4,
                     _ => 1,
                 });
                 e.u8(*added as u8);
@@ -975,6 +976,7 @@ impl FromRenderer {
                     1 => Dest::Stylesheet,
                     2 => Dest::Script,
                     3 => Dest::Image,
+                    4 => Dest::Module,
                     t => return Err(format!("invalid request type {t}")),
                 },
                 added: d.bool()?,

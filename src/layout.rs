@@ -13,7 +13,7 @@ use crate::font;
 use crate::image::Decoded;
 use crate::style::{
     Align, Clear, ComputedStyle, Display, Float, GridLine, Justify, Len, ListStyle, Position, StyledNode,
-    TextAlign, Track, TrackSize, VAlign, MAX_GRID_TRACKS,
+    TextAlign, Track, TrackSize, UnicodeBidi, VAlign, MAX_GRID_TRACKS,
 };
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -429,7 +429,9 @@ fn flatten_inline<'a>(node: &'a StyledNode<'a>, anon: &mut LayoutBox<'a>, bg: Co
             let edge = |side: usize, start: bool| {
                 let (margin, inner, border) = (st.margin[side], st.padding[side], st.border_width[side]);
                 let zero = |l: Len| matches!(l, Len::Px(v) if v == 0.0) || matches!(l, Len::Auto);
-                (!(zero(margin) && zero(inner) && border == 0.0)).then(|| InlineItem::Edge {
+                // Also where the element orders its text apart.
+                let bidi = st.unicode_bidi != UnicodeBidi::Normal;
+                (bidi || !(zero(margin) && zero(inner) && border == 0.0)).then(|| InlineItem::Edge {
                     margin,
                     inner,
                     border,
@@ -2180,6 +2182,8 @@ impl<'a> LayoutBox<'a> {
             OutOfFlow(usize),
         }
         let mut pieces = Vec::new();
+        // Direction marks (as Unicode controls) to put before piece n.
+        let mut controls: Vec<(usize, &'static str)> = Vec::new();
         let mut last_space = true;
         // Last character of the previous word, if nothing (no space, break
         // or inline-block) separates it from the next one.
@@ -2212,11 +2216,18 @@ impl<'a> LayoutBox<'a> {
                     // A start can't separate a word from the text right
                     // before it; an end always stays with what it closes.
                     let glue = !start || prev_tail.is_some() || stick;
+                    let (open, close) = bidi_controls(style);
                     if *start {
                         pieces.push(space(m, Color::TRANSPARENT, glue));
                         pieces.push(space(i, *bg, true));
+                        if !open.is_empty() {
+                            controls.push((pieces.len(), open));
+                        }
                         stick = true;
                     } else {
+                        if !close.is_empty() {
+                            controls.push((pieces.len(), close));
+                        }
                         pieces.push(space(i, *bg, true));
                         pieces.push(space(m, Color::TRANSPARENT, true));
                     }
@@ -2335,6 +2346,120 @@ impl<'a> LayoutBox<'a> {
             }
         }
 
+        // Order right-to-left and left-to-right text (the Unicode bidi
+        // algorithm, UAX #9) over the whole paragraph, in reading order. Each
+        // piece gets a level (odd reads right to left); a word with more than
+        // one is split where it changes. Lines are reordered by level once
+        // they're broken.
+        let mut levels = vec![0u8; pieces.len()];
+        let mut para_rtl = container_style.rtl;
+        {
+            let mut logical = String::new();
+            let mut at = Vec::with_capacity(pieces.len());
+            let mut ci = 0;
+            for (i, p) in pieces.iter().enumerate() {
+                while ci < controls.len() && controls[ci].0 == i {
+                    logical.push_str(controls[ci].1);
+                    ci += 1;
+                }
+                at.push(logical.len());
+                match p {
+                    Piece::Word { text, .. } => logical.push_str(text),
+                    Piece::Space { .. } => logical.push(' '),
+                    Piece::Break(_) => logical.push('\n'),
+                    Piece::Atomic(..) => logical.push('\u{FFFC}'),
+                    Piece::Float(_) | Piece::OutOfFlow(_) => {}
+                }
+            }
+            for c in &controls[ci..] {
+                logical.push_str(c.1);
+            }
+            let plain = container_style.unicode_bidi == UnicodeBidi::Plaintext;
+            let needed =
+                container_style.rtl || plain || !controls.is_empty() || logical.chars().any(font::is_rtl);
+            if needed && logical.len() <= MAX_BIDI {
+                use unicode_bidi::{BidiInfo, Level};
+                let base = if plain {
+                    None
+                } else if container_style.rtl {
+                    Some(Level::rtl())
+                } else {
+                    Some(Level::ltr())
+                };
+                let info = BidiInfo::new(&logical, base);
+                if plain {
+                    para_rtl = info.paragraphs.first().is_some_and(|p| p.level.is_rtl());
+                }
+                let base_n = u8::from(para_rtl);
+                let lv = |b: usize| info.levels.get(b).map_or(base_n, |l| l.number());
+                let mut out = Vec::with_capacity(pieces.len());
+                levels.clear();
+                for (p, start) in pieces.into_iter().zip(at) {
+                    match p {
+                        Piece::Word {
+                            text,
+                            style,
+                            bg,
+                            link,
+                            uid,
+                            w,
+                            glue,
+                        } => {
+                            let first = if text.is_empty() {
+                                lv(start).min(lv(start.saturating_sub(1)))
+                            } else {
+                                lv(start)
+                            };
+                            let mut cuts = Vec::new();
+                            for (i, _) in text.char_indices().skip(1) {
+                                if lv(start + i) != lv(start + i - 1) {
+                                    cuts.push(i);
+                                }
+                            }
+                            if cuts.is_empty() {
+                                out.push(Piece::Word {
+                                    text,
+                                    style,
+                                    bg,
+                                    link,
+                                    uid,
+                                    w,
+                                    glue,
+                                });
+                                levels.push(first);
+                            } else {
+                                let f = font::index(&style);
+                                let mut from = 0;
+                                for (k, &to) in cuts.iter().chain(std::iter::once(&text.len())).enumerate() {
+                                    let part = &text[from..to];
+                                    out.push(Piece::Word {
+                                        text: part.to_string(),
+                                        style: style.clone(),
+                                        bg,
+                                        link: link.clone(),
+                                        uid,
+                                        w: font::shaped_width(f, style.font_size, part),
+                                        glue: glue || k > 0,
+                                    });
+                                    levels.push(lv(start + from));
+                                    from = to;
+                                }
+                            }
+                        }
+                        p @ (Piece::Space { .. } | Piece::Atomic(..)) => {
+                            out.push(p);
+                            levels.push(lv(start));
+                        }
+                        p => {
+                            out.push(p);
+                            levels.push(base_n);
+                        }
+                    }
+                }
+                pieces = out;
+            }
+        }
+
         // Break into lines. Each line is as wide as the floats beside it
         // allow, and is placed as soon as it's complete, so that floats met
         // along the way affect the lines after them.
@@ -2362,6 +2487,7 @@ impl<'a> LayoutBox<'a> {
                     avail,
                     line_y,
                     &container_style,
+                    para_rtl,
                     &mut frags,
                 );
                 x = 0.0;
@@ -2425,16 +2551,19 @@ impl<'a> LayoutBox<'a> {
                     if !glue {
                         make_room!(gw);
                     }
-                    cur.push(Placed::Text(TextFrag {
-                        x,
-                        baseline: 0.0,
-                        w,
-                        text,
-                        style,
-                        bg,
-                        link,
-                        uid,
-                    }));
+                    cur.push(Placed::Text(
+                        TextFrag {
+                            x,
+                            baseline: 0.0,
+                            w,
+                            text,
+                            style,
+                            bg,
+                            link,
+                            uid,
+                        },
+                        levels[pi],
+                    ));
                     x += w;
                 }
                 Piece::Space {
@@ -2447,16 +2576,19 @@ impl<'a> LayoutBox<'a> {
                     if cur.is_empty() {
                         continue;
                     }
-                    cur.push(Placed::Text(TextFrag {
-                        x,
-                        baseline: 0.0,
-                        w,
-                        text: " ".into(),
-                        style,
-                        bg,
-                        link,
-                        uid,
-                    }));
+                    cur.push(Placed::Text(
+                        TextFrag {
+                            x,
+                            baseline: 0.0,
+                            w,
+                            text: " ".into(),
+                            style,
+                            bg,
+                            link,
+                            uid,
+                        },
+                        levels[pi],
+                    ));
                     x += w;
                 }
                 Piece::Break(s) => next_line!(Some(s)),
@@ -2465,7 +2597,7 @@ impl<'a> LayoutBox<'a> {
                         next_line!(None);
                     }
                     make_room!(w);
-                    cur.push(Placed::Atomic(i, x));
+                    cur.push(Placed::Atomic(i, x, levels[pi]));
                     x += w;
                 }
                 Piece::OutOfFlow(i) => {
@@ -2493,7 +2625,17 @@ impl<'a> LayoutBox<'a> {
             }
         }
         if !cur.is_empty() {
-            line_y += self.place_line(cur, x, None, left, avail, line_y, &container_style, &mut frags);
+            line_y += self.place_line(
+                cur,
+                x,
+                None,
+                left,
+                avail,
+                line_y,
+                &container_style,
+                para_rtl,
+                &mut frags,
+            );
         }
         for i in pending {
             self.place_float(i, line_y, floats, x0, x1);
@@ -2516,10 +2658,11 @@ impl<'a> LayoutBox<'a> {
         avail: f32,
         y: f32,
         container_style: &ComputedStyle,
+        rtl: bool,
         frags: &mut Vec<TextFrag>,
     ) -> f32 {
         // Drop trailing spaces.
-        while let Some(Placed::Text(t)) = line.last() {
+        while let Some(Placed::Text(t, _)) = line.last() {
             if t.text == " " {
                 width -= t.w;
                 line.pop();
@@ -2527,13 +2670,13 @@ impl<'a> LayoutBox<'a> {
                 break;
             }
         }
-        mirror_rtl_runs(&mut line);
+        self.reorder_line(&mut line);
         let mut asc = 0.0f32;
         let mut desc = 0.0f32;
         for p in &line {
             let (a, d) = match p {
-                Placed::Text(t) => half_leading(&t.style),
-                Placed::Atomic(i, _) => {
+                Placed::Text(t, _) => half_leading(&t.style),
+                Placed::Atomic(i, ..) => {
                     // Align the inline-block's last line baseline with ours.
                     let c = &self.children[*i];
                     let h = c.dims.margin_box().h;
@@ -2551,19 +2694,19 @@ impl<'a> LayoutBox<'a> {
             desc = d;
         }
         let baseline = y + asc;
-        let shift = match container_style.text_align {
-            TextAlign::Left => 0.0,
+        let shift = match container_style.text_align.resolve(rtl) {
             TextAlign::Center => ((avail - width) / 2.0).max(0.0),
             TextAlign::Right => (avail - width).max(0.0),
+            _ => 0.0,
         };
         for p in line {
             match p {
-                Placed::Text(mut t) => {
+                Placed::Text(mut t, _) => {
                     t.x += left + shift;
                     t.baseline = baseline;
                     frags.push(t);
                 }
-                Placed::Atomic(i, local_x) => {
+                Placed::Atomic(i, local_x, _) => {
                     // Laid out at the origin earlier; move onto the line,
                     // sitting on the baseline.
                     let child = &mut self.children[i];
@@ -2574,6 +2717,32 @@ impl<'a> LayoutBox<'a> {
             }
         }
         asc + desc
+    }
+
+    /// Show a line's pieces in visual order: pieces stay in reading order
+    /// (for selection and copying) and move to their place on the line.
+    fn reorder_line(&self, line: &mut [Placed]) {
+        let levels: Vec<u8> = line.iter().map(Placed::level).collect();
+        if levels.iter().all(|&l| l == 0) {
+            return;
+        }
+        let width = |p: &Placed| match p {
+            Placed::Text(t, _) => t.w,
+            Placed::Atomic(i, ..) => self.children[*i].dims.margin_box().w,
+        };
+        let start = line.first().map_or(0.0, |p| match p {
+            Placed::Text(t, _) => t.x,
+            Placed::Atomic(_, x, _) => *x,
+        });
+        let mut x = start;
+        for i in visual_order(&levels) {
+            let w = width(&line[i]);
+            match &mut line[i] {
+                Placed::Text(t, _) => t.x = x,
+                Placed::Atomic(_, lx, _) => *lx = x,
+            }
+            x += w;
+        }
     }
 
     /// Move float child `i` (laid out at the origin) to the highest spot at
@@ -2678,54 +2847,74 @@ pub fn paint_order<'b, 'a>(root: &'b LayoutBox<'a>) -> Vec<&'b LayoutBox<'a>> {
     out
 }
 
-/// A piece of a line, positioned relative to the line's start.
+/// A piece of a line, positioned relative to the line's start, with its
+/// bidi level (odd reads right to left).
 enum Placed {
-    Text(TextFrag),
+    Text(TextFrag, u8),
     /// An inline-block child, and its x on the line.
-    Atomic(usize, f32),
+    Atomic(usize, f32, u8),
 }
 
-/// Words are shaped (each in its own direction) and set left to right; a
-/// run of right-to-left words on a line, with the spaces and punctuation
-/// between them, is mirrored within the space it takes, so it reads from
-/// the right. (The paragraph itself stays left to right: this isn't the
-/// whole Unicode bidi algorithm.)
-fn mirror_rtl_runs(line: &mut [Placed]) {
-    let rtl: Vec<Option<bool>> = line
-        .iter()
-        .map(|p| match p {
-            Placed::Text(t) => font::direction(&t.text),
-            Placed::Atomic(..) => Some(false),
-        })
-        .collect();
-    let mut i = 0;
-    while i < line.len() {
-        if rtl[i] != Some(true) {
-            i += 1;
-            continue;
+impl Placed {
+    fn level(&self) -> u8 {
+        match self {
+            Placed::Text(_, l) | Placed::Atomic(_, _, l) => *l,
         }
-        // The run ends at the last right-to-left word before anything that
-        // reads left to right.
-        let mut end = i;
-        let mut j = i + 1;
-        while j < line.len() && rtl[j] != Some(false) {
-            if rtl[j] == Some(true) {
-                end = j;
-            }
-            j += 1;
-        }
-        let span = |p: &Placed| match p {
-            Placed::Text(t) => (t.x, t.x + t.w),
-            Placed::Atomic(_, x) => (*x, *x),
-        };
-        let (x0, x1) = (span(&line[i]).0, span(&line[end]).1);
-        for p in &mut line[i..=end] {
-            if let Placed::Text(t) = p {
-                t.x = x0 + x1 - (t.x + t.w);
-            }
-        }
-        i = end + 1;
     }
+}
+
+/// Past this many bytes of text in one paragraph, its text is set left to
+/// right as it comes, so hostile pages can't make layout slow.
+const MAX_BIDI: usize = 1 << 20;
+
+/// The Unicode controls that open and close an element's own level of
+/// direction, for its `unicode-bidi` and `direction`.
+fn bidi_controls(style: &ComputedStyle) -> (&'static str, &'static str) {
+    let rtl = style.rtl;
+    match style.unicode_bidi {
+        UnicodeBidi::Normal => ("", ""),
+        UnicodeBidi::Embed => (if rtl { "\u{202B}" } else { "\u{202A}" }, "\u{202C}"),
+        UnicodeBidi::Override => (if rtl { "\u{202E}" } else { "\u{202D}" }, "\u{202C}"),
+        UnicodeBidi::Isolate => (if rtl { "\u{2067}" } else { "\u{2066}" }, "\u{2069}"),
+        UnicodeBidi::IsolateOverride => (
+            if rtl {
+                "\u{2067}\u{202E}"
+            } else {
+                "\u{2066}\u{202D}"
+            },
+            "\u{202C}\u{2069}",
+        ),
+        UnicodeBidi::Plaintext => ("\u{2068}", "\u{2069}"),
+    }
+}
+
+/// The order pieces at these levels are shown in, left to right (UAX #9
+/// rule L2): from the highest level down to the lowest odd one, every run
+/// at that level or above is reversed.
+fn visual_order(levels: &[u8]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..levels.len()).collect();
+    let (Some(&max), Some(&min)) = (levels.iter().max(), levels.iter().min()) else {
+        return order;
+    };
+    let lowest_odd = min | 1;
+    let mut level = max;
+    while level >= lowest_odd {
+        let mut i = 0;
+        while i < order.len() {
+            if levels[order[i]] < level {
+                i += 1;
+                continue;
+            }
+            let mut j = i;
+            while j < order.len() && levels[order[j]] >= level {
+                j += 1;
+            }
+            order[i..j].reverse();
+            i = j;
+        }
+        level -= 1;
+    }
+    order
 }
 
 // ---------------------------------------------------------------------------
@@ -4779,6 +4968,101 @@ mod modern_layout_tests {
             x("one") < x("بالعالم") && x("بالعالم") < x("مرحبا") && x("مرحبا") < x("two"),
             "{f:?}"
         );
+    }
+
+    /// Each piece of text on the page with its x and width, laid out with
+    /// `sheet` (the body has no margin; the page is 1000px wide).
+    fn frags_of(sheet: &str, doc: &str) -> Vec<(String, f32, f32)> {
+        let dom = html::parse(doc);
+        let ua = css::parse(style::UA_CSS);
+        let author = css::parse(&format!("body{{margin:0;font:16px sans-serif}} {sheet}"));
+        let ctx = StyleContext {
+            text_scale: 1.0,
+            sheets: vec![(0, &ua), (1, &author)],
+            viewport: WIN,
+        };
+        let styled = style::style_tree(&dom, &ctx);
+        let root = layout_tree_with_images(&styled, WIN, &HashMap::new());
+        fn walk(b: &LayoutBox, out: &mut Vec<(String, f32, f32)>) {
+            if let BoxKind::Anonymous { frags, .. } = &b.kind {
+                out.extend(frags.iter().map(|f| (f.text.clone(), f.x, f.w)));
+            }
+            b.children.iter().for_each(|c| walk(c, out));
+        }
+        let mut out = Vec::new();
+        walk(&root, &mut out);
+        out
+    }
+
+    #[test]
+    fn bidi_paragraphs() {
+        let at = |f: &[(String, f32, f32)], w: &str| {
+            f.iter()
+                .find(|(t, ..)| t == w)
+                .map(|&(_, x, w)| (x, w))
+                .unwrap_or_else(|| panic!("no {w:?} in {f:?}"))
+        };
+        // A right-to-left paragraph starts on the right; English inside it
+        // reads left to right, as a block, to the left of the Hebrew.
+        let f = frags_of("", "<p dir=rtl>שלום world 123</p>");
+        let (heb, hw) = at(&f, "שלום");
+        assert!((heb + hw - 1000.0).abs() < 0.5, "{f:?}");
+        assert!(
+            at(&f, "world").0 < at(&f, "123").0 && at(&f, "123").0 < heb,
+            "{f:?}"
+        );
+        // The same from CSS; and `text-align: end` in left-to-right text.
+        let f = frags_of("p{direction:rtl}", "<p>שלום</p>");
+        assert!(
+            (at(&f, "שלום").0 + at(&f, "שלום").1 - 1000.0).abs() < 0.5,
+            "{f:?}"
+        );
+        let f = frags_of("p{text-align:end}", "<p>end</p>");
+        assert!((at(&f, "end").0 + at(&f, "end").1 - 1000.0).abs() < 0.5, "{f:?}");
+        let f = frags_of("p{direction:rtl;text-align:left}", "<p>שלום</p>");
+        assert!(at(&f, "שלום").0 < 1.0, "{f:?}");
+        // Numbers in Hebrew text keep their own order, in the right place:
+        // "page 12 of 30" reads from the right.
+        let f = frags_of("", "<p>עמוד 12 מתוך 30</p>");
+        let xs: Vec<f32> = ["30", "מתוך", "12", "עמוד"].iter().map(|w| at(&f, w).0).collect();
+        assert!(xs.windows(2).all(|p| p[0] < p[1]), "{f:?}");
+        // Inside a right-to-left element, a trailing "!" ends up on the
+        // left of the word, split off from it; the element is placed as a
+        // whole among the words around it.
+        let f = frags_of("", "<p>x <span dir=rtl>a!</span> y</p>");
+        assert!(
+            at(&f, "x").0 < at(&f, "!").0 && at(&f, "!").0 < at(&f, "a").0 && at(&f, "a").0 < at(&f, "y").0,
+            "{f:?}"
+        );
+        // `<bdo dir=rtl>` sets even English words from the right.
+        let f = frags_of("", "<p><bdo dir=rtl>one two</bdo></p>");
+        assert!(at(&f, "two").0 < at(&f, "one").0, "{f:?}");
+        // `dir=auto` takes the direction from the first letter.
+        let f = frags_of("", "<p dir=auto>שלום hello</p><div dir=auto>hello שלום</div>");
+        assert!(
+            (at(&f, "שלום").0 + at(&f, "שלום").1 - 1000.0).abs() < 0.5,
+            "{f:?}"
+        );
+        assert!(at(&f, "hello").0 < at(&f, "שלום").0, "{f:?}");
+        let f = frags_of("", "<div dir=auto>hello שלום</div>");
+        assert!(at(&f, "hello").0 < 1.0, "{f:?}");
+        // Left-to-right text is left alone.
+        let f = frags_of("", "<p>a (b) c</p>");
+        assert!(
+            at(&f, "a").0 < at(&f, "(b)").0 && at(&f, "(b)").0 < at(&f, "c").0,
+            "{f:?}"
+        );
+    }
+
+    #[test]
+    fn crafted_bidi_stays_fast() {
+        let doc = format!(
+            "<p>{}</p>",
+            "<span dir=rtl>א b <bdo dir=ltr>ג 1</bdo></span> ".repeat(3000)
+        );
+        let t = std::time::Instant::now();
+        frags_of("", &doc);
+        assert!(t.elapsed().as_secs() < 5, "{:?}", t.elapsed());
     }
 
     #[test]

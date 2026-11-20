@@ -463,7 +463,7 @@ fn print_log(log: &[LogEntry], page_url: &str) {
     let kind = |e: &LogEntry| match e.dest {
         net::Dest::Document => "page",
         net::Dest::Stylesheet => "css",
-        net::Dest::Script => "js",
+        net::Dest::Script | net::Dest::Module => "js",
         net::Dest::Xhr => "xhr",
         net::Dest::Image => "img",
         net::Dest::Download => "list",

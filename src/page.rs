@@ -286,6 +286,11 @@ pub trait Host {
             self.fetch(url, Dest::Script)
         }
     }
+    /// A JavaScript module file: like [`Host::fetch_script`], but under
+    /// CORS and only if it's served as JavaScript.
+    fn fetch_module(&mut self, url: &str, added: bool, csp: &[Vec<String>]) -> Result<String, String> {
+        self.fetch_script(url, added, csp)
+    }
     fn stylesheet(
         &mut self,
         url: &str,
@@ -2349,7 +2354,7 @@ impl ScriptLoader<'_> {
             return None;
         }
         self.modules += 1;
-        host.fetch_script(url, added, csp).ok() // failures are in the request log
+        host.fetch_module(url, added, csp).ok() // failures are in the request log
     }
 
     /// Scripts that scripts added to the document.

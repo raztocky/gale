@@ -1536,3 +1536,72 @@ fn excess_csp_headers_do_not_drop_a_restrictive_policy() {
         "excess restrictive policy was dropped"
     );
 }
+
+#[test]
+fn modules_are_fetched_under_cors_and_must_be_javascript() {
+    let home = temp_dir("modules-cors");
+    let (other, other_seen) = serve(vec![
+        (
+            "/shared.js",
+            "text/javascript\r\nAccess-Control-Allow-Origin: *",
+            "export const a = 'shared';".into(),
+        ),
+        (
+            "/closed.js",
+            "text/javascript",
+            "export const b = 'closed';".into(),
+        ),
+    ]);
+    let (port, seen) = serve(vec![
+        (
+            "/",
+            "text/html\r\nSet-Cookie: sid=synthetic; Path=/",
+            format!(
+                "<script type=module>import {{a}} from 'http://127.0.0.1:{other}/shared.js'; console.log('got', a);</script>\
+                 <script type=module>import {{b}} from 'http://127.0.0.1:{other}/closed.js'; console.log('LEAK', b);</script>\
+                 <script type=module>import {{t}} from '/m/text.js'; console.log('LEAK text', t);</script>\
+                 <script type=module src=/m/ok.js></script>"
+            ),
+        ),
+        ("/m/ok.js", "text/javascript", "import {d} from './dep.js'; console.log('own', d);".into()),
+        ("/m/dep.js", "application/javascript; charset=utf-8", "export const d = 'dep';".into()),
+        ("/m/text.js", "text/plain", "export const t = 'text';".into()),
+    ]);
+    let url = format!("http://127.0.0.1:{port}/");
+    assert!(brickle(&home)
+        .args(["js", "allow", &url])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    // Load twice: the second time the page's cookie is in the jar.
+    brickle(&home).args(["requests", &url]).output().unwrap();
+    let out = brickle(&home).args(["requests", &url]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    for want in ["[log] got shared", "[log] own dep"] {
+        assert!(text.contains(want), "missing {want:?}:\n{text}");
+    }
+    assert!(!text.contains("LEAK"), "{text}");
+    // Another origin's modules: asked for under CORS, without cookies.
+    let other_seen = other_seen.lock().unwrap();
+    assert!(!other_seen.is_empty());
+    for r in other_seen.iter() {
+        let has = |h: &str| r.iter().any(|l| l.eq_ignore_ascii_case(h));
+        assert!(has(&format!("Origin: http://127.0.0.1:{port}")), "{r:?}");
+        assert!(has("Sec-Fetch-Mode: cors"), "{r:?}");
+        assert!(
+            !r.iter().any(|l| l.to_ascii_lowercase().starts_with("cookie:")),
+            "{r:?}"
+        );
+    }
+    // The page's own: with its cookie, no Origin.
+    let seen = seen.lock().unwrap();
+    let ok = seen
+        .iter()
+        .rev()
+        .find(|r| r[0].contains("/m/ok.js"))
+        .expect("ok.js asked for");
+    assert!(ok[0].starts_with("GET /m/ok.js "), "{ok:?}");
+    assert!(ok.iter().any(|l| l == "Cookie: sid=synthetic"), "{ok:?}");
+    assert!(!ok.iter().any(|l| l.starts_with("Origin:")), "{ok:?}");
+}

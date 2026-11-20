@@ -598,7 +598,7 @@ pub fn explain(e: &LogEntry, page_url: &str) -> Vec<String> {
     }
 
     // Code from another site runs with the page's own powers.
-    if third_party && sent && e.dest == crate::net::Dest::Script {
+    if third_party && sent && matches!(e.dest, crate::net::Dest::Script | crate::net::Dest::Module) {
         out.push(format!(
             "Code from another site ({}) running in this page: it can read and change anything on it \
              (Brickle stops it sending to other sites)",

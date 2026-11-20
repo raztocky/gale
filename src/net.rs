@@ -436,6 +436,10 @@ pub enum Dest {
     Stylesheet,
     /// A page's script (only for sites where you allowed JavaScript).
     Script,
+    /// A JavaScript module, or a file one imports: fetched like a script,
+    /// but under CORS (no cookies for another site, which must agree to
+    /// share it) and only if it says it's JavaScript.
+    Module,
     /// A request a page's script made (`fetch`, `XMLHttpRequest`).
     Xhr,
     /// An `<img>`.
@@ -823,6 +827,20 @@ fn http_get_timeout(
             req = with_cookie(req, cookie);
             req.set("Sec-Fetch-Dest", "script")
                 .set("Sec-Fetch-Mode", "no-cors")
+                .set("Sec-Fetch-Site", site)
+        }
+        Dest::Module => {
+            req = req
+                .set("Accept", "*/*")
+                .set("Accept-Language", "en-US,en;q=0.5")
+                .set("Accept-Encoding", "gzip, deflate, br, zstd");
+            if let Some(origin) = script.and_then(|o| o.origin) {
+                req = req.set("Origin", origin);
+            }
+            req = req.set("Connection", "keep-alive");
+            req = with_cookie(req, cookie);
+            req.set("Sec-Fetch-Dest", "script")
+                .set("Sec-Fetch-Mode", "cors")
                 .set("Sec-Fetch-Site", site)
         }
         Dest::Xhr => {

@@ -25,8 +25,11 @@ Planned work, roughly in priority order. Items marked *discuss* need a decision 
       kerning, ligatures, Arabic/Indic/Thai shaping
 - [x] Font fallback: bundled Noto subsets for CJK, Korean, Devanagari, Thai, emoji, symbols
 - [ ] More fallback scripts on request (Bengali, Tamil, Ethiopic, ...); color emoji
-- [x] Right-to-left words read from the right (runs mirrored within each line)
-- [ ] Full bidirectional text (paragraph direction, `dir="rtl"`, numbers inside RTL), with `unicode-bidi`
+- [x] Full bidirectional text with `unicode-bidi` (UAX #9): paragraph direction, `dir`
+      (`rtl`/`ltr`/`auto`), `direction` and `unicode-bidi` in CSS, `<bdi>`/`<bdo>`, numbers inside
+      right-to-left text, `text-align: start/end`, mirrored brackets
+- [ ] Right-to-left page structure: list markers, floats, table columns and flex rows on the
+      right; `<bdo>` reversing the letters of left-to-right words (it reverses their order)
 - [x] Unicode line breaking (UAX #14) with `unicode-linebreak`
 - [ ] Thai/Lao/Khmer word breaking (needs a dictionary)
 - [x] Page titles in the tab bar are drawn by the page's own sandboxed renderer; the browser only
@@ -72,7 +75,9 @@ what's next:
 - [x] `document.cookie` for non-HttpOnly cookies, answered by the browser.
 - [x] JavaScript modules (`type=module`, static `import`, literal `import()`, import maps; `nomodule` skipped).
 - [x] `import()` of an address built at run time (fetched when asked, as a script's request).
-- [ ] CORS and the strict MIME type check for modules, `<link rel=modulepreload>`.
+- [x] Modules under CORS (no cookies for another origin, which must agree to share) and only if
+  served as JavaScript.
+- [ ] `<link rel=modulepreload>` (modules load when used, so it only saves time).
 - [x] Keyboard input and form controls (typing into fields, submitting forms).
 - [x] More selectors for `querySelector` (sibling combinators, `:not()`, attribute values),
   shared with CSS.
@@ -83,7 +88,8 @@ what's next:
 - [ ] Big framework apps that don't finish starting in time with Boa (yahoo.com's React app
   takes over 10 s; its feed stays as placeholders). The 32-script limit happens to keep it
   from starting; a long script is now stopped at the time budget instead of the renderer
-  being killed.
+  being killed. *Waiting on Boa getting faster* (decided 2026-11-20: no engine switch, no
+  snapshotting); try again with each Boa release.
 
 ## Forms
 

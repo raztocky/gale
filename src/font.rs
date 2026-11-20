@@ -528,14 +528,42 @@ pub fn shaped_width(primary: usize, size: f32, text: &str) -> f32 {
     shape(primary, size, text).width
 }
 
+/// Whether `c` is a letter of a script written right to left (Hebrew,
+/// Arabic and the like), or a mark that says the text is.
+pub fn is_rtl(c: char) -> bool {
+    matches!(c as u32,
+        0x0590..=0x08FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF | 0x10800..=0x10FFF | 0x1E800..=0x1EFFF
+        | 0x200F | 0x202B | 0x202E | 0x2067)
+}
+
+/// The mirror image of a bracket or similar character, drawn in its place
+/// in right-to-left text: "(" for ")" and so on.
+fn mirrored(c: char) -> Option<char> {
+    const PAIRS: [(char, char); 10] = [
+        ('(', ')'),
+        ('[', ']'),
+        ('{', '}'),
+        ('<', '>'),
+        ('«', '»'),
+        ('‹', '›'),
+        ('⁅', '⁆'),
+        ('⟨', '⟩'),
+        ('≤', '≥'),
+        ('〈', '〉'),
+    ];
+    PAIRS.iter().find_map(|&(a, b)| match c {
+        _ if c == a => Some(b),
+        _ if c == b => Some(a),
+        _ => None,
+    })
+}
+
 /// Which way a piece of text reads, by its first letter: right to left
 /// (`Some(true)`) for Hebrew, Arabic and the like, left to right for other
 /// letters, neither for spaces, digits and punctuation.
 pub fn direction(text: &str) -> Option<bool> {
     text.chars().find_map(|c| {
-        let rtl = matches!(c as u32,
-            0x0590..=0x08FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF | 0x10800..=0x10FFF | 0x1E800..=0x1EFFF);
-        if rtl {
+        if is_rtl(c) {
             Some(true)
         } else if c.is_alphabetic() {
             Some(false)
@@ -563,11 +591,27 @@ fn shape_uncached(primary: usize, size: f32, text: &str) -> Shaped {
     }
     // Text that reads right to left puts its runs (each shaped in its own
     // direction) right to left too: "العربية:" ends with its colon on the left.
-    if direction(text) == Some(true) {
+    let rtl = direction(text) == Some(true);
+    if rtl {
         runs.reverse();
     }
     for (font, start, end) in runs {
         let part = &text[start..end];
+        // Brackets and the like among right-to-left letters face the other
+        // way. A run in a right-to-left script is shaped right to left,
+        // which flips them already; a run of punctuation alone is shaped
+        // left to right, so they're flipped here (each pair has the same
+        // length, so clusters stay put).
+        let flipped: String;
+        let part = if rtl && !part.chars().any(is_rtl) && part.chars().any(|c| mirrored(c).is_some()) {
+            flipped = part
+                .chars()
+                .map(|c| mirrored(c).filter(|m| m.len_utf8() == c.len_utf8()).unwrap_or(c))
+                .collect();
+            flipped.as_str()
+        } else {
+            part
+        };
         let base = out.width;
         match shaper_font(font).filter(|_| end <= MAX_SHAPED) {
             Some(f) => {
@@ -746,6 +790,18 @@ mod tests {
             (q.width - measure(4, 40.0, "q")).abs() < 0.5,
             "the accent takes no room"
         );
+    }
+
+    #[test]
+    fn brackets_face_the_other_way_in_right_to_left_text() {
+        let close = shape(0, 16.0, ")").glyphs[0].id;
+        let open = shape(0, 16.0, "(").glyphs[0].id;
+        let rtl = shape(0, 16.0, "(שלום)");
+        let at = |c: usize| rtl.glyphs.iter().find(|g| g.cluster == c).unwrap().id;
+        assert_eq!((at(0), at("(שלום".len())), (close, open));
+        // In left-to-right text they're as written.
+        let ltr = shape(0, 16.0, "(abc)");
+        assert_eq!((ltr.glyphs[0].id, ltr.glyphs[4].id), (open, close));
     }
 
     #[test]
