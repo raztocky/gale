@@ -1,6 +1,7 @@
 //! The desktop browser window: address bar, page, request panel.
 
 use crate::describe;
+use brickle::bookmarks::{Bookmarks, Slot};
 use brickle::css::Color;
 use brickle::font;
 use brickle::forms::Submission;
@@ -437,6 +438,9 @@ struct Ui {
     /// Asking whether to send a form again: for a reload (0) or a step
     /// back (-1) or forward (1) onto a page that answered a form.
     resend: Option<i32>,
+    /// A bookmarks list that's open: a folder, the ones that don't fit on
+    /// the toolbar, or what you can do with one.
+    bm_popup: Option<BmPopup>,
 }
 
 /// What the window knows about the current page. The `Tab` itself may be
@@ -697,6 +701,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         can_back: false,
         can_forward: false,
         resend: None,
+        bm_popup: None,
         loading: false,
     };
     shared_scale.store(ui.text_scale.to_bits(), Ordering::Relaxed);
@@ -764,6 +769,11 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
     let mut asked_reveal: Option<(u64, i32)> = None;
     // A file dialog open for a file field: (tab, page, field, its answer).
     let mut file_pick: Option<FilePick> = None;
+    // A bookmark or folder held down on the toolbar: (slot, where the press
+    // was, dragged yet, Ctrl held). It opens when let go, unless dragged.
+    let mut bm_press: Option<(usize, f32, bool, bool)> = None;
+    // A name being asked for (renaming a bookmark or folder, a new folder).
+    let mut text_ask: Option<TextAsk> = None;
     let mut canvas = Canvas::new(w, h, Color::WHITE);
 
     // Tabs: the loop's variables above are the current tab's; the others
@@ -924,6 +934,9 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         let page_w = page_w_now(&ui, w);
         // Window pixels per interface unit, and where the page starts.
         let k = ui_scale();
+        if let Ok(mut size) = WINDOW_SIZE.lock() {
+            *size = (w as f32 / k, h as f32 / k);
+        }
         let bar = bar_h();
         let view_h = h as f32 - bar;
 
@@ -1124,8 +1137,9 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             None => window.get_keys_pressed(KeyRepeat::Yes),
         };
         for key in keys {
-            if key == Key::Escape && ui.menu.is_some() {
+            if key == Key::Escape && (ui.menu.is_some() || ui.bm_popup.is_some()) {
                 ui.menu = None;
+                ui.bm_popup = None;
                 dirty = true;
                 continue;
             }
@@ -1649,8 +1663,19 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     }
                     .into(),
                 )
-            } else if let Some(b) = bookmark_at(&bookmarks.list, w as f32 / k, lx, ly) {
-                Some(format!("{}  ·  right-click to remove", bookmarks.list[b].url))
+            } else if let Some(hit) = bookmark_hit(&bookmarks, w as f32 / k, lx, ly) {
+                Some(match hit {
+                    BarHit::Slot(Slot::Mark(b)) => {
+                        format!(
+                            "{}  ·  drag to move, right-click to rename, file or remove",
+                            bookmarks.list[b].url
+                        )
+                    }
+                    BarHit::Slot(Slot::Folder(f)) => {
+                        format!("Folder “{f}”  ·  right-click to rename or remove")
+                    }
+                    BarHit::More => "More bookmarks".into(),
+                })
             } else if badge.contains(lx, ly) {
                 Some("Show every request this page made (F12)".into())
             } else if my > bar && mx < page_w {
@@ -1683,17 +1708,29 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 }
             }
             if mid && !was_mid {
-                if let Some(b) = bookmark_at(&bookmarks.list, w as f32 / k, lx, ly) {
+                if let Some(BarHit::Slot(Slot::Mark(b))) = bookmark_hit(&bookmarks, w as f32 / k, lx, ly) {
                     tab_action = Some(TabAction::Background(bookmarks.list[b].url.clone()));
+                } else if let Some(BmEntry::Open(b)) = ui.bm_popup.as_ref().and_then(|p| p.entry_at(lx, ly)) {
+                    tab_action = Some(TabAction::Background(bookmarks.list[b].url.clone()));
+                    ui.bm_popup = None;
+                    dirty = true;
                 }
             }
             was_mid = mid;
             let right = window.get_mouse_down(MouseButton::Right);
             if right && !was_right {
-                if let Some(b) = bookmark_at(&bookmarks.list, w as f32 / k, lx, ly) {
-                    ui.flash = Some(match bookmarks.remove(b) {
-                        Ok(m) | Err(m) => m,
-                    });
+                // What you can do with a bookmark or folder, at the pointer.
+                let target = match ui.bm_popup.as_ref().and_then(|p| p.entry_at(lx, ly)) {
+                    Some(BmEntry::Open(b)) => Some(Slot::Mark(b)),
+                    Some(BmEntry::Folder(f)) => Some(Slot::Folder(f)),
+                    _ => match bookmark_hit(&bookmarks, w as f32 / k, lx, ly) {
+                        Some(BarHit::Slot(s)) => Some(s),
+                        _ => None,
+                    },
+                };
+                if let Some(t) = target {
+                    ui.bm_popup = Some(BmPopup::actions(&bookmarks, &t, lx, ly));
+                    ui.menu = None;
                     dirty = true;
                 }
             }
@@ -1726,6 +1763,71 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                         reload = true;
                     } else {
                         hist = dir;
+                    }
+                }
+                dirty = true;
+            } else if down && !was_down && ui.bm_popup.is_some() {
+                // A click with a bookmarks list open picks from it, or
+                // just closes it.
+                let popup = ui.bm_popup.take();
+                if let Some(e) = popup.as_ref().and_then(|p| p.entry_at(lx, ly)) {
+                    match e {
+                        BmEntry::Open(b) => {
+                            let url = bookmarks.list[b].url.clone();
+                            if ctrl {
+                                tab_action = Some(TabAction::Background(url));
+                            } else {
+                                navigate = Some((url, None));
+                            }
+                        }
+                        BmEntry::NewTab(b) => {
+                            tab_action = Some(TabAction::Background(bookmarks.list[b].url.clone()))
+                        }
+                        BmEntry::Folder(f) => {
+                            let x = popup.as_ref().map_or(lx, |p| p.x);
+                            ui.bm_popup = Some(BmPopup::folder(&bookmarks, &f, x, TOP_H + BOOK_H - 2.0));
+                        }
+                        BmEntry::Rename(b) => {
+                            let b = &bookmarks.list[b];
+                            text_ask = Some(TextAsk::start(
+                                TextAskKind::Rename(b.url.clone()),
+                                "Rename bookmark",
+                                "Name (leave it empty to show the address):",
+                                &b.title,
+                            ));
+                        }
+                        BmEntry::NewFolder(b) => {
+                            text_ask = Some(TextAsk::start(
+                                TextAskKind::NewFolder(bookmarks.list[b].url.clone()),
+                                "New folder",
+                                "Name of the new folder:",
+                                "",
+                            ));
+                        }
+                        BmEntry::RenameFolder(f) => {
+                            text_ask = Some(TextAsk::start(
+                                TextAskKind::RenameFolder(f.clone()),
+                                "Rename folder",
+                                "Folder name:",
+                                &f,
+                            ));
+                        }
+                        BmEntry::MoveTo(b, f) => {
+                            ui.flash = Some(bookmarks.set_folder(b, &f).unwrap_or_else(|e| e))
+                        }
+                        BmEntry::Shift(b, d) => {
+                            let j = bookmarks.in_folder(&bookmarks.list[b].folder);
+                            let at = j.iter().position(|&x| x == b).unwrap_or(0) as i32 + d;
+                            if let Some(&to) = usize::try_from(at).ok().and_then(|a| j.get(a)) {
+                                if let Err(e) = bookmarks.move_within(b, to) {
+                                    ui.flash = Some(e);
+                                }
+                            }
+                        }
+                        BmEntry::Remove(b) => ui.flash = Some(bookmarks.remove(b).unwrap_or_else(|e| e)),
+                        BmEntry::RemoveFolder(f) => {
+                            ui.flash = Some(bookmarks.remove_folder(&f).unwrap_or_else(|e| e))
+                        }
                     }
                 }
                 dirty = true;
@@ -1779,14 +1881,27 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 } else if badge.contains(lx, ly) {
                     ui.panel = !ui.panel;
                 } else if ly >= TOP_H && my < bar {
-                    // The bookmarks toolbar: Ctrl+click opens in a new tab.
-                    if let Some(b) = bookmark_at(&bookmarks.list, w as f32 / k, lx, ly) {
-                        let url = bookmarks.list[b].url.clone();
-                        if ctrl {
-                            tab_action = Some(TabAction::Background(url));
-                        } else {
-                            navigate = Some((url, None));
+                    // The bookmarks toolbar: a bookmark or folder opens when
+                    // you let go (Ctrl: in a new tab), unless you drag it.
+                    match bookmark_hit(&bookmarks, w as f32 / k, lx, ly) {
+                        Some(BarHit::Slot(s)) => {
+                            let slots = bookmarks.toolbar();
+                            if let Some(n) = slots.iter().position(|o| *o == s) {
+                                bm_press = Some((n, lx, false, ctrl));
+                            }
                         }
+                        Some(BarHit::More) => {
+                            let (shown, more) = bookmark_layout(&bookmarks, w as f32 / k);
+                            if let Some(m) = more {
+                                ui.bm_popup = Some(BmPopup::overflow(
+                                    &bookmarks,
+                                    shown.len(),
+                                    m.x + m.w,
+                                    m.y + m.h + 1.0,
+                                ));
+                            }
+                        }
+                        None => {}
                     }
                     if ui.editing {
                         ui.editing = false;
@@ -1936,6 +2051,82 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     ui.address.set(&info.url);
                 }
                 dirty = true;
+            }
+        }
+        if let Some((slot, from, moved, ctrl_held)) = bm_press.as_mut() {
+            match (down, mouse) {
+                (true, Some((mx, _))) => {
+                    let lx = mx / k;
+                    *moved |= (lx - *from).abs() > 6.0;
+                    if *moved {
+                        let (shown, _) = bookmark_layout(&bookmarks, w as f32 / k);
+                        let to = shown
+                            .iter()
+                            .position(|(_, r)| lx < r.x + r.w)
+                            .unwrap_or(shown.len().saturating_sub(1));
+                        if to != *slot && to < shown.len() {
+                            match bookmarks.move_slot(*slot, to) {
+                                Ok(()) => *slot = to,
+                                Err(e) => ui.flash = Some(e),
+                            }
+                            dirty = true;
+                        }
+                    }
+                }
+                _ => {
+                    if !*moved {
+                        match bookmarks.toolbar().get(*slot) {
+                            Some(Slot::Mark(b)) => {
+                                let url = bookmarks.list[*b].url.clone();
+                                if *ctrl_held {
+                                    tab_action = Some(TabAction::Background(url));
+                                } else {
+                                    navigate = Some((url, None));
+                                }
+                            }
+                            Some(Slot::Folder(f)) => {
+                                let (shown, _) = bookmark_layout(&bookmarks, w as f32 / k);
+                                if let Some((_, r)) = shown.get(*slot) {
+                                    ui.bm_popup = Some(BmPopup::folder(&bookmarks, f, r.x, r.y + r.h + 1.0));
+                                }
+                            }
+                            None => {}
+                        }
+                        dirty = true;
+                    }
+                    bm_press = None;
+                }
+            }
+        }
+        // A name you typed in the dialog (or nothing, if you cancelled).
+        if let Some(ask) = &text_ask {
+            match ask.answer.try_recv() {
+                Ok(answer) => {
+                    let kind = ask.kind.clone();
+                    text_ask = None;
+                    let find = |u: &str| bookmarks.list.iter().position(|b| b.url == u);
+                    let r = match (answer, kind) {
+                        (Ok(None), _) => Ok(String::new()),
+                        (Err(e), _) => Err(e),
+                        (Ok(Some(t)), TextAskKind::Rename(u)) => match find(&u) {
+                            Some(i) => bookmarks.rename(i, &t),
+                            None => Err("That bookmark is gone".into()),
+                        },
+                        (Ok(Some(t)), TextAskKind::NewFolder(u)) => match find(&u) {
+                            Some(_) if t.trim().is_empty() => Err("A folder needs a name".into()),
+                            Some(i) => bookmarks.set_folder(i, &t),
+                            None => Err("That bookmark is gone".into()),
+                        },
+                        (Ok(Some(t)), TextAskKind::RenameFolder(f)) => bookmarks.rename_folder(&f, &t),
+                    };
+                    match r {
+                        Ok(m) if m.is_empty() => {}
+                        Ok(m) | Err(m) => ui.flash = Some(m),
+                    }
+                    dirty = true;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => text_ask = None,
+                Err(mpsc::TryRecvError::Empty) => {}
             }
         }
         if let Some((id, from, moved)) = tab_drag.as_mut() {
@@ -2433,7 +2624,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             );
             if BOOKMARKS_BAR.load(Ordering::Relaxed) {
                 let at = mouse.map(|(x, y)| (x / k, y / k));
-                draw_bookmarks(&mut canvas, &bookmarks.list, &info.url, at, &mut cache);
+                draw_bookmarks(&mut canvas, &bookmarks, &info.url, at, &mut cache);
             }
             let titles: Vec<(TabLabel, bool)> = order
                 .iter()
@@ -2485,6 +2676,9 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             }
             if let Some(m) = ui.menu {
                 draw_menu(&mut canvas, m, mouse.map(|(x, y)| (x / k, y / k)), &mut cache);
+            }
+            if let Some(p) = &ui.bm_popup {
+                draw_bm_popup(&mut canvas, p, mouse.map(|(x, y)| (x / k, y / k)), &mut cache);
             }
             canvas.scale = 1.0;
             canvas.dark = false;
@@ -3113,44 +3307,237 @@ fn save_scale(name: &str, scale: f32) {
     }
 }
 
-/// Where each bookmark is on the toolbar, left to right, as many as fit
-/// in `w`.
-fn bookmark_rects(list: &[brickle::bookmarks::Bookmark], w: f32) -> Vec<Rect> {
-    let mut x = 8.0;
-    let mut out = Vec::new();
-    for b in list {
-        let bw = (font::measure(SANS, 11.5, &b.shown()) + 20.0).min(200.0);
-        if x + bw > w - 40.0 {
-            break;
-        }
-        out.push(Rect {
-            x,
-            y: TOP_H + 3.0,
-            w: bw,
-            h: BOOK_H - 6.0,
-        });
-        x += bw + 4.0;
-    }
-    out
+/// Where on the bookmarks toolbar a point is.
+#[derive(Debug, Clone, PartialEq)]
+enum BarHit {
+    Slot(Slot),
+    /// The » button for what doesn't fit.
+    More,
 }
 
-fn bookmark_at(list: &[brickle::bookmarks::Bookmark], w: f32, x: f32, y: f32) -> Option<usize> {
+/// How a toolbar slot is labelled.
+fn slot_label(bm: &Bookmarks, s: &Slot) -> String {
+    match s {
+        Slot::Mark(i) => bm.list[*i].shown(),
+        Slot::Folder(f) => format!("{f} ▾"),
+    }
+}
+
+/// The toolbar slots that fit in `w`, left to right, each with where it
+/// is, and the » button for the rest if some don't fit.
+fn bookmark_layout(bm: &Bookmarks, w: f32) -> (Vec<(Slot, Rect)>, Option<Rect>) {
+    let slots = bm.toolbar();
+    let more_w = 28.0;
+    let mut x = 8.0;
+    let mut out = Vec::new();
+    for (n, s) in slots.iter().enumerate() {
+        let bw = (font::measure(SANS, 11.5, &slot_label(bm, s)) + 20.0).min(200.0);
+        let room = if n + 1 == slots.len() {
+            w - 8.0
+        } else {
+            w - 12.0 - more_w
+        };
+        if x + bw > room {
+            break;
+        }
+        out.push((
+            s.clone(),
+            Rect {
+                x,
+                y: TOP_H + 3.0,
+                w: bw,
+                h: BOOK_H - 6.0,
+            },
+        ));
+        x += bw + 4.0;
+    }
+    let more = (out.len() < slots.len()).then_some(Rect {
+        x: w - 8.0 - more_w,
+        y: TOP_H + 3.0,
+        w: more_w,
+        h: BOOK_H - 6.0,
+    });
+    (out, more)
+}
+
+fn bookmark_hit(bm: &Bookmarks, w: f32, x: f32, y: f32) -> Option<BarHit> {
     if !BOOKMARKS_BAR.load(Ordering::Relaxed) || !(TOP_H..TOP_H + BOOK_H).contains(&y) {
         return None;
     }
-    bookmark_rects(list, w).iter().position(|r| r.contains(x, y))
+    let (shown, more) = bookmark_layout(bm, w);
+    if more.is_some_and(|m| m.contains(x, y)) {
+        return Some(BarHit::More);
+    }
+    shown
+        .into_iter()
+        .find(|(_, r)| r.contains(x, y))
+        .map(|(s, _)| BarHit::Slot(s))
+}
+
+/// What picking an entry in a bookmarks list does.
+#[derive(Debug, Clone, PartialEq)]
+enum BmEntry {
+    Open(usize),
+    NewTab(usize),
+    /// Open this folder's list.
+    Folder(String),
+    Rename(usize),
+    /// Move it up or down in its folder.
+    Shift(usize, i32),
+    MoveTo(usize, String),
+    NewFolder(usize),
+    Remove(usize),
+    RenameFolder(String),
+    RemoveFolder(String),
+}
+
+/// A bookmarks list on top of the window.
+#[derive(Debug, Clone)]
+struct BmPopup {
+    x: f32,
+    y: f32,
+    entries: Vec<(String, BmEntry)>,
+}
+
+/// Most entries a bookmarks list shows.
+const MAX_POPUP: usize = 40;
+
+impl BmPopup {
+    /// A folder's bookmarks, under (x, y).
+    fn folder(bm: &Bookmarks, folder: &str, x: f32, y: f32) -> BmPopup {
+        let entries = bm
+            .in_folder(folder)
+            .into_iter()
+            .map(|i| (bm.list[i].shown(), BmEntry::Open(i)))
+            .collect();
+        BmPopup { x, y, entries }
+    }
+
+    /// The toolbar's slots from `from` on, right-aligned at `right`.
+    fn overflow(bm: &Bookmarks, from: usize, right: f32, y: f32) -> BmPopup {
+        let entries: Vec<(String, BmEntry)> = bm.toolbar()[from..]
+            .iter()
+            .map(|s| match s {
+                Slot::Mark(i) => (bm.list[*i].shown(), BmEntry::Open(*i)),
+                Slot::Folder(f) => (slot_label(bm, s), BmEntry::Folder(f.clone())),
+            })
+            .collect();
+        let mut p = BmPopup { x: 0.0, y, entries };
+        p.x = right - p.width();
+        p
+    }
+
+    /// What you can do with a bookmark or folder, at (x, y).
+    fn actions(bm: &Bookmarks, target: &Slot, x: f32, y: f32) -> BmPopup {
+        let mut entries = Vec::new();
+        match target {
+            Slot::Mark(i) => {
+                let i = *i;
+                let here = bm.list[i].folder.clone();
+                entries.push(("Open in new tab".to_string(), BmEntry::NewTab(i)));
+                entries.push(("Rename…".into(), BmEntry::Rename(i)));
+                if !here.is_empty() {
+                    entries.push(("Move up".into(), BmEntry::Shift(i, -1)));
+                    entries.push(("Move down".into(), BmEntry::Shift(i, 1)));
+                    entries.push(("Move to the toolbar".into(), BmEntry::MoveTo(i, String::new())));
+                }
+                for f in bm.folders().into_iter().filter(|f| *f != here) {
+                    entries.push((format!("Move to “{f}”"), BmEntry::MoveTo(i, f)));
+                }
+                entries.push(("Move to a new folder…".into(), BmEntry::NewFolder(i)));
+                entries.push(("Remove".into(), BmEntry::Remove(i)));
+            }
+            Slot::Folder(f) => {
+                entries.push(("Rename folder…".to_string(), BmEntry::RenameFolder(f.clone())));
+                entries.push((
+                    "Remove folder (keeps its bookmarks)".into(),
+                    BmEntry::RemoveFolder(f.clone()),
+                ));
+            }
+        }
+        BmPopup { x, y, entries }
+    }
+
+    fn width(&self) -> f32 {
+        self.entries
+            .iter()
+            .map(|(l, _)| font::measure(SANS, 13.0, l) + 24.0)
+            .fold(160.0, f32::max)
+            .min(360.0)
+    }
+
+    /// Where the list and each entry are, kept inside the window.
+    fn rects(&self) -> (Rect, Vec<Rect>) {
+        let (ww, wh) = window_size();
+        let w = self.width();
+        let fit = ((wh - self.y - 8.0) / MENU_ITEM_H).max(1.0) as usize;
+        let n = self.entries.len().min(MAX_POPUP).min(fit);
+        let x = self.x.min(ww - w - 4.0).max(0.0);
+        let items: Vec<Rect> = (0..n)
+            .map(|i| Rect {
+                x: x + 4.0,
+                y: self.y + 4.0 + i as f32 * MENU_ITEM_H,
+                w: w - 8.0,
+                h: MENU_ITEM_H,
+            })
+            .collect();
+        let drop = Rect {
+            x,
+            y: self.y,
+            w,
+            h: n as f32 * MENU_ITEM_H + 8.0,
+        };
+        (drop, items)
+    }
+
+    fn entry_at(&self, x: f32, y: f32) -> Option<BmEntry> {
+        let (_, items) = self.rects();
+        items
+            .iter()
+            .position(|r| r.contains(x, y))
+            .map(|i| self.entries[i].1.clone())
+    }
+}
+
+/// The window's size in interface units, as last drawn.
+static WINDOW_SIZE: std::sync::Mutex<(f32, f32)> = std::sync::Mutex::new((1100.0, 768.0));
+
+fn window_size() -> (f32, f32) {
+    WINDOW_SIZE.lock().map(|s| *s).unwrap_or((1100.0, 768.0))
+}
+
+fn draw_bm_popup(c: &mut Canvas, p: &BmPopup, mouse: Option<(f32, f32)>, cache: &mut GlyphCache) {
+    let (drop, items) = p.rects();
+    c.fill(
+        drop.expand(Edges {
+            t: 1.0,
+            r: 1.0,
+            b: 1.0,
+            l: 1.0,
+        }),
+        LINE,
+        0.0,
+    );
+    c.fill(drop, Color::WHITE, 0.0);
+    for ((label, _), r) in p.entries.iter().zip(&items) {
+        if mouse.is_some_and(|(mx, my)| r.contains(mx, my)) {
+            c.fill(*r, Color::rgb(0xdb, 0xea, 0xfe), 0.0);
+        }
+        let label = fit(label, r.w - 20.0, SANS, 13.0);
+        text(c, r.x + 10.0, r.y + 17.0, &label, SANS, 13.0, DARK, cache, 0.0);
+    }
 }
 
 /// The bookmarks toolbar, under the address bar.
 fn draw_bookmarks(
     c: &mut Canvas,
-    list: &[brickle::bookmarks::Bookmark],
+    bm: &Bookmarks,
     page_url: &str,
     mouse: Option<(f32, f32)>,
     cache: &mut GlyphCache,
 ) {
     let w = c.size().0;
-    if list.is_empty() {
+    if bm.list.is_empty() {
         let hint = "Bookmark a page with Ctrl+D and it appears here  ·  Ctrl+Shift+B hides this bar";
         text(
             c,
@@ -3165,10 +3552,11 @@ fn draw_bookmarks(
         );
         return;
     }
-    let rects = bookmark_rects(list, w);
-    for (b, r) in list.iter().zip(&rects) {
+    let (shown, more) = bookmark_layout(bm, w);
+    for (s, r) in &shown {
         let hovered = mouse.is_some_and(|(x, y)| r.contains(x, y));
-        if hovered || b.url == page_url {
+        let current = matches!(s, Slot::Mark(i) if bm.list[*i].url == page_url);
+        if hovered || current {
             c.fill(
                 *r,
                 if hovered {
@@ -3179,24 +3567,73 @@ fn draw_bookmarks(
                 0.0,
             );
         }
-        let label = fit(&b.shown(), r.w - 20.0, SANS, 11.5);
+        let label = fit(&slot_label(bm, s), r.w - 20.0, SANS, 11.5);
         text(c, r.x + 10.0, r.y + 15.5, &label, SANS, 11.5, DARK, cache, 0.0);
     }
-    if rects.len() < list.len() {
-        let more = format!("+{}", list.len() - rects.len());
-        let mw = font::measure(SANS, 11.0, &more);
-        text(
-            c,
-            w - mw - 10.0,
-            TOP_H + 18.0,
-            &more,
-            SANS,
-            11.0,
-            GRAY,
-            cache,
-            0.0,
-        );
+    if let Some(m) = more {
+        if mouse.is_some_and(|(x, y)| m.contains(x, y)) {
+            c.fill(m, LINE, 0.0);
+        }
+        text(c, m.x + 8.0, m.y + 15.5, "»", SANS, 13.0, DARK, cache, 0.0);
     }
+}
+
+/// A name being asked for in your desktop's dialog, and what it's for.
+struct TextAsk {
+    kind: TextAskKind,
+    answer: Receiver<Result<Option<String>, String>>,
+}
+
+#[derive(Debug, Clone)]
+enum TextAskKind {
+    /// Renaming the bookmark for this address.
+    Rename(String),
+    /// Moving the bookmark for this address into a new folder.
+    NewFolder(String),
+    RenameFolder(String),
+}
+
+impl TextAsk {
+    fn start(kind: TextAskKind, title: &str, label: &str, initial: &str) -> TextAsk {
+        let (tx, rx) = mpsc::channel();
+        let (title, label, initial) = (title.to_string(), label.to_string(), initial.to_string());
+        let _ = std::thread::Builder::new()
+            .name("brickle-name-dialog".into())
+            .spawn(move || {
+                let _ = tx.send(ask_text(&title, &label, &initial));
+            });
+        TextAsk { kind, answer: rx }
+    }
+}
+
+/// Ask for a line of text in your desktop's own dialog (zenity, else
+/// kdialog). `None`: you cancelled.
+fn ask_text(title: &str, label: &str, initial: &str) -> Result<Option<String>, String> {
+    let run = |cmd: &mut std::process::Command| -> Option<Result<Option<String>, String>> {
+        let out = cmd.output().ok()?;
+        let t = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string();
+        Some(Ok(out.status.success().then_some(t)))
+    };
+    let mut zenity = std::process::Command::new("zenity");
+    zenity.args([
+        "--entry".to_string(),
+        format!("--title={title}"),
+        format!("--text={label}"),
+        format!("--entry-text={initial}"),
+    ]);
+    if let Some(r) = run(&mut zenity) {
+        return r;
+    }
+    let mut kdialog = std::process::Command::new("kdialog");
+    kdialog.args(["--title", title, "--inputbox", label, initial]);
+    if let Some(r) = run(&mut kdialog) {
+        return r;
+    }
+    Err("To name bookmarks, install zenity or kdialog".into())
 }
 
 /// The back, forward and reload/stop buttons, left of the address field.
@@ -4498,6 +4935,55 @@ mod menu_tests {
         assert!(tabs.iter().all(|(r, _)| r.y >= MENU_H) && plus_tab.y >= MENU_H);
     }
 
+    #[test]
+    fn bookmark_toolbar_folders_and_overflow() {
+        use brickle::bookmarks::Bookmark;
+        let mut bm = Bookmarks::load(None);
+        bm.list = (0..30)
+            .map(|i| Bookmark {
+                url: format!("https://site{i}.example/"),
+                title: format!("Site number {i}"),
+                folder: if i % 10 == 1 {
+                    "Reading".into()
+                } else {
+                    String::new()
+                },
+            })
+            .collect();
+        bm.set_folder(0, "Reading").unwrap();
+        // A folder is one slot; what doesn't fit goes behind ».
+        let (shown, more) = bookmark_layout(&bm, 600.0);
+        let more = more.expect("an overflow button");
+        assert!(shown.iter().all(|(_, r)| r.x + r.w <= more.x));
+        assert!(
+            matches!(shown[0].0, Slot::Folder(ref f) if f == "Reading"),
+            "{shown:?}"
+        );
+        assert_eq!(
+            bookmark_hit(&bm, 600.0, more.x + 2.0, more.y + 2.0),
+            Some(BarHit::More)
+        );
+        let rest = BmPopup::overflow(&bm, shown.len(), more.x + more.w, more.y + more.h);
+        assert_eq!(rest.entries.len() + shown.len(), bm.toolbar().len());
+        // A folder's list, and what you can do with a bookmark in it.
+        let folder = BmPopup::folder(&bm, "Reading", 8.0, TOP_H + BOOK_H);
+        assert_eq!(folder.entries.len(), 4);
+        let (_, items) = folder.rects();
+        let first = bm.in_folder("Reading")[0];
+        assert_eq!(
+            folder.entry_at(items[0].x + 2.0, items[0].y + 2.0),
+            Some(BmEntry::Open(first))
+        );
+        let actions = BmPopup::actions(&bm, &Slot::Mark(first), 10.0, 10.0);
+        let labels: Vec<&str> = actions.entries.iter().map(|(l, _)| l.as_str()).collect();
+        assert!(
+            labels.contains(&"Move up")
+                && labels.contains(&"Move to the toolbar")
+                && labels.contains(&"Remove"),
+            "{labels:?}"
+        );
+    }
+
     /// Paints the top of the window with the View menu open, to look at:
     /// `cargo test --bin brickle -- --ignored menu_bar_picture`.
     #[test]
@@ -4523,6 +5009,7 @@ mod menu_tests {
             can_back: true,
             can_forward: false,
             resend: None,
+            bm_popup: None,
             loading: false,
         };
         ui.address.set("https://example.com/");
@@ -4591,6 +5078,7 @@ mod menu_tests {
             can_back: true,
             can_forward: false,
             resend: None,
+            bm_popup: None,
             loading: false,
         };
         ui.address.set("https://www.facebook.com/?_fb_noscript=1");
@@ -4634,14 +5122,16 @@ mod menu_tests {
                 )
             },
         ];
-        let bm = |u: &str, t: &str| Bookmark {
+        let bm = |u: &str, t: &str, f: &str| Bookmark {
             url: u.into(),
             title: t.into(),
+            folder: f.into(),
         };
-        let marks = vec![
-            bm("https://www.facebook.com/?_fb_noscript=1", "Facebook"),
-            bm("https://lobste.rs/", "Lobsters"),
-            bm("https://example.com/a/very/long/path", ""),
+        let mut marks = Bookmarks::load(None);
+        marks.list = vec![
+            bm("https://www.facebook.com/?_fb_noscript=1", "Facebook", ""),
+            bm("https://lobste.rs/", "Lobsters", "News"),
+            bm("https://example.com/a/very/long/path", "", ""),
         ];
         let w = c.size().0;
         let pw = 340.0;

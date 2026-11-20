@@ -59,7 +59,7 @@ size, and clicking the percentage between them goes back to the normal size.
 | Scroll | mouse wheel, arrow keys, `Space`, `PgUp`/`PgDn`, `Home`/`End`; a box under the pointer (or the one you last clicked in) scrolls first, `Shift`+wheel or `←`/`→` sideways; drag a box's thumb |
 | Back / forward | the ← → buttons, `Backspace` or `Alt+←` / `Alt+→` |
 | Reload / stop | the ↻ button (✕ while loading), `Ctrl+R` or `F5` / `Esc` |
-| Bookmark this page (again to remove) / bookmarks toolbar | `Ctrl+D` / `Ctrl+Shift+B`; right-click a bookmark to remove it |
+| Bookmark this page (again to remove) / bookmarks toolbar | `Ctrl+D` / `Ctrl+Shift+B`; drag a bookmark or folder along the toolbar to move it; right-click one to rename it, put it in a folder or remove it; `»` shows the ones that don't fit |
 | Resize the request panel | drag its left edge |
 | New tab / close tab / reopen closed tab | `Ctrl+T` or `+` / `Ctrl+W` or `×` / `Ctrl+Shift+T` |
 | Move a tab | drag it along the tab strip |

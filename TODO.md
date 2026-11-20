@@ -117,5 +117,5 @@ its own renderer, history, scroll and form focus.
 - [x] Reopen closed tab (`Ctrl+Shift+T`), with its history (kept in memory only).
 - [x] Drag tabs to reorder.
 - [x] Bookmarks (`Ctrl+D`) and a bookmarks toolbar (on by default, `Ctrl+Shift+B`).
-- [ ] Bookmark folders, renaming and reordering; a menu for bookmarks that don't fit the toolbar.
+- [x] Bookmark folders (one level), renaming and reordering; a menu for bookmarks that don't fit the toolbar.
 - [x] Discard the renderers of tabs left in the background for a long time (10 minutes, or past 6 live background tabs; they reload when shown).
