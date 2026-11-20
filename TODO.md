@@ -28,8 +28,9 @@ Planned work, roughly in priority order. Items marked *discuss* need a decision 
 - [x] Full bidirectional text with `unicode-bidi` (UAX #9): paragraph direction, `dir`
       (`rtl`/`ltr`/`auto`), `direction` and `unicode-bidi` in CSS, `<bdi>`/`<bdo>`, numbers inside
       right-to-left text, `text-align: start/end`, mirrored brackets
-- [ ] Right-to-left page structure: list markers, floats, table columns and flex rows on the
-      right; `<bdo>` reversing the letters of left-to-right words (it reverses their order)
+- [x] Right-to-left page structure: list markers and indents, table and grid columns and flex
+      rows from the right; logical properties (`margin-inline-start`, `padding-inline`,
+      `inset-inline-*`, `float: inline-start`...); `<bdo>` reversing letters
 - [x] Unicode line breaking (UAX #14) with `unicode-linebreak`
 - [ ] Thai/Lao/Khmer word breaking (needs a dictionary)
 - [x] Page titles in the tab bar are drawn by the page's own sandboxed renderer; the browser only

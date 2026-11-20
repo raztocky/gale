@@ -528,6 +528,10 @@ pub fn shaped_width(primary: usize, size: f32, text: &str) -> f32 {
     shape(primary, size, text).width
 }
 
+/// Put in front of text, this mark (Unicode's right-to-left override,
+/// which draws as nothing) makes [`shape`] draw every letter right to left.
+pub const FORCE_RTL: char = '\u{202E}';
+
 /// Whether `c` is a letter of a script written right to left (Hebrew,
 /// Arabic and the like), or a mark that says the text is.
 pub fn is_rtl(c: char) -> bool {
@@ -591,7 +595,10 @@ fn shape_uncached(primary: usize, size: f32, text: &str) -> Shaped {
     }
     // Text that reads right to left puts its runs (each shaped in its own
     // direction) right to left too: "العربية:" ends with its colon on the left.
-    let rtl = direction(text) == Some(true);
+    // Text that starts with an override mark (see `FORCE_RTL`) is drawn
+    // right to left, letters of any script included.
+    let forced = text.starts_with(FORCE_RTL);
+    let rtl = forced || direction(text) == Some(true);
     if rtl {
         runs.reverse();
     }
@@ -619,6 +626,9 @@ fn shape_uncached(primary: usize, size: f32, text: &str) -> Shaped {
                 let mut buf = harfrust::Buffer::new();
                 buf.push_str(part);
                 buf.guess_segment_properties();
+                if forced {
+                    buf.set_direction(harfrust::Direction::RightToLeft);
+                }
                 let Ok(()) = harfrust::shape(&shaper, &mut buf, harfrust::ShapeOptions::new()) else {
                     continue;
                 };
@@ -802,6 +812,29 @@ mod tests {
         // In left-to-right text they're as written.
         let ltr = shape(0, 16.0, "(abc)");
         assert_eq!((ltr.glyphs[0].id, ltr.glyphs[4].id), (open, close));
+    }
+
+    #[test]
+    fn overridden_text_is_drawn_backwards() {
+        let plain = shape(0, 16.0, "abc");
+        let forced = shape(0, 16.0, &format!("{FORCE_RTL}abc"));
+        // The mark draws as nothing; the letters come out c, b, a.
+        assert!(
+            (forced.width - plain.width).abs() < 0.5,
+            "{} {}",
+            forced.width,
+            plain.width
+        );
+        let ids = |s: &Shaped| {
+            s.glyphs
+                .iter()
+                .filter(|g| g.advance > 0.0)
+                .map(|g| g.id)
+                .collect::<Vec<_>>()
+        };
+        let mut rev = ids(&plain);
+        rev.reverse();
+        assert_eq!(ids(&forced), rev);
     }
 
     #[test]

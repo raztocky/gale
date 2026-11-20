@@ -1572,13 +1572,24 @@ fn compute(
         vars = Rc::new(map);
     }
 
+    // The element's direction, which logical properties
+    // (`margin-inline-start` and the like) need to pick a side.
+    let rtl = matched
+        .iter()
+        .rev()
+        .find_map(|m| match (m.decl.name.as_str(), m.decl.values.first()) {
+            ("direction", Some(Value::Keyword(k))) if k == "rtl" => Some(true),
+            ("direction", Some(Value::Keyword(k))) if k == "ltr" => Some(false),
+            _ => None,
+        })
+        .unwrap_or(parent.rtl);
     let mut props: HashMap<String, Vec<Value>> = HashMap::new();
     for m in &matched {
         if m.decl.name.starts_with("--") {
             continue;
         }
         if !m.decl.values.iter().any(has_var) {
-            expand(m.decl, &mut props);
+            expand(m.decl, &mut props, rtl);
         } else if let Some(values) = substitute(&m.decl.values, &vars) {
             // Before shorthands are expanded, so `margin: var(--m)` works.
             expand(
@@ -1588,6 +1599,7 @@ fn compute(
                     important: m.decl.important,
                 },
                 &mut props,
+                rtl,
             );
         }
     }
@@ -1996,6 +2008,8 @@ fn compute(
             "border-collapse" => s.border_collapse = kw == "collapse",
             "float" => {
                 s.float = match kw {
+                    "inline-start" if rtl => Float::Right,
+                    "inline-end" if rtl => Float::Left,
                     "left" | "inline-start" => Float::Left,
                     "right" | "inline-end" => Float::Right,
                     _ => Float::None,
@@ -2003,6 +2017,8 @@ fn compute(
             }
             "clear" => {
                 s.clear = match kw {
+                    "inline-start" if rtl => Clear::Right,
+                    "inline-end" if rtl => Clear::Left,
                     "left" | "inline-start" => Clear::Left,
                     "right" | "inline-end" => Clear::Right,
                     "both" => Clear::Both,
@@ -2491,8 +2507,72 @@ impl Ctx<'_> {
     }
 }
 
-/// Expand shorthand properties into longhands.
-fn expand(d: &Declaration, props: &mut HashMap<String, Vec<Value>>) {
+/// The physical property a logical one (`padding-inline-start`,
+/// `inset-block-end`...) stands for, in text that runs right to left or
+/// not; or the two a two-value one (`margin-inline`) sets, start first.
+fn physical(name: &str, rtl: bool) -> Option<Vec<String>> {
+    let (start, end) = if rtl { ("right", "left") } else { ("left", "right") };
+    for (prefix, sep) in [("margin", "-"), ("padding", "-"), ("border", "-"), ("inset", "")] {
+        let Some(rest) = name.strip_prefix(prefix) else {
+            continue;
+        };
+        let named = |side: &str, tail: &str| {
+            if sep.is_empty() {
+                format!("{side}{tail}")
+            } else {
+                format!("{prefix}-{side}{tail}")
+            }
+        };
+        for (logical, side) in [
+            ("-inline-start", start),
+            ("-inline-end", end),
+            ("-block-start", "top"),
+            ("-block-end", "bottom"),
+        ] {
+            if let Some(tail) = rest.strip_prefix(logical) {
+                if tail.is_empty() || matches!(tail, "-width" | "-color" | "-style") {
+                    return Some(vec![named(side, tail)]);
+                }
+            }
+        }
+        if prefix != "border" {
+            match rest {
+                "-inline" => return Some(vec![named(start, ""), named(end, "")]),
+                "-block" => return Some(vec![named("top", ""), named("bottom", "")]),
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// Expand shorthand properties into longhands. `rtl`: the element's text
+/// runs right to left (for logical properties).
+fn expand(d: &Declaration, props: &mut HashMap<String, Vec<Value>>, rtl: bool) {
+    if let Some(names) = physical(&d.name, rtl) {
+        let values: Vec<&Value> = d.values.iter().filter(|v| **v != Value::Comma).collect();
+        for (i, name) in names.iter().enumerate() {
+            // `margin-inline: 1px` sets both sides; `1px 2px`, each its own.
+            let v = if names.len() == 1 {
+                d.values.clone()
+            } else {
+                match values.get(i).or(values.first()) {
+                    Some(v) => vec![(*v).clone()],
+                    None => continue,
+                }
+            };
+            expand(
+                &Declaration {
+                    name: name.clone(),
+                    values: v,
+                    important: d.important,
+                },
+                props,
+                rtl,
+            );
+        }
+        return;
+    }
     let sides = ["top", "right", "bottom", "left"];
     let four = |vals: &[Value]| -> [Value; 4] {
         let v: Vec<Value> = vals.iter().filter(|v| **v != Value::Comma).cloned().collect();

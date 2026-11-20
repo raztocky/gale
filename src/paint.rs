@@ -666,8 +666,15 @@ fn render_box(list: &mut Vec<DrawOp>, b: &LayoutBox, backgrounds: &Backgrounds, 
             let w = font::shaped_width(f, s.font_size, m);
             let (a, d) = font::vmetrics(f, s.font_size);
             let baseline = b.dims.content.y + (s.line_height - (a + d)) / 2.0 + a;
+            // Outside the start of the line: left, or right in
+            // right-to-left text.
+            let x = if s.rtl {
+                b.dims.content.x + b.dims.content.w + s.font_size * 0.5
+            } else {
+                b.dims.content.x - w - s.font_size * 0.5
+            };
             list.push(DrawOp::Text {
-                x: b.dims.content.x - w - s.font_size * 0.5,
+                x,
                 baseline,
                 text: m.clone(),
                 font: f,

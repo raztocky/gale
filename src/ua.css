@@ -16,8 +16,8 @@ img, input, button, select, textarea { display: inline-block; }
 body { margin: 8px; }
 p, dl, figure, blockquote { margin-top: 1em; margin-bottom: 1em; }
 blockquote, figure { margin-left: 40px; margin-right: 40px; }
-dd { margin-left: 40px; }
-ul, ol, menu { margin-top: 1em; margin-bottom: 1em; padding-left: 40px; }
+dd { margin-inline-start: 40px; }
+ul, ol, menu { margin-top: 1em; margin-bottom: 1em; padding-inline-start: 40px; }
 ul ul, ol ul, ul ol, ol ol { margin-top: 0; margin-bottom: 0; }
 ol { list-style-type: decimal; }
 ul ul { list-style-type: circle; }

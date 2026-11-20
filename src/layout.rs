@@ -273,7 +273,11 @@ fn build_block<'a>(node: &'a StyledNode<'a>, link: Option<String>) -> LayoutBox<
                         ListStyle::Disc => Some("•".into()),
                         ListStyle::Circle => Some("◦".into()),
                         ListStyle::Square => Some("▪".into()),
+                        // Right to left, the full stop ends up on the left
+                        // and a closed triangle points left.
+                        ListStyle::Decimal if child.style.rtl => Some(format!(".{}", start + li_index - 1)),
                         ListStyle::Decimal => Some(format!("{}.", start + li_index - 1)),
+                        ListStyle::DisclosureClosed if child.style.rtl => Some("\u{25C2}".into()),
                         ListStyle::DisclosureClosed => Some("\u{25B8}".into()),
                         ListStyle::DisclosureOpen => Some("\u{25BE}".into()),
                         ListStyle::None => None,
@@ -1380,8 +1384,9 @@ impl<'a> LayoutBox<'a> {
                     Align::End => line_h - mb.h,
                     Align::Center => (line_h - mb.h) / 2.0,
                 };
-                // `row-reverse` mirrors each line.
-                let target_x = if s.flex_reverse {
+                // `row-reverse` mirrors each line; so does right-to-left
+                // text (and the two together don't).
+                let target_x = if s.flex_reverse != s.rtl {
                     content.x + content.w - (x - content.x) - size[k]
                 } else {
                     x
@@ -1823,7 +1828,13 @@ impl<'a> LayoutBox<'a> {
                 Align::End => area_h - mb.h,
                 Align::Center => (area_h - mb.h) / 2.0,
             };
-            item.translate(col_x[c] - mb.x, row_y[r] + dy - mb.y);
+            // Right to left, columns count from the right.
+            let x = if s.rtl {
+                content.x + content.w - (col_x[c] - content.x) - mb.w
+            } else {
+                col_x[c]
+            };
+            item.translate(x - mb.x, row_y[r] + dy - mb.y);
         }
         self.dims.content.h = if nrows == 0 { 0.0 } else { y - rgap - content.y };
     }
@@ -2453,6 +2464,17 @@ impl<'a> LayoutBox<'a> {
                         p => {
                             out.push(p);
                             levels.push(base_n);
+                        }
+                    }
+                }
+                // Left-to-right letters at a right-to-left level (only under
+                // `<bdo>` or `unicode-bidi: bidi-override`) are drawn in
+                // reverse: an override mark in front tells the shaper.
+                for (p, &level) in out.iter_mut().zip(&levels) {
+                    if let Piece::Word { text, style, w, .. } = p {
+                        if level % 2 == 1 && font::direction(text) == Some(false) {
+                            text.insert(0, font::FORCE_RTL);
+                            *w = font::shaped_width(font::index(style), style.font_size, text);
                         }
                     }
                 }
@@ -3287,6 +3309,7 @@ impl<'a> LayoutBox<'a> {
     /// whose width is already set.
     fn layout_table(&mut self, t: TableCols) {
         let content = self.dims.content;
+        let rtl = self.style().rtl;
         let [hs, vs] = t.spacing;
         let mut y = content.y;
         for c in &mut self.children {
@@ -3311,7 +3334,13 @@ impl<'a> LayoutBox<'a> {
         let mut heights = Vec::with_capacity(t.cells.len());
         for c in &t.cells {
             let cell = &mut self.row_mut(t.rows[c.row]).children[c.idx];
-            cell.layout_at(col_x[c.col], 0.0, span_w(c));
+            // Right to left, the first column is on the right.
+            let x = if rtl {
+                content.x + content.w - (col_x[c.col] - content.x) - span_w(c)
+            } else {
+                col_x[c.col]
+            };
+            cell.layout_at(x, 0.0, span_w(c));
             heights.push(cell.dims.margin_box().h);
         }
         let mut row_h: Vec<f32> = t
@@ -5034,9 +5063,10 @@ mod modern_layout_tests {
             at(&f, "x").0 < at(&f, "!").0 && at(&f, "!").0 < at(&f, "a").0 && at(&f, "a").0 < at(&f, "y").0,
             "{f:?}"
         );
-        // `<bdo dir=rtl>` sets even English words from the right.
+        // `<bdo dir=rtl>` sets even English words from the right, each
+        // drawn backwards (marked for the shaper).
         let f = frags_of("", "<p><bdo dir=rtl>one two</bdo></p>");
-        assert!(at(&f, "two").0 < at(&f, "one").0, "{f:?}");
+        assert!(at(&f, "\u{202E}two").0 < at(&f, "\u{202E}one").0, "{f:?}");
         // `dir=auto` takes the direction from the first letter.
         let f = frags_of("", "<p dir=auto>שלום hello</p><div dir=auto>hello שלום</div>");
         assert!(
@@ -5051,6 +5081,54 @@ mod modern_layout_tests {
         assert!(
             at(&f, "a").0 < at(&f, "(b)").0 && at(&f, "(b)").0 < at(&f, "c").0,
             "{f:?}"
+        );
+    }
+
+    #[test]
+    fn right_to_left_page_structure() {
+        // Lists indent from the right (logical padding in the UA sheet).
+        let li = boxes("", "<ul dir=rtl><li>א</li></ul><ul><li>a</li></ul>", WIN, "li");
+        assert!(close(li[0].x, 0.0) && close(li[0].w, 960.0), "{li:?}");
+        assert!(close(li[1].x, 40.0), "{li:?}");
+        // Logical properties pick their side by direction.
+        let p = boxes(
+            "p{margin:0;margin-inline-start:100px;padding-inline:10px 30px;width:200px}",
+            "<p>a</p><p dir=rtl>א</p>",
+            WIN,
+            "p",
+        );
+        assert!(close(p[0].x, 100.0) && close(p[0].w, 240.0), "{p:?}");
+        assert!(close(p[1].x, 0.0), "{p:?}");
+        // A flex row starts on the right; `row-reverse` then starts on the left.
+        let f = |css: &str| {
+            boxes(
+                &format!("div{{display:flex;width:300px;{css}}} i{{display:block;width:50px}}"),
+                "<div><i>1</i><i>2</i></div>",
+                WIN,
+                "i",
+            )
+        };
+        let r = f("direction:rtl");
+        assert!(close(r[0].x, 250.0) && close(r[1].x, 200.0), "{r:?}");
+        let r = f("direction:rtl;flex-direction:row-reverse");
+        assert!(close(r[0].x, 0.0) && close(r[1].x, 50.0), "{r:?}");
+        // Grid and table columns count from the right.
+        let g = boxes(
+            "div{display:grid;grid-template-columns:100px 200px;width:300px;direction:rtl}",
+            "<div><p style=margin:0>1</p><p style=margin:0>2</p></div>",
+            WIN,
+            "p",
+        );
+        assert!(close(g[0].x, 200.0) && close(g[1].x, 0.0), "{g:?}");
+        let t = boxes(
+            "table{width:300px;border-spacing:0} td{padding:0}",
+            "<table dir=rtl><tr><td style=width:100px>1</td><td>2</td></tr></table>",
+            WIN,
+            "td",
+        );
+        assert!(
+            close(t[0].x + t[0].w, 300.0) && t[1].x < 1.0 && t[1].x + t[1].w <= t[0].x + 0.5,
+            "{t:?}"
         );
     }
 
