@@ -373,7 +373,7 @@ pub fn serve(input: impl Read + 'static, output: impl Write + 'static) -> Result
                     ToRenderer::Key(k) => p.key(rt.as_mut(), k),
                     ToRenderer::Scroll { uid, dx, dy } => p.scroll_box(rt.as_mut(), uid, dx, dy),
                     ToRenderer::Select { x, y, word } => p.select_at(rt.as_mut(), x, y, word),
-                    ToRenderer::Chose { field, file } => p.chose_file(rt.as_mut(), field, file),
+                    ToRenderer::Chose { field, files } => p.chose_file(rt.as_mut(), field, files),
                     _ => unreachable!(),
                 };
                 let (mut navigate, mut console, mut read) = (None, vec![], vec![]);

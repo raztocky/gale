@@ -973,11 +973,11 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 // off the window's thread.
                 if let (Some(ask), None) = (&click.choose_file, &file_pick) {
                     let (tx, rx) = mpsc::channel();
-                    let accept = ask.accept.clone();
+                    let (accept, multiple) = (ask.accept.clone(), ask.multiple);
                     let _ = std::thread::Builder::new()
                         .name("brickle-file-dialog".into())
                         .spawn(move || {
-                            let _ = tx.send(pick_file(&accept));
+                            let _ = tx.send(pick_file(&accept, multiple));
                         });
                     file_pick = Some(FilePick {
                         tab: cur_id,
@@ -2290,10 +2290,10 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 Ok(answer) => {
                     let here = pick.tab == cur_id && pick.url == info.url;
                     match answer {
-                        Ok(Some(path)) if here => {
+                        Ok(Some(paths)) if here => {
                             pending_input.push(Input::Chose {
                                 field: pick.field,
-                                path,
+                                paths,
                             });
                             dirty = true;
                         }
@@ -2957,22 +2957,37 @@ struct FilePick {
     tab: TabId,
     url: String,
     field: u32,
-    answer: Receiver<Result<Option<std::path::PathBuf>, String>>,
+    answer: Receiver<Result<Option<Vec<std::path::PathBuf>>, String>>,
 }
 
-/// Ask for a file in your desktop's own dialog (zenity, else kdialog),
-/// offering the types a field's `accept` names. `None`: you cancelled.
-fn pick_file(accept: &str) -> Result<Option<std::path::PathBuf>, String> {
+/// Ask for a file (or, with `multiple`, files) in your desktop's own
+/// dialog (zenity, else kdialog), offering the types a field's `accept`
+/// names. `None`: you cancelled.
+fn pick_file(accept: &str, multiple: bool) -> Result<Option<Vec<std::path::PathBuf>>, String> {
     let patterns = accept_patterns(accept);
-    let run = |cmd: &mut std::process::Command| -> Option<Result<Option<std::path::PathBuf>, String>> {
+    let title = if multiple {
+        "Choose files to send"
+    } else {
+        "Choose a file to send"
+    };
+    // One path per line (file names with a line break in them can't be
+    // chosen this way).
+    let run = |cmd: &mut std::process::Command| -> Option<Result<Option<Vec<std::path::PathBuf>>, String>> {
         let out = cmd.output().ok()?;
-        let path = String::from_utf8_lossy(&out.stdout)
-            .trim_end_matches(['\n', '\r'])
-            .to_string();
-        Some(Ok((out.status.success() && !path.is_empty()).then(|| path.into())))
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let paths: Vec<std::path::PathBuf> = text
+            .lines()
+            .map(|l| l.trim_end_matches('\r'))
+            .filter(|l| !l.is_empty())
+            .map(Into::into)
+            .collect();
+        Some(Ok((out.status.success() && !paths.is_empty()).then_some(paths)))
     };
     let mut zenity = std::process::Command::new("zenity");
-    zenity.args(["--file-selection", "--title=Choose a file to send"]);
+    zenity.args(["--file-selection", &format!("--title={title}")]);
+    if multiple {
+        zenity.args(["--multiple", "--separator=\n"]);
+    }
     if !patterns.is_empty() {
         zenity.arg(format!(
             "--file-filter=Files the page takes | {}",
@@ -2984,7 +2999,10 @@ fn pick_file(accept: &str) -> Result<Option<std::path::PathBuf>, String> {
         return r;
     }
     let mut kdialog = std::process::Command::new("kdialog");
-    kdialog.args(["--title", "Choose a file to send", "--getopenfilename"]);
+    kdialog.args(["--title", title, "--getopenfilename"]);
+    if multiple {
+        kdialog.args(["--multiple", "--separate-output"]);
+    }
     kdialog.arg(std::env::var_os("HOME").unwrap_or_else(|| ".".into()));
     if !patterns.is_empty() {
         kdialog.arg(patterns.join(" "));

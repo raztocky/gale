@@ -103,7 +103,7 @@ selects (with a drop-down), buttons, labels, Tab between fields, Enter to submit
 - [x] Placing the caret and selecting in a field with the mouse (click, drag, double-click for a word).
 - [x] File uploads (`<input type=file>`): your desktop's dialog (zenity or kdialog); the browser
   keeps the file and puts it in the form it sends; scripts see only its name, size and type.
-- [ ] Several files at once (`multiple`), and files in forms scripts send (`FormData`).
+- [x] Several files at once (`multiple`), and files in forms scripts send (`FormData`).
 - [x] Form validation before sending (`required`, `type=email`/`url`, `pattern`, `minlength`/`maxlength`, `min`/`max`/`step`, `novalidate`), with `checkValidity()`, `setCustomValidity()` and `validity` for scripts; arrow keys step number fields.
 - [x] Date picker (calendar, typing, arrow keys) and colour picker (palette); `:valid`, `:invalid`, `:required` and `:optional` in CSS and for scripts.
 - [x] Pickers for `time` (a clock of hours and five-minute steps), `datetime-local`, `month` and `week`, with validation and arrow keys.

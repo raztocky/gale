@@ -1219,9 +1219,15 @@ impl Page {
                         })
                         .flatten()
                         .unwrap_or_default();
+                    let multiple = self
+                        .with_dom(rt.as_deref_mut(), |d| {
+                            d.element(f).is_some_and(|e| e.attrs.contains_key("multiple"))
+                        })
+                        .unwrap_or(false);
                     out.choose_file = Some(forms::FileAsk {
                         field: f,
                         accept: accept.chars().take(500).collect(),
+                        multiple,
                     });
                 }
                 _ => {}
@@ -1238,23 +1244,27 @@ impl Page {
         out
     }
 
-    /// You chose `file` for file field `field` (the browser keeps the file;
-    /// the page learns its name, size and type).
+    /// You chose `files` for file field `field` (the browser keeps the
+    /// files; the page learns their names, sizes and types).
     pub fn chose_file(
         &mut self,
         mut rt: Option<&mut Runtime>,
         field: u32,
-        file: forms::ChosenFile,
+        mut files: Vec<forms::ChosenFile>,
     ) -> Interaction {
+        files.truncate(forms::MAX_FILES);
         let mut out = Interaction {
             focus: self.focus.is_some(),
             ..Default::default()
         };
         let ok = self
             .with_dom(rt.as_deref_mut(), |d| {
-                let ok = forms::kind(d, field) == Some(forms::Control::File) && !forms::disabled(d, field);
+                let ok = forms::kind(d, field) == Some(forms::Control::File)
+                    && !forms::disabled(d, field)
+                    && (files.len() <= 1
+                        || d.element(field).is_some_and(|e| e.attrs.contains_key("multiple")));
                 if ok {
-                    d.files.insert(field, file.clone());
+                    d.files.insert(field, files.clone());
                     d.version += 1;
                 }
                 ok
@@ -1263,7 +1273,12 @@ impl Page {
         if !ok {
             return out;
         }
-        self.file_names.insert(field, file.name.clone());
+        let label = match files.as_slice() {
+            [] => "No file chosen".to_string(),
+            [one] => one.name.clone(),
+            many => format!("{} files", many.len()),
+        };
+        self.file_names.insert(field, label);
         self.interact(rt.as_deref_mut(), &[field]);
         self.restyle = false;
         if let Some(rt) = rt.as_deref_mut() {
@@ -2638,17 +2653,18 @@ mod form_script_tests {
             out.choose_file,
             Some(forms::FileAsk {
                 field: f,
-                accept: "image/*".into()
+                accept: "image/*".into(),
+                multiple: false,
             })
         );
         let out = page.chose_file(
             Some(&mut rt),
             f,
-            forms::ChosenFile {
+            vec![forms::ChosenFile {
                 name: "cat \"x\".png".into(),
                 size: 5,
                 mime: "image/png".into(),
-            },
+            }],
         );
         assert!(out.changed);
         page.refresh(&rt);
@@ -2671,23 +2687,105 @@ mod form_script_tests {
             body.contains("filename=\"cat %22x%22.png\"\r\nContent-Type: image/png\r\n\r\n"),
             "{body}"
         );
-        assert!(body.contains(&forms::upload_token(f)));
+        assert!(body.contains(&forms::upload_token(f, 0)));
         // The browser puts the file in, and only a file you chose.
         let dir = std::env::temp_dir().join(format!("brickle-upload-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("cat.png");
         std::fs::write(&path, b"\x89PNG\0\xff").unwrap();
         assert_eq!(crate::network::upload_body(&sub).unwrap(), None, "no files given");
-        sub.files = vec![(f, path.clone())];
+        sub.files = vec![(f, 0, path.clone())];
         let bytes = crate::network::upload_body(&sub).unwrap().unwrap();
         let at = bytes.windows(4).position(|w| w == b"\x89PNG").unwrap();
         assert_eq!(&bytes[at..at + 8], b"\x89PNG\0\xff\r\n");
         assert!(!String::from_utf8_lossy(&bytes).contains("brickle-upload"));
         // A placeholder a script typed into a text field stays text.
         let mut forged = sub.clone();
-        forged.body = Some(body.replace("hi", &forms::upload_token(f)));
+        forged.body = Some(body.replace("hi", &forms::upload_token(f, 0)));
         let bytes = crate::network::upload_body(&forged).unwrap().unwrap();
         assert_eq!(bytes.windows(4).filter(|w| *w == b"\x89PNG").count(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A field with `multiple` takes several files, each its own part; a
+    /// script's `FormData` carries them (as placeholders the browser fills).
+    #[test]
+    fn several_files_and_form_data() {
+        let (mut page, mut rt) = load(
+            "<form id=form method=post enctype=multipart/form-data action=/up>\
+             <input id=f type=file name=pics multiple><input id=one type=file name=one></form><p id=out></p>",
+        );
+        let f = rt.with_dom(|d| forms::by_id(d, "f").unwrap());
+        let one = rt.with_dom(|d| forms::by_id(d, "one").unwrap());
+        let file = |name: &str| forms::ChosenFile {
+            name: name.into(),
+            size: 3,
+            mime: "image/png".into(),
+        };
+        // A field without `multiple` takes one file at most.
+        assert!(
+            !page
+                .chose_file(Some(&mut rt), one, vec![file("a.png"), file("b.png")])
+                .changed
+        );
+        assert!(
+            page.chose_file(Some(&mut rt), f, vec![file("a.png"), file("b.png")])
+                .changed
+        );
+        rt.run_script(
+            "const fd = new FormData(document.getElementById('form'));\
+             document.getElementById('out').textContent = [document.getElementById('f').files.length,\
+               fd.getAll('pics').map((p) => p.name + ':' + (p instanceof File) + ':' + p.size).join(','),\
+               JSON.stringify(fd.get('one')), String(document.getElementById('f').multiple)].join('|');\
+             let refused = false; try { new File(['x'], 'made.txt'); } catch (e) { refused = true; }\
+             document.getElementById('out').textContent += '|' + refused;",
+            0,
+            "test",
+        );
+        page.refresh(&rt);
+        let text = page.dom.text_content();
+        assert!(
+            text.contains("2|a.png:true:3,b.png:true:3|\"\"|true|true"),
+            "{text}"
+        );
+        let shown: String = page
+            .render(800.0, 600.0)
+            .texts
+            .iter()
+            .map(|t| t.text.clone() + " ")
+            .collect();
+        assert!(
+            shown
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains("2 files"),
+            "{shown}"
+        );
+        // The form: one part per file, each with its own placeholder.
+        let sub = rt.with_dom(|d| {
+            let form = forms::by_id(d, "form").unwrap();
+            forms::submission(d, form, None, "https://site.example/", "https://site.example/")
+        });
+        let body = sub.unwrap().body.unwrap();
+        assert!(
+            body.contains(&forms::upload_token(f, 0)) && body.contains(&forms::upload_token(f, 1)),
+            "{body}"
+        );
+        assert_eq!(body.matches("name=\"pics\"").count(), 2, "{body}");
+        // The browser fills each in once, from the files you chose.
+        let dir = std::env::temp_dir().join(format!("brickle-uploads-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.png"), dir.join("b.png"));
+        std::fs::write(&a, b"AAA").unwrap();
+        std::fs::write(&b, b"BBB").unwrap();
+        let filled = crate::network::fill_uploads(&body, &[(f, 0, a), (f, 1, b)]).unwrap();
+        let filled = String::from_utf8(filled).unwrap();
+        assert!(
+            filled.contains("\r\n\r\nAAA\r\n--") && filled.contains("\r\n\r\nBBB\r\n--"),
+            "{filled}"
+        );
+        assert!(!filled.contains("brickle-upload"), "{filled}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

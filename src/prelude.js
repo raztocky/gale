@@ -545,7 +545,7 @@
       if (tag === 'textarea') return this.textContent;
       if (tag === 'select') { const o = this.querySelector('option[selected]') || this.querySelector('option'); return o ? o.value : ''; }
       if (tag === 'option') { const v = this.getAttribute('value'); return v === null ? this.textContent : v; }
-      if (this._isFile()) { const f = dom.fileInfo(idOf(this)); return f ? 'C:\\fakepath\\' + f[0] : ''; }
+      if (this._isFile()) { const f = dom.fileInfo(idOf(this))[0]; return f ? 'C:\\fakepath\\' + f[0] : ''; }
       return this.getAttribute('value') || '';
     }
     set value(v) {
@@ -557,13 +557,12 @@
     // name, size and type. Its contents stay with the browser.
     get files() {
       if (!this._isFile()) return null;
-      const f = dom.fileInfo(idOf(this));
-      const list = f ? [{ name: f[0], size: f[1], type: f[2], lastModified: 0,
-        text: () => Promise.reject(new Error('Brickle keeps chosen files from scripts')),
-        arrayBuffer: () => Promise.reject(new Error('Brickle keeps chosen files from scripts')) }] : [];
+      const list = dom.fileInfo(idOf(this)).map((f) => new File(TOKEN, f));
       list.item = (i) => list[i] || null;
       return list;
     }
+    get multiple() { return this.hasAttribute('multiple'); }
+    set multiple(v) { if (v) this.setAttribute('multiple', ''); else this.removeAttribute('multiple'); }
     get form() { return this.closest('form'); }
     get options() { return this.querySelectorAll('option'); }
     get elements() { return this.querySelectorAll('input, select, textarea, button'); }
@@ -978,6 +977,21 @@
     }
   }
 
+  // A file you chose: its name, size and type. Its contents stay with the
+  // browser, which puts them in a `FormData` sent with `fetch` or
+  // `XMLHttpRequest` (in place of `_upload`).
+  class File {
+    constructor(token, f) {
+      if (token !== TOKEN) throw new TypeError('Brickle only has files you choose');
+      this.name = f[0]; this.size = f[1]; this.type = f[2]; this.lastModified = 0;
+      Object.defineProperty(this, '_upload', { value: f[3] });
+    }
+    text() { return Promise.reject(new Error('Brickle keeps chosen files from scripts')); }
+    arrayBuffer() { return this.text(); }
+    stream() { throw new Error('Brickle keeps chosen files from scripts'); }
+    slice() { throw new Error('Brickle keeps chosen files from scripts'); }
+  }
+
   class FormData {
     constructor(form) {
       this._e = [];
@@ -987,12 +1001,18 @@
           if (!name || el.hasAttribute('disabled')) continue;
           const type = (el.getAttribute('type') || '').toLowerCase();
           if ((type === 'checkbox' || type === 'radio') && !el.hasAttribute('checked')) continue;
-          if (['submit', 'button', 'reset', 'image', 'file'].includes(type)) continue;
+          if (type === 'file' && el.localName === 'input') {
+            const files = el.files;
+            if (files.length === 0) this.append(name, '');
+            for (const f of files) this.append(name, f);
+            continue;
+          }
+          if (['submit', 'button', 'reset', 'image'].includes(type)) continue;
           this.append(name, el.value);
         }
       }
     }
-    append(k, v) { this._e.push([str(k), str(v)]); }
+    append(k, v) { this._e.push([str(k), v instanceof File ? v : str(v)]); }
     set(k, v) { this.delete(k); this.append(k, v); }
     get(k) { const e = this._e.find((x) => x[0] === str(k)); return e ? e[1] : null; }
     getAll(k) { return this._e.filter((x) => x[0] === str(k)).map((x) => x[1]); }
@@ -1014,7 +1034,12 @@
       let out = '';
       for (const [k, v] of body._e) {
         const q = (x) => x.replace(/"/g, '%22').replace(/\r|\n/g, ' ');
-        out += `--${boundary}\r\nContent-Disposition: form-data; name="${q(k)}"\r\n\r\n${v}\r\n`;
+        if (v instanceof File) {
+          out += `--${boundary}\r\nContent-Disposition: form-data; name="${q(k)}"; filename="${q(v.name)}"\r\n` +
+            `Content-Type: ${q(v.type || 'application/octet-stream')}\r\n\r\n${v._upload}\r\n`;
+        } else {
+          out += `--${boundary}\r\nContent-Disposition: form-data; name="${q(k)}"\r\n\r\n${v}\r\n`;
+        }
       }
       return [out + `--${boundary}--\r\n`, 'multipart/form-data; boundary=' + boundary];
     }
@@ -1442,7 +1467,7 @@
     requestIdleCallback: (fn) => addTimer(() => fn({ didTimeout: false, timeRemaining: () => 10 }), 1, [], false),
     cancelIdleCallback: (id) => { timers.delete(id); },
     queueMicrotask: (fn) => { nativeThen.call(nativeResolved, () => fn()); },
-    fetch, Headers, Request, Response, AbortController, AbortSignal, FormData, TextEncoder, TextDecoder,
+    fetch, Headers, Request, Response, AbortController, AbortSignal, FormData, File, TextEncoder, TextDecoder,
     btoa, atob,
     // Plain elements: setting src requests nothing until the image is put
     // on the page (a hidden `new Image()` is the usual tracking pixel).

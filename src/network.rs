@@ -1823,14 +1823,10 @@ fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
-/// A warning page with a single "continue" link. The `brickle:proceed` link
-/// only works from an interstitial the browser itself generated.
-/// A warning page with no way to continue.
-/// A multipart form's body with the files you chose in it: each part the
-/// renderer filled with a file's placeholder ([`crate::forms::upload_token`])
-/// gets that file's bytes, read now. Only files you chose for this page's
-/// fields can be sent; a placeholder anywhere else is sent as written.
-/// `None` when the form has no files.
+/// The body of a form with files in it: the renderer put each file's
+/// placeholder ([`crate::forms::upload_token`]) where its contents go, and
+/// the browser, which has the files, puts them there. None for a form
+/// without files.
 pub fn upload_body(sub: &crate::forms::Submission) -> Result<Option<Vec<u8>>, String> {
     let multipart = sub
         .content_type
@@ -1839,38 +1835,49 @@ pub fn upload_body(sub: &crate::forms::Submission) -> Result<Option<Vec<u8>>, St
     let (Some(body), true) = (&sub.body, multipart && !sub.files.is_empty()) else {
         return Ok(None);
     };
+    fill_uploads(body, &sub.files).map(Some)
+}
+
+/// `body` (a multipart form, from the renderer) with the files you chose
+/// in place of their placeholders. Only a placeholder that is a whole part's
+/// contents counts, each file goes in at most once, and placeholders for
+/// files you didn't choose are left as they are.
+pub fn fill_uploads(body: &str, files: &[(u32, usize, std::path::PathBuf)]) -> Result<Vec<u8>, String> {
     let mut out = Vec::with_capacity(body.len());
-    let mut rest = body.as_str();
+    let mut rest = body;
     let mut total = 0u64;
-    let mut sent = Vec::new();
+    let mut sent: Vec<(u32, usize)> = Vec::new();
     const START: &str = "\u{1}brickle-upload-";
     while let Some(i) = rest.find(START) {
         let after = &rest[i + START.len()..];
-        let digits = after.find('\u{1}').map(|e| &after[..e]);
-        let field = digits.and_then(|d| d.parse::<u32>().ok());
-        let token_len = START.len() + digits.map_or(0, |d| d.len() + 1);
+        let id = after.find('\u{1}').map(|e| &after[..e]).filter(|d| d.len() <= 24);
+        let key = id.and_then(|d| {
+            let (f, n) = d.split_once('.')?;
+            Some((f.parse::<u32>().ok()?, n.parse::<usize>().ok()?))
+        });
+        let token_len = START.len() + id.map_or(0, |d| d.len() + 1);
         // A whole part's contents, right after its headers.
         let whole = rest[..i].ends_with("\r\n\r\n") && rest[i + token_len..].starts_with("\r\n--");
-        let path = field
-            .filter(|f| whole && !sent.contains(f))
-            .and_then(|f| sub.files.iter().find(|(g, _)| *g == f));
+        let file = key
+            .filter(|k| whole && !sent.contains(k))
+            .and_then(|(f, n)| files.iter().find(|(g, m, _)| *g == f && *m == n));
         out.extend_from_slice(&rest.as_bytes()[..i]);
-        match path {
-            Some((f, p)) => {
+        match file {
+            Some((f, n, p)) => {
                 let bytes = std::fs::read(p).map_err(|e| format!("Couldn't read {}: {e}", p.display()))?;
                 total += bytes.len() as u64;
                 if total > crate::tab::MAX_UPLOAD {
                     return Err("The files are too large to send.".into());
                 }
                 out.extend_from_slice(&bytes);
-                sent.push(*f);
+                sent.push((*f, *n));
             }
             None => out.extend_from_slice(&rest.as_bytes()[i..i + token_len]),
         }
         rest = &rest[i + token_len..];
     }
     out.extend_from_slice(rest.as_bytes());
-    Ok(Some(out))
+    Ok(out)
 }
 
 fn interstitial_page(title: &str, body: &str) -> String {

@@ -92,10 +92,10 @@ pub enum ToRenderer {
         y: f32,
         word: bool,
     },
-    /// You chose a file for a file field: what the page may know of it.
+    /// You chose files for a file field: what the page may know of them.
     Chose {
         field: u32,
-        file: crate::forms::ChosenFile,
+        files: Vec<crate::forms::ChosenFile>,
     },
     Render {
         width: f32,
@@ -548,12 +548,15 @@ impl ToRenderer {
                 e.f32(*top);
                 e.f32(*bottom);
             }
-            ToRenderer::Chose { field, file } => {
+            ToRenderer::Chose { field, files } => {
                 e.u8(14);
                 e.u32(*field);
-                e.str(&file.name);
-                e.0.extend_from_slice(&file.size.to_le_bytes());
-                e.str(&file.mime);
+                e.u32(files.len() as u32);
+                for file in files {
+                    e.str(&file.name);
+                    e.0.extend_from_slice(&file.size.to_le_bytes());
+                    e.str(&file.mime);
+                }
             }
             ToRenderer::Select { x, y, word } => {
                 e.u8(13);
@@ -656,14 +659,22 @@ impl ToRenderer {
                 top: d.f32()?,
                 bottom: d.f32()?,
             },
-            14 => ToRenderer::Chose {
-                field: d.u32()?,
-                file: crate::forms::ChosenFile {
-                    name: d.str()?,
-                    size: u64::from_le_bytes(d.take(8)?.try_into().map_err(|_| "bad size")?),
-                    mime: d.str()?,
-                },
-            },
+            14 => {
+                let field = d.u32()?;
+                let n = d.u32()? as usize;
+                if n > crate::forms::MAX_FILES {
+                    return Err("too many files".into());
+                }
+                let mut files = Vec::with_capacity(n);
+                for _ in 0..n {
+                    files.push(crate::forms::ChosenFile {
+                        name: d.str()?,
+                        size: u64::from_le_bytes(d.take(8)?.try_into().map_err(|_| "bad size")?),
+                        mime: d.str()?,
+                    });
+                }
+                ToRenderer::Chose { field, files }
+            }
             13 => ToRenderer::Select {
                 x: d.f32()?,
                 y: d.f32()?,
@@ -805,6 +816,7 @@ impl FromRenderer {
                         e.u8(1);
                         e.u32(a.field);
                         e.str(&a.accept);
+                        e.u8(a.multiple as u8);
                     }
                     None => e.u8(0),
                 }
@@ -1043,6 +1055,7 @@ impl FromRenderer {
                     Some(crate::forms::FileAsk {
                         field: d.u32()?,
                         accept: d.str()?.chars().take(500).collect(),
+                        multiple: d.bool()?,
                     })
                 } else {
                     None
@@ -1486,6 +1499,7 @@ mod tests {
                 choose_file: Some(crate::forms::FileAsk {
                     field: 7,
                     accept: "image/*,.pdf".into(),
+                    multiple: true,
                 }),
             },
             FromRenderer::Clicked {

@@ -26,9 +26,13 @@ pub struct ChosenFile {
 /// What stands for a chosen file's contents in a form the renderer puts
 /// together: the browser, which has the file, puts the bytes there when it
 /// sends the form (see `Network::submit_form`).
-pub fn upload_token(field: u32) -> String {
-    format!("\u{1}brickle-upload-{field}\u{1}")
+/// `index`: which of the field's files (fields with `multiple` have several).
+pub fn upload_token(field: u32, index: usize) -> String {
+    format!("\u{1}brickle-upload-{field}.{index}\u{1}")
 }
+
+/// Most files one field takes.
+pub const MAX_FILES: usize = 100;
 
 /// What clicking a file field asks the browser to show.
 #[derive(Debug, Clone, PartialEq)]
@@ -36,6 +40,8 @@ pub struct FileAsk {
     pub field: u32,
     /// The `accept` attribute (types or extensions), as written.
     pub accept: String,
+    /// The field takes more than one file.
+    pub multiple: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -822,9 +828,10 @@ pub struct Submission {
     /// own record of the page's policy (never sent by the renderer): every
     /// address the form goes to, redirects included, must match them.
     pub form_action: Vec<Vec<String>>,
-    /// The files you chose for the form's file fields, by field, filled in
-    /// by the browser from its own record (never sent by the renderer).
-    pub files: Vec<(u32, std::path::PathBuf)>,
+    /// The files you chose for the form's file fields, by field and index
+    /// (see [`upload_token`]), filled in by the browser from its own record
+    /// (never sent by the renderer).
+    pub files: Vec<(u32, usize, std::path::PathBuf)>,
 }
 
 /// What submitting `form` (with `submitter`) sends, or None if it can't be
@@ -864,8 +871,9 @@ pub fn submission(
     let multipart = enctype == "multipart/form-data";
     let mut entries: Vec<(String, String)> = Vec::new();
     // File fields in a multipart form: (index in `entries`, file name,
-    // type, field).
-    let mut files: Vec<(usize, String, String, Option<u32>)> = Vec::new();
+    // type, field and which of its files).
+    type FilePart = (usize, String, String, Option<(u32, usize)>);
+    let mut files: Vec<FilePart> = Vec::new();
     for c in controls(dom, form) {
         let Some(e) = dom.element(c) else { continue };
         let Some(name) = e.attrs.get("name").filter(|n| !n.is_empty()).cloned() else {
@@ -894,15 +902,27 @@ pub fn submission(
                 }
             }
             Some(Control::File) => {
-                let chosen = dom.files.get(&c);
-                let file = chosen.map_or(String::new(), |f| f.name.clone());
-                if multipart {
-                    let mime = chosen.map_or("application/octet-stream".into(), |f| f.mime.clone());
-                    files.push((entries.len(), file, mime, chosen.map(|_| c)));
-                    entries.push((name, String::new()));
-                } else {
-                    // Other forms send just the name.
-                    entries.push((name, file));
+                let chosen = dom.files.get(&c).map(Vec::as_slice).unwrap_or_default();
+                if chosen.is_empty() {
+                    // No file: an empty part (or value) under the name.
+                    if multipart {
+                        files.push((
+                            entries.len(),
+                            String::new(),
+                            "application/octet-stream".into(),
+                            None,
+                        ));
+                    }
+                    entries.push((name.clone(), String::new()));
+                }
+                for (i, f) in chosen.iter().enumerate() {
+                    if multipart {
+                        files.push((entries.len(), f.name.clone(), f.mime.clone(), Some((c, i))));
+                        entries.push((name.clone(), String::new()));
+                    } else {
+                        // Other forms send just the names.
+                        entries.push((name.clone(), f.name.clone()));
+                    }
                 }
             }
             Some(Control::Reset | Control::Button) | None => {}
@@ -918,7 +938,7 @@ pub fn submission(
             let k = clean(k);
             match files.iter().find(|f| f.0 == i) {
                 Some((_, file, mime, field)) => {
-                    let contents = field.map_or(String::new(), upload_token);
+                    let contents = field.map_or(String::new(), |(f, i)| upload_token(f, i));
                     b.push_str(&format!(
                         "--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"; filename=\"{}\"\r\nContent-Type: {}\r\n\r\n{contents}\r\n",
                         clean(file),

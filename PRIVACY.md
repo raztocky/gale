@@ -115,7 +115,11 @@ only when you click the field yourself: a page can't open it, and it never lists
 the page. The browser keeps the file you chose; the page and its scripts learn only its name, size
 and type, never its contents. When you send the form, the browser puts the file in at that
 moment, in the place the page's form left for it, and only a file you chose for that page's field
-can go out that way, at most 64 MB.
+can go out that way, at most 64 MB in all (a field with `multiple` takes up to 100 files). A
+script can put the files you chose into a `FormData` and send it with `fetch` or
+`XMLHttpRequest`, as on other browsers: the browser fills them in the same way, and the request
+follows the usual rules for scripts (to the page's own site, unless you allowed more). The script
+still never reads the contents.
 
 ## 5. HTTPS-only
 

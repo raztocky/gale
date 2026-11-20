@@ -42,6 +42,9 @@ struct NetHost<'a> {
     net: &'a mut Network,
     page: String,
     policy: crate::csp::Csp,
+    /// The files you chose on the page (see [`Tab::uploads`]): a script's
+    /// `FormData` may carry them, filled in here.
+    uploads: Vec<(u32, usize, std::path::PathBuf)>,
 }
 
 impl Host for NetHost<'_> {
@@ -90,7 +93,19 @@ impl Host for NetHost<'_> {
     fn image_added(&mut self, url: &str) -> Result<Vec<u8>, String> {
         self.image_policy(url, true, &[])
     }
-    fn request(&mut self, url: &str, req: ScriptRequest) -> Result<ScriptResponse, String> {
+    fn request(&mut self, url: &str, mut req: ScriptRequest) -> Result<ScriptResponse, String> {
+        // A multipart body with placeholders for files you chose on this
+        // page (a script's `FormData`): the files go in here.
+        let multipart = req.headers.iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case("content-type")
+                && v.trim().to_ascii_lowercase().starts_with("multipart/form-data")
+        });
+        if let (true, false, Some(body)) = (multipart, self.uploads.is_empty(), &req.body) {
+            if body.contains("\u{1}brickle-upload-") {
+                req.upload = Some(crate::network::fill_uploads(body, &self.uploads)?);
+                req.body = None;
+            }
+        }
         self.net.script_request(&self.page, url, req)
     }
     fn set_cookie(&mut self, value: &str) {
@@ -139,7 +154,7 @@ pub struct Tab {
     pub resubmit: Option<Submission>,
     /// Files you chose for the page's file fields, by field. Only the
     /// browser reads them, when a form sends them.
-    chosen: std::collections::HashMap<u32, std::path::PathBuf>,
+    chosen: std::collections::HashMap<u32, Vec<std::path::PathBuf>>,
     backend: Backend,
     policy: crate::csp::Csp,
 }
@@ -170,6 +185,34 @@ pub struct Click {
 
 /// Largest file you can send with a form.
 pub const MAX_UPLOAD: u64 = 64 * 1024 * 1024;
+
+/// One file you chose, checked: what the page may know of it.
+fn chosen_file(path: &std::path::Path) -> Result<crate::forms::ChosenFile, String> {
+    let meta = std::fs::metadata(path).map_err(|e| format!("Can't read {}: {e}", path.display()))?;
+    if !meta.is_file() {
+        return Err(format!("{} isn't a file.", path.display()));
+    }
+    if meta.len() > MAX_UPLOAD {
+        return Err(format!(
+            "{} is too large to send (over {} MB).",
+            path.display(),
+            MAX_UPLOAD >> 20
+        ));
+    }
+    let name: String = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(255)
+        .collect();
+    Ok(crate::forms::ChosenFile {
+        mime: mime_of(&name).into(),
+        name,
+        size: meta.len(),
+    })
+}
 
 /// A file's type, from its name, for the page and the form that sends it.
 fn mime_of(name: &str) -> &'static str {
@@ -260,10 +303,10 @@ pub enum Input {
         y: f32,
         word: bool,
     },
-    /// You chose this file for a file field (in the browser's own dialog).
+    /// You chose these files for a file field (in the browser's own dialog).
     Chose {
         field: u32,
-        path: std::path::PathBuf,
+        paths: Vec<std::path::PathBuf>,
     },
 }
 
@@ -417,6 +460,7 @@ impl Tab {
                 net,
                 page: url.to_string(),
                 policy: crate::csp::Csp::from_headers(url, csp),
+                uploads: Vec::new(),
             };
             let mut page = Page::parse_with_policy(url, html, &blocker_css, csp, &mut host);
             let sources = page.image_sources();
@@ -465,7 +509,7 @@ impl Tab {
     fn check_form(&self, click: &mut Click) {
         let Some(sub) = click.submit.as_mut() else { return };
         sub.form_action = self.policy.form_action_sources();
-        sub.files = self.chosen.iter().map(|(f, p)| (*f, p.clone())).collect();
+        sub.files = self.uploads();
         if !self.policy.form_action(&sub.url) {
             click.invalid = Some(format!(
                 "This page's security policy doesn't allow sending the form to {}",
@@ -486,44 +530,48 @@ impl Tab {
         click
     }
 
-    /// A file you chose: checked here, kept by the browser; the page is told
-    /// its name, size and type.
-    fn chosen_file(
+    /// The files you chose on this page, by field and index (see
+    /// [`crate::forms::upload_token`]).
+    fn uploads(&self) -> Vec<(u32, usize, std::path::PathBuf)> {
+        self.chosen
+            .iter()
+            .flat_map(|(f, ps)| ps.iter().enumerate().map(|(i, p)| (*f, i, p.clone())))
+            .collect()
+    }
+
+    /// Files you chose for a field: checked here, kept by the browser; the
+    /// page is told their names, sizes and types.
+    fn chosen_files(
         &mut self,
         field: u32,
-        path: &std::path::Path,
-    ) -> Result<crate::forms::ChosenFile, String> {
-        let meta = std::fs::metadata(path).map_err(|e| format!("Can't read that file: {e}"))?;
-        if !meta.is_file() {
-            return Err("That isn't a file.".into());
+        paths: &[std::path::PathBuf],
+    ) -> Result<Vec<crate::forms::ChosenFile>, String> {
+        if paths.len() > crate::forms::MAX_FILES {
+            return Err(format!("Choose at most {} files.", crate::forms::MAX_FILES));
         }
-        if meta.len() > MAX_UPLOAD {
-            return Err(format!(
-                "That file is too large to send (over {} MB).",
-                MAX_UPLOAD >> 20
-            ));
+        let mut out = Vec::with_capacity(paths.len());
+        let mut total = 0;
+        for path in paths {
+            let file = chosen_file(path)?;
+            total += file.size;
+            if total > MAX_UPLOAD {
+                return Err(format!(
+                    "Those files are too large to send (over {} MB together).",
+                    MAX_UPLOAD >> 20
+                ));
+            }
+            out.push(file);
         }
-        let name: String = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default()
-            .chars()
-            .filter(|c| !c.is_control())
-            .take(255)
-            .collect();
-        self.chosen.insert(field, path.to_path_buf());
-        Ok(crate::forms::ChosenFile {
-            mime: mime_of(&name).into(),
-            name,
-            size: meta.len(),
-        })
+        self.chosen.insert(field, paths.to_vec());
+        Ok(out)
     }
 
     fn interact_inner(&mut self, net: &mut Network, input: Input) -> Click {
-        let mut chosen = crate::forms::ChosenFile::default();
-        if let Input::Chose { field, path } = &input {
-            match self.chosen_file(*field, path) {
-                Ok(file) => chosen = file,
+        let uploads = self.uploads();
+        let mut chosen = Vec::new();
+        if let Input::Chose { field, paths } = &input {
+            match self.chosen_files(*field, paths) {
+                Ok(files) => chosen = files,
                 Err(e) => {
                     return Click {
                         invalid: accept_invalid(Some(e)),
@@ -569,6 +617,7 @@ impl Tab {
             net,
             page: self.url.clone(),
             policy: self.policy.clone(),
+            uploads,
         };
         let copy_key = matches!(input, Input::Key(Key::Copy | Key::Cut));
         let msg = match input {
@@ -578,7 +627,7 @@ impl Tab {
             Input::Scroll { uid, dx, dy } => ToRenderer::Scroll { uid, dx, dy },
             Input::Reveal { top, bottom } => ToRenderer::Reveal { top, bottom },
             Input::Select { x, y, word } => ToRenderer::Select { x, y, word },
-            Input::Chose { field, .. } => ToRenderer::Chose { field, file: chosen },
+            Input::Chose { field, .. } => ToRenderer::Chose { field, files: chosen },
         };
         let result = r.send(msg).and_then(|_| {
             match r.serve(Instant::now() + RENDERER_TIMEOUT, SCRIPT_BYTES, &mut host)? {
@@ -730,6 +779,7 @@ fn load_sandboxed(
         net,
         page: url.to_string(),
         policy: crate::csp::Csp::from_headers(url, csp),
+        uploads: Vec::new(),
     };
     let loaded = r.load(
         url,
@@ -1446,6 +1496,7 @@ mod resource_policy_boundary_tests {
                 net: &mut network,
                 page: url.clone(),
                 policy,
+                uploads: Vec::new(),
             };
             if image {
                 assert!(host.image_policy(&url, false, &[]).is_err());

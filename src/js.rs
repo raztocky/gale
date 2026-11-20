@@ -112,7 +112,7 @@ pub struct Dom {
     pub user_validity: std::collections::HashSet<u32>,
     /// Files you chose for `<input type=file>` fields: only what the page
     /// may know (name, size, type). The browser keeps the files.
-    pub files: std::collections::HashMap<u32, crate::forms::ChosenFile>,
+    pub files: std::collections::HashMap<u32, Vec<crate::forms::ChosenFile>>,
     /// Whether changes are written down for `MutationObserver`s (only
     /// while a script observes something, and only for scripts' changes).
     recording: bool,
@@ -1236,19 +1236,26 @@ fn n_set_custom_validity(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResul
 /// A file field's chosen file: [name, size, type], or null.
 fn n_file_info(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
     let id = arg_id(a, 0, c)?;
-    let f = with(|s| s.dom.files.get(&id).cloned());
-    Ok(match f {
-        Some(f) => JsArray::from_iter(
-            [
-                js_string!(f.name.as_str()).into(),
-                JsValue::from(f.size as f64),
-                js_string!(f.mime.as_str()).into(),
-            ],
-            c,
-        )
-        .into(),
-        None => JsValue::null(),
-    })
+    let files = with(|s| s.dom.files.get(&id).cloned()).unwrap_or_default();
+    // [name, size, type, placeholder] for each: the placeholder stands for
+    // the contents in a `FormData` the browser fills in when it's sent.
+    let list: Vec<JsValue> = files
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            JsArray::from_iter(
+                [
+                    js_string!(f.name.as_str()).into(),
+                    JsValue::from(f.size as f64),
+                    js_string!(f.mime.as_str()).into(),
+                    js_string!(crate::forms::upload_token(id, i).as_str()).into(),
+                ],
+                c,
+            )
+            .into()
+        })
+        .collect();
+    Ok(JsArray::from_iter(list, c).into())
 }
 
 fn n_validity(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
