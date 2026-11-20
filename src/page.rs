@@ -48,6 +48,11 @@ pub struct Page {
     caret: forms::Caret,
     /// The `<select>` showing its options.
     open_select: Option<u32>,
+    /// The month an open date picker shows.
+    picker_month: Option<(i32, u32)>,
+    /// Which fields and forms are filled in right, for `:valid` and
+    /// `:invalid` (worked out whenever the document changes).
+    validity: HashMap<u32, bool>,
     /// Images by URL: decoded, or `None` if they couldn't be loaded.
     images: HashMap<String, Option<Decoded>>,
     /// Inline `<svg>` elements by node, as the `data:` addresses of their
@@ -340,6 +345,7 @@ impl Page {
         page.policy.add_meta(&arena.to_tree());
         page.set_tree(arena.to_tree(), &mut |u, _, _, _| fetch(u, Dest::Stylesheet));
         page.arena = Some(arena);
+        page.mark_validity(None);
         page
     }
 
@@ -359,6 +365,7 @@ impl Page {
             host.stylesheet(u, i, c, false, n)
         });
         page.arena = Some(arena);
+        page.mark_validity(None);
         page
     }
 
@@ -449,6 +456,7 @@ impl Page {
             host.stylesheet(u, i, c, !from_server.contains(u), n)
         });
         page.from_server = Some(from_server);
+        page.mark_validity(Some(&mut rt));
         let out = ScriptOutput {
             console: rt.take_console(),
             read: rt.take_read(),
@@ -483,6 +491,8 @@ impl Page {
             focus: None,
             caret: forms::Caret::default(),
             open_select: None,
+            picker_month: None,
+            validity: HashMap::new(),
             images: HashMap::new(),
             inline_svgs: HashMap::new(),
             image_bytes: 0,
@@ -768,7 +778,8 @@ impl Page {
     }
 
     /// After the editable DOM changed: take the new tree.
-    fn sync(&mut self, rt: Option<&mut Runtime>) {
+    fn sync(&mut self, mut rt: Option<&mut Runtime>) {
+        self.mark_validity(rt.as_deref_mut());
         let tree = match rt {
             Some(rt) => rt.tree(),
             None => match &self.arena {
@@ -777,6 +788,13 @@ impl Page {
             },
         };
         self.set_tree(tree, &mut |_, _, _, _| Err("page already loaded".into()));
+    }
+
+    /// Work out `:valid`/`:invalid` for the document as it is now.
+    pub fn mark_validity(&mut self, rt: Option<&mut Runtime>) {
+        self.validity = self
+            .with_dom(rt, |d| crate::validate::marks(d))
+            .unwrap_or_default();
     }
 
     /// Submit `form` (as if by `submitter`): scripts first get a `submit`
@@ -844,6 +862,52 @@ impl Page {
         // With a select's options showing, a click picks one or closes
         // them; it does nothing else.
         if let Some(sel) = self.open_select.take() {
+            // A date or colour picker's cell: handled here, never seen by
+            // the page's scripts.
+            if let Some(uid) = hit.filter(|&u| crate::pickers::is_cell(u)) {
+                // The month shown: as last moved to, or the field's own.
+                let month = match self.picker_month {
+                    Some(m) => m,
+                    None => self
+                        .with_dom(rt.as_deref_mut(), |d| {
+                            crate::pickers::opening_month(&forms::value(d, sel))
+                        })
+                        .unwrap_or_else(crate::pickers::today_month),
+                };
+                let pick = self
+                    .with_dom(rt.as_deref_mut(), |d| crate::pickers::pick(d, sel, uid, month))
+                    .unwrap_or(crate::pickers::Pick::Nothing);
+                match pick {
+                    crate::pickers::Pick::Month(m) => {
+                        self.picker_month = Some(m);
+                        self.open_select = Some(sel);
+                    }
+                    crate::pickers::Pick::Set(v) => {
+                        self.picker_month = None;
+                        let changed = self
+                            .with_dom(rt.as_deref_mut(), |d| {
+                                let before = forms::value(d, sel);
+                                forms::set_field_value(d, sel, &v);
+                                forms::value(d, sel) != before
+                            })
+                            .unwrap_or(false);
+                        if let Some(c) = self.with_dom(rt.as_deref_mut(), |d| forms::Caret::at_end(d, sel)) {
+                            self.caret = c;
+                        }
+                        if let (true, Some(rt)) = (changed, rt.as_deref_mut()) {
+                            rt.fire(sel, "input", true, false);
+                            rt.fire(sel, "change", true, false);
+                        }
+                    }
+                    // A greyed-out day: keep the picker open.
+                    crate::pickers::Pick::Nothing => self.open_select = Some(sel),
+                }
+                let was = self.focus;
+                self.finish(rt, before, was, &mut out);
+                out.changed = true;
+                return out;
+            }
+            self.picker_month = None;
             let picked = hit.and_then(|uid| {
                 self.with_dom(rt.as_deref_mut(), |d| {
                     (forms::select_of(d, uid) == Some(sel) && forms::choose_option(d, sel, uid))
@@ -860,7 +924,7 @@ impl Page {
             out.changed = true;
             return out;
         }
-        let Some(uid) = hit else {
+        let Some(uid) = hit.filter(|&u| !crate::pickers::is_cell(u)) else {
             self.focus = None;
             return out;
         };
@@ -894,6 +958,17 @@ impl Page {
                 Some(Activation::Open(c)) => {
                     self.focus = Some(c);
                     self.open_select = Some(c);
+                    self.picker_month = None;
+                    // A date field takes typing with its calendar open.
+                    if was_focus != Some(c) {
+                        if let Some(caret) = self.with_dom(rt.as_deref_mut(), |d| forms::Caret::at_end(d, c))
+                        {
+                            self.caret = caret;
+                        }
+                        if let Some(rt) = rt.as_deref_mut() {
+                            rt.fire(c, "focus", false, false);
+                        }
+                    }
                     out.changed = true;
                 }
                 Some(Activation::Submit { form, submitter }) => {
@@ -953,6 +1028,30 @@ impl Page {
                 let down = matches!(key, Key::Down { .. });
                 change = self.with_dom(rt.as_deref_mut(), |d| forms::step_option(d, f, down)) == Some(true);
                 input = change;
+            }
+            // A date field moves a day later or earlier.
+            (Key::Up { .. } | Key::Down { .. }, Some(f))
+                if self
+                    .with_dom(rt.as_deref_mut(), |d| {
+                        d.element(f).is_some_and(crate::pickers::is_date)
+                    })
+                    .unwrap_or(false) =>
+            {
+                let up = matches!(key, Key::Up { .. });
+                input = self
+                    .with_dom(rt.as_deref_mut(), |d| {
+                        let next = d
+                            .element(f)
+                            .and_then(|e| crate::pickers::step_date(&forms::value(d, f), e, up));
+                        next.map(|v| forms::set_field_value(d, f, &v)).is_some()
+                    })
+                    .unwrap_or(false);
+                if input {
+                    caret = self
+                        .with_dom(rt.as_deref_mut(), |d| forms::Caret::at_end(d, f))
+                        .unwrap_or(caret);
+                    self.picker_month = None;
+                }
             }
             // A number field steps up and down.
             (Key::Up { .. } | Key::Down { .. }, Some(f))
@@ -1115,6 +1214,8 @@ impl Page {
                 focus: self.focus,
                 caret: self.caret,
                 open: self.open_select,
+                month: self.picker_month,
+                validity: self.validity.clone(),
             },
         );
         let images = self.images_by_node(&tree);
@@ -1828,6 +1929,34 @@ mod form_script_tests {
         );
     }
 
+    /// `:invalid`/`:valid`/`:required`/`:optional` for CSS and scripts,
+    /// following what's typed.
+    #[test]
+    fn validity_pseudo_classes() {
+        let (mut page, mut rt) = load(
+            "<style>input:invalid{color:red} input:valid{color:green}</style>\
+             <form id=f><input id=a required><input id=b></form><p id=out></p>\
+             <script>\
+             const q = (s) => document.querySelectorAll(s).length;\
+             window.report = () => document.getElementById('out').textContent =\
+               [q(':invalid'), q(':valid'), q(':required'), q(':optional'), q('form:invalid'),\
+                getComputedStyle(document.getElementById('a')).color].join('|');\
+             report();\
+             </script>",
+        );
+        let text = page.dom.text_content();
+        assert!(text.contains("2|1|1|1|1|rgb(255, 0, 0)"), "{text}");
+        // What's drawn follows: `a` is marked invalid until something's typed.
+        assert!(page.validity.values().any(|v| !v));
+        page.key(Some(&mut rt), Key::Tab);
+        page.type_text(Some(&mut rt), "x");
+        assert!(page.validity.values().all(|v| *v), "{:?}", page.validity);
+        rt.run_script("report()", 0, "test");
+        let mut out = String::new();
+        rt.tree().dump(0, &mut out);
+        assert!(out.contains("0|3|1|1|0|rgb(0, 128, 0)"), "{out}");
+    }
+
     /// React streams content in late as `<div hidden id=S:0>` and moves it
     /// over the loading placeholder, which it finds by comment markers.
     #[test]
@@ -2037,6 +2166,80 @@ mod image_tests {
             (40.0, 20.0),
             "height:auto overrides the attribute"
         );
+    }
+
+    /// The middle of the box of node `uid`, to click on.
+    fn centre_of(page: &Page, uid: u32) -> (f32, f32) {
+        let r = page
+            .boxes()
+            .into_iter()
+            .find(|(u, _)| *u == uid)
+            .map(|(_, r)| r)
+            .unwrap_or_else(|| panic!("no box for {uid:#x}"));
+        (r.x + r.w / 2.0, r.y + r.h / 2.0)
+    }
+
+    fn field_value(page: &mut Page, id: &str) -> String {
+        page.with_dom(None, |d| forms::value(d, forms::by_id(d, id).unwrap()))
+            .unwrap()
+    }
+
+    fn uid_of(page: &Page, id: &str) -> u32 {
+        let mut found = Vec::new();
+        page.dom.walk(&mut found, &|n| {
+            n.element().and_then(|e| e.attrs.get("id")).map(String::as_str) == Some(id)
+        });
+        found[0].uid
+    }
+
+    #[test]
+    fn date_picker() {
+        let (mut page, _) =
+            load("<body style='margin:0'><input id=d type=date value=2026-03-10 min=2026-03-05></body>");
+        let until = Instant::now() + std::time::Duration::from_secs(1);
+        let (x, y) = centre_of(&page, uid_of(&page, "d"));
+        let r = page.click_at(None, x, y, until);
+        assert!(r.changed);
+        let shown = page.render(800.0, 600.0);
+        let text: String = shown.texts.iter().map(|t| t.text.as_str()).collect();
+        assert!(text.contains("March 2026"), "{text}");
+        // A greyed-out day does nothing; the 20th is picked.
+        let (x, y) = centre_of(&page, crate::pickers::BASE + 20);
+        page.click_at(None, x, y, until);
+        assert_eq!(field_value(&mut page, "d"), "2026-03-20");
+        let shown = page.render(800.0, 600.0);
+        let text: String = shown.texts.iter().map(|t| t.text.as_str()).collect();
+        assert!(!text.contains("March 2026"), "closed after picking: {text}");
+        // Open again, go to April, pick the 1st.
+        let (x, y) = centre_of(&page, uid_of(&page, "d"));
+        page.click_at(None, x, y, until);
+        let _ = page.render(800.0, 600.0);
+        let next = crate::pickers::BASE + 101;
+        let (x, y) = centre_of(&page, next);
+        page.click_at(None, x, y, until);
+        let shown = page.render(800.0, 600.0);
+        let text: String = shown.texts.iter().map(|t| t.text.as_str()).collect();
+        assert!(text.contains("April 2026"), "{text}");
+        let (x, y) = centre_of(&page, crate::pickers::BASE + 1);
+        page.click_at(None, x, y, until);
+        assert_eq!(field_value(&mut page, "d"), "2026-04-01");
+        // Down steps a day back.
+        page.key(None, Key::Down { select: false });
+        assert_eq!(field_value(&mut page, "d"), "2026-03-31");
+    }
+
+    #[test]
+    fn colour_picker() {
+        let (mut page, _) =
+            load("<body style='margin:0'><form action=/s><input id=c name=c type=color></form></body>");
+        assert_eq!(field_value(&mut page, "c"), "#000000", "black until chosen");
+        let until = Instant::now() + std::time::Duration::from_secs(1);
+        let (x, y) = centre_of(&page, uid_of(&page, "c"));
+        page.click_at(None, x, y, until);
+        let _ = page.render(800.0, 600.0);
+        let (x, y) = centre_of(&page, crate::pickers::BASE + 1000 + 21);
+        page.click_at(None, x, y, until);
+        assert_eq!(field_value(&mut page, "c"), crate::pickers::PALETTE[21]);
     }
 
     /// A `<picture>` shows (and fetches) only the source it chooses.

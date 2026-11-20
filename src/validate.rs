@@ -59,7 +59,7 @@ pub fn will_validate(dom: &Dom, id: u32) -> bool {
     }
     match kind {
         Control::Text { .. } | Control::TextArea => attr(dom, id, "readonly").is_none(),
-        Control::Checkbox | Control::Radio | Control::Select | Control::File => true,
+        Control::Checkbox | Control::Radio | Control::Select | Control::File | Control::Color => true,
         // Submit buttons can carry a custom error; nothing else applies.
         Control::Submit => true,
         Control::Reset | Control::Button | Control::Hidden => false,
@@ -263,6 +263,31 @@ pub fn validity(dom: &Dom, id: u32, custom: &HashMap<u32, String>) -> Validity {
                         "Please use at least {min} characters (you are currently using {len} characters)."
                     ));
                 }
+                if ty == "date" {
+                    match crate::pickers::parse_date(&value) {
+                        None => {
+                            v.bad_input = true;
+                            say("Please enter a valid date.".into());
+                        }
+                        Some(d) => {
+                            let bound = |a: &str| attr(dom, id, a).and_then(crate::pickers::parse_date);
+                            if let Some(lo) = bound("min").filter(|&lo| d < lo) {
+                                v.range_underflow = true;
+                                say(format!(
+                                    "Please select a value that is no earlier than {}.",
+                                    crate::pickers::format_date(lo)
+                                ));
+                            }
+                            if let Some(hi) = bound("max").filter(|&hi| d > hi) {
+                                v.range_overflow = true;
+                                say(format!(
+                                    "Please select a value that is no later than {}.",
+                                    crate::pickers::format_date(hi)
+                                ));
+                            }
+                        }
+                    }
+                }
                 if matches!(ty.as_str(), "number" | "range") {
                     match number(&value) {
                         None => {
@@ -308,6 +333,42 @@ pub fn validity(dom: &Dom, id: u32, custom: &HashMap<u32, String>) -> Validity {
     }
     v.message = msg;
     v
+}
+
+/// `:valid`/`:invalid` for element `id`: a field that's checked, or a form
+/// (valid when all its fields are). None for anything else.
+pub fn state(dom: &Dom, id: u32) -> Option<bool> {
+    let e = dom.element(id)?;
+    if e.tag == "form" {
+        let fields = forms::controls(dom, id);
+        return Some(
+            fields
+                .into_iter()
+                .all(|c| validity(dom, c, &dom.custom_validity).valid()),
+        );
+    }
+    will_validate(dom, id).then(|| validity(dom, id, &dom.custom_validity).valid())
+}
+
+/// Most fields marked `:valid`/`:invalid` for styling; past it a page's
+/// fields are left unmarked (checking radio groups looks at the whole page).
+const MAX_MARKED: usize = 2000;
+
+/// `:valid`/`:invalid` for every form and checked field, by node.
+pub fn marks(dom: &Dom) -> HashMap<u32, bool> {
+    let mut all = Vec::new();
+    dom.descendants(0, &mut all);
+    let candidates: Vec<u32> = all
+        .into_iter()
+        .filter(|&n| dom.element(n).is_some_and(|e| e.tag == "form") || forms::kind(dom, n).is_some())
+        .collect();
+    if candidates.len() > MAX_MARKED {
+        return HashMap::new();
+    }
+    candidates
+        .into_iter()
+        .filter_map(|n| state(dom, n).map(|v| (n, v)))
+        .collect()
 }
 
 /// A number field's step (None for `step="any"`); 1 by default.
@@ -450,6 +511,18 @@ mod tests {
         assert_eq!(
             message("<input id=a type=number value=abc>", "a"),
             "Please enter a number."
+        );
+        assert_eq!(
+            message("<input id=a type=date value=2026-02-30>", "a"),
+            "Please enter a valid date."
+        );
+        assert_eq!(
+            message("<input id=a type=date min=2026-01-01 value=2025-12-31>", "a"),
+            "Please select a value that is no earlier than 2026-01-01."
+        );
+        assert_eq!(
+            message("<input id=a type=date required value=2026-01-01>", "a"),
+            ""
         );
     }
 

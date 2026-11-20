@@ -90,6 +90,9 @@ impl crate::selectors::Tree for Dom {
             .get(id as usize)
             .is_some_and(|n| matches!(&n.data, NodeType::Text(t) if !t.is_empty()))
     }
+    fn valid(&self, id: u32) -> Option<bool> {
+        crate::validate::state(self, id)
+    }
 }
 
 /// A mutable DOM. Node 0 is the document.
@@ -98,6 +101,8 @@ pub struct Dom {
     nodes: Vec<ANode>,
     /// Bumped on every change, so the renderer knows when to re-layout.
     pub version: u64,
+    /// Scripts' `setCustomValidity()` messages, by form field.
+    pub custom_validity: std::collections::HashMap<u32, String>,
 }
 
 const DOCUMENT: u32 = 0;
@@ -115,6 +120,7 @@ impl Dom {
                 }),
             }],
             version: 0,
+            custom_validity: std::collections::HashMap::new(),
         };
         let id = d.import(root);
         d.append(DOCUMENT, id);
@@ -486,8 +492,6 @@ struct State {
     viewport: (f32, f32),
     /// Computed styles by node, for the DOM version they were made for.
     computed: Option<(u64, ComputedMap)>,
-    /// `setCustomValidity()` messages, by form field.
-    custom_validity: std::collections::HashMap<u32, String>,
 }
 
 thread_local! {
@@ -899,7 +903,8 @@ fn computed_styles(s: &mut State) -> ComputedMap {
             return map.clone();
         }
     }
-    let tree = s.dom.to_tree();
+    let mut tree = s.dom.to_tree();
+    crate::forms::mark_validity(&mut tree, &crate::validate::marks(&s.dom));
     let mut sheets = vec![(0u8, crate::page::ua_sheet())];
     sheets.extend(s.sheets.iter().map(|sh| (1u8, sh)));
     let ctx = crate::style::StyleContext {
@@ -948,10 +953,14 @@ fn n_set_custom_validity(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResul
         msg.truncate(end);
     }
     with(|s| {
-        if msg.is_empty() {
-            s.custom_validity.remove(&id);
+        let old = if msg.is_empty() {
+            s.dom.custom_validity.remove(&id)
         } else {
-            s.custom_validity.insert(id, msg);
+            s.dom.custom_validity.insert(id, msg.clone())
+        };
+        // `:invalid` may change.
+        if old.as_deref() != Some(msg.as_str()) && !(old.is_none() && msg.is_empty()) {
+            s.dom.version += 1;
         }
     });
     Ok(JsValue::undefined())
@@ -965,7 +974,7 @@ fn n_validity(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> 
     let id = arg_id(a, 0, c)?;
     let (v, will) = with(|s| {
         (
-            crate::validate::validity(&s.dom, id, &s.custom_validity),
+            crate::validate::validity(&s.dom, id, &s.dom.custom_validity),
             crate::validate::will_validate(&s.dom, id),
         )
     });
@@ -1613,7 +1622,7 @@ impl Runtime {
 
     /// Scripts' `setCustomValidity()` messages, by field.
     pub fn custom_validity(&self) -> std::collections::HashMap<u32, String> {
-        with(|s| s.custom_validity.clone())
+        with(|s| s.dom.custom_validity.clone())
     }
 
     /// The page's stylesheets (not the browser's own), for

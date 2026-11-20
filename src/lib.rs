@@ -27,6 +27,7 @@ pub mod net;
 pub mod network;
 pub mod page;
 pub mod paint;
+pub mod pickers;
 pub mod renderer;
 pub mod sandbox;
 pub mod security;

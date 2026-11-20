@@ -86,6 +86,7 @@ browser validates before painting.
 | `font.rs` | Bundled fonts, per-character fallback, lazy loading, and text shaping with [HarfRust](https://github.com/harfbuzz/harfrust) (in the renderer only): kerning, ligatures, Arabic joining, Indic conjuncts, combining marks, right-to-left words |
 | `image.rs` | PNG, JPEG, GIF, WebP and SVG decoding (in the renderer only), with size checks before decoding, and resizing |
 | `computed.rs` | `getComputedStyle()`: Brickle's computed style for an element written as the CSS text browsers give scripts, with sizes from the layout |
+| `pickers.rs` | Date and colour pickers: a month calendar or a palette drawn under the field, whose cells are handled by Brickle and never reach the page's scripts |
 | `validate.rs` | Form validation before a form is sent (`required`, email and URL fields, `pattern` with JavaScript's regular expressions, lengths, number ranges and steps), with Firefox's messages |
 | `srcset.rs` | Which picture an `<img>` shows: `<picture>` sources by `media` and `type`, then `srcset` (`x` and `w` descriptors, `sizes`), then `src`; always chosen for 1x pixel density, so the file requested doesn't reveal your screen |
 | `inline_svg.rs` | Inline `<svg>` in HTML: written back out as an SVG document (SVG's capitalized names restored, the page's CSS `fill`/`stroke`/`color` applied, scripts and outside references left out) and drawn like an SVG image |

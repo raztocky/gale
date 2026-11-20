@@ -15,6 +15,11 @@ pub trait Tree {
     fn children(&self, id: u32) -> &[u32];
     /// `id` is a text node with something in it.
     fn has_text(&self, id: u32) -> bool;
+    /// Whether element `id` is filled in right (`:valid`/`:invalid`); None
+    /// for an element that isn't checked at all.
+    fn valid(&self, _id: u32) -> Option<bool> {
+        None
+    }
     /// Where `id` is in its parent's children.
     fn index(&self, id: u32) -> usize {
         self.parent_node(id)
@@ -240,6 +245,20 @@ fn pseudo<T: Tree + ?Sized>(t: &T, id: u32, e: &ElementData, p: &Pseudo) -> bool
             false
         }),
         Pseudo::Never => false,
+        Pseudo::Valid(want) => t.valid(id) == Some(*want),
+        Pseudo::Required(want) => {
+            let field = match e.tag.as_str() {
+                "select" | "textarea" => true,
+                "input" => !e.attrs.get("type").is_some_and(|ty| {
+                    matches!(
+                        ty.trim().to_ascii_lowercase().as_str(),
+                        "hidden" | "submit" | "reset" | "button" | "image"
+                    )
+                }),
+                _ => false,
+            };
+            field && e.attrs.contains_key("required") == *want
+        }
     }
 }
 
@@ -302,6 +321,18 @@ impl Tree for Flat<'_> {
     }
     fn index(&self, id: u32) -> usize {
         self.nodes.get(id as usize).map_or(0, |n| n.index)
+    }
+    /// From the marks the page put on its form fields while drawing them
+    /// (`forms::decorate`).
+    fn valid(&self, id: u32) -> Option<bool> {
+        let e = self.element(id)?;
+        if e.has_class(crate::forms::VALID_MARK) {
+            Some(true)
+        } else if e.has_class(crate::forms::INVALID_MARK) {
+            Some(false)
+        } else {
+            None
+        }
     }
 }
 

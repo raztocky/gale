@@ -411,6 +411,12 @@ pub enum Pseudo {
     /// Interaction states (`:hover`, `:focus`, `:checked`, ...): a page
     /// that's just been drawn has none of them.
     Never,
+    /// `:valid` (true) or `:invalid` (false): a form field that's checked
+    /// before sending, or a form, filled in right or not.
+    Valid(bool),
+    /// `:required` (true) or `:optional` (false): an input, select or
+    /// textarea with or without `required`.
+    Required(bool),
 }
 
 pub type Specificity = (usize, usize, usize);
@@ -1109,7 +1115,7 @@ fn parse_compound(chars: &[char], i: &mut usize, depth: usize) -> Option<SimpleS
                     ("has", Some(a)) => s.pseudo.push(Pseudo::Has(list(a, true)?)),
                     (
                         "hover" | "active" | "focus" | "focus-visible" | "focus-within" | "visited"
-                        | "target" | "target-within" | "indeterminate" | "invalid" | "user-invalid"
+                        | "target" | "target-within" | "indeterminate" | "user-invalid" | "user-valid"
                         | "autofill" | "placeholder-shown" | "fullscreen" | "modal" | "popover-open" | "open",
                         None,
                     ) => s.pseudo.push(Pseudo::Never),
@@ -1128,7 +1134,11 @@ fn parse_compound(chars: &[char], i: &mut usize, depth: usize) -> Option<SimpleS
                         value: String::new(),
                         ignore_case: false,
                     }),
-                    ("enabled" | "valid" | "read-write" | "defined" | "scope", None) => {}
+                    ("valid", None) => s.pseudo.push(Pseudo::Valid(true)),
+                    ("invalid", None) => s.pseudo.push(Pseudo::Valid(false)),
+                    ("required", None) => s.pseudo.push(Pseudo::Required(true)),
+                    ("optional", None) => s.pseudo.push(Pseudo::Required(false)),
+                    ("enabled" | "read-write" | "defined" | "scope", None) => {}
                     _ => return None,
                 }
             }

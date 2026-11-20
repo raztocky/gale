@@ -30,6 +30,8 @@ pub enum Control {
     Button,
     Hidden,
     File,
+    /// `<input type=color>`: a swatch that opens a palette.
+    Color,
 }
 
 impl Control {
@@ -49,6 +51,7 @@ pub fn control(e: &ElementData) -> Option<Control> {
             "button" => Control::Button,
             "hidden" => Control::Hidden,
             "file" => Control::File,
+            "color" => Control::Color,
             "password" => Control::Text { password: true },
             _ => Control::Text { password: false },
         },
@@ -165,11 +168,21 @@ pub fn value(dom: &Dom, id: u32) -> String {
         Some(Control::Select) => selected_option(dom, id)
             .map(|o| option_value(dom, o))
             .unwrap_or_default(),
+        Some(Control::Color) => crate::pickers::color_value(
+            dom.element(id)
+                .and_then(|e| e.attrs.get("value"))
+                .map_or("", String::as_str),
+        ),
         _ => dom
             .element(id)
             .and_then(|e| e.attrs.get("value").cloned())
             .unwrap_or_default(),
     }
+}
+
+/// Set a field's value as if you had typed or picked it.
+pub fn set_field_value(dom: &mut Dom, id: u32, v: &str) {
+    set_value(dom, id, v);
 }
 
 fn set_value(dom: &mut Dom, id: u32, v: &str) {
@@ -213,10 +226,14 @@ pub fn activate(dom: &mut Dom, id: u32) -> Activation {
         Some(c) if c.takes_typing() => {
             if dom.element(id).is_some_and(|e| e.attrs.contains_key("readonly")) {
                 Activation::Nothing
+            } else if dom.element(id).is_some_and(crate::pickers::is_date) {
+                // Takes typing too, with the calendar showing.
+                Activation::Open(id)
             } else {
                 Activation::Focus(id)
             }
         }
+        Some(Control::Color) if !disabled(dom, id) => Activation::Open(id),
         Some(Control::Checkbox) => {
             if dom.element(id).is_some_and(|e| e.attrs.contains_key("checked")) {
                 dom.remove_attr(id, "checked");
@@ -805,7 +822,28 @@ pub const UA_CSS: &str = "
 .-brickle-option { display: block; padding: 1px 8px; }
 .-brickle-chosen { background-color: #0060df; color: white; }
 .-brickle-off { color: #8f8f9d; }
+.-brickle-date-icon { padding-left: 4px; color: #5b5b66; }
+.-brickle-color { display: inline-block; padding: 3px; background-color: #e9e9ed; }
+.-brickle-swatch { display: inline-block; width: 32px; height: 14px; border: 1px solid #8f8f9d; }
+.-brickle-calendar, .-brickle-palette { padding: 4px; }
+.-brickle-calendar { width: 196px; }
+.-brickle-palette { width: 176px; }
+.-brickle-cal-head, .-brickle-cal-row, .-brickle-cal-foot { display: block; white-space: nowrap; }
+.-brickle-cell { display: inline-block; box-sizing: border-box; width: 28px; padding: 2px 0; text-align: center; }
+.-brickle-cal-title { display: inline-block; width: 140px; text-align: center; font-weight: bold; }
+.-brickle-cal-day { color: #5b5b66; font-size: 85%; }
+.-brickle-cal-today { border: 1px solid #0060df; }
+.-brickle-cal-button { width: 98px; color: #0060df; }
+.-brickle-swatch-cell { display: inline-block; width: 18px; height: 18px; margin: 1px; border: 1px solid #8f8f9d; }
 ";
+
+/// A popup (options, calendar, palette) is placed against its control.
+fn place_popup(n: &mut Node) {
+    if let NodeType::Element(e) = &mut n.node_type {
+        let style = e.attrs.entry("style".into()).or_default();
+        style.push_str(";position:relative");
+    }
+}
 
 fn add_class(n: &mut Node, class: &str) {
     if let NodeType::Element(e) = &mut n.node_type {
@@ -831,13 +869,36 @@ fn placeholder(s: &str) -> Node {
 /// button's label, the selected option; mark the focused field. Works on
 /// a copy of the tree used only for rendering.
 /// What the page's form controls show beyond their values.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Decor {
     /// The focused control, and its caret if it takes typing.
     pub focus: Option<u32>,
     pub caret: Caret,
-    /// The `<select>` whose options are shown.
+    /// The `<select>` whose options are shown, or the date or colour
+    /// field whose picker is.
     pub open: Option<u32>,
+    /// The month an open date picker shows.
+    pub month: Option<(i32, u32)>,
+    /// Which fields and forms are filled in right (`:valid`/`:invalid`).
+    pub validity: std::collections::HashMap<u32, bool>,
+}
+
+/// Classes marking `:valid` and `:invalid` fields for styling.
+pub const VALID_MARK: &str = "-brickle-valid";
+pub const INVALID_MARK: &str = "-brickle-invalid";
+
+/// Put the `:valid`/`:invalid` marks on a tree (for styling it).
+pub fn mark_validity(n: &mut Node, marks: &std::collections::HashMap<u32, bool>) {
+    if marks.is_empty() {
+        return;
+    }
+    let mut stack = vec![n];
+    while let Some(n) = stack.pop() {
+        if let Some(&valid) = marks.get(&n.uid).filter(|_| n.uid != 0) {
+            add_class(n, if valid { VALID_MARK } else { INVALID_MARK });
+        }
+        stack.extend(n.children.iter_mut());
+    }
 }
 
 /// Most options an open select lists.
@@ -845,6 +906,9 @@ const MAX_SHOWN_OPTIONS: usize = 1000;
 
 pub fn decorate(n: &mut Node, d: &Decor) {
     let focused = d.focus.is_some_and(|f| f == n.uid && n.uid != 0);
+    if let Some(&valid) = d.validity.get(&n.uid).filter(|_| n.uid != 0) {
+        add_class(n, if valid { VALID_MARK } else { INVALID_MARK });
+    }
     let Some(e) = n.element().cloned() else { return };
     let Some(kind) = control(&e) else {
         for c in &mut n.children {
@@ -887,11 +951,40 @@ pub fn decorate(n: &mut Node, d: &Decor) {
             } else {
                 val.clone()
             };
+            let date = crate::pickers::is_date(&e);
+            let ph = if ph.is_empty() && date {
+                "yyyy-mm-dd".to_string()
+            } else {
+                ph
+            };
             n.children = if shown.is_empty() && !ph.is_empty() && !focused {
                 vec![placeholder(&ph)]
             } else {
                 edited(&shown)
             };
+            if date {
+                let mut attrs = AttrMap::new();
+                attrs.insert("class".into(), "-brickle-date-icon".into());
+                n.children
+                    .push(dom::elem("span".into(), attrs, vec![text_child("▾")]));
+                if d.open.is_some_and(|o| o == n.uid && n.uid != 0) {
+                    let month = d.month.unwrap_or_else(|| crate::pickers::opening_month(&val));
+                    n.children.push(crate::pickers::calendar(&e, month));
+                    place_popup(n);
+                }
+            }
+        }
+        Control::Color => {
+            add_class(n, "-brickle-color");
+            let colour = crate::pickers::color_value(&val);
+            let mut attrs = AttrMap::new();
+            attrs.insert("class".into(), "-brickle-swatch".into());
+            attrs.insert("style".into(), format!("background-color:{colour}"));
+            n.children = vec![dom::elem("span".into(), attrs, vec![text_child("\u{a0}")])];
+            if d.open.is_some_and(|o| o == n.uid && n.uid != 0) {
+                n.children.push(crate::pickers::palette(&e));
+                place_popup(n);
+            }
         }
         Control::TextArea => {
             add_class(n, "-brickle-textarea");
@@ -960,11 +1053,7 @@ pub fn decorate(n: &mut Node, d: &Decor) {
                 let mut attrs = AttrMap::new();
                 attrs.insert("class".into(), "-brickle-options".into());
                 children.push(dom::elem("brickle-options".into(), attrs, items));
-                // The list is placed against the select.
-                if let NodeType::Element(e) = &mut n.node_type {
-                    let style = e.attrs.entry("style".into()).or_default();
-                    style.push_str(";position:relative");
-                }
+                place_popup(n);
             }
             n.children = children;
         }
@@ -1196,6 +1285,8 @@ mod tests {
                 focus: Some(p),
                 caret: Caret { at: 3, anchor: None },
                 open: None,
+                month: None,
+                validity: Default::default(),
             },
         );
         let mut out = String::new();
