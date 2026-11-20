@@ -259,6 +259,12 @@ pub struct ComputedStyle {
     /// `grid-template-rows`, and `grid-auto-rows` for the rows after them.
     pub grid_rows: Option<Rc<GridTemplate>>,
     pub grid_auto_rows: Option<Rc<GridTemplate>>,
+    /// `grid-auto-columns`: columns past the template (with column flow).
+    pub grid_auto_columns: Option<Rc<GridTemplate>>,
+    /// `grid-auto-flow: column`: items fill columns rather than rows.
+    pub grid_flow_column: bool,
+    /// `grid-auto-flow: dense`: later items fill earlier holes.
+    pub grid_dense: bool,
     /// `grid-template-areas`.
     pub grid_areas: Option<Rc<GridAreas>>,
     /// A grid item's `grid-column` and `grid-row` start and end.
@@ -532,6 +538,9 @@ impl ComputedStyle {
             grid_columns: None,
             grid_rows: None,
             grid_auto_rows: None,
+            grid_auto_columns: None,
+            grid_flow_column: false,
+            grid_dense: false,
             grid_areas: None,
             grid_column: [GridLine::Auto; 2],
             grid_row: [GridLine::Auto; 2],
@@ -1837,14 +1846,25 @@ fn compute(
                 let text: Vec<String> = vals.iter().map(|v| v.to_css()).collect();
                 s.grid_columns = GridTemplate::parse(&text.join(" "), fs, ctxv.rem).map(Rc::new);
             }
-            "grid-template-rows" | "grid-auto-rows" => {
+            "grid-template-rows" | "grid-auto-rows" | "grid-auto-columns" => {
                 let text: Vec<String> = vals.iter().map(|v| v.to_css()).collect();
                 let t = GridTemplate::parse(&text.join(" "), fs, ctxv.rem).map(Rc::new);
-                if name == "grid-template-rows" {
-                    s.grid_rows = t;
-                } else {
-                    s.grid_auto_rows = t;
+                match name.as_str() {
+                    "grid-template-rows" => s.grid_rows = t,
+                    "grid-auto-rows" => s.grid_auto_rows = t,
+                    _ => s.grid_auto_columns = t,
                 }
+            }
+            "grid-auto-flow" => {
+                let words: Vec<&str> = vals
+                    .iter()
+                    .filter_map(|v| match v {
+                        Value::Keyword(k) => Some(k.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                s.grid_flow_column = words.contains(&"column");
+                s.grid_dense = words.contains(&"dense");
             }
             "grid-template-areas" => s.grid_areas = GridAreas::parse(vals).map(Rc::new),
             "grid-column" | "grid-column-start" | "grid-column-end" | "grid-row" | "grid-row-start"

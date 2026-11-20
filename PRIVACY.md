@@ -110,6 +110,13 @@ Limits, honestly:
   Arial, Times New Roman, Courier New or system fonts get look-alikes with the same letter widths. A determined script can
   still tell Brickle from Firefox, for example by which APIs exist.
 
+**Files you send.** A file field opens your desktop's own file dialog (zenity or kdialog), and
+only when you click the field yourself: a page can't open it, and it never lists your folders to
+the page. The browser keeps the file you chose; the page and its scripts learn only its name, size
+and type, never its contents. When you send the form, the browser puts the file in at that
+moment, in the place the page's form left for it, and only a file you chose for that page's field
+can go out that way, at most 64 MB.
+
 ## 5. HTTPS-only
 
 Every `http://` address is upgraded to `https://`. If a site doesn't support HTTPS, Brickle

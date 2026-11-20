@@ -759,6 +759,8 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
     let mut shown_frames = 0u64;
     // The layout and scroll position lazy images were last asked for at.
     let mut asked_reveal: Option<(u64, i32)> = None;
+    // A file dialog open for a file field: (tab, page, field, its answer).
+    let mut file_pick: Option<FilePick> = None;
     let mut canvas = Canvas::new(w, h, Color::WHITE);
 
     // Tabs: the loop's variables above are the current tab's; the others
@@ -963,6 +965,23 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                 // Labelled as the form's: pages can write their own message.
                 if let Some(m) = &click.invalid {
                     ui.flash = Some(format!("Form not sent: {m}"));
+                }
+                // You clicked a file field: your desktop's file dialog,
+                // off the window's thread.
+                if let (Some(ask), None) = (&click.choose_file, &file_pick) {
+                    let (tx, rx) = mpsc::channel();
+                    let accept = ask.accept.clone();
+                    let _ = std::thread::Builder::new()
+                        .name("brickle-file-dialog".into())
+                        .spawn(move || {
+                            let _ = tx.send(pick_file(&accept));
+                        });
+                    file_pick = Some(FilePick {
+                        tab: cur_id,
+                        url: done.tab.url.clone(),
+                        field: ask.field,
+                        answer: rx,
+                    });
                 }
                 if let Some(sub) = &click.submit {
                     submitted = Some(sub.clone());
@@ -2236,6 +2255,32 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         if tiles.as_mut().is_some_and(|t| t.collect(&painter)) {
             dirty = true; // tiles came back from the painters
         }
+        // The file dialog answered: the file goes to the field, if you're
+        // still on that page.
+        if let Some(pick) = &file_pick {
+            match pick.answer.try_recv() {
+                Ok(answer) => {
+                    let here = pick.tab == cur_id && pick.url == info.url;
+                    match answer {
+                        Ok(Some(path)) if here => {
+                            pending_input.push(Input::Chose {
+                                field: pick.field,
+                                path,
+                            });
+                            dirty = true;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            ui.flash = Some(e);
+                            dirty = true;
+                        }
+                    }
+                    file_pick = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => file_pick = None,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
         // Lazy images near where you've scrolled: ask for them.
         let near = |&(top, bottom): &(f32, f32)| {
             bottom >= scroll - page::LAZY_MARGIN && top <= scroll + view_h + page::LAZY_MARGIN
@@ -2879,6 +2924,78 @@ impl BoxDrag {
 }
 
 /// Queue scrolling inside a box, joined with the last such request for it.
+/// A file dialog waiting for your answer.
+struct FilePick {
+    tab: TabId,
+    url: String,
+    field: u32,
+    answer: Receiver<Result<Option<std::path::PathBuf>, String>>,
+}
+
+/// Ask for a file in your desktop's own dialog (zenity, else kdialog),
+/// offering the types a field's `accept` names. `None`: you cancelled.
+fn pick_file(accept: &str) -> Result<Option<std::path::PathBuf>, String> {
+    let patterns = accept_patterns(accept);
+    let run = |cmd: &mut std::process::Command| -> Option<Result<Option<std::path::PathBuf>, String>> {
+        let out = cmd.output().ok()?;
+        let path = String::from_utf8_lossy(&out.stdout)
+            .trim_end_matches(['\n', '\r'])
+            .to_string();
+        Some(Ok((out.status.success() && !path.is_empty()).then(|| path.into())))
+    };
+    let mut zenity = std::process::Command::new("zenity");
+    zenity.args(["--file-selection", "--title=Choose a file to send"]);
+    if !patterns.is_empty() {
+        zenity.arg(format!(
+            "--file-filter=Files the page takes | {}",
+            patterns.join(" ")
+        ));
+        zenity.arg("--file-filter=All files | *");
+    }
+    if let Some(r) = run(&mut zenity) {
+        return r;
+    }
+    let mut kdialog = std::process::Command::new("kdialog");
+    kdialog.args(["--title", "Choose a file to send", "--getopenfilename"]);
+    kdialog.arg(std::env::var_os("HOME").unwrap_or_else(|| ".".into()));
+    if !patterns.is_empty() {
+        kdialog.arg(patterns.join(" "));
+    }
+    if let Some(r) = run(&mut kdialog) {
+        return r;
+    }
+    Err("To choose files, install zenity or kdialog".into())
+}
+
+/// Shell patterns for an `accept` attribute: extensions as written, and
+/// the usual ones for `image/*`, `video/*`, `audio/*` and common types.
+fn accept_patterns(accept: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for a in accept.split(',').map(|a| a.trim().to_ascii_lowercase()) {
+        let exts: &[&str] = match a.as_str() {
+            "image/*" => &["png", "jpg", "jpeg", "gif", "webp", "svg", "avif", "heic"],
+            "video/*" => &["mp4", "webm", "mov", "mkv"],
+            "audio/*" => &["mp3", "ogg", "wav", "flac", "m4a"],
+            "image/png" => &["png"],
+            "image/jpeg" => &["jpg", "jpeg"],
+            "application/pdf" => &["pdf"],
+            "text/plain" => &["txt"],
+            "text/csv" => &["csv"],
+            _ => &[],
+        };
+        out.extend(exts.iter().map(|e| format!("*.{e}")));
+        if let Some(e) = a
+            .strip_prefix('.')
+            .filter(|e| e.chars().all(|c| c.is_ascii_alphanumeric()))
+        {
+            out.push(format!("*.{e}"));
+        }
+    }
+    out.dedup();
+    out.truncate(64);
+    out
+}
+
 fn queue_box_scroll(pending: &mut Vec<Input>, uid: u32, dx: f32, dy: f32) {
     match pending.last_mut() {
         Some(Input::Scroll { uid: u, dx: x, dy: y }) if *u == uid => {

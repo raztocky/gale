@@ -476,6 +476,9 @@ pub struct ScriptRequest {
     /// Headers the script set (already filtered by policy).
     pub headers: Vec<(String, String)>,
     pub body: Option<String>,
+    /// Bytes sent instead of `body`: a form with files in it, put
+    /// together by the browser (see `Network::submit_form`).
+    pub upload: Option<Vec<u8>>,
     pub credentials: Credentials,
     /// `fetch`'s `mode`.
     pub mode: Mode,
@@ -523,7 +526,7 @@ pub enum Credentials {
 pub struct Outgoing<'a> {
     pub method: &'a str,
     pub headers: &'a [(String, String)],
-    pub body: Option<&'a str>,
+    pub body: Option<&'a [u8]>,
     /// `Origin` header value, if one is sent.
     pub origin: Option<&'a str>,
     /// A cross-origin (CORS) request rather than a same-origin one.
@@ -588,7 +591,7 @@ pub fn http_get_until(
 struct OwnedOutgoing {
     method: String,
     headers: Vec<(String, String)>,
-    body: Option<String>,
+    body: Option<Vec<u8>>,
     origin: Option<String>,
     cors: bool,
 }
@@ -620,7 +623,7 @@ pub fn http_request_until(
     let outgoing = script.map(|o| OwnedOutgoing {
         method: o.method.to_string(),
         headers: o.headers.to_vec(),
-        body: o.body.map(str::to_string),
+        body: o.body.map(<[u8]>::to_vec),
         origin: o.origin.map(str::to_string),
         cors: o.cors,
     });
@@ -880,7 +883,7 @@ fn http_get_timeout(
             .or_default() += 1;
     }
     let sent = match script.and_then(|o| o.body) {
-        Some(body) => req.send_string(body),
+        Some(body) => req.send_bytes(body),
         None => req.call(),
     };
     let resp = match sent {

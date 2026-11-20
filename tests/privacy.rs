@@ -1246,6 +1246,7 @@ fn pages_answering_a_post_remember_their_form() {
         body: Some("item=1".into()),
         content_type: Some("application/x-www-form-urlencoded".into()),
         form_action: vec![],
+        files: vec![],
     };
     let tab = Tab::submit(&mut net, &post("/buy"), Some(&from), false, (800.0, 600.0));
     assert_eq!(tab.resubmit, Some(post("/buy")));

@@ -545,9 +545,25 @@
       if (tag === 'textarea') return this.textContent;
       if (tag === 'select') { const o = this.querySelector('option[selected]') || this.querySelector('option'); return o ? o.value : ''; }
       if (tag === 'option') { const v = this.getAttribute('value'); return v === null ? this.textContent : v; }
+      if (this._isFile()) { const f = dom.fileInfo(idOf(this)); return f ? 'C:\\fakepath\\' + f[0] : ''; }
       return this.getAttribute('value') || '';
     }
-    set value(v) { if (this.localName === 'textarea') this.textContent = v; else this.setAttribute('value', v); }
+    set value(v) {
+      if (this._isFile()) return; // only you choose files
+      if (this.localName === 'textarea') this.textContent = v; else this.setAttribute('value', v);
+    }
+    _isFile() { return this.localName === 'input' && (this.getAttribute('type') || '').trim().toLowerCase() === 'file'; }
+    // What a file field's chosen file is, as far as the page may know: its
+    // name, size and type. Its contents stay with the browser.
+    get files() {
+      if (!this._isFile()) return null;
+      const f = dom.fileInfo(idOf(this));
+      const list = f ? [{ name: f[0], size: f[1], type: f[2], lastModified: 0,
+        text: () => Promise.reject(new Error('Brickle keeps chosen files from scripts')),
+        arrayBuffer: () => Promise.reject(new Error('Brickle keeps chosen files from scripts')) }] : [];
+      list.item = (i) => list[i] || null;
+      return list;
+    }
     get form() { return this.closest('form'); }
     get options() { return this.querySelectorAll('option'); }
     get elements() { return this.querySelectorAll('input, select, textarea, button'); }

@@ -75,6 +75,7 @@ pub fn unpack(bytes: &[u8]) -> Result<Decoded, String> {
         natural: (nw, nh),
         bitmap,
         frames,
+        svg: None,
     })
 }
 
@@ -116,22 +117,42 @@ fn bounded_frame(r: &mut impl Read, limit: usize) -> Result<Vec<u8>, String> {
 pub fn serve() -> Result<(), String> {
     let report = crate::sandbox::enter_decoder()?;
     crate::sandbox::validate_child(&report)?;
-    let bytes = bounded_frame(&mut std::io::stdin().lock(), MAX_INPUT)?;
-    let decoded = crate::image::decode(&bytes)?;
+    let input = bounded_frame(&mut std::io::stdin().lock(), MAX_INPUT + 8)?;
+    if input.len() < 8 {
+        return Err("image input too short".into());
+    }
+    let size = |i: usize| u32::from_le_bytes(input[i..i + 4].try_into().unwrap_or_default());
+    let want = (size(0) > 0 && size(4) > 0).then(|| (size(0), size(4)));
+    let decoded = crate::image::decode_at(&input[8..], want)?;
     crate::ipc::write_frame(&mut std::io::stdout().lock(), &pack(decoded)).map_err(|e| e.to_string())
 }
 
-pub fn decode_worker(bytes: Vec<u8>, cancel: &Cancel, deadline: Instant) -> Result<Vec<u8>, String> {
+/// Decode `bytes` in a sandboxed worker; an SVG is drawn at `want` pixels
+/// if given.
+pub fn decode_worker(
+    bytes: Vec<u8>,
+    want: Option<(u32, u32)>,
+    cancel: &Cancel,
+    deadline: Instant,
+) -> Result<Vec<u8>, String> {
     let mut cmd = Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
     cmd.arg("--image-decoder");
     if let Some(layers) = crate::sandbox::requirements() {
         cmd.arg(format!("--require-sandbox={layers}"));
     }
-    exchange(cmd, bytes, cancel, deadline.min(Instant::now() + WALL_LIMIT))
+    if bytes.len() > MAX_INPUT {
+        return Err("image input too large".into());
+    }
+    let (w, h) = want.unwrap_or((0, 0));
+    let mut input = Vec::with_capacity(bytes.len() + 8);
+    input.extend_from_slice(&w.to_le_bytes());
+    input.extend_from_slice(&h.to_le_bytes());
+    input.extend_from_slice(&bytes);
+    exchange(cmd, input, cancel, deadline.min(Instant::now() + WALL_LIMIT))
 }
 
 fn exchange(mut cmd: Command, bytes: Vec<u8>, cancel: &Cancel, deadline: Instant) -> Result<Vec<u8>, String> {
-    if bytes.len() > MAX_INPUT {
+    if bytes.len() > MAX_INPUT + 8 {
         return Err("image input too large".into());
     }
     if cancel.is_cancelled() || Instant::now() >= deadline {
@@ -197,6 +218,7 @@ mod tests {
                 bitmaps: vec![b(1), b(2)],
                 delays: vec![100, 250],
             })),
+            svg: None,
         };
         let bytes = pack(d);
         let back = unpack(&bytes).unwrap();

@@ -110,6 +110,9 @@ pub struct Dom {
     /// Fields you've changed and left, or whose form you tried to send
     /// (for `:user-valid`/`:user-invalid`).
     pub user_validity: std::collections::HashSet<u32>,
+    /// Files you chose for `<input type=file>` fields: only what the page
+    /// may know (name, size, type). The browser keeps the files.
+    pub files: std::collections::HashMap<u32, crate::forms::ChosenFile>,
     /// Whether changes are written down for `MutationObserver`s (only
     /// while a script observes something, and only for scripts' changes).
     recording: bool,
@@ -646,6 +649,8 @@ struct State {
     modules_running: bool,
     /// The page's import map.
     import_map: ImportMap,
+    /// Modules fetched while scripts ran.
+    runtime_modules: usize,
     /// Lays the document out for scripts that ask for sizes before the
     /// page is first shown (dropped once it has been).
     measure: Option<Measure>,
@@ -705,7 +710,22 @@ thread_local! {
     static DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
     /// Whether the console says so yet.
     static STOP_NOTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Asks the browser for a module there and then (see [`set_module_fetcher`]).
+    static FETCH_MODULE: RefCell<Option<ModuleFetcher>> = const { RefCell::new(None) };
 }
+
+/// Fetches a module file through the browser, as a script's request, held
+/// to the page's script policy (`csp`).
+pub type ModuleFetcher = Box<dyn FnMut(&str, &[Vec<String>]) -> Result<String, String>>;
+
+/// How modules that running scripts import from addresses they made up are
+/// fetched (the renderer asks the browser; without it they fail).
+pub fn set_module_fetcher(f: Option<ModuleFetcher>) {
+    FETCH_MODULE.with(|m| *m.borrow_mut() = f);
+}
+
+/// Most modules fetched while scripts run, per page.
+const MAX_RUNTIME_MODULES: usize = 32;
 
 /// Most promise callbacks run in one go (a promise chain that never ends
 /// stops here even with no deadline).
@@ -1213,6 +1233,24 @@ fn n_set_custom_validity(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResul
 /// its message: `[valueMissing, typeMismatch, patternMismatch, tooLong,
 /// tooShort, rangeUnderflow, rangeOverflow, stepMismatch, badInput,
 /// customError, willValidate, message]`.
+/// A file field's chosen file: [name, size, type], or null.
+fn n_file_info(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let id = arg_id(a, 0, c)?;
+    let f = with(|s| s.dom.files.get(&id).cloned());
+    Ok(match f {
+        Some(f) => JsArray::from_iter(
+            [
+                js_string!(f.name.as_str()).into(),
+                JsValue::from(f.size as f64),
+                js_string!(f.mime.as_str()).into(),
+            ],
+            c,
+        )
+        .into(),
+        None => JsValue::null(),
+    })
+}
+
 fn n_validity(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
     let id = arg_id(a, 0, c)?;
     let (v, will) = with(|s| {
@@ -1463,6 +1501,7 @@ fn n_request(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
                 method,
                 headers,
                 body,
+                upload: None,
                 credentials,
                 mode,
                 redirect,
@@ -1556,6 +1595,7 @@ const NATIVES: &[(&str, Native, usize)] = &[
     ("computedNames", n_computed_names, 0),
     ("setCustomValidity", n_set_custom_validity, 2),
     ("validity", n_validity, 1),
+    ("fileInfo", n_file_info, 1),
     ("log", n_log, 2),
     ("scroll", n_scroll, 1),
     ("setScroll", n_set_scroll, 3),
@@ -2339,7 +2379,9 @@ fn literal_dynamic_imports(code: &str) -> Vec<String> {
         };
         let Some(end) = t[1..].find(q) else { continue };
         let spec = &t[1..1 + end];
-        if !spec.contains(['\n', '$', '\\']) && out.len() < 64 {
+        // Only a string on its own (`import("a" + b)` isn't literal).
+        let whole = t[2 + end..].trim_start().starts_with([')', ',']);
+        if whole && !spec.contains(['\n', '$', '\\']) && out.len() < 64 {
             out.push(spec.to_string());
         }
     }
@@ -2361,7 +2403,24 @@ impl Modules {
         if let Some(m) = self.by_url.borrow().get(url) {
             return Ok(m.clone());
         }
-        let src = with(|s| s.module_sources.get(url).cloned());
+        let mut src = with(|s| s.module_sources.get(url).cloned());
+        // Asked for by running code and not fetched ahead: fetched now,
+        // as a script's request (kept to the page's site unless allowed).
+        if src.is_none() {
+            let ask = with(|s| {
+                (s.modules_running && s.runtime_modules < MAX_RUNTIME_MODULES).then(|| {
+                    s.runtime_modules += 1;
+                    s.csp.script_sources(None, false)
+                })
+            });
+            if let Some(csp) = ask {
+                let got = FETCH_MODULE.with(|f| f.borrow_mut().as_mut().map(|f| f(url, &csp)));
+                if let Some(got) = got {
+                    with(|s| s.module_sources.insert(url.to_string(), got.clone()));
+                    src = Some(got);
+                }
+            }
+        }
         match src {
             Some(Ok(code)) => {
                 let m = boa_engine::Module::parse(Source::from_bytes(&code), None, context)?;

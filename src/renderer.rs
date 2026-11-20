@@ -8,13 +8,21 @@ use crate::js::{self, Runtime};
 use crate::net::{Dest, ScriptRequest};
 use crate::network::ScriptResponse;
 use crate::page::{pump, Host, Page, ScriptOutput};
+use std::cell::RefCell;
 use std::io::{self, Read, Write};
+use std::rc::Rc;
 use std::time::Instant;
 
 pub fn run() -> Result<(), String> {
-    let mut input = io::stdin().lock();
-    let mut output = io::stdout().lock();
-    serve(&mut input, &mut output)
+    serve(io::stdin().lock(), io::stdout().lock())
+}
+
+/// The renderer's pipe to the browser, shared by everything that asks it
+/// something (one question at a time: the protocol is request/response).
+type Pipe = Rc<RefCell<(Box<dyn Read>, Box<dyn Write>)>>;
+
+fn tell(pipe: &Pipe, msg: FromRenderer) -> Result<(), String> {
+    send(&mut pipe.borrow_mut().1, msg)
 }
 
 fn send(out: &mut impl Write, msg: FromRenderer) -> Result<(), String> {
@@ -30,22 +38,24 @@ fn recv(input: &mut impl Read) -> Result<Option<ToRenderer>, String> {
 
 /// The browser, as the renderer sees it: every request goes over the pipe
 /// and waits for its answer (the protocol is strictly request/response).
-struct IpcHost<'a, R: Read, W: Write> {
-    input: &'a mut R,
-    output: &'a mut W,
+struct IpcHost {
+    pipe: Pipe,
     cookies: String,
     /// A protocol error: once set, everything fails and `serve` reports it.
     broken: Option<String>,
     policy: crate::csp::Csp,
 }
 
-impl<R: Read, W: Write> IpcHost<'_, R, W> {
+impl IpcHost {
     fn ask(&mut self, msg: FromRenderer) -> Result<ToRenderer, String> {
         if let Some(e) = &self.broken {
             return Err(e.clone());
         }
-        let r = send(self.output, msg)
-            .and_then(|_| recv(self.input)?.ok_or_else(|| "browser went away".to_string()));
+        let r = {
+            let mut pipe = self.pipe.borrow_mut();
+            let (input, output) = &mut *pipe;
+            send(output, msg).and_then(|_| recv(input)?.ok_or_else(|| "browser went away".to_string()))
+        };
         if let Err(e) = &r {
             self.broken = Some(e.clone());
         }
@@ -73,7 +83,24 @@ impl<R: Read, W: Write> IpcHost<'_, R, W> {
             None if url.starts_with("data:") => return Err("unsupported data address".into()),
             None => self.picture(url, added)?,
         };
-        match self.ask(FromRenderer::Decode(bytes))? {
+        let svg = crate::image::is_svg(&bytes).then(|| std::sync::Arc::<[u8]>::from(&bytes[..]));
+        match self.ask(FromRenderer::Decode { bytes, want: None })? {
+            ToRenderer::ImageReply(r) => {
+                crate::decoder::unpack(&r?).map(|d| crate::image::Decoded { svg, ..d })
+            }
+            _ => {
+                self.broken = Some("expected decoded image".into());
+                Err("protocol error".into())
+            }
+        }
+    }
+
+    /// An SVG drawn again at `want` pixels.
+    fn redraw(&mut self, bytes: &[u8], want: (u32, u32)) -> Result<crate::image::Decoded, String> {
+        match self.ask(FromRenderer::Decode {
+            bytes: bytes.to_vec(),
+            want: Some(want),
+        })? {
             ToRenderer::ImageReply(r) => crate::decoder::unpack(&r?),
             _ => {
                 self.broken = Some("expected decoded image".into());
@@ -98,7 +125,7 @@ impl<R: Read, W: Write> IpcHost<'_, R, W> {
     }
 }
 
-impl<R: Read, W: Write> Host for IpcHost<'_, R, W> {
+impl Host for IpcHost {
     fn stylesheet(
         &mut self,
         url: &str,
@@ -171,7 +198,27 @@ impl<R: Read, W: Write> Host for IpcHost<'_, R, W> {
     }
 }
 
-pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), String> {
+pub fn serve(input: impl Read + 'static, output: impl Write + 'static) -> Result<(), String> {
+    let pipe: Pipe = Rc::new(RefCell::new((Box::new(input), Box::new(output))));
+    // Modules a running script imports from an address it made up are
+    // asked for there and then, as a script's request.
+    let fetcher = pipe.clone();
+    crate::js::set_module_fetcher(Some(Box::new(move |url, csp| {
+        let mut host = IpcHost {
+            pipe: fetcher.clone(),
+            cookies: String::new(),
+            broken: None,
+            policy: crate::csp::Csp::new(""),
+        };
+        host.file(url, Dest::Script, true, csp)
+    })));
+    struct Forget;
+    impl Drop for Forget {
+        fn drop(&mut self) {
+            crate::js::set_module_fetcher(None);
+        }
+    }
+    let _forget = Forget;
     let mut page: Option<Page> = None;
     // The page's scripts, if it has any (only for sites you allowed).
     let mut rt: Option<Runtime> = None;
@@ -179,7 +226,9 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
     let mut policy = crate::csp::Csp::new("");
     // The stylesheets scripts last got for `getComputedStyle`.
     let mut sheets_key = (usize::MAX, 0);
-    while let Some(msg) = recv(input)? {
+    loop {
+        let next = recv(&mut pipe.borrow_mut().0)?;
+        let Some(msg) = next else { break };
         match msg {
             ToRenderer::Load {
                 url,
@@ -194,8 +243,7 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                 policy = crate::csp::Csp::from_headers(&url, &csp);
                 policy.add_meta(&crate::html::parse(&html));
                 let mut host = IpcHost {
-                    input: &mut *input,
-                    output: &mut *output,
+                    pipe: pipe.clone(),
                     cookies: cookies.clone(),
                     broken: None,
                     policy: policy.clone(),
@@ -222,8 +270,8 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                 if let Some(rt) = new_rt.as_mut() {
                     p.apply_script_scrolls(rt);
                 }
-                send(
-                    output,
+                tell(
+                    &pipe,
                     FromRenderer::Loaded {
                         title: p.title.clone(),
                         navigate: out.navigate.or_else(|| p.redirect.clone()),
@@ -248,7 +296,21 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                     0.0
                 };
                 let width = width.clamp(1.0, 16_000.0);
-                let rendered = p.render(width, height.clamp(1.0, 16_000.0));
+                let mut rendered = p.render(width, height.clamp(1.0, 16_000.0));
+                // SVGs shown larger than they were drawn: drawn again at
+                // their size by the browser's decoder, then painted again.
+                let mut host = IpcHost {
+                    pipe: pipe.clone(),
+                    cookies: cookies.clone(),
+                    broken: None,
+                    policy: policy.clone(),
+                };
+                if p.redraw_svgs(&mut |b, want| host.redraw(b, want)) {
+                    rendered = p.render(width, height.clamp(1.0, 16_000.0));
+                }
+                if let Some(e) = host.broken {
+                    return Err(e);
+                }
                 if let Some(rt) = rt.as_mut() {
                     rt.set_boxes(p.boxes());
                     rt.set_scrollers(p.scroll_info());
@@ -257,13 +319,12 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                         rt.set_sheets(p.script_sheets());
                     }
                 }
-                send(output, FromRenderer::Rendered(rendered))?;
+                tell(&pipe, FromRenderer::Rendered(rendered))?;
             }
             ToRenderer::Reveal { top, bottom } => {
                 let p = page.as_mut().ok_or("input before load")?;
                 let mut host = IpcHost {
-                    input: &mut *input,
-                    output: &mut *output,
+                    pipe: pipe.clone(),
                     cookies: cookies.clone(),
                     broken: None,
                     policy: policy.clone(),
@@ -273,8 +334,8 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                 if let Some(e) = host.broken {
                     return Err(e);
                 }
-                send(
-                    output,
+                tell(
+                    &pipe,
                     FromRenderer::Clicked {
                         prevented: false,
                         changed,
@@ -286,6 +347,7 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                         copied: None,
                         read: vec![],
                         invalid: None,
+                        choose_file: None,
                     },
                 )?;
             }
@@ -293,6 +355,7 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
             | ToRenderer::Type(_)
             | ToRenderer::Key(_)
             | ToRenderer::Select { .. }
+            | ToRenderer::Chose { .. }
             | ToRenderer::Scroll { .. }) => {
                 let p = page.as_mut().ok_or("input before load")?;
                 let until = Instant::now() + js::EVENT_BUDGET;
@@ -306,14 +369,14 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                     ToRenderer::Key(k) => p.key(rt.as_mut(), k),
                     ToRenderer::Scroll { uid, dx, dy } => p.scroll_box(rt.as_mut(), uid, dx, dy),
                     ToRenderer::Select { x, y, word } => p.select_at(rt.as_mut(), x, y, word),
+                    ToRenderer::Chose { field, file } => p.chose_file(rt.as_mut(), field, file),
                     _ => unreachable!(),
                 };
                 let (mut navigate, mut console, mut read) = (None, vec![], vec![]);
                 if let Some(rt) = rt.as_mut() {
                     // Handlers may have made requests or set timers.
                     let mut host = IpcHost {
-                        input: &mut *input,
-                        output: &mut *output,
+                        pipe: pipe.clone(),
                         cookies: cookies.clone(),
                         broken: None,
                         policy: policy.clone(),
@@ -339,8 +402,8 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                 if let Some(r) = rt.as_mut() {
                     r.set_deadline(None);
                 }
-                send(
-                    output,
+                tell(
+                    &pipe,
                     FromRenderer::Clicked {
                         prevented: done.prevented,
                         changed: done.changed,
@@ -351,6 +414,7 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                         copied: done.copied,
                         read,
                         invalid: done.invalid,
+                        choose_file: done.choose_file,
                     },
                 )?;
             }
@@ -359,7 +423,7 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                 if let Some(p) = &page {
                     p.dom.dump(0, &mut s);
                 }
-                send(output, FromRenderer::Dom(s))?;
+                tell(&pipe, FromRenderer::Dom(s))?;
             }
             ToRenderer::FetchReply(_)
             | ToRenderer::ImageReply(_)

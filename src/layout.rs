@@ -575,6 +575,86 @@ fn build_cell<'a>(
 /// Most grid cells placing a grid's items may check or mark.
 const GRID_PLACEMENT_WORK: usize = 4_000_000;
 
+/// A grid item's wanted (start, span) along rows and columns.
+type GridWant = (usize, (Option<usize>, usize), (Option<usize>, usize));
+/// A placed grid item: (item, column, span, row, row span).
+type GridPlaced = (usize, usize, usize, usize, usize);
+
+/// Place grid items in a grid `ncols` wide, as CSS does: items with a row
+/// first, then the rest in order with a cursor (from the start each time
+/// when `dense`). Returns (item, column, span, row, row span) and the
+/// number of rows used.
+fn grid_place(wants: &[GridWant], ncols: usize, dense: bool) -> (Vec<GridPlaced>, usize) {
+    let mut placed: Vec<(usize, usize, usize, usize, usize)> = Vec::with_capacity(wants.len());
+    let mut occupied: Vec<Vec<bool>> = Vec::new();
+    // Cells checked or marked. Past the budget, items just go where the
+    // cursor is (overlapping), so crafted spans can't take long.
+    let work = std::cell::Cell::new(0usize);
+    let spend = |n: usize| {
+        work.set(work.get().saturating_add(n));
+        work.get() <= GRID_PLACEMENT_WORK
+    };
+    let free = |occ: &Vec<Vec<bool>>, r: usize, rs: usize, c: usize, cs: usize| {
+        !spend(rs * cs) || (r..r + rs).all(|r| (c..c + cs).all(|k| !occ.get(r).is_some_and(|row| row[k])))
+    };
+    let mark = |occ: &mut Vec<Vec<bool>>, r: usize, rs: usize, c: usize, cs: usize| {
+        if !spend(rs * cs) {
+            return;
+        }
+        while occ.len() < r + rs {
+            occ.push(vec![false; ncols]);
+        }
+        for row in &mut occ[r..r + rs] {
+            row[c..c + cs].iter_mut().for_each(|o| *o = true);
+        }
+    };
+    for &(i, (r, rs), (c, cs)) in wants {
+        let Some(r) = r else { continue };
+        let c = c.unwrap_or_else(|| {
+            (0..=ncols - cs)
+                .find(|&c| free(&occupied, r, rs, c, cs))
+                .unwrap_or(0)
+        });
+        mark(&mut occupied, r, rs, c, cs);
+        placed.push((i, c, cs, r, rs));
+    }
+    let (mut cur_r, mut cur_c) = (0usize, 0usize);
+    for &(i, (r, rs), (c, cs)) in wants {
+        if r.is_some() {
+            continue;
+        }
+        if dense {
+            (cur_r, cur_c) = (0, 0);
+        }
+        let (r, c) = match c {
+            Some(c) => {
+                let mut r = cur_r + usize::from(c < cur_c);
+                while !free(&occupied, r, rs, c, cs) {
+                    r += 1;
+                }
+                (r, c)
+            }
+            None => loop {
+                if cur_c + cs > ncols {
+                    cur_r += 1;
+                    cur_c = 0;
+                } else if free(&occupied, cur_r, rs, cur_c, cs) {
+                    break (cur_r, cur_c);
+                } else {
+                    cur_c += 1;
+                }
+            },
+        };
+        (cur_r, cur_c) = (r, c + cs);
+        mark(&mut occupied, r, rs, c, cs);
+        placed.push((i, c, cs, r, rs));
+    }
+    let rows = occupied
+        .len()
+        .max(placed.iter().map(|p| p.3 + p.4).max().unwrap_or(0));
+    (placed, rows)
+}
+
 /// Lay out for a viewport `viewport_w` wide. Absolutely positioned boxes
 /// with no positioned ancestor use the page's own height as the viewport's.
 pub fn layout_tree<'a>(root: &'a StyledNode<'a>, viewport_w: f32) -> LayoutBox<'a> {
@@ -1434,7 +1514,8 @@ impl<'a> LayoutBox<'a> {
                 tracks.push(auto);
             }
         }
-        if tracks.is_empty() {
+        // (With column flow, the columns come from the items.)
+        if tracks.is_empty() && !s.grid_flow_column {
             tracks.push(auto);
         }
         let ncols = tracks.len();
@@ -1475,9 +1556,11 @@ impl<'a> LayoutBox<'a> {
                 (GridLine::Auto, GridLine::Auto) => (None, 1),
             }
         }
-        // (item, row, column) wanted.
-        type Want = (usize, (Option<usize>, usize), (Option<usize>, usize));
-        let wants: Vec<Want> = items
+        // (item, row, column) wanted. With column flow the rows are the
+        // fixed axis and columns are added as needed.
+        let column_flow = s.grid_flow_column;
+        let fixed_rows = explicit_rows.max(1);
+        let wants: Vec<GridWant> = items
             .iter()
             .map(|&i| {
                 let st = self.children[i].style();
@@ -1489,77 +1572,58 @@ impl<'a> LayoutBox<'a> {
                         col = (Some(c0), c1 - c0);
                     }
                 }
-                col.1 = col.1.clamp(1, ncols);
-                col.0 = col.0.map(|c| c.min(ncols - col.1));
-                row.1 = row.1.clamp(1, MAX_GRID_TRACKS);
-                row.0 = row.0.map(|r| r.min(MAX_GRID_TRACKS));
+                if column_flow {
+                    row.1 = row.1.clamp(1, fixed_rows);
+                    row.0 = row.0.map(|r| r.min(fixed_rows - row.1));
+                    col.1 = col.1.clamp(1, MAX_GRID_TRACKS);
+                    col.0 = col.0.map(|c| c.min(MAX_GRID_TRACKS));
+                } else {
+                    col.1 = col.1.clamp(1, ncols);
+                    col.0 = col.0.map(|c| c.min(ncols - col.1));
+                    row.1 = row.1.clamp(1, MAX_GRID_TRACKS);
+                    row.0 = row.0.map(|r| r.min(MAX_GRID_TRACKS));
+                }
                 (i, row, col)
             })
             .collect();
 
-        // Placement, as CSS does it: items with a row first, then the rest
-        // in order with a cursor. (item, column, span, row, row span).
-        let mut placed: Vec<(usize, usize, usize, usize, usize)> = Vec::with_capacity(items.len());
-        let mut occupied: Vec<Vec<bool>> = Vec::new();
-        // Cells checked or marked. Past the budget, items just go where the
-        // cursor is (overlapping), so crafted spans can't take long.
-        let work = std::cell::Cell::new(0usize);
-        let spend = |n: usize| {
-            work.set(work.get().saturating_add(n));
-            work.get() <= GRID_PLACEMENT_WORK
+        // (item, column, span, row, row span), and how many rows there are.
+        let (placed, rows_used): (Vec<GridPlaced>, usize) = if column_flow {
+            // The same placement with the axes swapped.
+            let swapped: Vec<GridWant> = wants.iter().map(|&(i, r, c)| (i, c, r)).collect();
+            let (p, cols_used) = grid_place(&swapped, fixed_rows, s.grid_dense);
+            let p: Vec<_> = p.into_iter().map(|(i, r, rs, c, cs)| (i, c, cs, r, rs)).collect();
+            // Columns past the template, sized by `grid-auto-columns`.
+            let template = tracks.len();
+            let autos = s
+                .grid_auto_columns
+                .as_ref()
+                .map(|t| t.tracks.clone())
+                .unwrap_or_default();
+            while tracks.len() < cols_used.min(MAX_GRID_TRACKS) {
+                let k = tracks.len() - template;
+                tracks.push(if autos.is_empty() {
+                    auto
+                } else {
+                    autos[k % autos.len()]
+                });
+            }
+            if tracks.is_empty() {
+                tracks.push(auto);
+            }
+            (p, fixed_rows)
+        } else {
+            grid_place(&wants, ncols, s.grid_dense)
         };
-        let free = |occ: &Vec<Vec<bool>>, r: usize, rs: usize, c: usize, cs: usize| {
-            !spend(rs * cs) || (r..r + rs).all(|r| (c..c + cs).all(|k| !occ.get(r).is_some_and(|row| row[k])))
-        };
-        let mark = |occ: &mut Vec<Vec<bool>>, r: usize, rs: usize, c: usize, cs: usize| {
-            if !spend(rs * cs) {
-                return;
-            }
-            while occ.len() < r + rs {
-                occ.push(vec![false; ncols]);
-            }
-            for row in &mut occ[r..r + rs] {
-                row[c..c + cs].iter_mut().for_each(|o| *o = true);
-            }
-        };
-        for &(i, (r, rs), (c, cs)) in &wants {
-            let Some(r) = r else { continue };
-            let c = c.unwrap_or_else(|| {
-                (0..=ncols - cs)
-                    .find(|&c| free(&occupied, r, rs, c, cs))
-                    .unwrap_or(0)
-            });
-            mark(&mut occupied, r, rs, c, cs);
-            placed.push((i, c, cs, r, rs));
-        }
-        let (mut cur_r, mut cur_c) = (0usize, 0usize);
-        for &(i, (r, rs), (c, cs)) in &wants {
-            if r.is_some() {
-                continue;
-            }
-            let (r, c) = match c {
-                Some(c) => {
-                    let mut r = cur_r + usize::from(c < cur_c);
-                    while !free(&occupied, r, rs, c, cs) {
-                        r += 1;
-                    }
-                    (r, c)
-                }
-                None => loop {
-                    if cur_c + cs > ncols {
-                        cur_r += 1;
-                        cur_c = 0;
-                    } else if free(&occupied, cur_r, rs, cur_c, cs) {
-                        break (cur_r, cur_c);
-                    } else {
-                        cur_c += 1;
-                    }
-                },
-            };
-            (cur_r, cur_c) = (r, c + cs);
-            mark(&mut occupied, r, rs, c, cs);
-            placed.push((i, c, cs, r, rs));
-        }
+        let ncols = tracks.len();
+        // (Past the track limit, items share the last columns.)
+        let placed: Vec<(usize, usize, usize, usize, usize)> = placed
+            .into_iter()
+            .map(|(i, c, cs, r, rs)| {
+                let c = c.min(ncols - 1);
+                (i, c, cs.clamp(1, ncols - c), r, rs)
+            })
+            .collect();
 
         // Column widths.
         let mut collapsed = vec![false; ncols];
@@ -1655,7 +1719,7 @@ impl<'a> LayoutBox<'a> {
         }
 
         // Rows: lay items out in their columns, then size and place.
-        let nrows = occupied.len().max(explicit_rows);
+        let nrows = rows_used.max(explicit_rows);
         let row_track = |r: usize| -> Track {
             if let Some(t) = row_tpl.get(r) {
                 return *t;
@@ -4577,6 +4641,44 @@ mod modern_layout_tests {
             "p",
         );
         assert!(close(b[1].x, 0.0), "{b:?}");
+    }
+
+    #[test]
+    fn grid_column_flow() {
+        // Items go down the two rows, then on to new columns sized by
+        // `grid-auto-columns`.
+        let b = boxes(
+            "p{margin:0;height:20px} .g{display:grid;grid-template-rows:30px 30px;grid-auto-flow:column;grid-auto-columns:50px 70px}",
+            "<div class=g><p>a</p><p>b</p><p>c</p><p>d</p><p>e</p></div>",
+            WIN,
+            "p",
+        );
+        let at: Vec<(f32, f32, f32)> = b.iter().map(|r| (r.x, r.y, r.w)).collect();
+        assert!(close(b[1].x, 0.0) && close(b[1].y, 30.0), "{at:?}");
+        assert!(
+            close(b[2].x, 50.0) && close(b[2].y, 0.0) && close(b[2].w, 70.0),
+            "{at:?}"
+        );
+        assert!(close(b[4].x, 120.0) && close(b[4].w, 50.0), "{at:?}");
+        // The `grid` shorthand's `rows / auto-flow columns`.
+        let b = boxes(
+            "p{margin:0} .g{display:grid;grid:40px / auto-flow 60px}",
+            "<div class=g><p>a</p><p>b</p><p>c</p></div>",
+            WIN,
+            "p",
+        );
+        assert!(
+            close(b[2].x, 120.0) && close(b[2].y, 0.0) && close(b[2].w, 60.0),
+            "{b:?}"
+        );
+        // `dense` fills a hole an earlier wide item left.
+        let b = boxes(
+            "p{margin:0} .g{display:grid;width:300px;grid-template-columns:repeat(3,100px);grid-auto-flow:row dense}",
+            "<div class=g><p>a</p><p style='grid-column:span 3'>wide</p><p>c</p></div>",
+            WIN,
+            "p",
+        );
+        assert!(close(b[2].x, 100.0) && close(b[2].y, b[0].y), "{b:?}");
     }
 
     #[test]

@@ -3,22 +3,32 @@ use std::process::{Command, Stdio};
 
 #[test]
 fn decoder_worker_returns_validated_pixels() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_brickle"))
-        .arg("--image-decoder")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut input = child.stdin.take().unwrap();
-    brickle::ipc::write_frame(&mut input, b"<svg xmlns='http://www.w3.org/2000/svg' width='2' height='3'><rect width='2' height='3' fill='red'/></svg>").unwrap();
-    input.flush().unwrap();
-    drop(input);
-    let out = child.wait_with_output().unwrap();
-    assert!(out.status.success(), "decoder worker must run without a display");
-    let frame = brickle::ipc::read_frame(&mut &out.stdout[..]).unwrap().unwrap();
+    // The worker reads the size to draw an SVG at (0 × 0: its own), then
+    // the image.
+    let decode = |w: u32, h: u32| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_brickle"))
+            .arg("--image-decoder")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let mut frame = [w.to_le_bytes(), h.to_le_bytes()].concat();
+        frame.extend_from_slice(b"<svg xmlns='http://www.w3.org/2000/svg' width='2' height='3'><rect width='2' height='3' fill='red'/></svg>");
+        brickle::ipc::write_frame(&mut input, &frame).unwrap();
+        input.flush().unwrap();
+        drop(input);
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "decoder worker must run without a display");
+        brickle::ipc::read_frame(&mut &out.stdout[..]).unwrap().unwrap()
+    };
     // Natural size 2×3; small SVGs are drawn at up to 4× for sharpness.
+    let frame = decode(0, 0);
     assert_eq!(&frame[..16], &[2, 0, 0, 0, 3, 0, 0, 0, 8, 0, 0, 0, 12, 0, 0, 0]);
     assert_eq!(frame.len(), 16 + 8 * 12 * 4);
+    // Asked for the size it's shown at: drawn at that, natural size kept.
+    let frame = decode(40, 60);
+    assert_eq!(&frame[..16], &[2, 0, 0, 0, 3, 0, 0, 0, 40, 0, 0, 0, 60, 0, 0, 0]);
 }
 
 #[test]

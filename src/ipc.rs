@@ -92,6 +92,11 @@ pub enum ToRenderer {
         y: f32,
         word: bool,
     },
+    /// You chose a file for a file field: what the page may know of it.
+    Chose {
+        field: u32,
+        file: crate::forms::ChosenFile,
+    },
     Render {
         width: f32,
         height: f32,
@@ -106,8 +111,12 @@ pub enum ToRenderer {
 /// Renderer -> browser.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FromRenderer {
-    /// Decode bytes in a disposable worker, including data URLs.
-    Decode(Vec<u8>),
+    /// Decode bytes in a disposable worker, including data URLs; an SVG
+    /// is drawn at `want` pixels if given (the size it's shown at).
+    Decode {
+        bytes: Vec<u8>,
+        want: Option<(u32, u32)>,
+    },
     Stylesheet {
         url: String,
         integrity: String,
@@ -162,6 +171,9 @@ pub enum FromRenderer {
         /// A form wasn't sent: what's wrong with a field (the browser
         /// shows it, shortened, as plain text).
         invalid: Option<String>,
+        /// You clicked a file field (the browser only asks you for a file
+        /// after a click of yours).
+        choose_file: Option<crate::forms::FileAsk>,
     },
 }
 
@@ -536,6 +548,13 @@ impl ToRenderer {
                 e.f32(*top);
                 e.f32(*bottom);
             }
+            ToRenderer::Chose { field, file } => {
+                e.u8(14);
+                e.u32(*field);
+                e.str(&file.name);
+                e.0.extend_from_slice(&file.size.to_le_bytes());
+                e.str(&file.mime);
+            }
             ToRenderer::Select { x, y, word } => {
                 e.u8(13);
                 e.f32(*x);
@@ -637,6 +656,14 @@ impl ToRenderer {
                 top: d.f32()?,
                 bottom: d.f32()?,
             },
+            14 => ToRenderer::Chose {
+                field: d.u32()?,
+                file: crate::forms::ChosenFile {
+                    name: d.str()?,
+                    size: u64::from_le_bytes(d.take(8)?.try_into().map_err(|_| "bad size")?),
+                    mime: d.str()?,
+                },
+            },
             13 => ToRenderer::Select {
                 x: d.f32()?,
                 y: d.f32()?,
@@ -678,10 +705,13 @@ impl FromRenderer {
                 e.u8(*added as u8);
                 e.opt_str(nonce);
             }
-            FromRenderer::Decode(bytes) => {
+            FromRenderer::Decode { bytes, want } => {
                 e.u8(20);
                 e.u32(bytes.len() as u32);
                 e.0.extend_from_slice(bytes);
+                let (w, h) = want.unwrap_or((0, 0));
+                e.u32(w);
+                e.u32(h);
             }
             FromRenderer::Fetch {
                 url,
@@ -748,6 +778,7 @@ impl FromRenderer {
                 copied,
                 read,
                 invalid,
+                choose_file,
             } => {
                 e.u8(5);
                 e.u8(*prevented as u8);
@@ -768,6 +799,14 @@ impl FromRenderer {
                 e.opt_str(copied);
                 e.strs(read);
                 e.opt_str(invalid);
+                match choose_file {
+                    Some(a) => {
+                        e.u8(1);
+                        e.u32(a.field);
+                        e.str(&a.accept);
+                    }
+                    None => e.u8(0),
+                }
             }
             FromRenderer::Rendered(r) => {
                 e.u8(3);
@@ -918,7 +957,15 @@ impl FromRenderer {
                 if n > crate::decoder::MAX_INPUT {
                     return Err("image input too large".into());
                 }
-                FromRenderer::Decode(d.take(n)?.to_vec())
+                let bytes = d.take(n)?.to_vec();
+                let (w, h) = (d.u32()?, d.u32()?);
+                if w > crate::image::STORE_SIDE || h > crate::image::STORE_SIDE {
+                    return Err("image size asked for is too large".into());
+                }
+                FromRenderer::Decode {
+                    bytes,
+                    want: (w > 0 && h > 0).then_some((w, h)),
+                }
             }
             1 => FromRenderer::Fetch {
                 url: d.str()?,
@@ -945,6 +992,8 @@ impl FromRenderer {
                     method: d.str()?,
                     headers: d.pairs(MAX_HEADERS)?,
                     body: d.opt_str()?,
+                    // Only the browser puts files in a request.
+                    upload: None,
                     credentials: match d.u8()? {
                         0 => Credentials::Omit,
                         1 => Credentials::SameOrigin,
@@ -979,6 +1028,7 @@ impl FromRenderer {
                         body: d.opt_str()?,
                         content_type: d.opt_str()?,
                         form_action: vec![],
+                        files: vec![],
                     })
                 } else {
                     None
@@ -987,6 +1037,14 @@ impl FromRenderer {
                 copied: d.opt_str()?,
                 read: d.strs(MAX_READ)?,
                 invalid: d.opt_str()?,
+                choose_file: if d.bool()? {
+                    Some(crate::forms::FileAsk {
+                        field: d.u32()?,
+                        accept: d.str()?.chars().take(500).collect(),
+                    })
+                } else {
+                    None
+                },
             },
             3 => {
                 let height = d.f32()?.max(0.0);
@@ -1405,6 +1463,7 @@ mod tests {
                     method: "POST".into(),
                     headers: vec![("content-type".into(), "text/plain".into())],
                     body: Some("hi".into()),
+                    upload: None,
                     credentials: Credentials::Include,
                     mode: Mode::SameOrigin,
                     redirect: Redirect::Manual,
@@ -1422,6 +1481,10 @@ mod tests {
                 copied: Some("copied text".into()),
                 read: vec![],
                 invalid: Some("Please fill out this field.".into()),
+                choose_file: Some(crate::forms::FileAsk {
+                    field: 7,
+                    accept: "image/*,.pdf".into(),
+                }),
             },
             FromRenderer::Clicked {
                 prevented: false,
@@ -1434,11 +1497,13 @@ mod tests {
                     body: Some("q=1".into()),
                     content_type: Some("application/x-www-form-urlencoded".into()),
                     form_action: vec![],
+                    files: vec![],
                 }),
                 focus: false,
                 copied: None,
                 read: vec!["screen.width".into()],
                 invalid: None,
+                choose_file: None,
             },
             FromRenderer::Rendered(sample()),
             FromRenderer::Dom("<html>".into()),

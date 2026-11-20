@@ -42,6 +42,14 @@ pub struct Decoded {
     pub bitmap: Arc<Bitmap>,
     /// An animated GIF's frames (the first is `bitmap`).
     pub frames: Option<Arc<Frames>>,
+    /// An SVG's source, kept by the page so it can be drawn again at the
+    /// size it's shown (never sent between processes with the pixels).
+    pub svg: Option<Arc<[u8]>>,
+}
+
+/// Whether `bytes` are an SVG document.
+pub fn is_svg(bytes: &[u8]) -> bool {
+    sniff(bytes) == Some(Format::Svg)
 }
 
 /// An animation: frames all one size, and how long each shows.
@@ -128,10 +136,16 @@ fn budget(w: u32, h: u32) -> usize {
 
 /// Decode an image.
 pub fn decode(bytes: &[u8]) -> Result<Decoded, String> {
+    decode_at(bytes, None)
+}
+
+/// Decode, drawing an SVG at `want` pixels (within [`STORE_SIDE`]) rather
+/// than its own size; other images ignore it.
+pub fn decode_at(bytes: &[u8], want: Option<(u32, u32)>) -> Result<Decoded, String> {
     let mut own_size = None;
     let (bitmap, more) = match sniff(bytes) {
         // Drawn straight at the size it's kept at, so it stays sharp.
-        Some(Format::Svg) => return decode_svg(bytes),
+        Some(Format::Svg) => return decode_svg(bytes, want),
         Some(Format::Png) => ((decode_png(bytes)?, 0), vec![]),
         Some(Format::Jpeg) => ((decode_jpeg(bytes)?, 0), vec![]),
         Some(Format::Gif) => {
@@ -162,6 +176,7 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, String> {
         natural,
         bitmap: first.0,
         frames,
+        svg: None,
     })
 }
 
@@ -400,7 +415,7 @@ fn svg_font(f: &usvg::Font, _: &mut Arc<usvg::fontdb::Database>) -> Option<usvg:
         .get(font::index_of(family, f.weight() >= 600, italic))?
 }
 
-fn decode_svg(bytes: &[u8]) -> Result<Decoded, String> {
+fn decode_svg(bytes: &[u8], want: Option<(u32, u32)>) -> Result<Decoded, String> {
     if bytes.len() > MAX_SVG_BYTES {
         return Err("SVG: file too large".into());
     }
@@ -471,12 +486,16 @@ fn decode_svg(bytes: &[u8]) -> Result<Decoded, String> {
     );
     // Small drawings (icons, logos) are drawn with more pixels than their
     // size, up to 4×, so they stay sharp when shown larger or zoomed.
+    // Asked for a size (the size it's shown at): that, within limits.
     let sharp = (SVG_SHARP_SIDE as f32 / natural.0.max(natural.1) as f32).clamp(1.0, 4.0);
-    let (mut w, mut h) = fit(
-        ((natural.0 as f32 * sharp) as u32).max(1),
-        ((natural.1 as f32 * sharp) as u32).max(1),
-        STORE_SIDE,
-    );
+    let (want_w, want_h) = match want {
+        Some((w, h)) if w > 0 && h > 0 => (w, h),
+        _ => (
+            ((natural.0 as f32 * sharp) as u32).max(1),
+            ((natural.1 as f32 * sharp) as u32).max(1),
+        ),
+    };
+    let (mut w, mut h) = fit(want_w, want_h, STORE_SIDE);
     // Each filter, clip, mask or see-through group is drawn on a layer of
     // its own, up to 25 times the canvas; many of them can take seconds
     // (found by fuzzing). Draw those smaller instead.
@@ -506,6 +525,7 @@ fn decode_svg(bytes: &[u8]) -> Result<Decoded, String> {
         natural,
         bitmap: Arc::new(Bitmap { w, h, rgba }),
         frames: None,
+        svg: None,
     })
 }
 

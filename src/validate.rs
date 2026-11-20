@@ -208,7 +208,7 @@ pub fn validity(dom: &Dom, id: u32, custom: &HashMap<u32, String>) -> Validity {
             }
         }
         Some(Control::File) => {
-            if required {
+            if required && !dom.files.contains_key(&id) {
                 v.value_missing = true;
                 say("Please select a file.".into());
             }

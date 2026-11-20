@@ -831,6 +831,8 @@ fn grid_shorthand(value: &str, grid: bool) -> Vec<(&'static str, String)> {
     ];
     if grid {
         out.push(("grid-auto-rows", "auto".to_string()));
+        out.push(("grid-auto-columns", "auto".to_string()));
+        out.push(("grid-auto-flow", "row".to_string()));
     }
     let (rows, cols) = split_slash(value);
     if rows.eq_ignore_ascii_case("none") && cols.is_none() {
@@ -843,20 +845,30 @@ fn grid_shorthand(value: &str, grid: bool) -> Vec<(&'static str, String)> {
             .collect::<Vec<_>>()
             .join(" ")
     };
+    let dense = |t: &str| t.split_whitespace().any(|w| w.eq_ignore_ascii_case("dense"));
     if grid && flows(rows) {
         let auto = after_flow(rows);
         if !auto.is_empty() {
             out[3].1 = auto;
         }
+        if dense(rows) {
+            out[5].1 = "row dense".into();
+        }
         out[1].1 = cols.unwrap_or("none").to_string();
         return out;
     }
     if let Some(c) = cols {
-        out[1].1 = if grid && flows(c) {
-            "none".into()
+        if grid && flows(c) {
+            // Rows / columns that flow: `grid-auto-flow: column`.
+            out[1].1 = "none".into();
+            let auto = after_flow(c);
+            if !auto.is_empty() {
+                out[4].1 = auto;
+            }
+            out[5].1 = if dense(c) { "column dense" } else { "column" }.into();
         } else {
-            c.to_string()
-        };
+            out[1].1 = c.to_string();
+        }
     }
     if rows.contains(['"', '\'']) {
         // Area rows, each with its height after it (`auto` if none);

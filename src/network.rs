@@ -457,6 +457,17 @@ impl Network {
             credentials: Credentials::Include,
             ..ScriptRequest::default()
         };
+        let req = match upload_body(sub) {
+            Ok(upload) => ScriptRequest { upload, ..req },
+            Err(e) => {
+                let html = interstitial_page("The form wasn't sent", &esc(&e));
+                return Nav::Page {
+                    url: sub.url.clone(),
+                    html,
+                    csp: vec![],
+                };
+            }
+        };
         self.navigate_with_csp(&sub.url, from, Some(&req), &sub.form_action)
     }
 
@@ -1132,7 +1143,11 @@ impl Network {
     ) -> Fetch {
         let fdest = filter_dest(dest);
         let mut method = script.map(|s| s.method.clone()).unwrap_or_else(|| "GET".into());
-        let mut body = script.and_then(|s| s.body.clone());
+        let mut body: Option<Vec<u8>> = script.and_then(|s| {
+            s.upload
+                .clone()
+                .or_else(|| s.body.clone().map(String::into_bytes))
+        });
         let mut script_headers: Vec<(String, String)> = script.map(|s| s.headers.clone()).unwrap_or_default();
         let page = if dest == Dest::Document { None } else { initiator };
         // The page whose policy holds: for a document, only a form's
@@ -1378,7 +1393,9 @@ impl Network {
                         let now = ScriptRequest {
                             method: method.clone(),
                             headers: script_headers.clone(),
-                            body: body.clone(),
+                            // (A preflight looks at the method and headers.)
+                            body: None,
+                            upload: None,
                             ..s.clone()
                         };
                         if dest != Dest::Document && !same_origin(p, &next) && !is_cors_simple(&now) {
@@ -1761,6 +1778,53 @@ fn esc(s: &str) -> String {
 /// A warning page with a single "continue" link. The `brickle:proceed` link
 /// only works from an interstitial the browser itself generated.
 /// A warning page with no way to continue.
+/// A multipart form's body with the files you chose in it: each part the
+/// renderer filled with a file's placeholder ([`crate::forms::upload_token`])
+/// gets that file's bytes, read now. Only files you chose for this page's
+/// fields can be sent; a placeholder anywhere else is sent as written.
+/// `None` when the form has no files.
+pub fn upload_body(sub: &crate::forms::Submission) -> Result<Option<Vec<u8>>, String> {
+    let multipart = sub
+        .content_type
+        .as_deref()
+        .is_some_and(|c| c.starts_with("multipart/form-data"));
+    let (Some(body), true) = (&sub.body, multipart && !sub.files.is_empty()) else {
+        return Ok(None);
+    };
+    let mut out = Vec::with_capacity(body.len());
+    let mut rest = body.as_str();
+    let mut total = 0u64;
+    let mut sent = Vec::new();
+    const START: &str = "\u{1}brickle-upload-";
+    while let Some(i) = rest.find(START) {
+        let after = &rest[i + START.len()..];
+        let digits = after.find('\u{1}').map(|e| &after[..e]);
+        let field = digits.and_then(|d| d.parse::<u32>().ok());
+        let token_len = START.len() + digits.map_or(0, |d| d.len() + 1);
+        // A whole part's contents, right after its headers.
+        let whole = rest[..i].ends_with("\r\n\r\n") && rest[i + token_len..].starts_with("\r\n--");
+        let path = field
+            .filter(|f| whole && !sent.contains(f))
+            .and_then(|f| sub.files.iter().find(|(g, _)| *g == f));
+        out.extend_from_slice(&rest.as_bytes()[..i]);
+        match path {
+            Some((f, p)) => {
+                let bytes = std::fs::read(p).map_err(|e| format!("Couldn't read {}: {e}", p.display()))?;
+                total += bytes.len() as u64;
+                if total > crate::tab::MAX_UPLOAD {
+                    return Err("The files are too large to send.".into());
+                }
+                out.extend_from_slice(&bytes);
+                sent.push(*f);
+            }
+            None => out.extend_from_slice(&rest.as_bytes()[i..i + token_len]),
+        }
+        rest = &rest[i + token_len..];
+    }
+    out.extend_from_slice(rest.as_bytes());
+    Ok(Some(out))
+}
+
 fn interstitial_page(title: &str, body: &str) -> String {
     format!(
         "<title>{t}</title><body style='font-family: sans-serif; margin: 0; background: #fdf6e3'>\

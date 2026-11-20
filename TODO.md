@@ -5,7 +5,7 @@ Planned work, roughly in priority order. Items marked *discuss* need a decision 
 ## Features
 - [x] Images (PNG/JPEG/WebP/GIF/SVG), decoded inside the sandboxed renderer
 - [x] SVG images: text, in the bundled fonts
-- [ ] SVG images: drawing at the size shown rather than the SVG's own size
+- [x] SVG images: drawn again at the size shown (`<img>` and inline `<svg>`; CSS backgrounds still at their own size)
 - [x] Images: CSS `background-image`
 - [x] Images: `<picture>` sources (`media`, `type`) and `srcset` (`x`/`w` with `sizes`), chosen for a fixed 1x density
 - [x] Images: animated GIFs (animated WebP shows its first frame), `loading=lazy`
@@ -15,7 +15,7 @@ Planned work, roughly in priority order. Items marked *discuss* need a decision 
 - [x] Grid rows (`grid-template-rows`, `grid-auto-rows`, `grid-row`, `grid-area`, named areas)
 - [x] `::before`/`::after` content (strings, `attr()`, quotes), and `<details>` that open on a click
 - [x] CSS counters (`counter()`/`counters()` in `content`, `counter-reset`/`-increment`/`-set`, `list-item`), `grid-template`/`grid` shorthands
-- [ ] `grid-auto-flow: column` and `grid-auto-columns` (`grid: … / auto-flow` keeps only the rows)
+- [x] `grid-auto-flow` (`column`, `dense`) and `grid-auto-columns`
 - [x] Show `<noscript>` content, and follow `<meta http-equiv=refresh>` redirects
 - [x] Cookies: session-only, first-party only, per-site keep list
 - [x] JavaScript: Boa in the sandboxed renderer, off unless you allow a site (see below)
@@ -71,8 +71,8 @@ what's next:
 - [x] Scripts can't send to other sites (requests, or files they put on the page) unless you allow it.
 - [x] `document.cookie` for non-HttpOnly cookies, answered by the browser.
 - [x] JavaScript modules (`type=module`, static `import`, literal `import()`, import maps; `nomodule` skipped).
-- [ ] `import()` of an address built at run time (fails unless it was fetched with the rest), CORS
-  and the strict MIME type check for modules, `<link rel=modulepreload>`.
+- [x] `import()` of an address built at run time (fetched when asked, as a script's request).
+- [ ] CORS and the strict MIME type check for modules, `<link rel=modulepreload>`.
 - [x] Keyboard input and form controls (typing into fields, submitting forms).
 - [x] More selectors for `querySelector` (sibling combinators, `:not()`, attribute values),
   shared with CSS.
@@ -93,7 +93,9 @@ selects (with a drop-down), buttons, labels, Tab between fields, Enter to submit
 - [x] A real drop-down for `<select>`, and `↑`/`↓` to change it.
 - [x] Moving the caret, selecting text in a field, copy, cut and paste.
 - [x] Placing the caret and selecting in a field with the mouse (click, drag, double-click for a word).
-- [ ] File uploads (`<input type=file>`).
+- [x] File uploads (`<input type=file>`): your desktop's dialog (zenity or kdialog); the browser
+  keeps the file and puts it in the form it sends; scripts see only its name, size and type.
+- [ ] Several files at once (`multiple`), and files in forms scripts send (`FormData`).
 - [x] Form validation before sending (`required`, `type=email`/`url`, `pattern`, `minlength`/`maxlength`, `min`/`max`/`step`, `novalidate`), with `checkValidity()`, `setCustomValidity()` and `validity` for scripts; arrow keys step number fields.
 - [x] Date picker (calendar, typing, arrow keys) and colour picker (palette); `:valid`, `:invalid`, `:required` and `:optional` in CSS and for scripts.
 - [x] Pickers for `time` (a clock of hours and five-minute steps), `datetime-local`, `month` and `week`, with validation and arrow keys.

@@ -74,8 +74,14 @@ pub struct Page {
     interacted: HashSet<u32>,
     /// `interacted` grew: styles may change.
     restyle: bool,
+    /// File fields' chosen file names, for drawing them.
+    file_names: HashMap<u32, String>,
     /// Bytes of decoded pixels kept in `images`.
     image_bytes: usize,
+    /// SVG pictures at the last layout, by node: the size shown.
+    svg_shown: RefCell<Vec<(u32, f32, f32)>>,
+    /// The size each SVG (by address) was last drawn again at.
+    svg_drawn: HashMap<String, (u32, u32)>,
     /// Your text size (see `StyleContext::text_scale`).
     pub text_scale: f32,
     /// The window's size, for choosing pictures (`<picture>`, `srcset`)
@@ -114,6 +120,8 @@ pub struct Interaction {
     /// A form wasn't sent because a field isn't filled in right: what's
     /// wrong (that field now has the keyboard).
     pub invalid: Option<String>,
+    /// You clicked a file field: the browser asks you for a file.
+    pub choose_file: Option<forms::FileAsk>,
 }
 
 /// A key that does something in a form control. `select` is Shift held
@@ -170,6 +178,12 @@ pub struct Rendered {
     /// text rather than the page's.
     pub fields: Vec<Rect>,
 }
+
+/// Draws an SVG (its source) again at a size in pixels.
+pub type SvgRedraw<'a> = dyn FnMut(&[u8], (u32, u32)) -> Result<Decoded, String> + 'a;
+
+/// Most SVGs drawn again at the size they're shown, per layout.
+pub const MAX_SVG_REDRAWS: usize = 32;
 
 /// Most text fields whose places are reported.
 pub const MAX_FIELDS: usize = 4096;
@@ -556,7 +570,10 @@ impl Page {
             edited: HashSet::new(),
             interacted: HashSet::new(),
             restyle: false,
+            file_names: HashMap::new(),
             image_bytes: 0,
+            svg_shown: RefCell::new(vec![]),
+            svg_drawn: HashMap::new(),
             text_scale: 1.0,
             viewport: (1024.0, 768.0),
             title_px: 0.0,
@@ -593,7 +610,8 @@ impl Page {
                 None if url.starts_with("data:") => Err("unsupported data: address".into()),
                 None => fetch(url, added),
             }?;
-            image::decode(&bytes)
+            let svg = image::is_svg(&bytes).then(|| std::sync::Arc::<[u8]>::from(&bytes[..]));
+            image::decode(&bytes).map(|d| Decoded { svg, ..d })
         });
     }
 
@@ -655,6 +673,72 @@ impl Page {
             }
             self.inline_svgs.insert(uid, url);
         }
+    }
+
+    /// SVGs shown larger than they were drawn (at the last layout) are
+    /// drawn again at the size shown, by `decode` (in a sandboxed worker),
+    /// so they stay sharp. Returns whether any were; the page then needs
+    /// painting again (its layout doesn't change).
+    pub fn redraw_svgs(&mut self, decode: &mut SvgRedraw) -> bool {
+        let shown = std::mem::take(&mut *self.svg_shown.borrow_mut());
+        if shown.is_empty() {
+            return false;
+        }
+        let mut by_node: HashMap<u32, String> = img_sources(&self.base, &self.dom, self.viewport)
+            .into_iter()
+            .map(|(uid, url, _)| (uid, url))
+            .collect();
+        by_node.extend(self.inline_svgs.iter().map(|(u, s)| (*u, s.clone())));
+        // The largest size each is shown at.
+        let mut want: Vec<(String, u32, u32)> = Vec::new();
+        for (uid, w, h) in shown {
+            let Some(url) = by_node.get(&uid) else { continue };
+            let size = image::fit(
+                (w.ceil() as u32).clamp(1, image::MAX_SIDE),
+                (h.ceil() as u32).clamp(1, image::MAX_SIDE),
+                image::STORE_SIDE,
+            );
+            match want.iter_mut().find(|(u, _, _)| u == url) {
+                Some(e) => (e.1, e.2) = (e.1.max(size.0), e.2.max(size.1)),
+                None => want.push((url.clone(), size.0, size.1)),
+            }
+        }
+        let mut changed = false;
+        for (url, w, h) in want.into_iter().take(MAX_SVG_REDRAWS) {
+            let Some(Some(d)) = self.images.get(&url) else {
+                continue;
+            };
+            let Some(svg) = d.svg.clone() else { continue };
+            // Already sharp enough, or tried at this size.
+            let blurry = w as f32 > d.bitmap.w as f32 * 1.1 || h as f32 > d.bitmap.h as f32 * 1.1;
+            if !blurry
+                || self
+                    .svg_drawn
+                    .get(&url)
+                    .is_some_and(|&(dw, dh)| dw >= w && dh >= h)
+            {
+                continue;
+            }
+            self.svg_drawn.insert(url.clone(), (w, h));
+            let Ok(new) = decode(&svg, (w, h)) else { continue };
+            let (old_n, new_n) = (d.bitmap.rgba.len(), new.bitmap.rgba.len());
+            if self.image_bytes - old_n.min(self.image_bytes) + new_n > MAX_IMAGE_MEMORY {
+                continue;
+            }
+            self.image_bytes = self.image_bytes - old_n.min(self.image_bytes) + new_n;
+            let natural = d.natural;
+            self.images.insert(
+                url,
+                Some(Decoded {
+                    natural,
+                    bitmap: new.bitmap,
+                    frames: None,
+                    svg: Some(svg),
+                }),
+            );
+            changed = true;
+        }
+        changed
     }
 
     /// Decoded images for the `<img>` elements in `tree`, by node.
@@ -1097,6 +1181,18 @@ impl Page {
                 Some(Activation::Submit { form, submitter }) => {
                     out.submit = self.submit(rt.as_deref_mut(), form, Some(submitter), &mut out.invalid);
                 }
+                Some(Activation::ChooseFile(f)) => {
+                    let accept = self
+                        .with_dom(rt.as_deref_mut(), |d| {
+                            d.element(f).and_then(|e| e.attrs.get("accept").cloned())
+                        })
+                        .flatten()
+                        .unwrap_or_default();
+                    out.choose_file = Some(forms::FileAsk {
+                        field: f,
+                        accept: accept.chars().take(500).collect(),
+                    });
+                }
                 _ => {}
             }
         } else if !out.prevented {
@@ -1108,6 +1204,43 @@ impl Page {
             }
         }
         self.finish(rt, before, was_focus, &mut out);
+        out
+    }
+
+    /// You chose `file` for file field `field` (the browser keeps the file;
+    /// the page learns its name, size and type).
+    pub fn chose_file(
+        &mut self,
+        mut rt: Option<&mut Runtime>,
+        field: u32,
+        file: forms::ChosenFile,
+    ) -> Interaction {
+        let mut out = Interaction {
+            focus: self.focus.is_some(),
+            ..Default::default()
+        };
+        let ok = self
+            .with_dom(rt.as_deref_mut(), |d| {
+                let ok = forms::kind(d, field) == Some(forms::Control::File) && !forms::disabled(d, field);
+                if ok {
+                    d.files.insert(field, file.clone());
+                    d.version += 1;
+                }
+                ok
+            })
+            .unwrap_or(false);
+        if !ok {
+            return out;
+        }
+        self.file_names.insert(field, file.name.clone());
+        self.interact(rt.as_deref_mut(), &[field]);
+        self.restyle = false;
+        if let Some(rt) = rt.as_deref_mut() {
+            rt.fire(field, "input", true, false);
+            rt.fire(field, "change", true, false);
+        }
+        self.mark_validity(rt);
+        out.changed = true;
         out
     }
 
@@ -1400,6 +1533,7 @@ impl Page {
                 month: self.picker_month,
                 validity: self.validity.clone(),
                 interacted: self.interacted.clone(),
+                files: self.file_names.clone(),
             },
         );
         let images = self.images_by_node(&tree);
@@ -1474,6 +1608,12 @@ impl Page {
             collect_hits(b, None, &mut whole);
         }
         *self.script_boxes.borrow_mut() = whole.into_iter().map(|(r, u)| (u, r)).collect();
+        *self.svg_shown.borrow_mut() = order
+            .iter()
+            .filter(|b| b.image.as_ref().is_some_and(|d| d.svg.is_some()))
+            .map(|b| (b.uid, b.dims.content.w, b.dims.content.h))
+            .take(MAX_SVG_REDRAWS * 4)
+            .collect();
         // Where held-back lazy images are, even with no size yet.
         let held = self.held_back();
         *self.lazy_boxes.borrow_mut() = if held.is_empty() {
@@ -2422,6 +2562,91 @@ mod form_script_tests {
         assert!(out.contains("0|3|1|1|0|rgb(0, 128, 0)"), "{out}");
     }
 
+    /// A file field asks the browser for a file; the page learns only its
+    /// name, size and type, and a form carries a placeholder the browser
+    /// fills with the file when it sends it.
+    #[test]
+    fn file_fields_and_uploads() {
+        let (mut page, mut rt) = load(
+            "<form method=post enctype=multipart/form-data action=/up>\
+             <input id=t name=t value=hi><input id=f type=file name=doc accept='image/*' required>\
+             <button id=go>Send</button></form>\
+             <form id=g action=/get><input type=file id=h name=h></form><p id=out></p>\
+             <script>document.getElementById('f').addEventListener('change', (e) => {\
+               const f = e.target.files[0]; document.getElementById('out').textContent =\
+               [e.target.files.length, f.name, f.size, f.type, e.target.value].join('|'); });</script>",
+        );
+        let f = rt.with_dom(|d| forms::by_id(d, "f").unwrap());
+        let go = rt.with_dom(|d| forms::by_id(d, "go").unwrap());
+        let center = |p: &Page, id: u32| {
+            let r = p.boxes().into_iter().find(|(u, _)| *u == id).unwrap().1;
+            (r.x + r.w / 2.0, r.y + r.h / 2.0)
+        };
+        let until = Instant::now() + std::time::Duration::from_secs(5);
+        // Not sent without a file (it's required).
+        let (x, y) = center(&page, go);
+        let out = page.click_at(Some(&mut rt), x, y, until);
+        assert!(out.submit.is_none() && out.invalid.is_some());
+        // A click on the field asks for a file, with what it accepts.
+        let (x, y) = center(&page, f);
+        let out = page.click_at(Some(&mut rt), x, y, until);
+        assert_eq!(
+            out.choose_file,
+            Some(forms::FileAsk {
+                field: f,
+                accept: "image/*".into()
+            })
+        );
+        let out = page.chose_file(
+            Some(&mut rt),
+            f,
+            forms::ChosenFile {
+                name: "cat \"x\".png".into(),
+                size: 5,
+                mime: "image/png".into(),
+            },
+        );
+        assert!(out.changed);
+        page.refresh(&rt);
+        assert!(
+            page.dom
+                .text_content()
+                .contains("1|cat \"x\".png|5|image/png|C:\\fakepath\\cat \"x\".png"),
+            "{}",
+            page.dom.text_content()
+        );
+        let r = page.render(800.0, 600.0);
+        assert!(
+            r.texts.iter().any(|t| t.text.contains("cat")),
+            "the name is shown"
+        );
+        let (x, y) = center(&page, go);
+        let mut sub = page.click_at(Some(&mut rt), x, y, until).submit.unwrap();
+        let body = sub.body.clone().unwrap();
+        assert!(
+            body.contains("filename=\"cat %22x%22.png\"\r\nContent-Type: image/png\r\n\r\n"),
+            "{body}"
+        );
+        assert!(body.contains(&forms::upload_token(f)));
+        // The browser puts the file in, and only a file you chose.
+        let dir = std::env::temp_dir().join(format!("brickle-upload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cat.png");
+        std::fs::write(&path, b"\x89PNG\0\xff").unwrap();
+        assert_eq!(crate::network::upload_body(&sub).unwrap(), None, "no files given");
+        sub.files = vec![(f, path.clone())];
+        let bytes = crate::network::upload_body(&sub).unwrap().unwrap();
+        let at = bytes.windows(4).position(|w| w == b"\x89PNG").unwrap();
+        assert_eq!(&bytes[at..at + 8], b"\x89PNG\0\xff\r\n");
+        assert!(!String::from_utf8_lossy(&bytes).contains("brickle-upload"));
+        // A placeholder a script typed into a text field stays text.
+        let mut forged = sub.clone();
+        forged.body = Some(body.replace("hi", &forms::upload_token(f)));
+        let bytes = crate::network::upload_body(&forged).unwrap().unwrap();
+        assert_eq!(bytes.windows(4).filter(|w| *w == b"\x89PNG").count(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// `<base href>` sets what the page's relative addresses mean, for
     /// links, images, forms and scripts, unless `base-uri` forbids it.
     #[test]
@@ -2935,6 +3160,37 @@ mod image_tests {
             (20.0, 20.0),
             "a 2x picture at half its pixel size"
         );
+    }
+
+    /// SVGs shown larger than they were drawn are drawn again at the size
+    /// shown, once, keeping their layout size.
+    #[test]
+    fn svgs_are_redrawn_at_the_size_shown() {
+        let svg = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20'%3E%3Crect width='20' height='20' fill='red'/%3E%3C/svg%3E";
+        let (mut page, _) = load(&format!(
+            "<img id=big src=\"{svg}\" style='width:400px;height:300px'><img id=small src=\"{svg}\">"
+        ));
+        // The pixels kept for it (one picture for both).
+        let pixels = |p: &Page| -> Vec<(u32, u32)> {
+            let _ = p.render(800.0, 600.0);
+            p.images
+                .values()
+                .flatten()
+                .map(|d| (d.bitmap.w, d.bitmap.h))
+                .collect()
+        };
+        // Drawn at 4x its size (80 px) at first.
+        assert_eq!(pixels(&page), [(80, 80)]);
+        let mut asked = vec![];
+        assert!(page.redraw_svgs(&mut |b, want| {
+            asked.push(want);
+            image::decode_at(b, Some(want))
+        }));
+        assert_eq!(asked, [(400, 300)], "once, at the largest size shown");
+        assert_eq!(pixels(&page), [(400, 300)]);
+        assert_eq!(size_of(&page, "small"), (20.0, 20.0), "layout unchanged");
+        // Sharp now: not drawn again.
+        assert!(!page.redraw_svgs(&mut |b, want| image::decode_at(b, Some(want))));
     }
 
     /// Inline `<svg>` is drawn as an image: sized like one, coloured by the
@@ -4056,6 +4312,48 @@ mod module_tests {
         assert_eq!(added("lazy.js"), Some(true));
         assert_eq!(added("other.example/x.js"), Some(true));
         assert!(text.contains("blocked"), "{text}");
+    }
+
+    /// `import()` of an address made up while the script runs: fetched
+    /// there and then, as a script's request (with the page's policy).
+    #[test]
+    fn runtime_imports_are_fetched_when_asked() {
+        let asked = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let seen = asked.clone();
+        js::set_module_fetcher(Some(Box::new(move |url, _csp| {
+            seen.borrow_mut().push(url.to_string());
+            match url {
+                "https://site.example/app/locale/fr.js" => {
+                    Ok("import { hi } from './base.js'; export const word = hi + 'jour';".into())
+                }
+                "https://site.example/app/locale/base.js" => Ok("export const hi = 'bon';".into()),
+                _ => Err("404".into()),
+            }
+        })));
+        let (page, host, console) = load(
+            "<p id=o>start</p><script type=module>const lang = ['f', 'r'].join('');\
+             import(`./locale/${lang}.js`).then((m) => { document.getElementById('o').textContent += ' ' + m.word; },\
+               (e) => { document.getElementById('o').textContent += ' FAILED ' + e; });\
+             import('./locale/' + 'xx.js').catch(() => { document.getElementById('o').textContent += ' missing'; });</script>",
+            vec![],
+        );
+        js::set_module_fetcher(None);
+        let text = page.dom.text_content();
+        // (The one that loads more files settles later.)
+        assert!(text.starts_with("start missing bonjour"), "{text}\n{console:?}");
+        assert_eq!(
+            *asked.borrow(),
+            [
+                "https://site.example/app/locale/fr.js",
+                "https://site.example/app/locale/xx.js",
+                "https://site.example/app/locale/base.js"
+            ]
+        );
+        assert!(
+            host.fetched.is_empty(),
+            "nothing fetched ahead: {:?}",
+            host.fetched
+        );
     }
 
     #[test]

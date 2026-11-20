@@ -134,6 +134,9 @@ pub struct Tab {
     /// The form submission this page answers, if loading it again means
     /// sending the form again (a POST that wasn't redirected).
     pub resubmit: Option<Submission>,
+    /// Files you chose for the page's file fields, by field. Only the
+    /// browser reads them, when a form sends them.
+    chosen: std::collections::HashMap<u32, std::path::PathBuf>,
     backend: Backend,
     policy: crate::csp::Csp,
 }
@@ -158,6 +161,35 @@ pub struct Click {
     /// A form wasn't sent: what's wrong with a field, cleaned up and
     /// shortened (a page can set its own message).
     pub invalid: Option<String>,
+    /// You clicked a file field: ask for a file (only ever after a click).
+    pub choose_file: Option<crate::forms::FileAsk>,
+}
+
+/// Largest file you can send with a form.
+pub const MAX_UPLOAD: u64 = 64 * 1024 * 1024;
+
+/// A file's type, from its name, for the page and the form that sends it.
+fn mime_of(name: &str) -> &'static str {
+    let ext = name
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "txt" => "text/plain",
+        "csv" => "text/csv",
+        "html" | "htm" => "text/html",
+        "json" => "application/json",
+        "zip" => "application/zip",
+        "mp4" => "video/mp4",
+        "mp3" => "audio/mpeg",
+        _ => "application/octet-stream",
+    }
 }
 
 /// Longest form-validation message shown.
@@ -224,6 +256,11 @@ pub enum Input {
         x: f32,
         y: f32,
         word: bool,
+    },
+    /// You chose this file for a file field (in the browser's own dialog).
+    Chose {
+        field: u32,
+        path: std::path::PathBuf,
     },
 }
 
@@ -317,6 +354,7 @@ impl Tab {
                     text_scale: 1.0,
                     title_px: 0.0,
                     resubmit: None,
+                    chosen: Default::default(),
                 }
             }
         }
@@ -368,6 +406,7 @@ impl Tab {
             text_scale: 1.0,
             title_px: 0.0,
             resubmit: None,
+            chosen: Default::default(),
         };
         let blocker_css = net.cosmetic_css(url);
         if !sandbox {
@@ -423,6 +462,7 @@ impl Tab {
     fn check_form(&self, click: &mut Click) {
         let Some(sub) = click.submit.as_mut() else { return };
         sub.form_action = self.policy.form_action_sources();
+        sub.files = self.chosen.iter().map(|(f, p)| (*f, p.clone())).collect();
         if !self.policy.form_action(&sub.url) {
             click.invalid = Some(format!(
                 "This page's security policy doesn't allow sending the form to {}",
@@ -434,6 +474,61 @@ impl Tab {
 
     /// A click, typing or a key press on the page.
     pub fn interact(&mut self, net: &mut Network, input: Input) -> Click {
+        // Only a click of yours on a file field opens the file dialog.
+        let clicked = matches!(input, Input::Click(..));
+        let mut click = self.interact_inner(net, input);
+        if !clicked {
+            click.choose_file = None;
+        }
+        click
+    }
+
+    /// A file you chose: checked here, kept by the browser; the page is told
+    /// its name, size and type.
+    fn chosen_file(
+        &mut self,
+        field: u32,
+        path: &std::path::Path,
+    ) -> Result<crate::forms::ChosenFile, String> {
+        let meta = std::fs::metadata(path).map_err(|e| format!("Can't read that file: {e}"))?;
+        if !meta.is_file() {
+            return Err("That isn't a file.".into());
+        }
+        if meta.len() > MAX_UPLOAD {
+            return Err(format!(
+                "That file is too large to send (over {} MB).",
+                MAX_UPLOAD >> 20
+            ));
+        }
+        let name: String = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(255)
+            .collect();
+        self.chosen.insert(field, path.to_path_buf());
+        Ok(crate::forms::ChosenFile {
+            mime: mime_of(&name).into(),
+            name,
+            size: meta.len(),
+        })
+    }
+
+    fn interact_inner(&mut self, net: &mut Network, input: Input) -> Click {
+        let mut chosen = crate::forms::ChosenFile::default();
+        if let Input::Chose { field, path } = &input {
+            match self.chosen_file(*field, path) {
+                Ok(file) => chosen = file,
+                Err(e) => {
+                    return Click {
+                        invalid: accept_invalid(Some(e)),
+                        ..Click::default()
+                    }
+                }
+            }
+        }
         let r = match &mut self.backend {
             Backend::Failed(_) => return Click::default(),
             Backend::InProcess(page) => {
@@ -445,6 +540,7 @@ impl Tab {
                     Input::Key(k) => page.key(None, k),
                     Input::Scroll { uid, dx, dy } => page.scroll_box(None, uid, dx, dy),
                     Input::Select { x, y, word } => page.select_at(None, x, y, word),
+                    Input::Chose { field, .. } => page.chose_file(None, field, chosen),
                     // Pages without scripts load every image at once.
                     Input::Reveal { .. } => crate::page::Interaction {
                         focus: page.focus.is_some(),
@@ -459,6 +555,7 @@ impl Tab {
                     focus: done.focus,
                     copied: accept_copied(done.copied, copy_key),
                     invalid: accept_invalid(done.invalid),
+                    choose_file: done.choose_file,
                 };
                 self.check_form(&mut click);
                 return click;
@@ -478,6 +575,7 @@ impl Tab {
             Input::Scroll { uid, dx, dy } => ToRenderer::Scroll { uid, dx, dy },
             Input::Reveal { top, bottom } => ToRenderer::Reveal { top, bottom },
             Input::Select { x, y, word } => ToRenderer::Select { x, y, word },
+            Input::Chose { field, .. } => ToRenderer::Chose { field, file: chosen },
         };
         let result = r.send(msg).and_then(|_| {
             match r.serve(Instant::now() + RENDERER_TIMEOUT, SCRIPT_BYTES, &mut host)? {
@@ -491,6 +589,7 @@ impl Tab {
                     copied,
                     read,
                     invalid,
+                    choose_file,
                 } => Ok((
                     Click {
                         prevented,
@@ -500,6 +599,7 @@ impl Tab {
                         focus,
                         copied: accept_copied(copied, copy_key),
                         invalid: accept_invalid(invalid),
+                        choose_file,
                     },
                     console,
                     read,
@@ -530,7 +630,12 @@ impl Tab {
             Backend::InProcess(p) => {
                 p.text_scale = self.text_scale;
                 p.title_px = self.title_px;
-                return p.render(width, height);
+                let out = p.render(width, height);
+                // (Without the sandbox, images are decoded here anyway.)
+                if p.redraw_svgs(&mut |b, want| crate::image::decode_at(b, Some(want))) {
+                    return p.render(width, height);
+                }
+                return out;
             }
             Backend::Failed(e) => Err(e.clone()),
             Backend::Sandboxed(r) => r
@@ -540,12 +645,28 @@ impl Tab {
                     text_scale: self.text_scale,
                     title_px: self.title_px,
                 })
-                .and_then(
-                    |_| match r.recv(Instant::now() + RENDERER_TIMEOUT, &mut { MAX_FRAME })? {
-                        FromRenderer::Rendered(out) => Ok(out),
-                        _ => Err(r.kill("renderer sent an unexpected message and was killed")),
-                    },
-                ),
+                .and_then(|_| {
+                    // SVGs shown larger than they were drawn are drawn again
+                    // at their size, in a sandboxed worker, before the page
+                    // comes back.
+                    let deadline = Instant::now() + RENDERER_TIMEOUT;
+                    let mut redraws = 0;
+                    loop {
+                        match r.recv(deadline, &mut { MAX_FRAME })? {
+                            FromRenderer::Rendered(out) => return Ok(out),
+                            FromRenderer::Decode {
+                                bytes,
+                                want: Some(want),
+                            } if redraws < crate::page::MAX_SVG_REDRAWS => {
+                                redraws += 1;
+                                let got =
+                                    crate::decoder::decode_worker(bytes, Some(want), &r.cancel, deadline);
+                                r.send(ToRenderer::ImageReply(got))?;
+                            }
+                            _ => return Err(r.kill("renderer sent an unexpected message and was killed")),
+                        }
+                    }
+                }),
         };
         result.unwrap_or_else(|e| {
             self.backend = Backend::Failed(e.clone());
@@ -746,12 +867,12 @@ impl Renderer {
                 return Err(self.kill("renderer sent too many messages and was killed"));
             }
             match self.recv_budgets(deadline, &mut budget, &mut image_budget)? {
-                FromRenderer::Decode(bytes) if fetches < MAX_FETCHES => {
+                FromRenderer::Decode { bytes, want } if fetches < MAX_FETCHES => {
                     fetches += 1;
-                    let r = crate::decoder::decode_worker(bytes, &self.cancel, deadline);
+                    let r = crate::decoder::decode_worker(bytes, want, &self.cancel, deadline);
                     self.send(ToRenderer::ImageReply(r))?;
                 }
-                FromRenderer::Decode(_) => return Err(self.kill("too many image decodes")),
+                FromRenderer::Decode { .. } => return Err(self.kill("too many image decodes")),
                 FromRenderer::Stylesheet {
                     url,
                     integrity,
@@ -940,7 +1061,7 @@ try:
             f = frame(bytes.fromhex(v))
             while True: out.write(f); out.flush()
         elif k == 'decode':
-            b = bytes(int(v)); out.write(frame(bytes([20]) + struct.pack('<I', len(b)) + b)); out.flush()
+            b = bytes(int(v)); out.write(frame(bytes([20]) + struct.pack('<I', len(b)) + b + struct.pack('<II', 0, 0))); out.flush()
         elif k == 'zeros': out.write(bytes(int(v))); out.flush()
         elif k == 'read': read_frame()
         elif k == 'sleep': time.sleep(float(v))

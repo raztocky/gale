@@ -15,6 +15,29 @@ const MAX_VALUE: usize = 64 * 1024;
 /// Largest form body Brickle submits.
 pub const MAX_BODY: usize = 1024 * 1024;
 
+/// A file you chose for a file field, as the page sees it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ChosenFile {
+    pub name: String,
+    pub size: u64,
+    pub mime: String,
+}
+
+/// What stands for a chosen file's contents in a form the renderer puts
+/// together: the browser, which has the file, puts the bytes there when it
+/// sends the form (see `Network::submit_form`).
+pub fn upload_token(field: u32) -> String {
+    format!("\u{1}brickle-upload-{field}\u{1}")
+}
+
+/// What clicking a file field asks the browser to show.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileAsk {
+    pub field: u32,
+    /// The `accept` attribute (types or extensions), as written.
+    pub accept: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Control {
     /// text, search, email, url, tel, number, password, ...
@@ -216,6 +239,8 @@ pub enum Activation {
     Open(u32),
     /// Submit `form` (with this submit button).
     Submit { form: u32, submitter: u32 },
+    /// A file field: the browser asks you for a file.
+    ChooseFile(u32),
     /// Reset `form` to its original values (not supported: nothing).
     Nothing,
 }
@@ -234,6 +259,7 @@ pub fn activate(dom: &mut Dom, id: u32) -> Activation {
             }
         }
         Some(Control::Color) if !disabled(dom, id) => Activation::Open(id),
+        Some(Control::File) if !disabled(dom, id) => Activation::ChooseFile(id),
         Some(Control::Checkbox) => {
             if dom.element(id).is_some_and(|e| e.attrs.contains_key("checked")) {
                 dom.remove_attr(id, "checked");
@@ -796,6 +822,9 @@ pub struct Submission {
     /// own record of the page's policy (never sent by the renderer): every
     /// address the form goes to, redirects included, must match them.
     pub form_action: Vec<Vec<String>>,
+    /// The files you chose for the form's file fields, by field, filled in
+    /// by the browser from its own record (never sent by the renderer).
+    pub files: Vec<(u32, std::path::PathBuf)>,
 }
 
 /// What submitting `form` (with `submitter`) sends, or None if it can't be
@@ -832,7 +861,11 @@ pub fn submission(
         .unwrap_or_default()
         .to_ascii_lowercase();
 
+    let multipart = enctype == "multipart/form-data";
     let mut entries: Vec<(String, String)> = Vec::new();
+    // File fields in a multipart form: (index in `entries`, file name,
+    // type, field).
+    let mut files: Vec<(usize, String, String, Option<u32>)> = Vec::new();
     for c in controls(dom, form) {
         let Some(e) = dom.element(c) else { continue };
         let Some(name) = e.attrs.get("name").filter(|n| !n.is_empty()).cloned() else {
@@ -860,7 +893,19 @@ pub fn submission(
                     }
                 }
             }
-            Some(Control::Reset | Control::Button | Control::File) | None => {}
+            Some(Control::File) => {
+                let chosen = dom.files.get(&c);
+                let file = chosen.map_or(String::new(), |f| f.name.clone());
+                if multipart {
+                    let mime = chosen.map_or("application/octet-stream".into(), |f| f.mime.clone());
+                    files.push((entries.len(), file, mime, chosen.map(|_| c)));
+                    entries.push((name, String::new()));
+                } else {
+                    // Other forms send just the name.
+                    entries.push((name, file));
+                }
+            }
+            Some(Control::Reset | Control::Button) | None => {}
             Some(_) => entries.push((name, value(dom, c))),
         }
     }
@@ -868,11 +913,22 @@ pub fn submission(
     let (body, content_type) = if enctype == "multipart/form-data" {
         let boundary = format!("----brickle{:016x}", boundary_seed());
         let mut b = String::new();
-        for (k, v) in &entries {
-            let k = k.replace('"', "%22").replace(['\r', '\n'], " ");
-            b.push_str(&format!(
-                "--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n"
-            ));
+        let clean = |s: &str| s.replace('"', "%22").replace(['\r', '\n'], " ");
+        for (i, (k, v)) in entries.iter().enumerate() {
+            let k = clean(k);
+            match files.iter().find(|f| f.0 == i) {
+                Some((_, file, mime, field)) => {
+                    let contents = field.map_or(String::new(), upload_token);
+                    b.push_str(&format!(
+                        "--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"; filename=\"{}\"\r\nContent-Type: {}\r\n\r\n{contents}\r\n",
+                        clean(file),
+                        clean(mime),
+                    ));
+                }
+                None => b.push_str(&format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n"
+                )),
+            }
         }
         b.push_str(&format!("--{boundary}--\r\n"));
         (b, format!("multipart/form-data; boundary={boundary}"))
@@ -895,6 +951,7 @@ pub fn submission(
             body: Some(body),
             content_type: Some(content_type),
             form_action: vec![],
+            files: vec![],
         });
     }
     let mut u = url::Url::parse(&action).ok()?;
@@ -908,6 +965,7 @@ pub fn submission(
         body: None,
         content_type: None,
         form_action: vec![],
+        files: vec![],
     })
 }
 
@@ -1018,6 +1076,8 @@ pub struct Decor {
     pub validity: std::collections::HashMap<u32, bool>,
     /// Fields you've interacted with (`:user-valid`/`:user-invalid`).
     pub interacted: std::collections::HashSet<u32>,
+    /// File fields' chosen file names.
+    pub files: std::collections::HashMap<u32, String>,
 }
 
 /// Classes marking `:valid` and `:invalid` fields for styling.
@@ -1220,7 +1280,10 @@ pub fn decorate(n: &mut Node, d: &Decor) {
         Control::Submit | Control::Reset | Control::Button | Control::File if e.tag == "input" => {
             add_class(n, "-brickle-button");
             let label = match kind {
-                Control::File => "Browse… (not supported)".to_string(),
+                Control::File => match d.files.get(&n.uid) {
+                    Some(name) => format!("Browse…  {name}"),
+                    None => "Browse…  No file chosen".to_string(),
+                },
                 // `value=""` is an empty label (often an icon button).
                 _ if !val.is_empty() || e.attrs.contains_key("value") => val,
                 Control::Submit => e.attrs.get("alt").cloned().unwrap_or_else(|| "Submit".into()),
@@ -1468,6 +1531,7 @@ mod tests {
                 month: None,
                 validity: Default::default(),
                 interacted: Default::default(),
+                files: Default::default(),
             },
         );
         let mut out = String::new();
