@@ -205,7 +205,10 @@ in `src/cookies.rs`.
   (another registrable domain: `api.example.com` is the same site as `www.example.com`) isn't
   sent. Neither is an image, stylesheet or script a script puts on the page from another site,
   so a script can't smuggle what it learned out in an image address. Files written in the page
-  as the server sent it load as usual. These show in the request panel as "BLOCKED (script
+  as the server sent it load as usual. JavaScript modules follow the same line: files a module
+  imports with an `import` written at its top load like the page's own scripts (they're fixed in
+  the files before anything runs), while `import()` calls, which running code can point anywhere,
+  count as a script's requests and stay on the page's site unless you allowed more. These show in the request panel as "BLOCKED (script
   sending to another site)"; clicking one adds an allow rule for just that site and kind of
   request (`@@||api.other.example^$xhr,domain=example.com`), which also overrides the filter
   lists for it. A request that's redirected is checked again at every hop before anything is sent

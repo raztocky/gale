@@ -70,7 +70,9 @@ what's next:
   HTTPS-only already upgrades every address.)
 - [x] Scripts can't send to other sites (requests, or files they put on the page) unless you allow it.
 - [x] `document.cookie` for non-HttpOnly cookies, answered by the browser.
-- [ ] JavaScript modules (`type=module`, `import`).
+- [x] JavaScript modules (`type=module`, static `import`, literal `import()`, import maps; `nomodule` skipped).
+- [ ] `import()` of an address built at run time (fails unless it was fetched with the rest), CORS
+  and the strict MIME type check for modules, `<link rel=modulepreload>`.
 - [x] Keyboard input and form controls (typing into fields, submitting forms).
 - [x] More selectors for `querySelector` (sibling combinators, `:not()`, attribute values),
   shared with CSS.

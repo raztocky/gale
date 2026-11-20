@@ -25,7 +25,8 @@ const LOAD_EXTRA: Duration = Duration::from_secs(10);
 /// Most subresource requests a renderer may make for one page. The network
 /// service refuses anything past its own budget; a renderer that keeps
 /// asking anyway is misbehaving.
-const MAX_FETCHES: usize = MAX_STYLESHEETS + crate::js::MAX_SCRIPTS + crate::network::MAX_IMAGES * 2 + 8;
+const MAX_FETCHES: usize =
+    MAX_STYLESHEETS + crate::js::MAX_SCRIPTS + crate::js::MAX_MODULES + crate::network::MAX_IMAGES * 2 + 8;
 /// Longest a page with JavaScript may take to load before Brickle gives up
 /// on its scripts and shows it without them.
 const SCRIPT_LOAD_LIMIT: Duration = Duration::from_secs(15);

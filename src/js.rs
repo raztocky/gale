@@ -33,6 +33,7 @@ use boa_engine::{
     NativeFunction, Source,
 };
 use std::cell::RefCell;
+use std::future::Future;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -634,6 +635,17 @@ struct State {
     computed: Option<(u64, ComputedMap)>,
     /// The base address, as of a DOM version (see [`doc_base`]).
     base: Option<(u64, String)>,
+    /// Module files fetched for the page, by address (or why not).
+    module_sources: std::collections::HashMap<String, Result<String, String>>,
+    /// Modules asked for that haven't been fetched: (address, asked for
+    /// by running code, as `import()` is, rather than written as a
+    /// static `import`).
+    module_missing: Vec<(String, bool)>,
+    /// Whether module code is running (imports it asks for now are
+    /// dynamic ones).
+    modules_running: bool,
+    /// The page's import map.
+    import_map: ImportMap,
     /// Lays the document out for scripts that ask for sizes before the
     /// page is first shown (dropped once it has been).
     measure: Option<Measure>,
@@ -707,6 +719,9 @@ const MAX_JOBS: usize = 1_000_000;
 struct Jobs {
     promise: RefCell<std::collections::VecDeque<boa_engine::job::PromiseJob>>,
     generic: RefCell<std::collections::VecDeque<boa_engine::job::GenericJob>>,
+    /// Module loading. Brickle's module loader always answers at once
+    /// (see [`Modules`]), so each runs to its end in one go.
+    asyncs: RefCell<std::collections::VecDeque<boa_engine::job::NativeAsyncJob>>,
 }
 
 impl boa_engine::job::JobExecutor for Jobs {
@@ -714,6 +729,7 @@ impl boa_engine::job::JobExecutor for Jobs {
         match job {
             boa_engine::job::Job::PromiseJob(p) => self.promise.borrow_mut().push_back(p),
             boa_engine::job::Job::GenericJob(g) => self.generic.borrow_mut().push_back(g),
+            boa_engine::job::Job::AsyncJob(a) => self.asyncs.borrow_mut().push_back(a),
             _ => {}
         }
     }
@@ -729,9 +745,18 @@ impl boa_engine::job::JobExecutor for Jobs {
                 continue;
             }
             let next = self.generic.borrow_mut().pop_front();
+            if let Some(job) = next {
+                let _ = job.call(context);
+                continue;
+            }
+            let next = self.asyncs.borrow_mut().pop_front();
             match next {
                 Some(job) => {
-                    let _ = job.call(context);
+                    let cell = RefCell::new(&mut *context);
+                    let mut fut = job.call(&cell);
+                    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                    // Never pending with Brickle's loader; if it were, it's dropped.
+                    let _ = std::pin::Pin::new(&mut fut).poll(&mut cx);
                 }
                 None => return Ok(()),
             }
@@ -739,6 +764,7 @@ impl boa_engine::job::JobExecutor for Jobs {
         // Out of time (or callbacks): the rest never run.
         self.promise.borrow_mut().clear();
         self.generic.borrow_mut().clear();
+        self.asyncs.borrow_mut().clear();
         Ok(())
     }
 }
@@ -1612,6 +1638,9 @@ pub struct ClickResult {
 pub struct Runtime {
     // Declared before `ctx` so these handles are dropped first.
     internals: Internals,
+    modules: Rc<Modules>,
+    /// Inline module scripts' modules, by element.
+    inline_modules: std::collections::HashMap<u32, boa_engine::Module>,
     ctx: Context,
     // Declared last, so it runs after the context is gone.
     _collect: CollectOnDrop,
@@ -1646,9 +1675,11 @@ impl Runtime {
                 ..State::default()
             }
         });
+        let modules = Rc::new(Modules::default());
         let mut ctx = Context::builder()
             .host_hooks(Rc::new(Hooks))
             .job_executor(Rc::new(Jobs::default()))
+            .module_loader(modules.clone())
             .build()
             .map_err(|e| format!("can't start JavaScript: {e}"))?;
         {
@@ -1700,6 +1731,8 @@ impl Runtime {
         };
         let mut rt = Runtime {
             internals,
+            modules,
+            inline_modules: Default::default(),
             ctx,
             _collect: CollectOnDrop,
         };
@@ -1929,8 +1962,9 @@ impl Runtime {
         with(|s| s.navigate.take())
     }
 
-    /// Script elements scripts inserted since last asked: (id, src, inline code).
-    pub fn take_pending_scripts(&mut self) -> Vec<(u32, Option<String>, String)> {
+    /// Script elements scripts inserted since last asked: (id, src, inline
+    /// code, whether it's a module).
+    pub fn take_pending_scripts(&mut self) -> Vec<(u32, Option<String>, String, bool)> {
         with(|s| {
             let pending = std::mem::take(&mut s.pending_scripts);
             let base = doc_base(s);
@@ -1938,7 +1972,46 @@ impl Runtime {
                 .into_iter()
                 .filter_map(|id| {
                     let e = s.dom.element(id)?;
-                    if !is_classic_script(e) {
+                    let module = is_module_script(e);
+                    if !is_classic_script(e) && !module {
+                        return None;
+                    }
+                    let src = e.attrs.get("src").map(|src| crate::net::resolve(&base, src));
+                    let mut code = String::new();
+                    s.dom.text_content(id, &mut code);
+                    Some((id, src, code, module))
+                })
+                .collect()
+        })
+    }
+
+    /// Module scripts in the document, in order: (id, src, inline code).
+    pub fn document_modules(&self) -> Vec<(u32, Option<String>, String)> {
+        self.scripts_where(is_module_script)
+    }
+
+    /// Import maps in the document: (id, the map).
+    pub fn import_maps(&self) -> Vec<(u32, String)> {
+        self.scripts_where(|e| {
+            e.attrs
+                .get("type")
+                .is_some_and(|t| t.trim().eq_ignore_ascii_case("importmap"))
+        })
+        .into_iter()
+        .filter(|(_, src, _)| src.is_none())
+        .map(|(id, _, code)| (id, code))
+        .collect()
+    }
+
+    fn scripts_where(&self, want: fn(&ElementData) -> bool) -> Vec<(u32, Option<String>, String)> {
+        with(|s| {
+            let mut all = Vec::new();
+            s.dom.descendants(DOCUMENT, &mut all);
+            let base = doc_base(s);
+            all.into_iter()
+                .filter_map(|id| {
+                    let e = s.dom.element(id)?;
+                    if e.tag != "script" || !want(e) {
                         return None;
                     }
                     let src = e.attrs.get("src").map(|src| crate::net::resolve(&base, src));
@@ -1948,6 +2021,127 @@ impl Runtime {
                 })
                 .collect()
         })
+    }
+
+    /// Use an import map (the policy allowed it).
+    pub fn add_import_map(&mut self, json: &str) {
+        with(|s| {
+            let base = doc_base(s);
+            s.import_map.add(json, &base);
+        });
+    }
+
+    /// Whether module `url` has been fetched (or failed).
+    pub fn has_module(&self, url: &str) -> bool {
+        with(|s| s.module_sources.contains_key(url))
+    }
+
+    /// A module file the page fetched for `url`, or why it couldn't. Returns
+    /// the addresses of literal `import("…")`s in it not fetched yet.
+    pub fn add_module_source(&mut self, url: &str, code: Result<String, String>) -> Vec<String> {
+        with(|s| {
+            let lazy = match &code {
+                Ok(c) => literal_dynamic_imports(c),
+                Err(_) => vec![],
+            };
+            s.module_sources.insert(url.to_string(), code);
+            lazy.iter()
+                .filter_map(|spec| module_address(s, spec, url))
+                .filter(|u| !s.module_sources.contains_key(u))
+                .collect()
+        })
+    }
+
+    /// Literal `import("…")`s in an inline module, as addresses.
+    pub fn inline_dynamic_imports(&self, code: &str) -> Vec<String> {
+        with(|s| {
+            let base = doc_base(s);
+            literal_dynamic_imports(code)
+                .iter()
+                .filter_map(|spec| module_address(s, spec, &base))
+                .filter(|u| !s.module_sources.contains_key(u))
+                .collect()
+        })
+    }
+
+    /// The module for script `id` (inline `code`) or at `url`.
+    fn root_module(&mut self, id: u32, url: Option<&str>, code: &str) -> JsResult<boa_engine::Module> {
+        match url {
+            Some(u) => self.modules.module(u, &mut self.ctx),
+            None => {
+                if let Some(m) = self.inline_modules.get(&id) {
+                    return Ok(m.clone());
+                }
+                let m = boa_engine::Module::parse(Source::from_bytes(code), None, &mut self.ctx)?;
+                let base = with(doc_base);
+                self.modules.url_of.borrow_mut().insert(m.clone(), base);
+                self.inline_modules.insert(id, m.clone());
+                Ok(m)
+            }
+        }
+    }
+
+    /// Load the module for script `id` (or at `url`) and everything it
+    /// imports, from what's been fetched. `Ok(vec![])` when it's all
+    /// there; else the addresses still to fetch.
+    pub fn prepare_module(&mut self, id: u32, url: Option<&str>, code: &str) -> Result<Vec<String>, String> {
+        with(|s| s.module_missing.clear());
+        let m = self.root_module(id, url, code).map_err(|e| e.to_string())?;
+        let p = m.load(&mut self.ctx);
+        let _ = self.ctx.run_jobs();
+        let missing: Vec<String> = with(|s| std::mem::take(&mut s.module_missing))
+            .into_iter()
+            .map(|(u, _)| u)
+            .collect();
+        match p.state() {
+            boa_engine::builtins::promise::PromiseState::Fulfilled(_) => Ok(vec![]),
+            _ if !missing.is_empty() => Ok(missing),
+            boa_engine::builtins::promise::PromiseState::Rejected(e) => Err(e
+                .to_string(&mut self.ctx)
+                .map_or("error".into(), |s| s.to_std_string_escaped())),
+            boa_engine::builtins::promise::PromiseState::Pending => Err("didn't finish loading".into()),
+        }
+    }
+
+    /// Run the module for script `id` (or at `url`), loaded by
+    /// [`Runtime::prepare_module`]. Errors go to the console.
+    pub fn run_module(&mut self, id: u32, url: Option<&str>, code: &str) {
+        let name = url.unwrap_or("inline module").to_string();
+        let m = match self.root_module(id, url, code) {
+            Ok(m) => m,
+            Err(e) => {
+                with(|s| push_console(s, format!("[error] {name}: {e}")));
+                return;
+            }
+        };
+        if let Err(e) = m.link(&mut self.ctx) {
+            with(|s| push_console(s, format!("[error] {name}: {e}")));
+            return;
+        }
+        // Imports from now on are asked for by running code.
+        with(|s| s.modules_running = true);
+        let f = self.internals.run_script.clone();
+        self.call(&f, &[JsValue::undefined(), (-1).into()]);
+        let r = m.evaluate(&mut self.ctx);
+        let _ = self.ctx.run_jobs();
+        let failed = match r {
+            Err(e) => Some(e.to_string()),
+            Ok(p) => match p.state() {
+                boa_engine::builtins::promise::PromiseState::Rejected(e) => Some(
+                    e.to_string(&mut self.ctx)
+                        .map_or("error".into(), |s| s.to_std_string_escaped()),
+                ),
+                _ => None,
+            },
+        };
+        if let Some(msg) = failed {
+            with(|s| push_console(s, format!("[error] {name}: {msg}")));
+        }
+    }
+
+    /// Write a line to the page's console.
+    pub fn note(&mut self, line: &str) {
+        with(|s| push_console(s, line.to_string()));
     }
 
     /// Hold the page's scripts to this policy.
@@ -2016,9 +2210,12 @@ impl Runtime {
     }
 }
 
-/// Classic JavaScript: no `type`, or a JavaScript MIME type. Modules aren't
-/// supported yet, so `nomodule` fallbacks run, as in older browsers.
+/// Classic JavaScript: no `type`, or a JavaScript MIME type. `nomodule`
+/// ones are fallbacks for browsers without modules, so they don't run.
 fn is_classic_script(e: &ElementData) -> bool {
+    if e.attrs.contains_key("nomodule") {
+        return false;
+    }
     match e.attrs.get("type").map(|t| t.trim().to_ascii_lowercase()) {
         None => true,
         Some(t) => matches!(
@@ -2028,6 +2225,195 @@ fn is_classic_script(e: &ElementData) -> bool {
                 | "application/x-javascript"
                 | "text/ecmascript"
         ),
+    }
+}
+
+/// `<script type=module>`.
+fn is_module_script(e: &ElementData) -> bool {
+    e.attrs
+        .get("type")
+        .is_some_and(|t| t.trim().eq_ignore_ascii_case("module"))
+}
+
+/// Most module files one page may load.
+pub const MAX_MODULES: usize = 96;
+/// Rounds of fetching a module's imports (each goes a level deeper).
+pub const MAX_MODULE_ROUNDS: usize = 24;
+
+/// `<script type=importmap>`: bare names (`"react"`) and address prefixes
+/// (`"lib/"`) mapped to addresses, for the page and for scripts under a
+/// scope.
+#[derive(Debug, Default, Clone)]
+struct ImportMap {
+    imports: Vec<(String, String)>,
+    scopes: Vec<(String, Vec<(String, String)>)>,
+}
+
+impl ImportMap {
+    /// Add a map's entries (the first map to name something wins, as when
+    /// browsers merge them). Addresses are resolved against `base`.
+    fn add(&mut self, json: &str, base: &str) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+            return;
+        };
+        let entries = |o: &serde_json::Value, base: &str| -> Vec<(String, String)> {
+            o.as_object()
+                .map(|m| {
+                    m.iter()
+                        .take(1000)
+                        .filter_map(|(k, v)| Some((k.clone(), crate::net::resolve(base, v.as_str()?))))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        for (k, v) in entries(&v["imports"], base) {
+            if !self.imports.iter().any(|(e, _)| *e == k) && self.imports.len() < 1000 {
+                self.imports.push((k, v));
+            }
+        }
+        if let Some(scopes) = v["scopes"].as_object() {
+            for (scope, m) in scopes.iter().take(100) {
+                let scope = crate::net::resolve(base, scope);
+                self.scopes.push((scope, entries(m, base)));
+            }
+        }
+    }
+
+    /// Where `spec` (already resolved, if it was an address) points, from
+    /// a module at `referrer`: the longest matching key wins, in the
+    /// narrowest scope that has one.
+    fn map(&self, spec: &str, referrer: &str) -> Option<String> {
+        let lookup = |list: &[(String, String)]| -> Option<String> {
+            list.iter()
+                .filter(|(k, _)| *k == spec || (k.ends_with('/') && spec.starts_with(k.as_str())))
+                .max_by_key(|(k, _)| k.len())
+                .map(|(k, v)| format!("{v}{}", &spec[k.len()..]))
+        };
+        let mut scopes: Vec<&(String, Vec<(String, String)>)> = self
+            .scopes
+            .iter()
+            .filter(|(s, _)| referrer.starts_with(s.as_str()))
+            .collect();
+        scopes.sort_by_key(|(s, _)| std::cmp::Reverse(s.len()));
+        scopes
+            .into_iter()
+            .find_map(|(_, list)| lookup(list))
+            .or_else(|| lookup(&self.imports))
+    }
+}
+
+/// The address an `import` of `spec` from `referrer` means: through the
+/// import map, else relative (`./`, `../`, `/`) or a full address. Bare
+/// names nothing maps are errors, as in browsers.
+fn module_address(s: &State, spec: &str, referrer: &str) -> Option<String> {
+    let relative = spec.starts_with("./") || spec.starts_with("../") || spec.starts_with('/');
+    let full = url::Url::parse(spec).is_ok();
+    let key = if relative {
+        crate::net::resolve(referrer, spec)
+    } else {
+        spec.to_string()
+    };
+    if let Some(mapped) = s.import_map.map(&key, referrer) {
+        return Some(mapped);
+    }
+    (relative || full)
+        .then_some(key)
+        .filter(|u| matches!(crate::net::scheme(u).as_str(), "http" | "https"))
+}
+
+/// Literal `import("…")` calls in module code: bundlers write lazy
+/// chunks this way, so they're fetched with the rest (as dynamic imports)
+/// and are ready when the code asks.
+fn literal_dynamic_imports(code: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = code;
+    while let Some(i) = rest.find("import(") {
+        let before = rest[..i].chars().next_back();
+        rest = &rest[i + 7..];
+        if before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$' || c == '.') {
+            continue;
+        }
+        let t = rest.trim_start();
+        let Some(q) = t.chars().next().filter(|c| matches!(c, '"' | '\'' | '`')) else {
+            continue;
+        };
+        let Some(end) = t[1..].find(q) else { continue };
+        let spec = &t[1..1 + end];
+        if !spec.contains(['\n', '$', '\\']) && out.len() < 64 {
+            out.push(spec.to_string());
+        }
+    }
+    out
+}
+
+/// Brickle's module loader: imports are answered from the files the page
+/// fetched ahead (through the browser, see `Page`), never from the network
+/// directly. One not fetched yet is noted for the page to fetch, and the
+/// import fails this time.
+#[derive(Default)]
+struct Modules {
+    by_url: RefCell<std::collections::HashMap<String, boa_engine::Module>>,
+    url_of: RefCell<std::collections::HashMap<boa_engine::Module, String>>,
+}
+
+impl Modules {
+    fn module(&self, url: &str, context: &mut Context) -> JsResult<boa_engine::Module> {
+        if let Some(m) = self.by_url.borrow().get(url) {
+            return Ok(m.clone());
+        }
+        let src = with(|s| s.module_sources.get(url).cloned());
+        match src {
+            Some(Ok(code)) => {
+                let m = boa_engine::Module::parse(Source::from_bytes(&code), None, context)?;
+                self.by_url.borrow_mut().insert(url.to_string(), m.clone());
+                self.url_of.borrow_mut().insert(m.clone(), url.to_string());
+                Ok(m)
+            }
+            Some(Err(e)) => Err(type_error(&format!("couldn't load module {url}: {e}"))),
+            None => {
+                with(|s| {
+                    let dynamic = s.modules_running;
+                    if !s.module_missing.iter().any(|(u, _)| u == url) {
+                        s.module_missing.push((url.to_string(), dynamic));
+                    }
+                });
+                Err(type_error(&format!("module {url} isn't loaded")))
+            }
+        }
+    }
+}
+
+impl boa_engine::module::ModuleLoader for Modules {
+    fn load_imported_module(
+        self: Rc<Self>,
+        referrer: boa_engine::module::Referrer,
+        request: boa_engine::module::ModuleRequest,
+        context: &RefCell<&mut Context>,
+    ) -> impl std::future::Future<Output = JsResult<boa_engine::Module>> {
+        let spec = request.specifier().to_std_string_escaped();
+        let from = match &referrer {
+            boa_engine::module::Referrer::Module(m) => self.url_of.borrow().get(m).cloned(),
+            _ => None,
+        };
+        let result = with(|s| {
+            let from = from.unwrap_or_else(|| doc_base(s));
+            module_address(s, &spec, &from)
+        })
+        .ok_or_else(|| type_error(&format!("can't resolve module specifier {spec:?}")))
+        .and_then(|url| self.module(&url, &mut context.borrow_mut()));
+        std::future::ready(result)
+    }
+
+    /// `import.meta.url`: the module's address.
+    fn init_import_meta(
+        self: Rc<Self>,
+        import_meta: &JsObject,
+        module: &boa_engine::Module,
+        context: &mut Context,
+    ) {
+        if let Some(url) = self.url_of.borrow().get(module) {
+            let _ = import_meta.set(js_string!("url"), js_string!(url.as_str()), false, context);
+        }
     }
 }
 

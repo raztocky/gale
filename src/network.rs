@@ -671,7 +671,9 @@ impl Network {
             }
             Dest::Script => {
                 self.page_scripts += 1;
-                (self.page_scripts > crate::js::MAX_SCRIPTS).then_some("too many scripts")
+                // Classic scripts and module files, each also limited by the renderer.
+                (self.page_scripts > crate::js::MAX_SCRIPTS + crate::js::MAX_MODULES)
+                    .then_some("too many scripts")
             }
             _ => {
                 self.record(url, dest, Outcome::NotAllowed, vec![]);

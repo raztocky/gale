@@ -468,14 +468,30 @@ impl Page {
         rt.set_deadline(Some(until));
         let mut loader = ScriptLoader {
             fetched: 0,
+            modules: 0,
             until,
             from_server: &from_server,
         };
+        // Import maps first (inline only, as the policy allows).
+        for (id, map) in rt.import_maps() {
+            if rt.script_allowed(id, None, &map, true) {
+                rt.add_import_map(&map);
+            }
+        }
         for (id, src, code) in rt.document_scripts() {
             if Instant::now() >= until {
                 break;
             }
             loader.run(&mut rt, id, src, code, host, true);
+            loader.run_pending(&mut rt, host);
+            pump(&mut rt, host, until);
+        }
+        // Modules wait for the document, as `defer` scripts do.
+        for (id, src, code) in rt.document_modules() {
+            if Instant::now() >= until {
+                break;
+            }
+            loader.run_module(&mut rt, id, src, code, host, true);
             loader.run_pending(&mut rt, host);
             pump(&mut rt, host, until);
         }
@@ -2040,6 +2056,8 @@ fn refresh_url(content: &str) -> Option<String> {
 /// Runs scripts while a page loads, fetching external ones from the browser.
 struct ScriptLoader<'a> {
     fetched: usize,
+    /// Module files fetched.
+    modules: usize,
     until: Instant,
     /// See [`Page::files`]: scripts not in it were added by scripts.
     from_server: &'a HashSet<String>,
@@ -2084,6 +2102,116 @@ impl ScriptLoader<'_> {
         rt.run_script(&code, id, &name);
     }
 
+    /// A module script: it and everything it imports are fetched through
+    /// the browser, a level of imports at a time, then it runs. Imports
+    /// written in the files load like the page's own scripts; `import()`s
+    /// in them are fetched too (literal ones), but as requests made by a
+    /// script, which the browser keeps to the page's site unless you allowed
+    /// more.
+    fn run_module(
+        &mut self,
+        rt: &mut Runtime,
+        id: u32,
+        src: Option<String>,
+        code: String,
+        host: &mut dyn Host,
+        parser_inserted: bool,
+    ) {
+        if !rt.script_allowed(id, src.as_deref(), &code, parser_inserted) {
+            return;
+        }
+        let csp = rt.script_sources(id, parser_inserted);
+        // A module from the document's own files, and the files it
+        // imports, load like the page's scripts; one a script added keeps
+        // that status for its imports.
+        let root_added = match &src {
+            Some(u) => !self.from_server.contains(u),
+            None => !parser_inserted,
+        };
+        // (address, asked for by `import()`)
+        let mut want: Vec<(String, bool)> = Vec::new();
+        match &src {
+            Some(url) => {
+                if !rt.has_module(url) {
+                    let Some(code) = self.fetch_module(rt, url, root_added, &csp, host) else {
+                        return;
+                    };
+                    if !rt.integrity_ok(id, url, &code) {
+                        return;
+                    }
+                    want.extend(rt.add_module_source(url, Ok(code)).into_iter().map(|u| (u, true)));
+                }
+            }
+            None => want.extend(rt.inline_dynamic_imports(&code).into_iter().map(|u| (u, true))),
+        }
+        // Lazy chunks are loaded (with their imports) ahead too.
+        let mut lazy: Vec<String> = Vec::new();
+        let mut ready = false;
+        for _ in 0..js::MAX_MODULE_ROUNDS {
+            for (url, dynamic) in std::mem::take(&mut want) {
+                if rt.has_module(&url) || Instant::now() >= self.until {
+                    continue;
+                }
+                let added = dynamic || root_added;
+                let got = self
+                    .fetch_module(rt, &url, added, &csp, host)
+                    .ok_or_else(|| "not loaded".to_string());
+                if got.is_ok() && dynamic {
+                    lazy.push(url.clone());
+                }
+                want.extend(rt.add_module_source(&url, got).into_iter().map(|u| (u, true)));
+            }
+            match rt.prepare_module(id, src.as_deref(), &code) {
+                Ok(missing) => {
+                    ready = missing.is_empty();
+                    want.extend(missing.into_iter().map(|u| (u, false)));
+                }
+                Err(e) => {
+                    rt.note(&format!(
+                        "[error] {}: {e}",
+                        src.as_deref().unwrap_or("inline module")
+                    ));
+                    return;
+                }
+            }
+            for url in &lazy {
+                if let Ok(missing) = rt.prepare_module(0, Some(url), "") {
+                    want.extend(missing.into_iter().map(|u| (u, false)));
+                }
+            }
+            want.retain(|(u, _)| !rt.has_module(u));
+            want.dedup();
+            if want.is_empty() || Instant::now() >= self.until {
+                break;
+            }
+        }
+        if ready {
+            rt.run_module(id, src.as_deref(), &code);
+        } else {
+            rt.note(&format!(
+                "[error] {}: its imports didn't all load",
+                src.as_deref().unwrap_or("inline module")
+            ));
+        }
+    }
+
+    /// One module file through the browser, within the page's limit.
+    fn fetch_module(
+        &mut self,
+        rt: &mut Runtime,
+        url: &str,
+        added: bool,
+        csp: &[Vec<String>],
+        host: &mut dyn Host,
+    ) -> Option<String> {
+        if self.modules >= js::MAX_MODULES {
+            rt.note(&format!("[brickle] too many modules, skipped {url}"));
+            return None;
+        }
+        self.modules += 1;
+        host.fetch_script(url, added, csp).ok() // failures are in the request log
+    }
+
     /// Scripts that scripts added to the document.
     fn run_pending(&mut self, rt: &mut Runtime, host: &mut dyn Host) {
         for _ in 0..64 {
@@ -2091,8 +2219,12 @@ impl ScriptLoader<'_> {
             if pending.is_empty() || Instant::now() >= self.until {
                 return;
             }
-            for (id, src, code) in pending {
-                self.run(rt, id, src, code, host, false);
+            for (id, src, code, module) in pending {
+                if module {
+                    self.run_module(rt, id, src, code, host, false);
+                } else {
+                    self.run(rt, id, src, code, host, false);
+                }
             }
         }
     }
@@ -3831,5 +3963,117 @@ fn strip_inline_styles(node: &mut Node, policy: &crate::csp::Csp) {
     }
     for child in &mut node.children {
         strip_inline_styles(child, policy);
+    }
+}
+
+#[cfg(test)]
+mod module_tests {
+    use super::*;
+
+    /// Serves module files from a list, recording each fetch and whether
+    /// it was asked for as one a script added.
+    struct Files {
+        files: Vec<(&'static str, &'static str)>,
+        fetched: Vec<(String, bool)>,
+    }
+
+    impl Host for Files {
+        fn fetch(&mut self, url: &str, _: Dest) -> Result<String, String> {
+            self.fetch_script(url, false, &[])
+        }
+        fn fetch_script(&mut self, url: &str, added: bool, _: &[Vec<String>]) -> Result<String, String> {
+            self.fetched.push((url.to_string(), added));
+            self.files
+                .iter()
+                .find(|(u, _)| *u == url)
+                .map(|(_, c)| c.to_string())
+                .ok_or_else(|| format!("404 {url}"))
+        }
+        fn request(&mut self, _: &str, _: ScriptRequest) -> Result<ScriptResponse, String> {
+            Err("no network".into())
+        }
+        fn set_cookie(&mut self, _: &str) {}
+        fn cookies(&mut self) -> String {
+            String::new()
+        }
+    }
+
+    fn load(html: &str, files: Vec<(&'static str, &'static str)>) -> (Page, Files, Vec<String>) {
+        let mut host = Files {
+            files,
+            fetched: vec![],
+        };
+        let (page, _rt, out) = Page::load_with_scripts(
+            "https://site.example/app/",
+            html,
+            "",
+            (800.0, 600.0),
+            &[],
+            &mut host,
+        );
+        (page, host, out.console)
+    }
+
+    #[test]
+    fn modules_import_through_the_browser() {
+        let (page, host, console) = load(
+            "<script type=importmap>{\"imports\": {\"lib\": \"/js/lib.js\", \"pkg/\": \"https://cdn.example/pkg/\"}}</script>\
+             <p id=o>start</p>\
+             <script nomodule>document.getElementById('o').textContent += ' LEGACY'</script>\
+             <script type=module src=main.js></script>\
+             <script>document.getElementById('o').textContent += ' classic'</script>\
+             <script type=module>import { name } from 'lib'; document.getElementById('o').textContent += ' inline-' + name;\
+               document.getElementById('o').textContent += ' ' + (document.currentScript === null)</script>",
+            vec![
+                (
+                    "https://site.example/app/main.js",
+                    "import { name } from 'lib'; import { v } from './util.js'; import * as p from 'pkg/p.js';\
+                     const o = document.getElementById('o'); o.textContent += ' main-' + name + v + p.x;\
+                     import('./lazy.js').then((m) => { o.textContent += ' ' + m.lazy; });\
+                     import('https://other.example/x.js').catch(() => { o.textContent += ' blocked'; });",
+                ),
+                ("https://site.example/js/lib.js", "export const name = 'lib';"),
+                ("https://site.example/app/util.js", "import { name } from 'lib'; export const v = '-' + name.length;"),
+                ("https://cdn.example/pkg/p.js", "export const x = '-p'; if (!import.meta.url.endsWith('/pkg/p.js')) throw 'meta';"),
+                ("https://site.example/app/lazy.js", "import { v } from './util.js'; export const lazy = 'lazy' + v;"),
+            ],
+        );
+        let text = page.dom.text_content();
+        // Classic scripts first, then modules in order (each one's promise
+        // callbacks before the next); nomodule never runs; a module shared
+        // by two importers is fetched once.
+        assert!(
+            text.contains("start classic main-lib-3-p lazy-3 blocked inline-lib true"),
+            "{text}\n{console:?}"
+        );
+        let count = |u: &str| host.fetched.iter().filter(|(f, _)| f.ends_with(u)).count();
+        assert_eq!(count("util.js"), 1, "{:?}", host.fetched);
+        // Static imports load like the page's scripts; `import()` ones as
+        // a script's (kept to the page's site unless you allowed more).
+        let added = |u: &str| host.fetched.iter().find(|(f, _)| f.ends_with(u)).map(|(_, a)| *a);
+        assert_eq!(added("/js/lib.js"), Some(false));
+        assert_eq!(added("pkg/p.js"), Some(false));
+        assert_eq!(added("lazy.js"), Some(true));
+        assert_eq!(added("other.example/x.js"), Some(true));
+        assert!(text.contains("blocked"), "{text}");
+    }
+
+    #[test]
+    fn broken_module_graphs_report_and_stop() {
+        let (page, _, console) = load(
+            "<p id=o>start</p><script type=module>import 'react'; document.getElementById('o').textContent += ' RAN'</script>\
+             <script type=module src=/bad.js></script>\
+             <script type=module>import './missing.js'; document.getElementById('o').textContent += ' RAN2'</script>",
+            vec![("https://site.example/bad.js", "export const = ;")],
+        );
+        let text = page.dom.text_content();
+        assert_eq!(text.split("import").next(), Some("start"), "{text}");
+        let all = console.join("\n");
+        assert!(all.contains("react"), "{all}");
+        assert!(all.contains("bad.js"), "{all}");
+        assert!(
+            all.contains("missing.js") || all.contains("didn't all load"),
+            "{all}"
+        );
     }
 }

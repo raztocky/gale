@@ -48,6 +48,7 @@ const OPS: &[&str] = &[
     "setTimeout(() => pick().remove(), r())",
     "setInterval(() => pick().appendChild(pick()), 1)",
     "requestAnimationFrame(() => pick().textContent = 'raf')",
+    "import(['./m.js', 'bare', 'https://x.example/a.js', ':bad', ''][r()%5]).catch(() => {})",
     "document.write('<em>w</em>')",
     "document.title = 'T' + r()",
     "pick().getBoundingClientRect()",
