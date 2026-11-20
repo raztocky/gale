@@ -103,7 +103,35 @@ pub struct Dom {
     pub version: u64,
     /// Scripts' `setCustomValidity()` messages, by form field.
     pub custom_validity: std::collections::HashMap<u32, String>,
+    /// Whether changes are written down for `MutationObserver`s (only
+    /// while a script observes something, and only for scripts' changes).
+    recording: bool,
+    mutations: Vec<Mutation>,
 }
+
+/// One change, as a `MutationRecord` describes it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Mutation {
+    pub kind: MutationKind,
+    pub target: u32,
+    pub added: Vec<u32>,
+    pub removed: Vec<u32>,
+    pub prev: Option<u32>,
+    pub next: Option<u32>,
+    pub name: Option<String>,
+    pub old: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MutationKind {
+    ChildList,
+    Attributes,
+    CharacterData,
+}
+
+/// Changes kept between deliveries; a script changing more than this
+/// before its observers run loses the rest (the DOM itself is still right).
+const MAX_MUTATIONS: usize = 10_000;
 
 const DOCUMENT: u32 = 0;
 const FRAGMENT_TAG: &str = "#fragment";
@@ -119,8 +147,7 @@ impl Dom {
                     attrs: AttrMap::new(),
                 }),
             }],
-            version: 0,
-            custom_validity: std::collections::HashMap::new(),
+            ..Dom::default()
         };
         let id = d.import(root);
         d.append(DOCUMENT, id);
@@ -162,17 +189,95 @@ impl Dom {
     /// Set an attribute (lower-case name) on an element.
     pub fn set_attr(&mut self, id: u32, name: &str, value: &str) {
         if let Some(e) = self.element_mut(id) {
-            e.attrs.insert(name.to_string(), value.to_string());
+            let old = e.attrs.insert(name.to_string(), value.to_string());
             self.version += 1;
+            self.note_attr(id, name, old);
         }
     }
 
     pub fn remove_attr(&mut self, id: u32, name: &str) {
         if let Some(e) = self.element_mut(id) {
-            if e.attrs.remove(name).is_some() {
+            if let Some(old) = e.attrs.remove(name) {
                 self.version += 1;
+                self.note_attr(id, name, Some(old));
             }
         }
+    }
+
+    /// Start or stop writing changes down. Stopping forgets any not taken.
+    pub fn record_mutations(&mut self, on: bool) {
+        self.recording = on;
+        if !on {
+            self.mutations.clear();
+        }
+    }
+
+    pub fn recording(&self) -> bool {
+        self.recording
+    }
+
+    /// The changes written down since the last call.
+    pub fn take_mutations(&mut self) -> Vec<Mutation> {
+        std::mem::take(&mut self.mutations)
+    }
+
+    fn note(&mut self, m: Mutation) {
+        if self.recording && self.mutations.len() < MAX_MUTATIONS {
+            self.mutations.push(m);
+        }
+    }
+
+    fn note_attr(&mut self, id: u32, name: &str, old: Option<String>) {
+        if self.recording {
+            self.note(Mutation {
+                kind: MutationKind::Attributes,
+                target: id,
+                added: vec![],
+                removed: vec![],
+                prev: None,
+                next: None,
+                name: Some(name.to_string()),
+                old,
+            });
+        }
+    }
+
+    fn note_children(
+        &mut self,
+        parent: u32,
+        added: Vec<u32>,
+        removed: Vec<u32>,
+        prev: Option<u32>,
+        next: Option<u32>,
+    ) {
+        if self.recording && (!added.is_empty() || !removed.is_empty()) {
+            self.note(Mutation {
+                kind: MutationKind::ChildList,
+                target: parent,
+                added,
+                removed,
+                prev,
+                next,
+                name: None,
+                old: None,
+            });
+        }
+    }
+
+    /// The siblings either side of the child at `pos`.
+    fn siblings_at(&self, parent: u32, pos: usize, len: usize) -> (Option<u32>, Option<u32>) {
+        let c = &self.nodes[parent as usize].children;
+        let prev = pos.checked_sub(1).and_then(|i| c.get(i)).copied();
+        (prev, c.get(pos + len).copied())
+    }
+
+    /// Remove every child quietly; returns them.
+    fn clear_children(&mut self, parent: u32) -> Vec<u32> {
+        let old = std::mem::take(&mut self.nodes[parent as usize].children);
+        for &c in &old {
+            self.nodes[c as usize].parent = None;
+        }
+        old
     }
 
     pub fn element(&self, id: u32) -> Option<&ElementData> {
@@ -219,7 +324,13 @@ impl Dom {
 
     fn detach(&mut self, id: u32) {
         if let Some(p) = self.nodes[id as usize].parent.take() {
-            self.nodes[p as usize].children.retain(|&c| c != id);
+            let pos = self.nodes[p as usize].children.iter().position(|&c| c == id);
+            if let Some(pos) = pos {
+                let (prev, _) = self.siblings_at(p, pos, 1);
+                self.nodes[p as usize].children.remove(pos);
+                let next = self.nodes[p as usize].children.get(pos).copied();
+                self.note_children(p, vec![], vec![id], prev, next);
+            }
             self.version += 1;
         }
     }
@@ -261,6 +372,10 @@ impl Dom {
             };
             self.nodes[m as usize].parent = Some(parent);
             self.nodes[parent as usize].children.insert(pos, m);
+            if self.recording {
+                let (prev, next) = self.siblings_at(parent, pos, 1);
+                self.note_children(parent, vec![m], vec![], prev, next);
+            }
         }
         self.version += 1;
         Ok(())
@@ -288,17 +403,30 @@ impl Dom {
 
     pub fn set_text_content(&mut self, id: u32, s: String) -> Result<(), &'static str> {
         if let NodeType::Text(t) | NodeType::Comment(t) = &mut self.nodes[id as usize].data {
-            *t = s;
+            let old = std::mem::replace(t, s);
             self.version += 1;
+            if self.recording {
+                self.note(Mutation {
+                    kind: MutationKind::CharacterData,
+                    target: id,
+                    added: vec![],
+                    removed: vec![],
+                    prev: None,
+                    next: None,
+                    name: None,
+                    old: Some(old),
+                });
+            }
             return Ok(());
         }
-        for c in self.nodes[id as usize].children.clone() {
-            self.detach(c);
-        }
+        let removed = self.clear_children(id);
+        let mut added = vec![];
         if !s.is_empty() {
             let t = self.new_node(NodeType::Text(s))?;
-            self.insert(id, t, None)?;
+            self.append(id, t);
+            added.push(t);
         }
+        self.note_children(id, added, removed, None, None);
         self.version += 1;
         Ok(())
     }
@@ -320,17 +448,23 @@ impl Dom {
         if self.element(parent).is_none() {
             return Err("not an element");
         }
-        for c in self.nodes[parent as usize].children.clone() {
-            self.detach(c);
-        }
+        let removed = self.clear_children(parent);
+        let mut added = vec![];
+        let mut full = false;
         for n in parse_fragment(html) {
             if self.nodes.len() >= MAX_NODES {
-                return Err("too many DOM nodes");
+                full = true;
+                break;
             }
             let id = self.import(&n);
             self.append(parent, id);
+            added.push(id);
         }
+        self.note_children(parent, added, removed, None, None);
         self.version += 1;
+        if full {
+            return Err("too many DOM nodes");
+        }
         Ok(())
     }
 
@@ -492,6 +626,57 @@ struct State {
     viewport: (f32, f32),
     /// Computed styles by node, for the DOM version they were made for.
     computed: Option<(u64, ComputedMap)>,
+    /// Lays the document out for scripts that ask for sizes before the
+    /// page is first shown (dropped once it has been).
+    measure: Option<Measure>,
+    /// The DOM version the boxes were measured for.
+    measured: Option<u64>,
+    early_layouts: u32,
+}
+
+/// The boxes scripts see, and the boxes that scroll (as
+/// `Page::scroll_info` gives them).
+pub type Measured = (Vec<(u32, Rect)>, Vec<(u32, [f32; 6])>);
+/// Lays out a document.
+pub type Measure = Box<dyn FnMut(&Node) -> Measured>;
+
+/// Layouts scripts can cause before the page is first shown (each is a
+/// whole layout, so a script measuring in a loop can't take forever).
+const MAX_EARLY_LAYOUTS: u32 = 16;
+
+/// Before the page is first shown, lay it out when a script asks for a
+/// size, so it isn't told everything is 0 × 0.
+fn fresh_boxes() {
+    if check_deadline().is_err() {
+        return;
+    }
+    let job = with(|s| {
+        if s.measured == Some(s.dom.version) || s.early_layouts >= MAX_EARLY_LAYOUTS {
+            return None;
+        }
+        let m = s.measure.take()?;
+        s.early_layouts += 1;
+        s.measured = Some(s.dom.version);
+        Some((m, s.dom.to_tree()))
+    });
+    let Some((mut m, tree)) = job else { return };
+    let (boxes, scrollers) = m(&tree);
+    with(|s| {
+        s.measure = Some(m);
+        s.boxes = boxes;
+        s.scrollers = scrollers;
+        // Scrolling scripts asked for, as far as it can go.
+        for &(id, x, y) in &s.scroll_sets {
+            if let Some((_, v)) = s.scrollers.iter_mut().find(|(u, _)| *u == id) {
+                if let Some(x) = x {
+                    v[0] = x.min(v[2]).round();
+                }
+                if let Some(y) = y {
+                    v[1] = y.min(v[3]).round();
+                }
+            }
+        }
+    });
 }
 
 thread_local! {
@@ -682,6 +867,39 @@ fn n_parent(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
     Ok(with(|s| s.dom.nodes[id as usize].parent.map(|p| p as i32).unwrap_or(-1)).into())
 }
 
+fn n_record_mutations(_: &JsValue, a: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
+    let on = a.get_or_undefined(0).to_boolean();
+    with(|s| s.dom.record_mutations(on));
+    Ok(JsValue::undefined())
+}
+
+/// The changes since the last call, each as
+/// `[kind, target, added, removed, prev, next, name, old]` (-1 for none).
+fn n_take_mutations(_: &JsValue, _: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+    let list = with(|s| s.dom.take_mutations());
+    let opt_id = |n: Option<u32>| JsValue::from(n.map(|p| p as i32).unwrap_or(-1));
+    let mut out = Vec::with_capacity(list.len());
+    for m in list {
+        let kind = match m.kind {
+            MutationKind::ChildList => 0,
+            MutationKind::Attributes => 1,
+            MutationKind::CharacterData => 2,
+        };
+        let fields = [
+            JsValue::from(kind),
+            JsValue::from(m.target),
+            ids(m.added, c),
+            ids(m.removed, c),
+            opt_id(m.prev),
+            opt_id(m.next),
+            opt_str(m.name),
+            opt_str(m.old),
+        ];
+        out.push(JsValue::from(JsArray::from_iter(fields, c)));
+    }
+    Ok(JsArray::from_iter(out, c).into())
+}
+
 fn n_children(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
     let id = arg_id(a, 0, c)?;
     let list = with(|s| s.dom.nodes[id as usize].children.clone());
@@ -717,25 +935,14 @@ fn n_set_attr(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> 
     if name.is_empty() || name.chars().any(|ch| ch.is_whitespace() || "\"'>/=".contains(ch)) {
         return Err(dom_error("invalid attribute name"));
     }
-    with(|s| {
-        if let Some(e) = s.dom.element_mut(id) {
-            e.attrs.insert(name, value);
-            s.dom.version += 1;
-        }
-    });
+    with(|s| s.dom.set_attr(id, &name, &value));
     Ok(JsValue::undefined())
 }
 
 fn n_remove_attr(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
     let id = arg_id(a, 0, c)?;
     let name = arg_str(a, 1, c)?.to_ascii_lowercase();
-    with(|s| {
-        if let Some(e) = s.dom.element_mut(id) {
-            if e.attrs.remove(&name).is_some() {
-                s.dom.version += 1;
-            }
-        }
-    });
+    with(|s| s.dom.remove_attr(id, &name));
     Ok(JsValue::undefined())
 }
 
@@ -931,6 +1138,7 @@ fn computed_styles(s: &mut State) -> ComputedMap {
 fn n_computed(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
     let id = arg_id(a, 0, c)?;
     let name = arg_str(a, 1, c)?;
+    fresh_boxes();
     Ok(opt_str(with(|s| {
         let map = computed_styles(s);
         let style = map.get(&id)?;
@@ -1008,6 +1216,7 @@ fn n_computed_names(_: &JsValue, _: &[JsValue], c: &mut Context) -> JsResult<JsV
 
 fn n_rect(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
     let id = arg_id(a, 0, c)?;
+    fresh_boxes();
     let r = with(|s| s.boxes.iter().find(|(u, _)| *u == id).map(|(_, r)| *r)).unwrap_or(Rect {
         x: 0.0,
         y: 0.0,
@@ -1021,6 +1230,7 @@ fn n_rect(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
 /// it doesn't scroll.
 fn n_scroll(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
     let id = arg_id(a, 0, c)?;
+    fresh_boxes();
     Ok(
         match with(|s| s.scrollers.iter().find(|(u, _)| *u == id).map(|(_, v)| *v)) {
             Some(v) => JsArray::from_iter(v.map(|v| JsValue::from(v as f64)), c).into(),
@@ -1032,6 +1242,7 @@ fn n_scroll(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
 /// Scroll a box to (x, y); NaN leaves that coordinate as it is.
 fn n_set_scroll(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
     let id = arg_id(a, 0, c)?;
+    fresh_boxes();
     let coord = |i: usize, c: &mut Context| -> JsResult<Option<f32>> {
         let v = a.get_or_undefined(i).to_number(c)?;
         Ok(v.is_finite().then_some(v.clamp(0.0, 1e7) as f32))
@@ -1283,6 +1494,8 @@ const NATIVES: &[(&str, Native, usize)] = &[
     ("byId", n_by_id, 1),
     ("connected", n_connected, 1),
     ("rect", n_rect, 1),
+    ("recordMutations", n_record_mutations, 1),
+    ("takeMutations", n_take_mutations, 0),
     ("computed", n_computed, 2),
     ("computedNames", n_computed_names, 0),
     ("setCustomValidity", n_set_custom_validity, 2),
@@ -1583,8 +1796,16 @@ impl Runtime {
     }
 
     /// Use the page's DOM directly (forms: typed text, checkboxes).
+    /// Change the DOM as the browser (typing, pickers): not as a script,
+    /// so observers aren't told.
     pub fn with_dom<R>(&mut self, f: impl FnOnce(&mut Dom) -> R) -> R {
-        with(|s| f(&mut s.dom))
+        with(|s| {
+            let was = s.dom.recording;
+            s.dom.recording = false;
+            let r = f(&mut s.dom);
+            s.dom.recording = was;
+            r
+        })
     }
 
     /// Dispatch a plain event (`input`, `change`, `submit`, `focus`) on a
@@ -1634,8 +1855,21 @@ impl Runtime {
         });
     }
 
+    /// The boxes from a layout of the page as shown. From then on scripts
+    /// see these (laid out again after each event), not early layouts.
     pub fn set_boxes(&mut self, boxes: Vec<(u32, Rect)>) {
-        with(|s| s.boxes = boxes);
+        with(|s| {
+            s.boxes = boxes;
+            s.measure = None;
+        });
+    }
+
+    /// How to lay the page out if a script asks for sizes before it's shown.
+    pub fn set_measure(&mut self, m: Measure) {
+        with(|s| {
+            s.measure = Some(m);
+            s.measured = None;
+        });
     }
 
     pub fn set_scrollers(&mut self, scrollers: Vec<(u32, [f32; 6])>) {
@@ -1885,6 +2119,62 @@ mod tests {
             "{out}"
         );
         assert_eq!(rt.take_console(), vec!["[log] 2 true true two"]);
+    }
+
+    #[test]
+    fn mutation_observers_hear_scripts_changes() {
+        let (mut rt, _) = run(
+            "<div id=box><p id=a title=t>hi</p></div><span id=out></span>",
+            r#"
+            const box = document.getElementById('box');
+            const a = document.getElementById('a');
+            const seen = [];
+            const mo = new MutationObserver((records, o) => {
+                for (const r of records) {
+                    if (r.type === 'childList')
+                        seen.push('child:' + r.target.id + ':+' + r.addedNodes.length + '-' + r.removedNodes.length);
+                    else if (r.type === 'attributes')
+                        seen.push('attr:' + r.attributeName + ':' + r.oldValue);
+                    else seen.push('text:' + r.oldValue);
+                }
+                console.log(seen.join(' '), o === mo);
+            });
+            mo.observe(box, { childList: true, subtree: true, attributeOldValue: true, characterDataOldValue: true });
+            const b = document.createElement('b');
+            box.appendChild(b);
+            a.setAttribute('title', 'u');
+            a.firstChild.data = 'ho';
+            b.remove();
+            // Not seen: outside the box, and before observing.
+            document.getElementById('out').textContent = 'x';
+            console.log('sync', seen.length);
+            const filtered = new MutationObserver((r) => console.log('filtered', r.map((x) => x.attributeName).join()));
+            filtered.observe(a, { attributeFilter: ['class'] });
+            a.title = 'v';
+            a.className = 'c';
+            filtered.disconnect();
+            a.className = 'd';
+            "#,
+        );
+        assert_eq!(
+            rt.take_console(),
+            vec![
+                "[log] sync 0",
+                "[log] child:box:+1-0 attr:title:t text:hi child:box:+0-1 attr:title:u attr:class:null attr:class:c true",
+            ]
+        );
+    }
+
+    /// Typing and pickers aren't scripts' changes.
+    #[test]
+    fn the_browsers_own_changes_are_not_observed() {
+        let (mut rt, _) = run(
+            "<input id=f>",
+            "new MutationObserver(() => console.log('seen')).observe(document.body, { attributes: true, subtree: true });",
+        );
+        rt.with_dom(|d| d.set_attr(2, "value", "typed"));
+        rt.run_timers(Instant::now() + Duration::from_secs(1));
+        assert!(rt.take_console().is_empty());
     }
 
     #[test]

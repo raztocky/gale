@@ -1,5 +1,5 @@
-//! Date and colour pickers for `<input type=date>` and `<input type=color>`:
-//! a month calendar or a palette under the field, drawn into the page like
+//! Pickers for date, time, month, week and colour fields: a month
+//! calendar, a clock, a year of months or a palette under the field, drawn into the page like
 //! a select's options. Their cells have no node in the document, so they
 //! get uids from a range no document reaches ([`BASE`]); a click on one is
 //! handled here and never reaches the page's scripts.
@@ -13,6 +13,11 @@ const PREV: u32 = BASE + 100;
 const NEXT: u32 = BASE + 101;
 const TODAY: u32 = BASE + 102;
 const CLEAR: u32 = BASE + 103;
+/// Month `m` (1-12) of a month picker is `MONTH_CELL + m`.
+const MONTH_CELL: u32 = BASE + 200;
+/// Hour `h` of a clock is `HOUR + h`; minute `5i` is `MINUTE + i`.
+const HOUR: u32 = BASE + 300;
+const MINUTE: u32 = BASE + 400;
 /// Day `d` of the shown month is `BASE + d`; swatch `i` is `SWATCH + i`.
 const SWATCH: u32 = BASE + 1000;
 
@@ -48,6 +53,21 @@ const MONTHS: [&str; 12] = [
 /// A year, month (1-12) and day.
 pub type Date = (i32, u32, u32);
 
+/// The fields with a calendar or clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// `yyyy-mm-dd`
+    Date,
+    /// `hh:mm` (with seconds if given)
+    Time,
+    /// `yyyy-mm-ddThh:mm` (`datetime-local`)
+    DateTime,
+    /// `yyyy-mm`
+    Month,
+    /// `yyyy-Www` (ISO weeks, Monday first)
+    Week,
+}
+
 fn input_type(e: &dom::ElementData) -> Option<String> {
     (e.tag == "input").then(|| {
         e.attrs
@@ -57,8 +77,20 @@ fn input_type(e: &dom::ElementData) -> Option<String> {
     })
 }
 
+pub fn kind(e: &dom::ElementData) -> Option<Kind> {
+    match input_type(e)?.as_str() {
+        "date" => Some(Kind::Date),
+        "time" => Some(Kind::Time),
+        "datetime-local" => Some(Kind::DateTime),
+        "month" => Some(Kind::Month),
+        "week" => Some(Kind::Week),
+        _ => None,
+    }
+}
+
+/// A date, time, month or week field.
 pub fn is_date(e: &dom::ElementData) -> bool {
-    input_type(e).as_deref() == Some("date")
+    kind(e).is_some()
 }
 
 pub fn is_color(e: &dom::ElementData) -> bool {
@@ -97,6 +129,153 @@ pub fn parse_date(s: &str) -> Option<Date> {
 
 pub fn format_date((y, m, d): Date) -> String {
     format!("{y:04}-{m:02}-{d:02}")
+}
+
+const MS_DAY: i64 = 86_400_000;
+const MS_HOUR: i64 = 3_600_000;
+const MS_MINUTE: i64 = 60_000;
+
+fn digits(s: &str, n: usize) -> Option<u32> {
+    (s.len() == n && s.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| s.parse().ok())
+        .flatten()
+}
+
+/// `hh:mm`, `hh:mm:ss` or `hh:mm:ss.sss`, as milliseconds into the day.
+fn parse_time(s: &str) -> Option<i64> {
+    let mut parts = s.split(':');
+    let h = digits(parts.next()?, 2).filter(|&h| h < 24)?;
+    let m = digits(parts.next()?, 2).filter(|&m| m < 60)?;
+    let mut ms = 0;
+    if let Some(sec) = parts.next() {
+        let (whole, frac) = sec.split_once('.').unwrap_or((sec, ""));
+        let whole = digits(whole, 2).filter(|&s| s < 60)?;
+        if sec.contains('.') && (frac.is_empty() || frac.len() > 3) {
+            return None;
+        }
+        let frac = if frac.is_empty() {
+            0
+        } else {
+            digits(frac, frac.len())? * 10u32.pow(3 - frac.len() as u32)
+        };
+        ms = whole as i64 * 1000 + frac as i64;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(h as i64 * MS_HOUR + m as i64 * MS_MINUTE + ms)
+}
+
+fn format_time(ms: i64) -> String {
+    let (h, m) = (ms / MS_HOUR, ms % MS_HOUR / MS_MINUTE);
+    let (sec, frac) = (ms % MS_MINUTE / 1000, ms % 1000);
+    match (sec, frac) {
+        (0, 0) => format!("{h:02}:{m:02}"),
+        (_, 0) => format!("{h:02}:{m:02}:{sec:02}"),
+        _ => format!("{h:02}:{m:02}:{sec:02}.{frac:03}"),
+    }
+}
+
+/// ISO weeks in a year: 53 when it starts on a Thursday (or a Wednesday
+/// in a leap year).
+fn weeks_in_year(y: i32) -> u32 {
+    let jan1 = weekday((y, 1, 1));
+    if jan1 == 3 || (leap(y) && jan1 == 2) {
+        53
+    } else {
+        52
+    }
+}
+
+/// The day the Monday of ISO week `w` of `y` falls on.
+fn week_monday(y: i32, w: u32) -> i64 {
+    let jan4 = (y, 1, 4);
+    days_from_civil(jan4) - weekday(jan4) as i64 + 7 * (w as i64 - 1)
+}
+
+/// The ISO week a day is in.
+fn iso_week(day: i64) -> (i32, u32) {
+    let thursday = day + 3 - weekday(civil_from_days(day)) as i64;
+    let (y, _, _) = civil_from_days(thursday);
+    (y, ((thursday - days_from_civil((y, 1, 1))) / 7 + 1) as u32)
+}
+
+/// A field's value as a number that sorts like it: days for dates and
+/// weeks (their Monday), months since year 0, milliseconds for times.
+pub fn parse(kind: Kind, s: &str) -> Option<i64> {
+    let s = s.trim();
+    match kind {
+        Kind::Date => parse_date(s).map(days_from_civil),
+        Kind::Time => parse_time(s),
+        Kind::DateTime => {
+            let (d, t) = s.split_once(['T', ' '])?;
+            Some(days_from_civil(parse_date(d)?) * MS_DAY + parse_time(t)?)
+        }
+        Kind::Month => {
+            let (y, m) = s.split_once('-')?;
+            let m = digits(m, 2).filter(|m| (1..=12).contains(m))?;
+            let y: i32 = (y.len() >= 4 && y.len() <= 6 && y.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| y.parse().ok())
+                .flatten()
+                .filter(|&y| y >= 1)?;
+            Some(y as i64 * 12 + m as i64 - 1)
+        }
+        Kind::Week => {
+            let (y, w) = s.split_once("-W")?;
+            let y: i32 = (y.len() >= 4 && y.len() <= 6 && y.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| y.parse().ok())
+                .flatten()
+                .filter(|&y| y >= 1)?;
+            let w = digits(w, 2).filter(|&w| w >= 1 && w <= weeks_in_year(y))?;
+            Some(week_monday(y, w))
+        }
+    }
+}
+
+/// The value for a number from [`parse`].
+pub fn format(kind: Kind, k: i64) -> String {
+    match kind {
+        Kind::Date => format_date(civil_from_days(k)),
+        Kind::Time => format_time(k.rem_euclid(MS_DAY)),
+        Kind::DateTime => format!(
+            "{}T{}",
+            format_date(civil_from_days(k.div_euclid(MS_DAY))),
+            format_time(k.rem_euclid(MS_DAY))
+        ),
+        Kind::Month => format!("{:04}-{:02}", k.div_euclid(12), k.rem_euclid(12) + 1),
+        Kind::Week => {
+            let (y, w) = iso_week(k);
+            format!("{y:04}-W{w:02}")
+        }
+    }
+}
+
+/// What an empty field shows.
+pub fn placeholder(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Date => "yyyy-mm-dd",
+        Kind::Time => "hh:mm",
+        Kind::DateTime => "yyyy-mm-dd hh:mm",
+        Kind::Month => "yyyy-mm",
+        Kind::Week => "yyyy-Www",
+    }
+}
+
+/// Why a value isn't one (Firefox's words where it has them).
+pub fn bad_input_message(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Date => "Please enter a valid date.",
+        Kind::Time => "Please enter a valid time.",
+        Kind::DateTime => "Please enter a valid date and time.",
+        Kind::Month => "Please enter a valid month.",
+        Kind::Week => "Please enter a valid week.",
+    }
+}
+
+/// The field's `min` and `max`.
+pub fn bounds(e: &dom::ElementData, kind: Kind) -> (Option<i64>, Option<i64>) {
+    let b = |a: &str| e.attrs.get(a).and_then(|v| parse(kind, v));
+    (b("min"), b("max"))
 }
 
 /// Days since 1970-01-01 (Howard Hinnant's algorithm).
@@ -147,9 +326,29 @@ pub fn today_month() -> (i32, u32) {
     (y, m)
 }
 
-/// The month a field's calendar opens on: its date's, or else today's.
-pub fn opening_month(value: &str) -> (i32, u32) {
-    let (y, m, _) = parse_date(value).unwrap_or_else(today);
+fn today_days() -> i64 {
+    days_from_civil(today())
+}
+
+/// The day a value falls on (none for times).
+fn day_of(kind: Kind, value: &str) -> Option<i64> {
+    let k = parse(kind, value)?;
+    match kind {
+        Kind::Date | Kind::Week => Some(k),
+        Kind::DateTime => Some(k.div_euclid(MS_DAY)),
+        Kind::Time | Kind::Month => None,
+    }
+}
+
+/// The month a field's picker opens on: its value's, or else today's. A
+/// month field's picker shows a year, as (year, 1).
+pub fn opening(e: &dom::ElementData, value: &str) -> (i32, u32) {
+    let kind = kind(e).unwrap_or(Kind::Date);
+    if kind == Kind::Month {
+        let y = parse(kind, value).map_or(today().0, |k| k.div_euclid(12) as i32);
+        return (y, 1);
+    }
+    let (y, m, _) = civil_from_days(day_of(kind, value).unwrap_or_else(today_days));
     (y, m)
 }
 
@@ -193,80 +392,186 @@ fn styled(mut n: Node, style: &str) -> Node {
     n
 }
 
-/// The calendar for a date field showing `month`; days outside the
-/// field's `min`/`max` are greyed out and can't be picked.
-pub fn calendar(e: &dom::ElementData, month: (i32, u32)) -> Node {
-    let (y, m) = month;
-    let chosen = e.attrs.get("value").and_then(|v| parse_date(v));
-    let min = e.attrs.get("min").and_then(|v| parse_date(v));
-    let max = e.attrs.get("max").and_then(|v| parse_date(v));
-    let now = today();
-    let cell = |label: &str, class: &str, uid: u32| el("brickle-cell", class, uid, vec![text(label)]);
-    let mut rows = vec![el(
-        "brickle-row",
+const SHORT_MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+fn cell(label: &str, class: &str, uid: u32) -> Node {
+    el("brickle-cell", class, uid, vec![text(label)])
+}
+
+fn row(class: &str, cells: Vec<Node>) -> Node {
+    el("brickle-row", class, 0, cells)
+}
+
+/// The ‹ title › row.
+fn head(title: &str) -> Node {
+    row(
         "-brickle-cal-head",
-        0,
         vec![
             cell("‹", "-brickle-cell -brickle-cal-nav", PREV),
-            el(
-                "brickle-cell",
-                "-brickle-cal-title",
-                0,
-                vec![text(&format!("{} {y}", MONTHS[(m - 1) as usize]))],
-            ),
+            cell(title, "-brickle-cal-title", 0),
             cell("›", "-brickle-cell -brickle-cal-nav", NEXT),
         ],
-    )];
-    rows.push(el(
-        "brickle-row",
+    )
+}
+
+fn foot(today: Option<&str>) -> Node {
+    let mut cells = vec![];
+    if let Some(t) = today {
+        cells.push(cell(t, "-brickle-cell -brickle-cal-button", TODAY));
+    }
+    cells.push(cell("Clear", "-brickle-cell -brickle-cal-button", CLEAR));
+    row("-brickle-cal-foot", cells)
+}
+
+fn cell_class(chosen: bool, today: bool, off: bool) -> String {
+    let mut class = "-brickle-cell".to_string();
+    if chosen {
+        class.push_str(" -brickle-chosen");
+    } else if today {
+        class.push_str(" -brickle-cal-today");
+    }
+    if off {
+        class.push_str(" -brickle-off");
+    }
+    class
+}
+
+/// Whether a day can't be picked: outside the field's `min`/`max` (for
+/// weeks, its week; for dates and times, all of it).
+fn day_off(kind: Kind, (lo, hi): (Option<i64>, Option<i64>), day: i64) -> bool {
+    let (first, last) = match kind {
+        Kind::Week => {
+            let monday = day - weekday(civil_from_days(day)) as i64;
+            (monday, monday)
+        }
+        Kind::DateTime => (day * MS_DAY, (day + 1) * MS_DAY - 1),
+        _ => (day, day),
+    };
+    lo.is_some_and(|lo| last < lo) || hi.is_some_and(|hi| first > hi)
+}
+
+/// The picker for field `e`, showing `month` (a month field: its year).
+pub fn popup(e: &dom::ElementData, month: (i32, u32)) -> Node {
+    match kind(e) {
+        Some(Kind::Time) => {
+            let mut rows = clock(e, Kind::Time);
+            rows.push(foot(None));
+            el("brickle-options", "-brickle-options -brickle-calendar", 0, rows)
+        }
+        Some(Kind::Month) => months(e, month.0),
+        _ => calendar(e, month),
+    }
+}
+
+/// A month calendar for a date, week or date-and-time field.
+pub fn calendar(e: &dom::ElementData, month: (i32, u32)) -> Node {
+    let kind = kind(e).unwrap_or(Kind::Date);
+    let (y, m) = month;
+    let value = e.attrs.get("value").map_or("", String::as_str);
+    let chosen = |day: i64| match kind {
+        Kind::Week => parse(kind, value).is_some_and(|mon| (mon..mon + 7).contains(&day)),
+        _ => day_of(kind, value) == Some(day),
+    };
+    let bounds = bounds(e, kind);
+    let now = today_days();
+    let mut rows = vec![head(&format!("{} {y}", MONTHS[(m - 1) as usize]))];
+    rows.push(row(
         "-brickle-cal-row",
-        0,
         ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
             .iter()
             .map(|d| cell(d, "-brickle-cell -brickle-cal-day", 0))
             .collect(),
     ));
     let lead = weekday((y, m, 1));
-    let days = days_in_month(y, m);
     let mut week: Vec<Node> = (0..lead).map(|_| cell("\u{a0}", "-brickle-cell", 0)).collect();
-    for d in 1..=days {
-        let date = (y, m, d);
-        let off = min.is_some_and(|lo| date < lo) || max.is_some_and(|hi| date > hi);
-        let mut class = "-brickle-cell".to_string();
-        if chosen == Some(date) {
-            class.push_str(" -brickle-chosen");
-        } else if date == now {
-            class.push_str(" -brickle-cal-today");
-        }
-        if off {
-            class.push_str(" -brickle-off");
-        }
+    for d in 1..=days_in_month(y, m) {
+        let day = days_from_civil((y, m, d));
+        let off = day_off(kind, bounds, day);
+        let class = cell_class(chosen(day), day == now, off);
         week.push(cell(&d.to_string(), &class, if off { 0 } else { BASE + d }));
         if week.len() == 7 {
-            rows.push(el(
-                "brickle-row",
-                "-brickle-cal-row",
-                0,
-                std::mem::take(&mut week),
-            ));
+            rows.push(row("-brickle-cal-row", std::mem::take(&mut week)));
         }
     }
     if !week.is_empty() {
         while week.len() < 7 {
             week.push(cell("\u{a0}", "-brickle-cell", 0));
         }
-        rows.push(el("brickle-row", "-brickle-cal-row", 0, week));
+        rows.push(row("-brickle-cal-row", week));
     }
-    rows.push(el(
-        "brickle-row",
-        "-brickle-cal-foot",
-        0,
-        vec![
-            cell("Today", "-brickle-cell -brickle-cal-button", TODAY),
-            cell("Clear", "-brickle-cell -brickle-cal-button", CLEAR),
-        ],
-    ));
+    if kind == Kind::DateTime {
+        rows.extend(clock(e, kind));
+    }
+    rows.push(foot(Some(if kind == Kind::Week { "This week" } else { "Today" })));
     el("brickle-options", "-brickle-options -brickle-calendar", 0, rows)
+}
+
+/// Hours, then minutes in fives, for a time or date-and-time field.
+fn clock(e: &dom::ElementData, kind: Kind) -> Vec<Node> {
+    let time = time_of(kind, e.attrs.get("value").map_or("", String::as_str));
+    let title = |t: &str| row("-brickle-cal-head", vec![cell(t, "-brickle-clock-title", 0)]);
+    let mut rows = vec![title("Hour")];
+    for r in 0..4 {
+        let cells = (r * 6..r * 6 + 6)
+            .map(|h| {
+                let chosen = time.is_some_and(|t| t / MS_HOUR == h as i64);
+                cell(&format!("{h:02}"), &cell_class(chosen, false, false), HOUR + h)
+            })
+            .collect();
+        rows.push(row("-brickle-cal-row", cells));
+    }
+    rows.push(title("Minute"));
+    for r in 0..2 {
+        let cells = (r * 6..r * 6 + 6)
+            .map(|i| {
+                let chosen = time.is_some_and(|t| t % MS_HOUR / MS_MINUTE == i as i64 * 5);
+                cell(
+                    &format!(":{:02}", i * 5),
+                    &cell_class(chosen, false, false),
+                    MINUTE + i,
+                )
+            })
+            .collect();
+        rows.push(row("-brickle-cal-row", cells));
+    }
+    rows
+}
+
+/// A year's months, for a month field.
+fn months(e: &dom::ElementData, y: i32) -> Node {
+    let value = e.attrs.get("value").and_then(|v| parse(Kind::Month, v));
+    let (lo, hi) = bounds(e, Kind::Month);
+    let (ty, tm, _) = today();
+    let now = ty as i64 * 12 + tm as i64 - 1;
+    let mut rows = vec![head(&y.to_string())];
+    for r in 0..4 {
+        let cells = (r * 3..r * 3 + 3)
+            .map(|i| {
+                let k = y as i64 * 12 + i as i64;
+                let off = lo.is_some_and(|lo| k < lo) || hi.is_some_and(|hi| k > hi);
+                let class = cell_class(value == Some(k), k == now, off) + " -brickle-month-cell";
+                cell(
+                    SHORT_MONTHS[i as usize],
+                    &class,
+                    if off { 0 } else { MONTH_CELL + 1 + i },
+                )
+            })
+            .collect();
+        rows.push(row("-brickle-cal-row", cells));
+    }
+    rows.push(foot(Some("This month")));
+    el("brickle-options", "-brickle-options -brickle-calendar", 0, rows)
+}
+
+/// The time part of a time or date-and-time value.
+fn time_of(kind: Kind, value: &str) -> Option<i64> {
+    let k = parse(kind, value)?;
+    Some(match kind {
+        Kind::DateTime => k.rem_euclid(MS_DAY),
+        _ => k,
+    })
 }
 
 /// The palette for a colour field.
@@ -302,6 +607,9 @@ pub fn palette(e: &dom::ElementData) -> Node {
 pub enum Pick {
     /// Set the field to this and close the picker.
     Set(String),
+    /// Set the field to this and keep the picker open (a date or hour
+    /// picked, a time still to come).
+    Keep(String),
     /// Show another month, keeping the picker open.
     Month((i32, u32)),
     /// Not a cell of this picker.
@@ -319,44 +627,114 @@ pub fn pick(dom: &Dom, id: u32, uid: u32, month: (i32, u32)) -> Pick {
             None => Pick::Nothing,
         };
     }
-    if !is_date(e) {
+    let Some(kind) = kind(e) else {
         return Pick::Nothing;
-    }
-    let min = e.attrs.get("min").and_then(|v| parse_date(v));
-    let max = e.attrs.get("max").and_then(|v| parse_date(v));
-    let allowed = |d: Date| !min.is_some_and(|lo| d < lo) && !max.is_some_and(|hi| d > hi);
+    };
+    let value = crate::forms::value(dom, id);
+    let (lo, hi) = bounds(e, kind);
+    let allowed = |k: i64| !lo.is_some_and(|lo| k < lo) && !hi.is_some_and(|hi| k > hi);
+    let set = |k: i64| Pick::Set(format(kind, k));
+    let has_days = matches!(kind, Kind::Date | Kind::Week | Kind::DateTime);
+    let time = time_of(kind, &value);
+    let day = day_of(kind, &value).unwrap_or_else(today_days);
+    let at = |day: i64, t: i64| {
+        if kind == Kind::DateTime {
+            day * MS_DAY + t
+        } else {
+            t
+        }
+    };
     match uid {
-        PREV => Pick::Month(shift_month(month, -1)),
-        NEXT => Pick::Month(shift_month(month, 1)),
+        PREV | NEXT if kind != Kind::Time => {
+            let by = if kind == Kind::Month { 12 } else { 1 };
+            Pick::Month(shift_month(month, if uid == PREV { -by } else { by }))
+        }
         CLEAR => Pick::Set(String::new()),
-        TODAY if allowed(today()) => Pick::Set(format_date(today())),
-        u if (BASE + 1..=BASE + 31).contains(&u) => {
-            let d = (month.0, month.1, u - BASE);
-            if d.2 <= days_in_month(month.0, month.1) && allowed(d) {
-                Pick::Set(format_date(d))
+        TODAY => {
+            let k = match kind {
+                Kind::Date => today_days(),
+                Kind::Week => today_days() - weekday(today()) as i64,
+                Kind::Month => {
+                    let (y, m, _) = today();
+                    y as i64 * 12 + m as i64 - 1
+                }
+                Kind::DateTime => today_days() * MS_DAY + time.unwrap_or(0),
+                Kind::Time => return Pick::Nothing,
+            };
+            if allowed(k) || (kind == Kind::Week && !day_off(kind, (lo, hi), k)) {
+                if kind == Kind::DateTime {
+                    Pick::Keep(format(kind, k))
+                } else {
+                    set(k)
+                }
             } else {
                 Pick::Nothing
             }
+        }
+        u if has_days && (BASE + 1..=BASE + 31).contains(&u) => {
+            let d = u - BASE;
+            if d > days_in_month(month.0, month.1) {
+                return Pick::Nothing;
+            }
+            let picked = days_from_civil((month.0, month.1, d));
+            if day_off(kind, (lo, hi), picked) {
+                return Pick::Nothing;
+            }
+            match kind {
+                Kind::Week => set(picked - weekday(civil_from_days(picked)) as i64),
+                Kind::DateTime => Pick::Keep(format(kind, picked * MS_DAY + time.unwrap_or(0))),
+                _ => set(picked),
+            }
+        }
+        u if kind == Kind::Month && (MONTH_CELL + 1..=MONTH_CELL + 12).contains(&u) => {
+            let k = month.0 as i64 * 12 + (u - MONTH_CELL - 1) as i64;
+            if allowed(k) {
+                set(k)
+            } else {
+                Pick::Nothing
+            }
+        }
+        u if matches!(kind, Kind::Time | Kind::DateTime) && (HOUR..HOUR + 24).contains(&u) => {
+            let minutes = time.map_or(0, |t| t % MS_HOUR / MS_MINUTE * MS_MINUTE);
+            Pick::Keep(format(kind, at(day, (u - HOUR) as i64 * MS_HOUR + minutes)))
+        }
+        u if matches!(kind, Kind::Time | Kind::DateTime) && (MINUTE..MINUTE + 12).contains(&u) => {
+            let hour = time.map_or(0, |t| t / MS_HOUR * MS_HOUR);
+            set(at(day, hour + (u - MINUTE) as i64 * 5 * MS_MINUTE))
         }
         _ => Pick::Nothing,
     }
 }
 
-/// Up/Down in a date field: a day later or earlier (from today if empty),
-/// within `min` and `max`.
-pub fn step_date(value: &str, e: &dom::ElementData, up: bool) -> Option<String> {
-    let next = match parse_date(value) {
-        Some(d) => add_days(d, if up { 1 } else { -1 }),
-        None => today(),
+/// Up/Down in a date or time field: a step later or earlier (a day, a
+/// minute, a month or a week; from now if empty), within `min` and `max`.
+pub fn step(value: &str, e: &dom::ElementData, up: bool) -> Option<String> {
+    let kind = kind(e)?;
+    let by = match kind {
+        Kind::Date | Kind::Month => 1,
+        Kind::Week => 7,
+        Kind::Time | Kind::DateTime => MS_MINUTE,
     };
-    let min = e.attrs.get("min").and_then(|v| parse_date(v));
-    let max = e.attrs.get("max").and_then(|v| parse_date(v));
-    let next = match (min, max) {
+    let next = match parse(kind, value) {
+        Some(k) => k + if up { by } else { -by },
+        None => match kind {
+            Kind::Date => today_days(),
+            Kind::Week => today_days() - weekday(today()) as i64,
+            Kind::Month => {
+                let (y, m, _) = today();
+                y as i64 * 12 + m as i64 - 1
+            }
+            Kind::Time => 12 * MS_HOUR,
+            Kind::DateTime => today_days() * MS_DAY + 12 * MS_HOUR,
+        },
+    };
+    let (lo, hi) = bounds(e, kind);
+    let next = match (lo, hi) {
         (Some(lo), _) if next < lo => lo,
         (_, Some(hi)) if next > hi => hi,
         _ => next,
     };
-    let s = format_date(next);
+    let s = format(kind, next);
     (s != value).then_some(s)
 }
 
@@ -406,8 +784,77 @@ mod tests {
         assert_eq!(pick(&d, id, NEXT, (2026, 3)), Pick::Month((2026, 4)));
         assert_eq!(pick(&d, id, CLEAR, (2026, 3)), Pick::Set(String::new()));
         let e = d.element(id).unwrap();
-        assert_eq!(step_date("2026-04-05", e, true), None, "stays at max");
-        assert_eq!(step_date("2026-03-11", e, false).as_deref(), Some("2026-03-10"));
+        assert_eq!(step("2026-04-05", e, true), None, "stays at max");
+        assert_eq!(step("2026-03-11", e, false).as_deref(), Some("2026-03-10"));
+    }
+
+    #[test]
+    fn times_months_and_weeks() {
+        let round = |k: Kind, s: &str| parse(k, s).map(|v| format(k, v));
+        assert_eq!(round(Kind::Time, "09:05").as_deref(), Some("09:05"));
+        assert_eq!(round(Kind::Time, "23:59:30.5").as_deref(), Some("23:59:30.500"));
+        assert_eq!(parse(Kind::Time, "24:00"), None);
+        assert_eq!(parse(Kind::Time, "9:05"), None);
+        assert_eq!(
+            round(Kind::DateTime, "2026-11-19 08:30").as_deref(),
+            Some("2026-11-19T08:30")
+        );
+        assert_eq!(parse(Kind::DateTime, "2026-11-19"), None);
+        assert_eq!(round(Kind::Month, "2026-02").as_deref(), Some("2026-02"));
+        assert_eq!(parse(Kind::Month, "2026-13"), None);
+        // 2026 starts on a Thursday, so it has a week 53; 2025 doesn't.
+        assert_eq!(round(Kind::Week, "2026-W53").as_deref(), Some("2026-W53"));
+        assert_eq!(parse(Kind::Week, "2025-W53"), None);
+        assert_eq!(
+            parse(Kind::Week, "2026-W01").map(civil_from_days),
+            Some((2025, 12, 29)),
+            "week 1 has the year's first Thursday"
+        );
+        assert_eq!(iso_week(days_from_civil((2027, 1, 1))), (2026, 53));
+        assert!(parse(Kind::Time, "08:00") < parse(Kind::Time, "08:00:01"));
+    }
+
+    fn input(ty: &str, attrs: &str) -> (Dom, u32) {
+        let d = Dom::from_tree(&crate::html::parse(&format!("<input id=d type={ty} {attrs}>")));
+        let id = crate::forms::by_id(&d, "d").unwrap();
+        (d, id)
+    }
+
+    #[test]
+    fn clock_month_and_week_picks() {
+        let (d, id) = input("time", "value=09:20");
+        assert_eq!(pick(&d, id, HOUR + 14, (2026, 1)), Pick::Keep("14:20".into()));
+        assert_eq!(pick(&d, id, MINUTE + 9, (2026, 1)), Pick::Set("09:45".into()));
+        let (d, id) = input("datetime-local", "value=2026-11-19T09:20");
+        assert_eq!(
+            pick(&d, id, BASE + 3, (2026, 12)),
+            Pick::Keep("2026-12-03T09:20".into())
+        );
+        assert_eq!(
+            pick(&d, id, MINUTE, (2026, 11)),
+            Pick::Set("2026-11-19T09:00".into())
+        );
+        let (d, id) = input("month", "min=2026-03");
+        assert_eq!(
+            pick(&d, id, MONTH_CELL + 2, (2026, 1)),
+            Pick::Nothing,
+            "before min"
+        );
+        assert_eq!(
+            pick(&d, id, MONTH_CELL + 5, (2026, 1)),
+            Pick::Set("2026-05".into())
+        );
+        assert_eq!(pick(&d, id, NEXT, (2026, 1)), Pick::Month((2027, 1)));
+        let (d, id) = input("week", "");
+        assert_eq!(pick(&d, id, BASE + 19, (2026, 11)), Pick::Set("2026-W47".into()));
+        let e = d.element(id).unwrap();
+        assert_eq!(step("2026-W53", e, true).as_deref(), Some("2027-W01"));
+        let (d, id) = input("time", "max=10:00");
+        assert_eq!(step("10:00", d.element(id).unwrap(), true), None);
+        assert_eq!(
+            step("09:00", d.element(id).unwrap(), false).as_deref(),
+            Some("08:59")
+        );
     }
 
     #[test]

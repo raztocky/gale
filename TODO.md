@@ -8,7 +8,7 @@ Planned work, roughly in priority order. Items marked *discuss* need a decision 
 - [ ] SVG images: drawing at the size shown rather than the SVG's own size
 - [x] Images: CSS `background-image`
 - [x] Images: `<picture>` sources (`media`, `type`) and `srcset` (`x`/`w` with `sizes`), chosen for a fixed 1x density
-- [ ] Images: animation, lazy loading
+- [x] Images: animated GIFs (animated WebP shows its first frame), `loading=lazy`
 - [x] Floats and positioning (`float`, `position: absolute/fixed/relative`)
 - [x] Real table layout
 - [x] Flexbox, CSS grid, `@media` queries, `aspect-ratio`, percentage heights
@@ -73,7 +73,8 @@ what's next:
 - [x] More selectors for `querySelector` (sibling combinators, `:not()`, attribute values),
   shared with CSS.
 - [x] `getComputedStyle()` from the page's stylesheets (sizes from the layout once there is one).
-- [ ] `MutationObserver` callbacks.
+- [x] `MutationObserver` callbacks (scripts' changes only, delivered in a microtask).
+- [x] Sizes for scripts before the page is first shown (an early layout, at most 16 per load).
 - [ ] Faster startup for the JS fuzzer (snapshot the prelude).
 - [ ] Big framework apps that don't finish starting in time with Boa (yahoo.com's React app
   takes over 10 s; its feed stays as placeholders). The 32-script limit happens to keep it
@@ -91,7 +92,8 @@ selects (with a drop-down), buttons, labels, Tab between fields, Enter to submit
 - [ ] File uploads (`<input type=file>`).
 - [x] Form validation before sending (`required`, `type=email`/`url`, `pattern`, `minlength`/`maxlength`, `min`/`max`/`step`, `novalidate`), with `checkValidity()`, `setCustomValidity()` and `validity` for scripts; arrow keys step number fields.
 - [x] Date picker (calendar, typing, arrow keys) and colour picker (palette); `:valid`, `:invalid`, `:required` and `:optional` in CSS and for scripts.
-- [ ] Pickers for `time`, `datetime-local`, `month` and `week` (typed as text for now); `:user-invalid`.
+- [x] Pickers for `time` (a clock of hours and five-minute steps), `datetime-local`, `month` and `week`, with validation and arrow keys.
+- [ ] `:user-invalid` and `:user-valid` (never match for now).
 - [x] Ask before re-sending a POST on reload, back or forward (a page reached by a redirect after the POST reloads freely, as in Firefox).
 
 ## Tabs

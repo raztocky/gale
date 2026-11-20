@@ -257,13 +257,19 @@ tracking-parameter stripping, HTTPS-only, the local-network block and the cookie
 third-party cookies) applied to each. Brickle sends Firefox's headers for images. Each image is
 fetched once per page, and a page gets at most 300 images and 64 MB of them.
 
-PNG, JPEG, GIF, WebP and SVG are shown (GIFs and WebPs only their first frame). An SVG is drawn
+PNG, JPEG, GIF, WebP and SVG are shown (animated GIFs play; WebPs show only their first frame). An SVG is drawn
 as a plain picture in the sandboxed renderer: its shapes, gradients, clipping, filters and text.
 Text uses Brickle's own bundled fonts, chosen as for web pages (Arial is Liberation Sans), never
 the ones on your computer. Its scripts and links are ignored, and it can't load anything, so
 images, fonts or files it points to are never fetched or read. `data:` images are decoded without any request.
 
-*Enforced by:* `images_follow_the_rules` in `tests/privacy.rs`, and the tests in
+`<img loading=lazy>` is fetched only when you scroll within 1250 px of it, and only on pages
+whose scripts you allowed. Without scripts every image loads with the page, as the HTML
+standard asks: otherwise the order of image requests would tell the site how far you scrolled,
+which it couldn't learn any other way.
+
+*Enforced by:* `images_follow_the_rules` in `tests/privacy.rs`,
+`lazy_images_wait_until_you_scroll_near` in `src/page.rs`, and the tests in
 `src/network.rs` and `src/filter.rs`.
 
 ## 11. The clipboard is yours

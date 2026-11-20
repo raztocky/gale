@@ -58,6 +58,10 @@ pub struct Page {
     /// Inline `<svg>` elements by node, as the `data:` addresses of their
     /// SVG documents (keys of `images`).
     inline_svgs: HashMap<u32, String>,
+    /// Lazy images you've scrolled near (by node), loaded like any other.
+    revealed: HashSet<u32>,
+    /// Where the lazy images not loaded yet were at the last layout.
+    lazy_boxes: RefCell<Vec<(u32, Rect)>>,
     /// Bytes of decoded pixels kept in `images`.
     image_bytes: usize,
     /// Your text size (see `StyleContext::text_scale`).
@@ -147,7 +151,15 @@ pub struct Rendered {
     pub title: Option<paint::GlyphBitmap>,
     /// Boxes you can scroll inside, outer ones first.
     pub scrollers: Vec<Scroller>,
+    /// Where `loading=lazy` images not loaded yet are (top and bottom):
+    /// the browser asks for them ([`Page::reveal`]) when you scroll near.
+    pub lazy: Vec<(f32, f32)>,
 }
+
+/// How near (in px) you scroll to a lazy image before it's loaded.
+pub const LAZY_MARGIN: f32 = 1250.0;
+/// Most lazy images whose places are reported.
+pub const MAX_LAZY: usize = 4096;
 
 /// A box you can scroll inside: the wheel over it scrolls it (by
 /// [`Page::scroll_box`]) before the page.
@@ -424,6 +436,12 @@ impl Page {
         };
         // `getComputedStyle` while the page loads sees the server's sheets.
         rt.set_sheets(first.script_sheets());
+        // Sizes asked for before the page is shown come from a layout with
+        // those sheets (images not loaded yet count by their attributes).
+        let mut measuring = Page::empty(url, blocker_css, true);
+        measuring.policy = policy.clone();
+        measuring.sheet_cache = first.sheet_cache.clone();
+        rt.set_measure(Box::new(move |tree| measuring.measure(tree, viewport)));
         rt.set_cookies(host.cookies());
         rt.set_csp(policy.clone());
         let until = Instant::now() + js::LOAD_BUDGET;
@@ -495,6 +513,8 @@ impl Page {
             validity: HashMap::new(),
             images: HashMap::new(),
             inline_svgs: HashMap::new(),
+            revealed: HashSet::new(),
+            lazy_boxes: RefCell::new(vec![]),
             image_bytes: 0,
             text_scale: 1.0,
             viewport: (1024.0, 768.0),
@@ -537,8 +557,10 @@ impl Page {
     }
 
     pub fn load_images_decoded(&mut self, fetch: &mut dyn FnMut(&str, bool) -> Result<Decoded, String>) {
+        let held = self.held_back();
         let mut urls: Vec<String> = img_sources(&self.url, &self.dom, self.viewport)
             .into_iter()
+            .filter(|(uid, _, _)| !held.contains(uid))
             .map(|(_, u, _)| u)
             .collect();
         // CSS background images, after the page's own images.
@@ -557,7 +579,7 @@ impl Page {
             .ok()
             .and_then(Result::ok);
             let decoded = decoded.filter(|d| {
-                let n = d.bitmap.rgba.len();
+                let n = d.frames.as_ref().map_or(d.bitmap.rgba.len(), |f| f.bytes());
                 if self.image_bytes + n > MAX_IMAGE_MEMORY {
                     return false;
                 }
@@ -581,7 +603,7 @@ impl Page {
                     .ok()
                     .and_then(Result::ok)
                     .filter(|d| {
-                        let n = d.bitmap.rgba.len();
+                        let n = d.frames.as_ref().map_or(d.bitmap.rgba.len(), |f| f.bytes());
                         if self.image_bytes + n > MAX_IMAGE_MEMORY {
                             return false;
                         }
@@ -760,6 +782,20 @@ impl Page {
 
     /// After scripts changed the DOM (in response to an event): take the new
     /// tree. Stylesheets not fetched while loading aren't fetched now.
+    /// Lay out `tree` with the stylesheets fetched so far, for scripts.
+    fn measure(&mut self, tree: &Node, viewport: (f32, f32)) -> crate::js::Measured {
+        let size = |v: f32, or: f32| {
+            if v.is_finite() && v >= 1.0 {
+                v.min(16_000.0)
+            } else {
+                or
+            }
+        };
+        self.set_tree(tree.clone(), &mut |_, _, _, _| Err("not fetched yet".into()));
+        self.render(size(viewport.0, 1000.0), size(viewport.1, 700.0));
+        (self.boxes(), self.scroll_info())
+    }
+
     pub fn refresh(&mut self, rt: &Runtime) {
         self.set_tree(rt.tree(), &mut |_, _, _, _| Err("page already loaded".into()));
     }
@@ -870,8 +906,10 @@ impl Page {
                     Some(m) => m,
                     None => self
                         .with_dom(rt.as_deref_mut(), |d| {
-                            crate::pickers::opening_month(&forms::value(d, sel))
+                            let value = forms::value(d, sel);
+                            d.element(sel).map(|e| crate::pickers::opening(e, &value))
                         })
+                        .flatten()
                         .unwrap_or_else(crate::pickers::today_month),
                 };
                 let pick = self
@@ -882,12 +920,18 @@ impl Page {
                         self.picker_month = Some(m);
                         self.open_select = Some(sel);
                     }
-                    crate::pickers::Pick::Set(v) => {
-                        self.picker_month = None;
+                    crate::pickers::Pick::Set(ref v) | crate::pickers::Pick::Keep(ref v) => {
+                        if matches!(pick, crate::pickers::Pick::Keep(_)) {
+                            // A date or hour picked: the time is still to come.
+                            self.open_select = Some(sel);
+                            self.picker_month = Some(month);
+                        } else {
+                            self.picker_month = None;
+                        }
                         let changed = self
                             .with_dom(rt.as_deref_mut(), |d| {
                                 let before = forms::value(d, sel);
-                                forms::set_field_value(d, sel, &v);
+                                forms::set_field_value(d, sel, v);
                                 forms::value(d, sel) != before
                             })
                             .unwrap_or(false);
@@ -1029,7 +1073,7 @@ impl Page {
                 change = self.with_dom(rt.as_deref_mut(), |d| forms::step_option(d, f, down)) == Some(true);
                 input = change;
             }
-            // A date field moves a day later or earlier.
+            // A date or time field moves a step later or earlier.
             (Key::Up { .. } | Key::Down { .. }, Some(f))
                 if self
                     .with_dom(rt.as_deref_mut(), |d| {
@@ -1042,7 +1086,7 @@ impl Page {
                     .with_dom(rt.as_deref_mut(), |d| {
                         let next = d
                             .element(f)
-                            .and_then(|e| crate::pickers::step_date(&forms::value(d, f), e, up));
+                            .and_then(|e| crate::pickers::step(&forms::value(d, f), e, up));
                         next.map(|v| forms::set_field_value(d, f, &v)).is_some()
                     })
                     .unwrap_or(false);
@@ -1267,6 +1311,18 @@ impl Page {
             collect_hits(b, None, &mut whole);
         }
         *self.script_boxes.borrow_mut() = whole.into_iter().map(|(r, u)| (u, r)).collect();
+        // Where held-back lazy images are, even with no size yet.
+        let held = self.held_back();
+        *self.lazy_boxes.borrow_mut() = if held.is_empty() {
+            vec![]
+        } else {
+            order
+                .iter()
+                .filter(|b| held.contains(&b.uid))
+                .map(|b| (b.uid, b.dims.border_box()))
+                .take(MAX_LAZY)
+                .collect()
+        };
         let mut texts = Vec::new();
         // Text pushed off the left, top or right is hidden; the page scrolls
         // down, so nothing below it is.
@@ -1326,7 +1382,74 @@ impl Page {
                 .then(|| paint::text_mask(&self.title, 0, self.title_px, paint::MAX_TITLE_W))
                 .flatten(),
             scrollers,
+            lazy: self.lazy_places(),
         }
+    }
+
+    /// `<img loading=lazy>` elements held back until you scroll near: only
+    /// with scripts, as the HTML standard says, since without them image
+    /// requests would be the only way a site could follow your scrolling.
+    /// Images in the document itself (`data:`) cost no request and load.
+    fn held_back(&self) -> HashSet<u32> {
+        if !self.scripting {
+            return HashSet::new();
+        }
+        let mut imgs = Vec::new();
+        self.dom.walk(&mut imgs, &|n| {
+            n.element().is_some_and(|e| {
+                e.tag == "img"
+                    && e.attrs
+                        .get("loading")
+                        .is_some_and(|l| l.trim().eq_ignore_ascii_case("lazy"))
+            })
+        });
+        let lazy: HashSet<u32> = imgs
+            .iter()
+            .map(|n| n.uid)
+            .filter(|u| !self.revealed.contains(u))
+            .collect();
+        img_sources(&self.url, &self.dom, self.viewport)
+            .into_iter()
+            .filter(|(uid, url, _)| {
+                lazy.contains(uid) && !url.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("data:"))
+            })
+            .map(|(uid, _, _)| uid)
+            .collect()
+    }
+
+    /// Where held-back images are, as last laid out.
+    fn lazy_places(&self) -> Vec<(f32, f32)> {
+        self.lazy_boxes
+            .borrow()
+            .iter()
+            .map(|(_, r)| (r.y, r.y + r.h))
+            .collect()
+    }
+
+    /// You scrolled to show page-space `top..bottom`: load the lazy images
+    /// near it. Returns whether any were.
+    pub fn reveal(
+        &mut self,
+        top: f32,
+        bottom: f32,
+        fetch: &mut dyn FnMut(&str, bool) -> Result<Decoded, String>,
+    ) -> bool {
+        let held = self.held_back();
+        let near: Vec<u32> = self
+            .lazy_boxes
+            .borrow()
+            .iter()
+            .filter(|(u, r)| {
+                held.contains(u) && r.y + r.h >= top - LAZY_MARGIN && r.y <= bottom + LAZY_MARGIN
+            })
+            .map(|(u, _)| *u)
+            .collect();
+        if near.is_empty() {
+            return false;
+        }
+        self.revealed.extend(near);
+        self.load_images_decoded(fetch);
+        true
     }
 
     /// The boxes you can scroll inside, for scripts: node, offset, how far
@@ -2059,6 +2182,25 @@ mod form_script_tests {
         );
     }
 
+    /// Scripts measuring while the page loads get real sizes, and see
+    /// changes they made since.
+    #[test]
+    fn scripts_measure_before_the_page_is_shown() {
+        let (page, _rt) = load(
+            "<style>#box { width: 300px; height: 40px; padding: 5px } #box.wide { width: 500px }</style>\
+             <div id=box></div><p id=out></p>\
+             <script>\
+             const box = document.getElementById('box');\
+             const parts = [box.offsetWidth, box.getBoundingClientRect().height];\
+             box.className = 'wide';\
+             parts.push(box.offsetWidth, getComputedStyle(box).width);\
+             document.getElementById('out').textContent = parts.join('|');\
+             </script>",
+        );
+        let text = page.dom.text_content();
+        assert!(text.contains("310|50|510|500px"), "{text}");
+    }
+
     #[test]
     fn scripts_see_typing_and_can_cancel_submission() {
         let (mut page, mut rt) = load(
@@ -2126,6 +2268,53 @@ mod image_tests {
         });
         let _ = page.render(800.0, 600.0);
         (page, asked)
+    }
+
+    fn serve(u: &str) -> Result<Vec<u8>, String> {
+        let name = u.rsplit('/').next().unwrap_or("");
+        let size = name.strip_suffix(".png").and_then(|s| s.split_once('x'));
+        match size.and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?))) {
+            Some((w, h)) => Ok(png(w, h)),
+            None => Err("404".into()),
+        }
+    }
+
+    /// With scripts, `loading=lazy` images load when you scroll near them;
+    /// without, they load with the rest (so requests can't follow you).
+    #[test]
+    fn lazy_images_wait_until_you_scroll_near() {
+        let html = "<body style='margin:0'><img id=a src=/10x10.png loading=lazy>\
+                    <div style='height:5000px'></div><img id=b src=/20x20.png loading=LAZY>\
+                    <img id=c src=/30x30.png>";
+        let mut page = Page::parse("https://example.com/", html, "", &mut |_, _| Err("none".into()));
+        page.scripting = true;
+        let mut asked = Vec::new();
+        page.load_images(&mut |u, _| {
+            asked.push(u.to_string());
+            serve(u)
+        });
+        assert_eq!(asked, ["https://example.com/30x30.png"]);
+        assert_eq!(page.render(800.0, 600.0).lazy.len(), 2);
+        let mut fetch = |u: &str, _: bool| {
+            asked.push(u.to_string());
+            crate::image::decode(&serve(u)?)
+        };
+        assert!(page.reveal(0.0, 600.0, &mut fetch));
+        assert!(!page.reveal(0.0, 600.0, &mut fetch), "nothing more near the top");
+        let lazy = page.render(800.0, 600.0).lazy;
+        assert_eq!(lazy.len(), 1);
+        assert!(lazy[0].0 >= 5000.0, "{lazy:?}");
+        assert!(page.reveal(4000.0, 4600.0, &mut fetch));
+        assert!(page.render(800.0, 600.0).lazy.is_empty());
+        assert_eq!(size_of(&page, "b"), (20.0, 20.0));
+        assert_eq!(
+            asked[1..],
+            ["https://example.com/10x10.png", "https://example.com/20x20.png"]
+        );
+        // Without scripts, all at once.
+        let (page, asked) = load(html);
+        assert_eq!(asked.len(), 3);
+        assert!(page.render(800.0, 600.0).lazy.is_empty());
     }
 
     /// The border box of the element with this id.
@@ -2226,6 +2415,46 @@ mod image_tests {
         // Down steps a day back.
         page.key(None, Key::Down { select: false });
         assert_eq!(field_value(&mut page, "d"), "2026-03-31");
+    }
+
+    #[test]
+    fn date_and_time_picker() {
+        let (mut page, _) = load(
+            "<body style='margin:0'><input id=d type=datetime-local value=2026-03-10T09:15>\
+             <input id=t type=time min=08:00></body>",
+        );
+        let until = Instant::now() + std::time::Duration::from_secs(1);
+        let text = |page: &Page| -> String {
+            let shown = page.render(800.0, 600.0);
+            shown.texts.iter().map(|t| t.text.as_str()).collect()
+        };
+        let (x, y) = centre_of(&page, uid_of(&page, "d"));
+        page.click_at(None, x, y, until);
+        assert!(text(&page).contains("March 2026") && text(&page).contains("Hour"));
+        // A day keeps the picker open for the time; a minute closes it.
+        let (x, y) = centre_of(&page, crate::pickers::BASE + 20);
+        page.click_at(None, x, y, until);
+        assert_eq!(field_value(&mut page, "d"), "2026-03-20T09:15");
+        assert!(text(&page).contains("Minute"), "still open");
+        let (x, y) = centre_of(&page, crate::pickers::BASE + 300 + 17);
+        page.click_at(None, x, y, until);
+        let (x, y) = centre_of(&page, crate::pickers::BASE + 400 + 6);
+        page.click_at(None, x, y, until);
+        assert_eq!(field_value(&mut page, "d"), "2026-03-20T17:30");
+        assert!(!text(&page).contains("Minute"), "closed");
+        // A time field: typing works, and too early a time is invalid.
+        let (x, y) = centre_of(&page, uid_of(&page, "t"));
+        page.click_at(None, x, y, until);
+        page.type_text(None, "07:30");
+        let msg = page
+            .with_dom(None, |d| {
+                let id = crate::forms::by_id(d, "t").unwrap();
+                crate::validate::validity(d, id, &HashMap::new()).message
+            })
+            .unwrap();
+        assert_eq!(msg, "Please select a value that is no earlier than 08:00.");
+        page.key(None, Key::Up { select: false });
+        assert_eq!(field_value(&mut page, "t"), "08:00", "up to min");
     }
 
     #[test]

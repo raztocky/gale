@@ -1194,6 +1194,95 @@
     constructor(cb) { this._cb = cb; }
     observe() {} unobserve() {} disconnect() {} takeRecords() { return []; }
   }
+
+  // MutationObserver: the DOM writes scripts' changes down (only while
+  // something is observed) and they are delivered in a microtask.
+  const mutationObservers = new Set();
+  let mutationsQueued = false;
+  const MUTATION_TYPES = ['childList', 'attributes', 'characterData'];
+  const MAX_DEPTH = 4096;
+  function queueMutations() {
+    if (mutationsQueued || mutationObservers.size === 0) return;
+    mutationsQueued = true;
+    nativeThen.call(nativeResolved, deliverMutations);
+  }
+  for (const name of ['insert', 'remove', 'setAttr', 'removeAttr', 'setTextContent', 'setInnerHTML']) {
+    const f = dom[name];
+    dom[name] = function () {
+      try { return f.apply(dom, arguments); } finally { queueMutations(); }
+    };
+  }
+  // Hands the written-down changes to the observers that asked for them.
+  function sortMutations() {
+    const raw = dom.takeMutations();
+    for (const [kind, target, added, removed, prev, next, name, old] of raw) {
+      const type = MUTATION_TYPES[kind];
+      const chain = [];
+      for (let n = target, d = 0; n !== -1 && d < MAX_DEPTH; n = dom.parent(n), d++) chain.push(n);
+      for (const mo of mutationObservers) {
+        let opts = null;
+        for (let i = 0; i < chain.length && !opts; i++) {
+          const o = mo._targets.get(chain[i]);
+          if (o && (i === 0 || o.subtree)) opts = o;
+        }
+        if (!opts || !opts[type]) continue;
+        if (kind === 1 && opts.attributeFilter && !opts.attributeFilter.includes(name)) continue;
+        const keepOld = (kind === 1 && opts.attributeOldValue) || (kind === 2 && opts.characterDataOldValue);
+        mo._records.push({
+          type, target: wrap(target),
+          addedNodes: wrapAll(added), removedNodes: wrapAll(removed),
+          previousSibling: wrap(prev), nextSibling: wrap(next),
+          attributeName: kind === 1 ? name : null, attributeNamespace: null,
+          oldValue: keepOld ? old : null,
+        });
+      }
+    }
+  }
+  function deliverMutations() {
+    mutationsQueued = false;
+    sortMutations();
+    for (const mo of Array.from(mutationObservers)) {
+      if (mo._records.length === 0) continue;
+      const records = mo._records;
+      mo._records = [];
+      try { mo._cb.call(mo, records, mo); } catch (e) { reportError(e); }
+    }
+  }
+  class MutationObserver {
+    constructor(cb) {
+      if (typeof cb !== 'function') throw new TypeError('MutationObserver needs a callback');
+      this._cb = cb; this._targets = new Map(); this._records = [];
+    }
+    observe(target, options = {}) {
+      const id = idOf(target);
+      const o = {
+        childList: !!options.childList, subtree: !!options.subtree,
+        attributeOldValue: !!options.attributeOldValue,
+        characterDataOldValue: !!options.characterDataOldValue,
+        attributeFilter: options.attributeFilter ? Array.from(options.attributeFilter, (n) => str(n).toLowerCase()) : null,
+      };
+      o.attributes = options.attributes === undefined ? (o.attributeOldValue || !!o.attributeFilter) : !!options.attributes;
+      o.characterData = options.characterData === undefined ? o.characterDataOldValue : !!options.characterData;
+      if (!o.childList && !o.attributes && !o.characterData)
+        throw new TypeError("MutationObserver.observe: one of 'childList', 'attributes', 'characterData' must be true");
+      if ((o.attributeOldValue || o.attributeFilter) && !o.attributes)
+        throw new TypeError("MutationObserver.observe: 'attributes' can't be false here");
+      // Changes made before this call aren't this observer's.
+      if (mutationObservers.size === 0) dom.recordMutations(true); else sortMutations();
+      this._targets.set(id, o);
+      mutationObservers.add(this);
+    }
+    disconnect() {
+      sortMutations();
+      this._targets.clear(); this._records = [];
+      mutationObservers.delete(this);
+      if (mutationObservers.size === 0) dom.recordMutations(false);
+    }
+    takeRecords() {
+      sortMutations();
+      const r = this._records; this._records = []; return r;
+    }
+  }
   class IntersectionObserver extends Observer {
     // Everything counts as visible (Brickle lays out the whole page).
     observe(target) {
@@ -1327,7 +1416,7 @@
     EventTarget, Event, CustomEvent, UIEvent, MouseEvent, KeyboardEvent, FocusEvent, DOMTokenList,
     URL: URLImpl, URLSearchParams, XMLHttpRequest, Storage,
     localStorage: new Storage(), sessionStorage: new Storage(),
-    MutationObserver: Observer, ResizeObserver: Observer, IntersectionObserver, PerformanceObserver: Observer,
+    MutationObserver, ResizeObserver: Observer, IntersectionObserver, PerformanceObserver: Observer,
     setTimeout: (fn, ms, ...args) => addTimer(fn, ms, args, false),
     setInterval: (fn, ms, ...args) => addTimer(fn, ms, args, true),
     clearTimeout: (id) => { timers.delete(id); },

@@ -1,4 +1,4 @@
-//! Image decoding: PNG, JPEG, GIF (first frame), WebP (first frame) and
+//! Image decoding: PNG, JPEG, GIF (animated), WebP (first frame) and
 //! SVG (shapes and text in Brickle's own fonts; no embedded images, nothing
 //! external).
 //!
@@ -40,6 +40,47 @@ pub struct Decoded {
     pub natural: (u32, u32),
     /// The pixels, scaled to fit [`STORE_SIDE`].
     pub bitmap: Arc<Bitmap>,
+    /// An animated GIF's frames (the first is `bitmap`).
+    pub frames: Option<Arc<Frames>>,
+}
+
+/// An animation: frames all one size, and how long each shows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Frames {
+    pub bitmaps: Vec<Arc<Bitmap>>,
+    /// Milliseconds, one per frame.
+    pub delays: Vec<u32>,
+}
+
+/// Most frames kept of an animation.
+pub const MAX_FRAMES: usize = 500;
+/// Most bytes of pixels kept for an animation's frames; longer ones are
+/// cut short.
+pub const MAX_ANIMATION_BYTES: usize = 32 * 1024 * 1024;
+/// Frames asking for 10 ms or less show for 100 ms, as in Firefox.
+const DEFAULT_DELAY: u32 = 100;
+
+impl Frames {
+    /// The frame showing `ms` into the animation, which loops forever.
+    pub fn at(&self, ms: u64) -> usize {
+        let total: u64 = self.delays.iter().map(|&d| d as u64).sum();
+        if total == 0 {
+            return 0;
+        }
+        let mut t = ms % total;
+        for (i, &d) in self.delays.iter().enumerate() {
+            if t < d as u64 {
+                return i;
+            }
+            t -= d as u64;
+        }
+        0
+    }
+
+    /// Bytes of pixels in all the frames.
+    pub fn bytes(&self) -> usize {
+        self.bitmaps.iter().map(|b| b.rgba.len()).sum()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,26 +128,40 @@ fn budget(w: u32, h: u32) -> usize {
 
 /// Decode an image.
 pub fn decode(bytes: &[u8]) -> Result<Decoded, String> {
-    let bitmap = match sniff(bytes) {
+    let mut own_size = None;
+    let (bitmap, more) = match sniff(bytes) {
         // Drawn straight at the size it's kept at, so it stays sharp.
         Some(Format::Svg) => return decode_svg(bytes),
-        Some(Format::Png) => decode_png(bytes),
-        Some(Format::Jpeg) => decode_jpeg(bytes),
-        Some(Format::Gif) => decode_gif(bytes),
-        Some(Format::WebP) => decode_webp(bytes),
-        None => Err("not an image format Brickle can show".into()),
-    }?;
-    debug_assert_eq!(bitmap.rgba.len(), bitmap.w as usize * bitmap.h as usize * 4);
-    let natural = (bitmap.w, bitmap.h);
-    let (w, h) = fit(bitmap.w, bitmap.h, STORE_SIDE);
-    let bitmap = if (w, h) == natural {
-        bitmap
-    } else {
-        resize(&bitmap, w, h)
+        Some(Format::Png) => ((decode_png(bytes)?, 0), vec![]),
+        Some(Format::Jpeg) => ((decode_jpeg(bytes)?, 0), vec![]),
+        Some(Format::Gif) => {
+            let (first, more, size) = decode_gif(bytes)?;
+            own_size = Some(size);
+            (first, more)
+        }
+        Some(Format::WebP) => ((decode_webp(bytes)?, 0), vec![]),
+        None => return Err("not an image format Brickle can show".into()),
     };
+    debug_assert_eq!(bitmap.0.rgba.len(), bitmap.0.w as usize * bitmap.0.h as usize * 4);
+    let natural = own_size.unwrap_or((bitmap.0.w, bitmap.0.h));
+    let (w, h) = fit(natural.0, natural.1, STORE_SIDE);
+    let store = |b: Bitmap| if (b.w, b.h) == (w, h) { b } else { resize(&b, w, h) };
+    let first = (Arc::new(store(bitmap.0)), bitmap.1);
+    let frames = (!more.is_empty()).then(|| {
+        let mut f = Frames {
+            bitmaps: vec![first.0.clone()],
+            delays: vec![first.1],
+        };
+        for (b, d) in more {
+            f.bitmaps.push(Arc::new(store(b)));
+            f.delays.push(d);
+        }
+        Arc::new(f)
+    });
     Ok(Decoded {
         natural,
-        bitmap: Arc::new(bitmap),
+        bitmap: first.0,
+        frames,
     })
 }
 
@@ -450,6 +505,7 @@ fn decode_svg(bytes: &[u8]) -> Result<Decoded, String> {
     Ok(Decoded {
         natural,
         bitmap: Arc::new(Bitmap { w, h, rgba }),
+        frames: None,
     })
 }
 
@@ -514,7 +570,12 @@ fn decode_jpeg(bytes: &[u8]) -> Result<Bitmap, String> {
     Ok(Bitmap { w, h, rgba })
 }
 
-fn decode_gif(bytes: &[u8]) -> Result<Bitmap, String> {
+/// The first frame and its delay in ms, the frames after it, and the
+/// GIF's own size (frames are already scaled to fit [`STORE_SIDE`]).
+type GifFrames = ((Bitmap, u32), Vec<(Bitmap, u32)>, (u32, u32));
+
+/// A GIF's frames, each the whole canvas as it shows then.
+fn decode_gif(bytes: &[u8]) -> Result<GifFrames, String> {
     let err = |e: gif::DecodingError| format!("GIF: {e}");
     let mut o = gif::DecodeOptions::new();
     o.set_color_output(gif::ColorOutput::RGBA);
@@ -523,36 +584,79 @@ fn decode_gif(bytes: &[u8]) -> Result<Bitmap, String> {
     let mut d = o.read_info(Cursor::new(bytes)).map_err(err)?;
     let (w, h) = (d.width() as u32, d.height() as u32);
     check_size(w, h)?;
-    let mut rgba = vec![0u8; w as usize * h as usize * 4];
-    // The first frame only (no animation), drawn where it says on the canvas.
-    if let Some(f) = d.read_next_frame().map_err(err)? {
+    // As many frames as fit the budget once scaled to the stored size.
+    let (sw, sh) = fit(w, h, STORE_SIDE);
+    let keep = (MAX_ANIMATION_BYTES / (sw as usize * sh as usize * 4).max(1)).min(MAX_FRAMES);
+    let (wu, hu) = (w as usize, h as usize);
+    let mut canvas = vec![0u8; wu * hu * 4];
+    let mut out: Vec<(Bitmap, u32)> = Vec::new();
+    loop {
+        let f = match d.read_next_frame() {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            // A broken later frame ends the animation; a broken first one
+            // is an error.
+            Err(e) if out.is_empty() => return Err(err(e)),
+            Err(_) => break,
+        };
         let (fl, ft, fw, fh) = (
             f.left as usize,
             f.top as usize,
             f.width as usize,
             f.height as usize,
         );
+        let delay = match f.delay as u32 * 10 {
+            0..=10 => DEFAULT_DELAY,
+            ms => ms,
+        };
+        let before = (f.dispose == gif::DisposalMethod::Previous).then(|| canvas.clone());
         if f.buffer.len() >= fw * fh * 4 {
-            for row in 0..fh {
-                let y = ft + row;
-                if y >= h as usize {
-                    break;
-                }
-                for col in 0..fw {
-                    let x = fl + col;
-                    if x >= w as usize {
-                        break;
-                    }
+            for row in 0..fh.min(hu.saturating_sub(ft)) {
+                for col in 0..fw.min(wu.saturating_sub(fl)) {
                     let s = (row * fw + col) * 4;
                     if f.buffer[s + 3] != 0 {
-                        let o = (y * w as usize + x) * 4;
-                        rgba[o..o + 4].copy_from_slice(&f.buffer[s..s + 4]);
+                        let o = ((ft + row) * wu + fl + col) * 4;
+                        canvas[o..o + 4].copy_from_slice(&f.buffer[s..s + 4]);
                     }
                 }
             }
         }
+        let dispose = f.dispose;
+        let shown = Bitmap {
+            w,
+            h,
+            rgba: canvas.clone(),
+        };
+        let shown = if (sw, sh) == (w, h) {
+            shown
+        } else {
+            resize(&shown, sw, sh)
+        };
+        out.push((shown, delay));
+        if out.len() >= keep.max(1) {
+            break;
+        }
+        match (dispose, before) {
+            (gif::DisposalMethod::Background, _) => {
+                for row in ft..(ft + fh).min(hu) {
+                    let (a, b) = ((row * wu + fl.min(wu)) * 4, (row * wu + (fl + fw).min(wu)) * 4);
+                    canvas[a..b].fill(0);
+                }
+            }
+            (gif::DisposalMethod::Previous, Some(b)) => canvas = b,
+            _ => {}
+        }
     }
-    Ok(Bitmap { w, h, rgba })
+    let mut frames = out.into_iter();
+    let first = frames.next().unwrap_or((
+        Bitmap {
+            w: sw,
+            h: sh,
+            rgba: vec![0; sw as usize * sh as usize * 4],
+        },
+        DEFAULT_DELAY,
+    ));
+    Ok((first, frames.collect(), (w, h)))
 }
 
 fn decode_webp(bytes: &[u8]) -> Result<Bitmap, String> {
@@ -776,6 +880,35 @@ mod tests {
         let d = decode(&out).unwrap();
         assert_eq!(d.natural, (2, 2));
         assert_eq!(&d.bitmap.rgba[0..8], &[0, 0, 0, 255, 255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn decodes_gif_animation() {
+        let mut out = Vec::new();
+        {
+            let mut e = gif::Encoder::new(&mut out, 2, 1, &[0, 0, 0, 255, 255, 255]).unwrap();
+            let mut f = gif::Frame::default();
+            (f.width, f.height) = (2, 1);
+            f.buffer = std::borrow::Cow::Owned(vec![0, 0]);
+            f.dispose = gif::DisposalMethod::Background;
+            e.write_frame(&f).unwrap();
+            // Only the right pixel, white; the left was cleared to transparent.
+            let mut f = gif::Frame::default();
+            (f.left, f.width, f.height) = (1, 1, 1);
+            f.delay = 25;
+            f.buffer = std::borrow::Cow::Owned(vec![1]);
+            e.write_frame(&f).unwrap();
+        }
+        let d = decode(&out).unwrap();
+        assert_eq!(d.natural, (2, 1));
+        assert_eq!(d.bitmap.rgba, vec![0, 0, 0, 255, 0, 0, 0, 255]);
+        let f = d.frames.unwrap();
+        assert_eq!(f.delays, vec![100, 250], "no delay shows for 100 ms");
+        assert_eq!(f.bitmaps[1].rgba, vec![0, 0, 0, 0, 255, 255, 255, 255]);
+        assert_eq!(
+            (f.at(0), f.at(99), f.at(100), f.at(349), f.at(350)),
+            (0, 0, 1, 1, 0)
+        );
     }
 
     #[test]

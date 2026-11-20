@@ -263,26 +263,28 @@ pub fn validity(dom: &Dom, id: u32, custom: &HashMap<u32, String>) -> Validity {
                         "Please use at least {min} characters (you are currently using {len} characters)."
                     ));
                 }
-                if ty == "date" {
-                    match crate::pickers::parse_date(&value) {
+                if let Some(kind) = dom.element(id).and_then(crate::pickers::kind) {
+                    match crate::pickers::parse(kind, &value) {
                         None => {
                             v.bad_input = true;
-                            say("Please enter a valid date.".into());
+                            say(crate::pickers::bad_input_message(kind).into());
                         }
-                        Some(d) => {
-                            let bound = |a: &str| attr(dom, id, a).and_then(crate::pickers::parse_date);
-                            if let Some(lo) = bound("min").filter(|&lo| d < lo) {
+                        Some(k) => {
+                            let (lo, hi) = dom
+                                .element(id)
+                                .map_or((None, None), |e| crate::pickers::bounds(e, kind));
+                            if let Some(lo) = lo.filter(|&lo| k < lo) {
                                 v.range_underflow = true;
                                 say(format!(
                                     "Please select a value that is no earlier than {}.",
-                                    crate::pickers::format_date(lo)
+                                    crate::pickers::format(kind, lo)
                                 ));
                             }
-                            if let Some(hi) = bound("max").filter(|&hi| d > hi) {
+                            if let Some(hi) = hi.filter(|&hi| k > hi) {
                                 v.range_overflow = true;
                                 say(format!(
                                     "Please select a value that is no later than {}.",
-                                    crate::pickers::format_date(hi)
+                                    crate::pickers::format(kind, hi)
                                 ));
                             }
                         }

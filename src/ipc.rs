@@ -8,7 +8,7 @@
 
 use crate::css::Color;
 use crate::forms::Submission;
-use crate::image::{Bitmap, MAX_DRAW_SIDE};
+use crate::image::{Bitmap, MAX_DRAW_SIDE, MAX_FRAMES};
 use crate::layout::Rect;
 use crate::layout::MAX_SCROLLERS;
 use crate::net::{Credentials, Dest, Mode, Redirect, ScriptRequest};
@@ -78,6 +78,12 @@ pub enum ToRenderer {
         uid: u32,
         dx: f32,
         dy: f32,
+    },
+    /// You scrolled the page to show page-space `top..bottom`: load the
+    /// lazy images near it.
+    Reveal {
+        top: f32,
+        bottom: f32,
     },
     Render {
         width: f32,
@@ -396,9 +402,10 @@ fn check_paint_budget(list: &[DisplayCommand], atlas: &[GlyphBitmap], height: f3
     };
     for cmd in list {
         match cmd {
-            DisplayCommand::Rect { rect, .. } | DisplayCommand::Image { rect, .. } => {
-                add(rect.x, rect.y, rect.w, rect.h)?
-            }
+            // An animation shows one frame at a time.
+            DisplayCommand::Rect { rect, .. }
+            | DisplayCommand::Image { rect, .. }
+            | DisplayCommand::Animation { rect, .. } => add(rect.x, rect.y, rect.w, rect.h)?,
             DisplayCommand::Glyphs { glyphs, .. } => {
                 for g in glyphs {
                     let bmp = &atlas[g.id as usize];
@@ -517,6 +524,11 @@ impl ToRenderer {
                 e.f32(*dx);
                 e.f32(*dy);
             }
+            ToRenderer::Reveal { top, bottom } => {
+                e.u8(12);
+                e.f32(*top);
+                e.f32(*bottom);
+            }
             ToRenderer::ImageReply(r) => {
                 e.u8(10);
                 match r {
@@ -607,6 +619,10 @@ impl ToRenderer {
                 uid: d.u32()?,
                 dx: d.f32()?,
                 dy: d.f32()?,
+            },
+            12 => ToRenderer::Reveal {
+                top: d.f32()?,
+                bottom: d.f32()?,
             },
             10 => match d.u8()? {
                 1 => {
@@ -739,7 +755,12 @@ impl FromRenderer {
                 let mut index: std::collections::HashMap<*const Bitmap, u32> = Default::default();
                 let mut table: Vec<&Bitmap> = Vec::new();
                 for cmd in &r.list {
-                    if let DisplayCommand::Image { image, .. } = cmd {
+                    let images: &[Arc<Bitmap>] = match cmd {
+                        DisplayCommand::Image { image, .. } => std::slice::from_ref(image),
+                        DisplayCommand::Animation { frames, .. } => &frames.bitmaps,
+                        _ => &[],
+                    };
+                    for image in images {
                         index.entry(Arc::as_ptr(image)).or_insert_with(|| {
                             table.push(image);
                             (table.len() - 1) as u32
@@ -774,6 +795,15 @@ impl FromRenderer {
                             e.u8(3);
                             e.rect(*rect);
                             e.u32(index[&Arc::as_ptr(image)]);
+                        }
+                        DisplayCommand::Animation { rect, frames } => {
+                            e.u8(4);
+                            e.rect(*rect);
+                            e.u32(frames.bitmaps.len() as u32);
+                            for (b, d) in frames.bitmaps.iter().zip(&frames.delays) {
+                                e.u32(index[&Arc::as_ptr(b)]);
+                                e.u32(*d);
+                            }
                         }
                     }
                 }
@@ -823,6 +853,11 @@ impl FromRenderer {
                             e.f32(max_dy);
                         }
                     }
+                }
+                e.u32(r.lazy.len() as u32);
+                for (top, bottom) in &r.lazy {
+                    e.f32(*top);
+                    e.f32(*bottom);
                 }
                 // The title bitmap, if any, goes last, flagged after.
                 e.u32((r.atlas.len() + r.title.is_some() as usize) as u32);
@@ -983,6 +1018,28 @@ impl FromRenderer {
                             let image = images.get(id).ok_or("image id out of range")?.clone();
                             DisplayCommand::Image { rect, image }
                         }
+                        4 => {
+                            let rect = d.rect()?;
+                            let n = d.count(8)?;
+                            if !(2..=MAX_FRAMES).contains(&n) {
+                                return Err("bad animation frame count".into());
+                            }
+                            let mut bitmaps: Vec<Arc<Bitmap>> = Vec::with_capacity(n);
+                            let mut delays = Vec::with_capacity(n);
+                            for _ in 0..n {
+                                let id = d.u32()? as usize;
+                                let b = images.get(id).ok_or("image id out of range")?.clone();
+                                if bitmaps.first().is_some_and(|f| (f.w, f.h) != (b.w, b.h)) {
+                                    return Err("animation frames differ in size".into());
+                                }
+                                bitmaps.push(b);
+                                delays.push(d.u32()?.min(60_000));
+                            }
+                            DisplayCommand::Animation {
+                                rect,
+                                frames: Arc::new(crate::image::Frames { bitmaps, delays }),
+                            }
+                        }
                         t => return Err(format!("unknown display command {t}")),
                     });
                 }
@@ -1093,6 +1150,23 @@ impl FromRenderer {
                         layer,
                     });
                 }
+                // Where lazy images wait to be loaded.
+                let n = d.count(8)?;
+                if n > crate::page::MAX_LAZY {
+                    return Err("too many lazy images".into());
+                }
+                let mut lazy = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let (top, bottom) = (d.f32()?, d.f32()?);
+                    if !(top.is_finite()
+                        && bottom.is_finite()
+                        && top.abs() <= MAX_COORD
+                        && bottom.abs() <= MAX_COORD)
+                    {
+                        return Err("lazy image out of range".into());
+                    }
+                    lazy.push((top, bottom));
+                }
                 let n = d.count(4)?;
                 let mut atlas = Vec::with_capacity(n);
                 let mut atlas_bytes = 0usize;
@@ -1141,6 +1215,7 @@ impl FromRenderer {
                     layers,
                     title,
                     scrollers,
+                    lazy,
                 })
             }
             4 => FromRenderer::Dom(d.str()?),
@@ -1250,6 +1325,7 @@ mod tests {
                 h: 1,
                 data: vec![9, 8, 7],
             }),
+            lazy: vec![(900.0, 1100.0)],
         }
     }
 
@@ -1508,6 +1584,53 @@ mod tests {
             });
         }
         r
+    }
+
+    #[test]
+    fn animations_round_trip_and_are_checked() {
+        let frame = |v: u8| {
+            Arc::new(Bitmap {
+                w: 2,
+                h: 2,
+                rgba: vec![v; 16],
+            })
+        };
+        let mut r = sample();
+        let rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 2.0,
+            h: 2.0,
+        };
+        r.list.push(DisplayCommand::Animation {
+            rect,
+            frames: Arc::new(crate::image::Frames {
+                bitmaps: vec![frame(1), frame(2), frame(3)],
+                delays: vec![100, 200, 300],
+            }),
+        });
+        let bytes = FromRenderer::Rendered(r.clone()).encode();
+        let FromRenderer::Rendered(back) = FromRenderer::decode(&bytes).unwrap() else {
+            panic!("not a frame");
+        };
+        assert_eq!(back, r);
+        // Frames of different sizes are refused.
+        let mut bad = sample();
+        bad.list.push(DisplayCommand::Animation {
+            rect,
+            frames: Arc::new(crate::image::Frames {
+                bitmaps: vec![
+                    frame(1),
+                    Arc::new(Bitmap {
+                        w: 1,
+                        h: 1,
+                        rgba: vec![0; 4],
+                    }),
+                ],
+                delays: vec![100, 100],
+            }),
+        });
+        assert!(FromRenderer::decode(&FromRenderer::Rendered(bad).encode()).is_err());
     }
 
     #[test]

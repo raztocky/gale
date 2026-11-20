@@ -2,7 +2,7 @@
 
 use crate::css::Color;
 use crate::font;
-use crate::image::{self, Bitmap};
+use crate::image::{self, Bitmap, Frames};
 use crate::layout::{BoxKind, LayoutBox, Rect};
 use crate::style::{BgSize, Len, Position};
 use std::collections::HashMap;
@@ -33,6 +33,8 @@ pub enum DrawOp {
         rect: Rect,
         image: Arc<Bitmap>,
         clip: Option<Rect>,
+        /// An animated image's frames (the first is `image`).
+        frames: Option<Arc<Frames>>,
     },
 }
 
@@ -53,6 +55,75 @@ pub enum DisplayCommand {
         rect: Rect,
         image: Arc<Bitmap>,
     },
+    /// An animated image: frames like `Image`'s, all one size. The browser
+    /// draws the frame showing now over the page (see [`Canvas::paint_animation`]).
+    Animation {
+        rect: Rect,
+        frames: Arc<Frames>,
+    },
+}
+
+/// An image scaled to the size it's drawn at (only ever shrunk: enlarging
+/// is left to the browser's painter) and cropped to `clip`: where it goes
+/// and its pixels. The same image at the same size is scaled once. Past
+/// the frame's budget it's sent small if `shrink`, else not at all.
+fn place_image(
+    image: &Arc<Bitmap>,
+    rect: Rect,
+    clip: Option<Rect>,
+    scaled: &mut HashMap<(usize, u32, u32), Arc<Bitmap>>,
+    image_bytes: &mut usize,
+    shrink: bool,
+) -> Option<(Rect, Arc<Bitmap>)> {
+    let (w, h) = (
+        (rect.w.round() as u32).clamp(1, image.w),
+        (rect.h.round() as u32).clamp(1, image.h),
+    );
+    let key = (Arc::as_ptr(image) as usize, w, h);
+    let bmp = match scaled.get(&key) {
+        Some(b) => b.clone(),
+        None => {
+            let (w, h) = if shrink && *image_bytes + w as usize * h as usize * 4 > MAX_FRAME_IMAGE_BYTES {
+                image::fit(w, h, 64)
+            } else {
+                (w, h)
+            };
+            if *image_bytes + w as usize * h as usize * 4 > MAX_FRAME_IMAGE_BYTES {
+                return None;
+            }
+            let b = if (w, h) == (image.w, image.h) {
+                image.clone()
+            } else {
+                Arc::new(image::resize(image, w, h))
+            };
+            *image_bytes += b.rgba.len();
+            scaled.insert(key, b.clone());
+            b
+        }
+    };
+    match clip {
+        Some(c) if !contains(c, rect) => {
+            // Crop to the pixels inside the clip, and draw just those.
+            let v = rect.intersect(c);
+            let (sx, sy) = (bmp.w as f32 / rect.w, bmp.h as f32 / rect.h);
+            let x0 = ((v.x - rect.x) * sx).floor().max(0.0) as u32;
+            let y0 = ((v.y - rect.y) * sy).floor().max(0.0) as u32;
+            let x1 = ((v.x + v.w - rect.x) * sx).ceil() as u32;
+            let y1 = ((v.y + v.h - rect.y) * sy).ceil() as u32;
+            let part = image::crop(&bmp, x0, y0, x1, y1);
+            if part.w == 0 || part.h == 0 {
+                return None;
+            }
+            let dest = Rect {
+                x: rect.x + x0 as f32 / sx,
+                y: rect.y + y0 as f32 / sy,
+                w: part.w as f32 / sx,
+                h: part.h as f32 / sy,
+            };
+            Some((dest, Arc::new(part)))
+        }
+        _ => Some((rect, bmp)),
+    }
 }
 
 /// Image pixels sent with one frame, in bytes. Past this, images are sent
@@ -159,63 +230,45 @@ pub fn rasterize_indexed(ops: Vec<DrawOp>) -> (DisplayList, Vec<GlyphBitmap>, Ve
         starts.push(list.len());
         match op {
             DrawOp::Rect { rect, color } => list.push(DisplayCommand::Rect { rect, color }),
-            DrawOp::Image { rect, image, clip } => {
+            DrawOp::Image {
+                rect,
+                image,
+                clip,
+                frames,
+            } => {
                 if !(rect.w >= 1.0 && rect.h >= 1.0) || clip.is_some_and(|c| rect.intersect(c).is_empty()) {
                     continue;
                 }
-                // Only ever shrunk here: enlarging is left to the browser's
-                // painter, so no bitmap is bigger than the decoded image.
+                // An animation's frames, if they all fit the frame's budget
+                // (else just its first frame, like any image).
                 let (w, h) = (
                     (rect.w.round() as u32).clamp(1, image.w),
                     (rect.h.round() as u32).clamp(1, image.h),
                 );
-                let key = (Arc::as_ptr(&image) as usize, w, h);
-                let bmp = match scaled.get(&key) {
-                    Some(b) => b.clone(),
-                    None => {
-                        let (w, h) = if image_bytes + w as usize * h as usize * 4 > MAX_FRAME_IMAGE_BYTES {
-                            image::fit(w, h, 64)
-                        } else {
-                            (w, h)
-                        };
-                        if image_bytes + w as usize * h as usize * 4 > MAX_FRAME_IMAGE_BYTES {
-                            continue;
-                        }
-                        let b = if (w, h) == (image.w, image.h) {
-                            image.clone()
-                        } else {
-                            Arc::new(image::resize(&image, w, h))
-                        };
-                        image_bytes += b.rgba.len();
-                        scaled.insert(key, b.clone());
-                        b
-                    }
-                };
-                match clip {
-                    Some(c) if !contains(c, rect) => {
-                        // Crop to the pixels inside the clip, and draw just those.
-                        let v = rect.intersect(c);
-                        let (sx, sy) = (bmp.w as f32 / rect.w, bmp.h as f32 / rect.h);
-                        let x0 = ((v.x - rect.x) * sx).floor().max(0.0) as u32;
-                        let y0 = ((v.y - rect.y) * sy).floor().max(0.0) as u32;
-                        let x1 = ((v.x + v.w - rect.x) * sx).ceil() as u32;
-                        let y1 = ((v.y + v.h - rect.y) * sy).ceil() as u32;
-                        let part = image::crop(&bmp, x0, y0, x1, y1);
-                        if part.w == 0 || part.h == 0 {
-                            continue;
-                        }
-                        let dest = Rect {
-                            x: rect.x + x0 as f32 / sx,
-                            y: rect.y + y0 as f32 / sy,
-                            w: part.w as f32 / sx,
-                            h: part.h as f32 / sy,
-                        };
-                        list.push(DisplayCommand::Image {
-                            rect: dest,
-                            image: Arc::new(part),
+                if let Some(f) = frames.filter(|f| {
+                    image_bytes + f.bitmaps.len() * w as usize * h as usize * 4 <= MAX_FRAME_IMAGE_BYTES
+                }) {
+                    let placed: Option<Vec<(Rect, Arc<Bitmap>)>> = f
+                        .bitmaps
+                        .iter()
+                        .map(|b| place_image(b, rect, clip, &mut scaled, &mut image_bytes, false))
+                        .collect();
+                    if let Some(placed) = placed.filter(|p| !p.is_empty()) {
+                        let at = placed[0].0;
+                        list.push(DisplayCommand::Animation {
+                            rect: at,
+                            frames: Arc::new(Frames {
+                                bitmaps: placed.into_iter().map(|(_, b)| b).collect(),
+                                delays: f.delays.clone(),
+                            }),
                         });
+                        continue;
                     }
-                    _ => list.push(DisplayCommand::Image { rect, image: bmp }),
+                }
+                if let Some((rect, image)) =
+                    place_image(&image, rect, clip, &mut scaled, &mut image_bytes, true)
+                {
+                    list.push(DisplayCommand::Image { rect, image });
                 }
             }
             DrawOp::Text {
@@ -337,6 +390,7 @@ fn background_gradient(
             rect: area,
             image: Arc::new(bmp),
             clip: None,
+            frames: None,
         });
     }
 }
@@ -404,6 +458,7 @@ fn background_image(list: &mut Vec<DrawOp>, b: &LayoutBox, img: &crate::image::D
                 },
                 image: img.bitmap.clone(),
                 clip: Some(area),
+                frames: None,
             });
         }
     }
@@ -620,6 +675,7 @@ fn render_box(list: &mut Vec<DrawOp>, b: &LayoutBox, backgrounds: &Backgrounds, 
             rect: b.dims.content,
             image: img.bitmap.clone(),
             clip: None,
+            frames: img.frames.clone(),
         });
     }
     if let BoxKind::Anonymous { frags, .. } = &b.kind {
@@ -780,7 +836,19 @@ impl Canvas {
 
     /// Paint a display list. Glyph ids must index `atlas` (the IPC decoder
     /// checks this); out-of-range ids are skipped anyway.
+    /// Animations show their first frame.
     pub fn paint(&mut self, list: &DisplayList, atlas: &[GlyphBitmap], scroll_y: f32, offset_y: f32) {
+        for cmd in list {
+            if let DisplayCommand::Animation { rect, frames } = cmd {
+                self.paint_animation(*rect, frames, 0, offset_y - scroll_y, offset_y);
+            }
+            self.paint_cmd(cmd, atlas, offset_y - scroll_y, offset_y);
+        }
+    }
+
+    /// Like [`Canvas::paint`], leaving animations out (the caller draws
+    /// them a frame at a time).
+    pub fn paint_live(&mut self, list: &DisplayList, atlas: &[GlyphBitmap], scroll_y: f32, offset_y: f32) {
         for cmd in list {
             self.paint_cmd(cmd, atlas, offset_y - scroll_y, offset_y);
         }
@@ -813,6 +881,22 @@ impl Canvas {
                 image,
                 clip_top,
             ),
+            // Drawn over the page by the browser, a frame at a time.
+            DisplayCommand::Animation { .. } => {}
+        }
+    }
+
+    /// Draw the frame of an animation showing `ms` into it (see `paint_cmd`).
+    pub fn paint_animation(&mut self, rect: Rect, frames: &Frames, ms: u64, dy: f32, clip_top: f32) {
+        if let Some(b) = frames.bitmaps.get(frames.at(ms)) {
+            self.draw_image(
+                Rect {
+                    y: rect.y + dy,
+                    ..rect
+                },
+                b,
+                clip_top,
+            );
         }
     }
 
@@ -1099,9 +1183,9 @@ impl TileCache {
         let extents = list
             .iter()
             .map(|cmd| match cmd {
-                DisplayCommand::Rect { rect, .. } | DisplayCommand::Image { rect, .. } => {
-                    (rect.y, rect.y + rect.h)
-                }
+                DisplayCommand::Rect { rect, .. }
+                | DisplayCommand::Image { rect, .. }
+                | DisplayCommand::Animation { rect, .. } => (rect.y, rect.y + rect.h),
                 DisplayCommand::Glyphs { glyphs, .. } => {
                     glyphs.iter().fold((f32::MAX, f32::MIN), |(lo, hi), g| {
                         let h = atlas.get(g.id as usize).map(|b| b.h as f32).unwrap_or(0.0);
@@ -1420,6 +1504,57 @@ mod tests {
         assert!(c.pixels[top * w..]
             .iter()
             .all(|&p| p == pack(Color::rgb(200, 0, 0))));
+    }
+
+    #[test]
+    fn animations_are_scaled_and_cropped_frame_by_frame() {
+        let frame = |v: u8| {
+            Arc::new(Bitmap {
+                w: 4,
+                h: 4,
+                rgba: vec![v; 64],
+            })
+        };
+        let frames = Arc::new(Frames {
+            bitmaps: vec![frame(1), frame(2)],
+            delays: vec![100, 100],
+        });
+        let rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 2.0,
+            h: 2.0,
+        };
+        let clip = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 1.0,
+            h: 2.0,
+        };
+        let (list, _) = rasterize(vec![DrawOp::Image {
+            rect,
+            image: frames.bitmaps[0].clone(),
+            clip: Some(clip),
+            frames: Some(frames),
+        }]);
+        let [DisplayCommand::Animation { rect, frames }] = &list[..] else {
+            panic!("{list:?}");
+        };
+        assert_eq!((rect.w, rect.h), (1.0, 2.0));
+        assert_eq!(
+            frames
+                .bitmaps
+                .iter()
+                .map(|b| (b.w, b.h, b.rgba[0]))
+                .collect::<Vec<_>>(),
+            [(1, 2, 1), (1, 2, 2)]
+        );
+        // A still picture of the page shows the first frame.
+        let mut c = Canvas::new(2, 2, Color::WHITE);
+        c.paint(&list, &[], 0.0, 0.0);
+        let mut live = Canvas::new(2, 2, Color::WHITE);
+        live.paint_live(&list, &[], 0.0, 0.0);
+        assert_ne!(c.pixels, live.pixels);
     }
 
     #[test]

@@ -259,6 +259,36 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                 }
                 send(output, FromRenderer::Rendered(rendered))?;
             }
+            ToRenderer::Reveal { top, bottom } => {
+                let p = page.as_mut().ok_or("input before load")?;
+                let mut host = IpcHost {
+                    input: &mut *input,
+                    output: &mut *output,
+                    cookies: cookies.clone(),
+                    broken: None,
+                    policy: policy.clone(),
+                };
+                let finite = top.is_finite() && bottom.is_finite();
+                let changed = finite && p.reveal(top, bottom, &mut |u, added| host.decoded(u, added));
+                if let Some(e) = host.broken {
+                    return Err(e);
+                }
+                send(
+                    output,
+                    FromRenderer::Clicked {
+                        prevented: false,
+                        changed,
+                        navigate: None,
+                        console: vec![],
+                        submit: None,
+                        // A field you're typing in keeps the keyboard.
+                        focus: p.focus.is_some(),
+                        copied: None,
+                        read: vec![],
+                        invalid: None,
+                    },
+                )?;
+            }
             msg @ (ToRenderer::Click { .. }
             | ToRenderer::Type(_)
             | ToRenderer::Key(_)

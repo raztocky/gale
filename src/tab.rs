@@ -211,6 +211,12 @@ pub enum Input {
         dx: f32,
         dy: f32,
     },
+    /// The page is scrolled to show page-space `top..bottom` (lazy images
+    /// near it are loaded).
+    Reveal {
+        top: f32,
+        bottom: f32,
+    },
 }
 
 /// What the renderer reported when a page loaded.
@@ -415,6 +421,11 @@ impl Tab {
                     Input::Type(t) => page.type_text(None, &t),
                     Input::Key(k) => page.key(None, k),
                     Input::Scroll { uid, dx, dy } => page.scroll_box(None, uid, dx, dy),
+                    // Pages without scripts load every image at once.
+                    Input::Reveal { .. } => crate::page::Interaction {
+                        focus: page.focus.is_some(),
+                        ..Default::default()
+                    },
                 };
                 return Click {
                     prevented: done.prevented,
@@ -439,6 +450,7 @@ impl Tab {
             Input::Type(t) => ToRenderer::Type(t),
             Input::Key(k) => ToRenderer::Key(k),
             Input::Scroll { uid, dx, dy } => ToRenderer::Scroll { uid, dx, dy },
+            Input::Reveal { top, bottom } => ToRenderer::Reveal { top, bottom },
         };
         let result = r.send(msg).and_then(|_| {
             match r.serve(Instant::now() + RENDERER_TIMEOUT, SCRIPT_BYTES, &mut host)? {

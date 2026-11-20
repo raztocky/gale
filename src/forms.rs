@@ -834,6 +834,8 @@ pub const UA_CSS: &str = "
 .-brickle-cal-day { color: #5b5b66; font-size: 85%; }
 .-brickle-cal-today { border: 1px solid #0060df; }
 .-brickle-cal-button { width: 98px; color: #0060df; }
+.-brickle-clock-title { display: block; text-align: center; font-weight: bold; padding-top: 4px; }
+.-brickle-month-cell { width: 65px; }
 .-brickle-swatch-cell { display: inline-block; width: 18px; height: 18px; margin: 1px; border: 1px solid #8f8f9d; }
 ";
 
@@ -951,11 +953,11 @@ pub fn decorate(n: &mut Node, d: &Decor) {
             } else {
                 val.clone()
             };
-            let date = crate::pickers::is_date(&e);
-            let ph = if ph.is_empty() && date {
-                "yyyy-mm-dd".to_string()
-            } else {
-                ph
+            let picker = crate::pickers::kind(&e);
+            let date = picker.is_some();
+            let ph = match picker {
+                Some(k) if ph.is_empty() => crate::pickers::placeholder(k).to_string(),
+                _ => ph,
             };
             n.children = if shown.is_empty() && !ph.is_empty() && !focused {
                 vec![placeholder(&ph)]
@@ -968,8 +970,8 @@ pub fn decorate(n: &mut Node, d: &Decor) {
                 n.children
                     .push(dom::elem("span".into(), attrs, vec![text_child("▾")]));
                 if d.open.is_some_and(|o| o == n.uid && n.uid != 0) {
-                    let month = d.month.unwrap_or_else(|| crate::pickers::opening_month(&val));
-                    n.children.push(crate::pickers::calendar(&e, month));
+                    let month = d.month.unwrap_or_else(|| crate::pickers::opening(&e, &val));
+                    n.children.push(crate::pickers::popup(&e, month));
                     place_popup(n);
                 }
             }

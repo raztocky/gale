@@ -1,7 +1,7 @@
 //! One disposable sandboxed process per image. The browser only handles
 //! bounded byte buffers and validated pixels, never image parsers.
 use crate::{
-    image::{Bitmap, Decoded, MAX_PIXELS, MAX_SIDE, STORE_SIDE},
+    image::{Bitmap, Decoded, Frames, MAX_ANIMATION_BYTES, MAX_FRAMES, MAX_PIXELS, MAX_SIDE, STORE_SIDE},
     net::Cancel,
 };
 use std::{
@@ -12,14 +12,17 @@ use std::{
 };
 
 pub const MAX_INPUT: usize = 8 * 1024 * 1024;
-const MAX_OUTPUT: usize = 16 + STORE_SIDE as usize * STORE_SIDE as usize * 4;
+const MAX_OUTPUT: usize =
+    16 + STORE_SIDE as usize * STORE_SIDE as usize * 4 + 4 + MAX_FRAMES * 4 + MAX_ANIMATION_BYTES;
 const WALL_LIMIT: Duration = Duration::from_secs(3);
 
+/// The worker's answer: natural and stored size, the pixels, then for an
+/// animation the frame count, each frame's delay and the other frames.
 pub fn unpack(bytes: &[u8]) -> Result<Decoded, String> {
     if bytes.len() < 16 {
         return Err("short image result".into());
     }
-    let n = |i| u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap());
+    let n = |i: usize| u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap());
     let (nw, nh, w, h) = (n(0), n(4), n(8), n(12));
     if nw == 0
         || nh == 0
@@ -30,17 +33,48 @@ pub fn unpack(bytes: &[u8]) -> Result<Decoded, String> {
         || h == 0
         || w > STORE_SIDE
         || h > STORE_SIDE
-        || bytes.len() != 16 + w as usize * h as usize * 4
+        || bytes.len() < 16 + w as usize * h as usize * 4
     {
         return Err("invalid image result dimensions".into());
     }
+    let size = w as usize * h as usize * 4;
+    let bitmap = Arc::new(Bitmap {
+        w,
+        h,
+        rgba: bytes[16..16 + size].to_vec(),
+    });
+    let rest = &bytes[16 + size..];
+    let frames = if rest.is_empty() {
+        None
+    } else {
+        let bad = || "invalid animation in image result".to_string();
+        let count = u32::from_le_bytes(rest.get(..4).ok_or_else(bad)?.try_into().unwrap()) as usize;
+        if !(2..=MAX_FRAMES).contains(&count)
+            || (count - 1) * size > MAX_ANIMATION_BYTES
+            || rest.len() != 4 + count * 4 + (count - 1) * size
+        {
+            return Err(bad());
+        }
+        let delays: Vec<u32> = rest[4..4 + count * 4]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c).min(60_000))
+            .collect();
+        let mut bitmaps = vec![bitmap.clone()];
+        for px in rest[4 + count * 4..].chunks_exact(size) {
+            bitmaps.push(Arc::new(Bitmap {
+                w,
+                h,
+                rgba: px.to_vec(),
+            }));
+        }
+        Some(Arc::new(Frames { bitmaps, delays }))
+    };
     Ok(Decoded {
         natural: (nw, nh),
-        bitmap: Arc::new(Bitmap {
-            w,
-            h,
-            rgba: bytes[16..].to_vec(),
-        }),
+        bitmap,
+        frames,
     })
 }
 
@@ -50,6 +84,15 @@ fn pack(d: Decoded) -> Vec<u8> {
         bytes.extend_from_slice(&n.to_le_bytes());
     }
     bytes.extend_from_slice(&d.bitmap.rgba);
+    if let Some(f) = d.frames.filter(|f| f.bitmaps.len() >= 2) {
+        bytes.extend_from_slice(&(f.bitmaps.len() as u32).to_le_bytes());
+        for d in &f.delays {
+            bytes.extend_from_slice(&d.to_le_bytes());
+        }
+        for b in &f.bitmaps[1..] {
+            bytes.extend_from_slice(&b.rgba);
+        }
+    }
     bytes
 }
 
@@ -138,6 +181,33 @@ fn exchange(mut cmd: Command, bytes: Vec<u8>, cancel: &Cancel, deadline: Instant
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn animations_cross_from_the_worker() {
+        let b = |v: u8| {
+            Arc::new(Bitmap {
+                w: 1,
+                h: 2,
+                rgba: vec![v; 8],
+            })
+        };
+        let d = Decoded {
+            natural: (1, 2),
+            bitmap: b(1),
+            frames: Some(Arc::new(Frames {
+                bitmaps: vec![b(1), b(2)],
+                delays: vec![100, 250],
+            })),
+        };
+        let bytes = pack(d);
+        let back = unpack(&bytes).unwrap();
+        let f = back.frames.unwrap();
+        assert_eq!(f.delays, vec![100, 250]);
+        assert_eq!(f.bitmaps[1].rgba, vec![2; 8]);
+        assert!(unpack(&bytes[..bytes.len() - 1]).is_err(), "truncated");
+        let mut one = bytes.clone();
+        one[16 + 8..16 + 12].copy_from_slice(&1u32.to_le_bytes());
+        assert!(unpack(&one).is_err(), "an animation of one frame");
+    }
     #[test]
     fn output_is_bounded_and_validated() {
         for b in [vec![], vec![0; 16], vec![255; 16]] {

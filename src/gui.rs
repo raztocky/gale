@@ -9,11 +9,13 @@ use brickle::lineedit::LineEdit;
 use brickle::net;
 use brickle::network::{Action, LogEntry, Network, Outcome};
 use brickle::page::{self, Key as PageKey, Rendered};
-use brickle::paint::{self, Canvas, DisplayList, GlyphBitmap, GlyphCache, Layer, TileCache, TilePainter};
+use brickle::paint::{
+    self, Canvas, DisplayCommand, DisplayList, GlyphBitmap, GlyphCache, Layer, TileCache, TilePainter,
+};
 use brickle::select::{self, Bands, FindText, Pos};
 use brickle::tab::{Input, Tab};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -273,6 +275,11 @@ struct PageIndex {
     /// each layer's own list.
     page: DisplayList,
     layers: Vec<(Layer, DisplayList)>,
+    /// Animated images, drawn over the page a frame at a time, with the
+    /// layer each is on.
+    animations: Vec<(Rect, Arc<brickle::image::Frames>, Option<Layer>)>,
+    /// Which page this is the index of (a new one for every layout).
+    id: u64,
 }
 
 impl PageIndex {
@@ -286,12 +293,52 @@ impl PageIndex {
             at = l.end;
         }
         page.extend_from_slice(&r.list[at.min(r.list.len())..]);
+        let mut animations = Vec::new();
+        for (i, cmd) in r.list.iter().enumerate() {
+            if let DisplayCommand::Animation { rect, frames } = cmd {
+                let layer = r
+                    .layers
+                    .iter()
+                    .rev()
+                    .find(|l| (l.start..l.end).contains(&i))
+                    .copied();
+                animations.push((*rect, frames.clone(), layer));
+            }
+        }
         PageIndex {
             text: Bands::new(r.texts.iter().map(|t| t.rect)),
             links: Bands::new(r.links.iter().map(|(rect, _)| *rect)),
             page,
             layers,
+            animations,
+            id: {
+                static NEXT: AtomicU64 = AtomicU64::new(1);
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            },
         }
+    }
+
+    /// The animations in view at page scroll `scroll`, and where each shows
+    /// on the page as scrolled (its layer moved for scrolling).
+    fn animations_in_view(
+        &self,
+        scroll: f32,
+        view_h: f32,
+    ) -> impl Iterator<Item = (Rect, &brickle::image::Frames, Option<&Layer>, f32)> + '_ {
+        self.animations.iter().filter_map(move |(rect, frames, layer)| {
+            let shift = layer.map_or(0.0, |l| l.shift(scroll));
+            let y = rect.y + shift - scroll;
+            (y + rect.h > 0.0 && y < view_h).then_some((*rect, &**frames, layer.as_ref(), shift))
+        })
+    }
+
+    /// Which frame each animation in view shows `ms` in, as one number:
+    /// when it changes, the window is painted again.
+    fn animation_frames(&self, ms: u64, scroll: f32, view_h: f32) -> u64 {
+        self.animations_in_view(scroll, view_h)
+            .fold(0u64, |h, (_, f, _, _)| {
+                h.wrapping_mul(1_000_003).wrapping_add(f.at(ms) as u64 + 1)
+            })
     }
 
     /// The page point under window point (`mx`, `my`): on a fixed or sticky
@@ -610,6 +657,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         texts: vec![],
         layers: vec![],
         scrollers: vec![],
+        lazy: vec![],
         title: None,
     };
     // In flight: the URL being loaded (None for a re-layout).
@@ -701,6 +749,11 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
     let mut last_press: Option<(Instant, f32, f32)> = None;
     let mut dirty = true;
     let mut frame = 0u32;
+    // Animated images' clock, and the frames last painted.
+    let anim_clock = Instant::now();
+    let mut shown_frames = 0u64;
+    // The layout and scroll position lazy images were last asked for at.
+    let mut asked_reveal: Option<(u64, i32)> = None;
     let mut canvas = Canvas::new(w, h, Color::WHITE);
 
     // Tabs: the loop's variables above are the current tab's; the others
@@ -2146,6 +2199,29 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         if tiles.as_mut().is_some_and(|t| t.collect(&painter)) {
             dirty = true; // tiles came back from the painters
         }
+        // Lazy images near where you've scrolled: ask for them.
+        let near = |&(top, bottom): &(f32, f32)| {
+            bottom >= scroll - page::LAZY_MARGIN && top <= scroll + view_h + page::LAZY_MARGIN
+        };
+        let here = (ix.id, (scroll / 200.0) as i32);
+        if tab.is_some()
+            && busy.is_none()
+            && pending_input.is_empty()
+            && asked_reveal != Some(here)
+            && rendered.lazy.iter().any(near)
+        {
+            asked_reveal = Some(here);
+            pending_input.push(Input::Reveal {
+                top: scroll,
+                bottom: scroll + view_h,
+            });
+        }
+        let anim_ms = anim_clock.elapsed().as_millis() as u64;
+        let frames_now = ix.animation_frames(anim_ms, scroll, view_h);
+        if frames_now != shown_frames {
+            shown_frames = frames_now;
+            dirty = true;
+        }
         if dirty || loading {
             canvas = Canvas::new(w, h, rendered.background);
             if tiles.as_ref().is_some_and(|t| t.width() != page_w as usize) {
@@ -2166,9 +2242,19 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
             if tc.draw(&mut canvas, scroll, bar as usize, Some(&painter)) {
                 stale_tiles = None;
             }
+            // Animated images: the frame showing now, over the page.
+            let anims: Vec<_> = ix.animations_in_view(scroll, view_h).collect();
+            for (rect, frames, _, _) in anims.iter().filter(|a| a.2.is_none()) {
+                canvas.paint_animation(*rect, frames, anim_ms, bar - scroll, bar);
+            }
             // Fixed and sticky boxes, where scrolling puts them.
             for (l, list) in &ix.layers {
-                canvas.paint(list, &rendered.atlas, scroll - l.shift(scroll), bar);
+                canvas.paint_live(list, &rendered.atlas, scroll - l.shift(scroll), bar);
+                for (rect, frames, _, shift) in
+                    anims.iter().filter(|a| a.2.is_some_and(|x| x.start == l.start))
+                {
+                    canvas.paint_animation(*rect, frames, anim_ms, bar - scroll + shift, bar);
+                }
             }
             if let Some(f) = &find {
                 let shown = |(a, _): &(Pos, Pos)| {
@@ -2467,6 +2553,7 @@ fn blank_rendered() -> Rendered {
         texts: vec![],
         layers: vec![],
         scrollers: vec![],
+        lazy: vec![],
         title: None,
     }
 }
