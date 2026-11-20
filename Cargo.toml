@@ -13,7 +13,7 @@ gui = ["dep:minifb", "dep:arboard"]
 png = "0.18"
 url = "2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-native-certs = "0.7"
+rustls-native-certs = "0.8"
 # Certificate revocation (CRLite) filters, and the SHA-256 that keys them.
 clubcard-crlite = { version = "0.6", default-features = false }
 ring = "0.17"
