@@ -33,6 +33,18 @@ cargo run --release -- sandbox-test         # check the renderer sandbox works o
 Debugging flags: `--no-sandbox` runs everything in one process, and `--no-filters` skips the
 filter lists and your rules.
 
+**In your app menu:** copy the launcher and icon into your home folder, pointing it at the
+binary you built:
+
+```sh
+mkdir -p ~/.local/share/applications ~/.local/share/icons/hicolor/scalable/apps
+sed "s|^Exec=brickle|Exec=$PWD/target/release/brickle|" assets/brickle.desktop > ~/.local/share/applications/brickle.desktop
+cp assets/brickle.svg ~/.local/share/icons/hicolor/scalable/apps/
+```
+
+It then also shows in "Open with" for web pages and links, and can be picked as the default
+browser in your system settings (Brickle never makes itself the default).
+
 **Linux Mint:** works out of the box on X11 (Cinnamon). If the build complains about missing
 libraries, run `sudo apt install build-essential libxkbcommon-dev`.
 
@@ -50,6 +62,7 @@ size, and clicking the percentage between them goes back to the normal size.
 | Bookmark this page (again to remove) / bookmarks toolbar | `Ctrl+D` / `Ctrl+Shift+B`; right-click a bookmark to remove it |
 | Resize the request panel | drag its left edge |
 | New tab / close tab / reopen closed tab | `Ctrl+T` or `+` / `Ctrl+W` or `×` / `Ctrl+Shift+T` |
+| Move a tab | drag it along the tab strip |
 | Switch tabs | `Ctrl+Tab`, `Ctrl+Shift+Tab`, `Ctrl+PgDn`/`PgUp`, `Ctrl+1`…`Ctrl+9` |
 | Open a link in a new tab | middle-click, or `Ctrl`+click |
 | Forms | click a field to type (where you click puts the caret; drag to select, double-click a word); `Tab` next field, `Enter` submit, `Esc` leave the field. In a field: arrows, `Home`/`End` move the caret (`Ctrl`: by words), `Shift` selects, `Ctrl+A` selects all. Click a drop-down to see its options; `↑`/`↓` change it |

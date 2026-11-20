@@ -5,7 +5,7 @@ Planned work, roughly in priority order. Items marked *discuss* need a decision 
 ## Features
 - [x] Images (PNG/JPEG/WebP/GIF/SVG), decoded inside the sandboxed renderer
 - [x] SVG images: text, in the bundled fonts
-- [x] SVG images: drawn again at the size shown (`<img>` and inline `<svg>`; CSS backgrounds still at their own size)
+- [x] SVG images: drawn again at the size shown (`<img>`, inline `<svg>` and CSS backgrounds)
 - [x] Images: CSS `background-image`
 - [x] Images: `<picture>` sources (`media`, `type`) and `srcset` (`x`/`w` with `sizes`), chosen for a fixed 1x density
 - [x] Images: animated GIFs (animated WebP shows its first frame), `loading=lazy`
@@ -50,7 +50,8 @@ Planned work, roughly in priority order. Items marked *discuss* need a decision 
 ## Project
 - [ ] Choose a license
 - [x] App icon of Brickle the cat (`assets/brickle.svg`)
-- [ ] Home-page art; `.desktop` file for the Linux menu
+- [x] `.desktop` file for the Linux menu (`assets/brickle.desktop`)
+- [ ] Home-page art
 - [ ] Bump `FIREFOX_VERSION` and `FIREFOX_RELEASED` in `src/net.rs` now and then: Brickle
       assumes up to six releases have come out since (about three months), then asks to be updated
 
@@ -77,7 +78,7 @@ what's next:
 - [x] `import()` of an address built at run time (fetched when asked, as a script's request).
 - [x] Modules under CORS (no cookies for another origin, which must agree to share) and only if
   served as JavaScript.
-- [ ] `<link rel=modulepreload>` (modules load when used, so it only saves time).
+- [x] `<link rel=modulepreload>`, fetched before modules run and checked against its `integrity`.
 - [x] Keyboard input and form controls (typing into fields, submitting forms).
 - [x] More selectors for `querySelector` (sibling combinators, `:not()`, attribute values),
   shared with CSS.
@@ -113,7 +114,7 @@ selects (with a drop-down), buttons, labels, Tab between fields, Enter to submit
 Done: tab strip, new/close/switch (keyboard and mouse), links in background tabs, each tab with
 its own renderer, history, scroll and form focus.
 - [x] Reopen closed tab (`Ctrl+Shift+T`), with its history (kept in memory only).
-- [ ] Drag tabs to reorder.
+- [x] Drag tabs to reorder.
 - [x] Bookmarks (`Ctrl+D`) and a bookmarks toolbar (on by default, `Ctrl+Shift+B`).
 - [ ] Bookmark folders, renaming and reordering; a menu for bookmarks that don't fit the toolbar.
 - [x] Discard the renderers of tabs left in the background for a long time (10 minutes, or past 6 live background tabs; they reload when shown).

@@ -397,12 +397,14 @@ fn background_gradient(
 
 /// A box's background image: sized, positioned and tiled in its padding
 /// box, and clipped to it.
-fn background_image(list: &mut Vec<DrawOp>, b: &LayoutBox, img: &crate::image::Decoded) {
+/// The size one tile of box `b`'s background image is drawn at, for an
+/// image `natural` in size.
+pub fn background_tile(b: &LayoutBox, natural: (u32, u32)) -> Option<(f32, f32)> {
     let s = b.style();
     let area = b.dims.padding_box();
-    let (nw, nh) = (img.natural.0 as f32, img.natural.1 as f32);
+    let (nw, nh) = (natural.0 as f32, natural.1 as f32);
     if nw < 1.0 || nh < 1.0 || area.is_empty() {
-        return;
+        return None;
     }
     let (w, h) = match s.background_size {
         BgSize::Auto => (nw, nh),
@@ -422,9 +424,15 @@ fn background_image(list: &mut Vec<DrawOp>, b: &LayoutBox, img: &crate::image::D
             (None, None) => (nw, nh),
         },
     };
-    if !(w >= 0.5 && h >= 0.5 && w.is_finite() && h.is_finite()) {
+    (w >= 0.5 && h >= 0.5 && w.is_finite() && h.is_finite()).then_some((w, h))
+}
+
+fn background_image(list: &mut Vec<DrawOp>, b: &LayoutBox, img: &crate::image::Decoded) {
+    let s = b.style();
+    let area = b.dims.padding_box();
+    let Some((w, h)) = background_tile(b, img.natural) else {
         return;
-    }
+    };
     // Percentages line up that point of the image with that point of the box.
     let at = |l: Len, free: f32| match l {
         Len::Percent(p) => free * p / 100.0,

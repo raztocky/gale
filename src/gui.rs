@@ -739,6 +739,9 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
     let mut key_box: Option<(u32, String)> = None;
     // Dragging the requests panel's left edge to resize it.
     let mut panel_drag = false;
+    // A tab held down with the mouse, and where the press was: dragging it
+    // along the strip moves it.
+    let mut tab_drag: Option<(TabId, f32, bool)> = None;
     // The page as it was painted before its latest change, shown until the
     // new tiles are painted.
     let mut stale_tiles: Option<TileCache> = None;
@@ -1760,6 +1763,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                         tab_action = Some(if rects[i].1.contains(lx, ly) {
                             TabAction::Close(order[i])
                         } else {
+                            tab_drag = Some((order[i], lx, false));
                             TabAction::Switch(i)
                         });
                     }
@@ -1932,6 +1936,30 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     ui.address.set(&info.url);
                 }
                 dirty = true;
+            }
+        }
+        if let Some((id, from, moved)) = tab_drag.as_mut() {
+            match (down, mouse) {
+                (true, Some((mx, _))) => {
+                    let lx = mx / k;
+                    // A few pixels of slack, so a click doesn't move it.
+                    *moved |= (lx - *from).abs() > 6.0;
+                    if *moved {
+                        let (rects, _) = tab_rects(order.len(), w as f32 / k);
+                        let to = rects
+                            .iter()
+                            .position(|(r, _)| lx < r.x + r.w)
+                            .unwrap_or(order.len().saturating_sub(1));
+                        if let Some(at) = order.iter().position(|t| t == id) {
+                            if at != to && to < order.len() {
+                                let t = order.remove(at);
+                                order.insert(to, t);
+                                dirty = true;
+                            }
+                        }
+                    }
+                }
+                _ => tab_drag = None,
             }
         }
         if panel_drag {

@@ -80,6 +80,8 @@ pub struct Page {
     image_bytes: usize,
     /// SVG pictures at the last layout, by node: the size shown.
     svg_shown: RefCell<Vec<(u32, f32, f32)>>,
+    /// SVG backgrounds at the last layout, by address: the size of a tile.
+    svg_backgrounds_shown: RefCell<Vec<(String, f32, f32)>>,
     /// The size each SVG (by address) was last drawn again at.
     svg_drawn: HashMap<String, (u32, u32)>,
     /// Your text size (see `StyleContext::text_scale`).
@@ -505,6 +507,24 @@ impl Page {
             loader.run_pending(&mut rt, host);
             pump(&mut rt, host, until);
         }
+        // Modules the page says it will need are fetched first, checked
+        // against the link's `integrity`; a mismatch means a later import
+        // of it fails.
+        for (id, url) in rt.module_preloads() {
+            if Instant::now() >= until || rt.has_module(&url) {
+                continue;
+            }
+            let csp = rt.script_sources(id, true);
+            let added = !from_server.contains(&url);
+            if let Some(code) = loader.fetch_module(&mut rt, &url, added, &csp, host) {
+                let code = if rt.integrity_ok(id, &url, &code) {
+                    Ok(code)
+                } else {
+                    Err("integrity mismatch".to_string())
+                };
+                rt.add_module_source(&url, code);
+            }
+        }
         // Modules wait for the document, as `defer` scripts do.
         for (id, src, code) in rt.document_modules() {
             if Instant::now() >= until {
@@ -578,6 +598,7 @@ impl Page {
             file_names: HashMap::new(),
             image_bytes: 0,
             svg_shown: RefCell::new(vec![]),
+            svg_backgrounds_shown: RefCell::new(vec![]),
             svg_drawn: HashMap::new(),
             text_scale: 1.0,
             viewport: (1024.0, 768.0),
@@ -686,7 +707,8 @@ impl Page {
     /// painting again (its layout doesn't change).
     pub fn redraw_svgs(&mut self, decode: &mut SvgRedraw) -> bool {
         let shown = std::mem::take(&mut *self.svg_shown.borrow_mut());
-        if shown.is_empty() {
+        let backgrounds = std::mem::take(&mut *self.svg_backgrounds_shown.borrow_mut());
+        if shown.is_empty() && backgrounds.is_empty() {
             return false;
         }
         let mut by_node: HashMap<u32, String> = img_sources(&self.base, &self.dom, self.viewport)
@@ -696,8 +718,12 @@ impl Page {
         by_node.extend(self.inline_svgs.iter().map(|(u, s)| (*u, s.clone())));
         // The largest size each is shown at.
         let mut want: Vec<(String, u32, u32)> = Vec::new();
-        for (uid, w, h) in shown {
-            let Some(url) = by_node.get(&uid) else { continue };
+        let shown = shown
+            .into_iter()
+            .filter_map(|(uid, w, h)| Some((by_node.get(&uid)?.clone(), w, h)))
+            .chain(backgrounds);
+        for (url, w, h) in shown {
+            let url = &url;
             let size = image::fit(
                 (w.ceil() as u32).clamp(1, image::MAX_SIDE),
                 (h.ceil() as u32).clamp(1, image::MAX_SIDE),
@@ -1617,6 +1643,19 @@ impl Page {
             .iter()
             .filter(|b| b.image.as_ref().is_some_and(|d| d.svg.is_some()))
             .map(|b| (b.uid, b.dims.content.w, b.dims.content.h))
+            .take(MAX_SVG_REDRAWS * 4)
+            .collect();
+        *self.svg_backgrounds_shown.borrow_mut() = order
+            .iter()
+            .filter_map(|b| {
+                let url = net::resolve(&self.base, b.style().background_image.as_deref()?);
+                let Some(Some(d)) = self.images.get(&url) else {
+                    return None;
+                };
+                d.svg.as_ref()?;
+                let (w, h) = paint::background_tile(b, d.natural)?;
+                Some((url, w, h))
+            })
             .take(MAX_SVG_REDRAWS * 4)
             .collect();
         // Where held-back lazy images are, even with no size yet.
@@ -3198,6 +3237,25 @@ mod image_tests {
         assert!(!page.redraw_svgs(&mut |b, want| image::decode_at(b, Some(want))));
     }
 
+    #[test]
+    fn svg_backgrounds_are_redrawn_at_the_tile_size() {
+        let svg = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20'%3E%3Crect width='20' height='20' fill='red'/%3E%3C/svg%3E";
+        let svg = svg.replace('\'', "%27");
+        let (mut page, _) = load(&format!(
+            "<div style='width:400px;height:300px;background:url(\"{svg}\") center/cover no-repeat'></div>"
+        ));
+        let _ = page.render(800.0, 600.0);
+        let mut asked = vec![];
+        assert!(page.redraw_svgs(&mut |b, want| {
+            asked.push(want);
+            image::decode_at(b, Some(want))
+        }));
+        // Covering 400x300 with a square: 400x400.
+        assert_eq!(asked, [(400, 400)]);
+        let _ = page.render(800.0, 600.0);
+        assert!(!page.redraw_svgs(&mut |b, want| image::decode_at(b, Some(want))));
+    }
+
     /// Inline `<svg>` is drawn as an image: sized like one, coloured by the
     /// page's CSS, with nothing fetched and its text not shown as HTML.
     #[test]
@@ -4273,6 +4331,35 @@ mod module_tests {
             &mut host,
         );
         (page, host, out.console)
+    }
+
+    #[test]
+    fn module_preloads_are_fetched_first_and_checked() {
+        let (page, host, console) = load(
+            "<link rel=modulepreload href=/js/a.js>\
+             <link rel=modulepreload href=/js/bad.js integrity='sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU='>\
+             <link rel=modulepreload href=/js/style.css as=style>\
+             <p id=o>start</p>\
+             <script type=module>import { a } from '/js/a.js'; const o = document.getElementById('o'); o.textContent += ' ' + a;\
+               import('/js/bad.js').then(() => { o.textContent += ' LEAK'; }, () => { o.textContent += ' refused'; });</script>",
+            vec![
+                ("https://site.example/js/a.js", "export const a = 'a';"),
+                ("https://site.example/js/bad.js", "export const b = 'tampered';"),
+            ],
+        );
+        let text = page.dom.text_content();
+        assert!(text.contains("start a refused"), "{text}\n{console:?}");
+        let urls: Vec<&str> = host.fetched.iter().map(|(u, _)| u.as_str()).collect();
+        // Each fetched once, in the order linked; `as=style` isn't a module.
+        assert_eq!(
+            urls,
+            ["https://site.example/js/a.js", "https://site.example/js/bad.js"],
+            "{console:?}"
+        );
+        assert!(
+            console.iter().any(|l| l.contains("doesn't match its integrity")),
+            "{console:?}"
+        );
     }
 
     #[test]

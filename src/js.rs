@@ -2043,6 +2043,28 @@ impl Runtime {
         .collect()
     }
 
+    /// `<link rel=modulepreload>`s in the document: (element, address).
+    pub fn module_preloads(&self) -> Vec<(u32, String)> {
+        with(|s| {
+            let mut all = Vec::new();
+            s.dom.descendants(DOCUMENT, &mut all);
+            let base = doc_base(s);
+            all.into_iter()
+                .filter_map(|id| {
+                    let e = s.dom.element(id)?;
+                    let rel = e.attrs.get("rel")?;
+                    let preload = e.tag == "link"
+                        && rel.split_ascii_whitespace().any(|t| t.eq_ignore_ascii_case("modulepreload"))
+                        // `as` is a script, or left out.
+                        && e.attrs.get("as").is_none_or(|a| a.trim().is_empty() || a.trim().eq_ignore_ascii_case("script"));
+                    let href = e.attrs.get("href").filter(|h| !h.trim().is_empty())?;
+                    preload.then(|| (id, crate::net::resolve(&base, href)))
+                })
+                .take(MAX_MODULES)
+                .collect()
+        })
+    }
+
     fn scripts_where(&self, want: fn(&ElementData) -> bool) -> Vec<(u32, Option<String>, String)> {
         with(|s| {
             let mut all = Vec::new();
