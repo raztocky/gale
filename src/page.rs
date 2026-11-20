@@ -31,6 +31,9 @@ pub struct Page {
     /// External stylesheets fetched so far, by URL.
     sheet_cache: HashMap<String, Stylesheet>,
     policy: crate::csp::Csp,
+    /// What relative addresses on the page are resolved against: its
+    /// `<base href>`, else its own address.
+    base: String,
     /// Boxes from the last layout and the node each is for, in paint
     /// order, for finding what a click hit.
     hits: RefCell<Vec<(Rect, u32)>>,
@@ -518,6 +521,7 @@ impl Page {
             scripting,
             sheet_cache: HashMap::new(),
             policy: crate::csp::Csp::new(url),
+            base: url.to_string(),
             hits: RefCell::new(Vec::new()),
             script_boxes: RefCell::new(Vec::new()),
             scrolled: RefCell::new(HashMap::new()),
@@ -579,7 +583,7 @@ impl Page {
 
     pub fn load_images_decoded(&mut self, fetch: &mut dyn FnMut(&str, bool) -> Result<Decoded, String>) {
         let held = self.held_back();
-        let mut urls: Vec<String> = img_sources(&self.url, &self.dom, self.viewport)
+        let mut urls: Vec<String> = img_sources(&self.base, &self.dom, self.viewport)
             .into_iter()
             .filter(|(uid, _, _)| !held.contains(uid))
             .map(|(_, u, _)| u)
@@ -646,19 +650,19 @@ impl Page {
         self.dom
             .walk(&mut els, &|n| matches!(n.tag(), Some("link" | "script")));
         out.extend(
-            img_sources(&self.url, &self.dom, self.viewport)
+            img_sources(&self.base, &self.dom, self.viewport)
                 .into_iter()
                 .map(|(_, u, _)| u),
         );
         for e in els.iter().filter_map(|n| n.element()) {
             let href = match e.tag.as_str() {
-                "link" => e.attrs.get("href").map(|h| net::resolve(&self.url, h)),
-                _ => e.attrs.get("src").map(|s| net::resolve(&self.url, s)),
+                "link" => e.attrs.get("href").map(|h| net::resolve(&self.base, h)),
+                _ => e.attrs.get("src").map(|s| net::resolve(&self.base, s)),
             };
             out.extend(href);
         }
         for s in &self.sheets {
-            out.extend(css::urls(s).map(|u| net::resolve(&self.url, u)));
+            out.extend(css::urls(s).map(|u| net::resolve(&self.base, u)));
         }
         out
     }
@@ -704,12 +708,12 @@ impl Page {
             backgrounds: Vec::new(),
             svgs: Vec::new(),
         };
-        walk(&styled, &self.url, &mut out);
+        walk(&styled, &self.base, &mut out);
         (out.backgrounds, out.svgs)
     }
 
     fn images_by_node(&self, tree: &Node) -> HashMap<u32, Decoded> {
-        let mut out: HashMap<u32, Decoded> = img_sources(&self.url, tree, self.viewport)
+        let mut out: HashMap<u32, Decoded> = img_sources(&self.base, tree, self.viewport)
             .into_iter()
             .filter_map(|(uid, url, density)| {
                 let mut d = self.images.get(&url)?.clone()?;
@@ -733,6 +737,7 @@ impl Page {
     /// external ones not seen before) and title.
     fn set_tree(&mut self, mut dom: Node, fetch: &mut StyleFetcher) {
         strip_inline_styles(&mut dom, &self.policy);
+        self.base = page_base(&self.url, &dom, &self.policy);
         let mut sheets = Vec::new();
         let mut found = Vec::new();
         let scripting = self.scripting;
@@ -761,7 +766,7 @@ impl Page {
                     if media.contains("print") {
                         continue;
                     }
-                    let abs = net::resolve(&self.url, href);
+                    let abs = net::resolve(&self.base, href);
                     let nonce = e.attrs.get("nonce").map(String::as_str);
                     if !self.policy.style_link(nonce, &abs) {
                         continue;
@@ -796,7 +801,7 @@ impl Page {
             .unwrap_or_default();
         self.redirect = meta_refresh(&dom, scripting)
             .and_then(|c| refresh_url(&c))
-            .map(|to| net::resolve(&self.url, &to));
+            .map(|to| net::resolve(&self.base, &to));
         self.sheets = sheets;
         self.dom = dom;
     }
@@ -911,9 +916,26 @@ impl Page {
                 return None;
             }
         }
-        let url = self.url.clone();
-        self.with_dom(rt, |d| forms::submission(d, form, submitter, &url))
-            .flatten()
+        let (url, base) = (self.url.clone(), self.base.clone());
+        let sub = self
+            .with_dom(rt, |d| forms::submission(d, form, submitter, &url, &base))
+            .flatten();
+        self.form_allowed(sub, invalid)
+    }
+
+    /// The page's `form-action` (with `<meta>` policies, which the browser
+    /// doesn't see) may forbid sending a form where it's going.
+    fn form_allowed(&self, sub: Option<Submission>, invalid: &mut Option<String>) -> Option<Submission> {
+        match sub {
+            Some(s) if !self.policy.form_action(&s.url) => {
+                *invalid = Some(format!(
+                    "This page's security policy doesn't allow sending the form to {}",
+                    crate::filter::host_of(&s.url)
+                ));
+                None
+            }
+            s => s,
+        }
     }
 
     /// You clicked the page at page-space (x, y).
@@ -1301,10 +1323,13 @@ impl Page {
     ) {
         if out.submit.is_none() {
             if let Some((form, submitter)) = rt.as_deref_mut().and_then(|r| r.take_submit()) {
-                let url = self.url.clone();
-                out.submit = self
-                    .with_dom(rt.as_deref_mut(), |d| forms::submission(d, form, submitter, &url))
+                let (url, base) = (self.url.clone(), self.base.clone());
+                let sub = self
+                    .with_dom(rt.as_deref_mut(), |d| {
+                        forms::submission(d, form, submitter, &url, &base)
+                    })
                     .flatten();
+                out.submit = self.form_allowed(sub, &mut out.invalid);
             }
         }
         // A field you changed and left now shows whether it's right.
@@ -1377,7 +1402,7 @@ impl Page {
             background = Color::WHITE;
         }
 
-        let backgrounds = |u: &str| self.images.get(&net::resolve(&self.url, u)).cloned().flatten();
+        let backgrounds = |u: &str| self.images.get(&net::resolve(&self.base, u)).cloned().flatten();
         let (ops, layer_ops) = paint::build_layered(&root, &backgrounds);
         let (list, atlas, starts) = paint::rasterize_indexed(ops);
         let layers = layer_ops
@@ -1398,6 +1423,13 @@ impl Page {
             collect_links(b, clip_of(b), &mut links);
         }
         links.truncate(MAX_LINKS);
+        // With a `<base href>`, links go where it says: the browser gets
+        // them whole.
+        if self.base != self.url {
+            for (_, l) in &mut links {
+                *l = net::resolve(&self.base, l);
+            }
+        }
         let mut hits = Vec::new();
         for b in &order {
             collect_hits(b, clip_of(b), &mut hits);
@@ -1524,7 +1556,7 @@ impl Page {
             .map(|n| n.uid)
             .filter(|u| !self.revealed.contains(u))
             .collect();
-        img_sources(&self.url, &self.dom, self.viewport)
+        img_sources(&self.base, &self.dom, self.viewport)
             .into_iter()
             .filter(|(uid, url, _)| {
                 lazy.contains(uid) && !url.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("data:"))
@@ -1817,6 +1849,21 @@ fn collect_text(b: &LayoutBox, seen: &Seen, mut under: Color, out: &mut Vec<Text
 /// Every `<img>` in `tree` with the address it shows (absolute), chosen
 /// from its `<picture>`'s sources, `srcset` and `src` (see `srcset.rs`).
 /// Also gives each one's pixel density.
+/// The page's base address (see [`net::document_base`]): from the first
+/// `<base>` with an `href`.
+pub fn page_base(url: &str, tree: &Node, policy: &crate::csp::Csp) -> String {
+    let mut bases = Vec::new();
+    tree.walk(&mut bases, &|n| {
+        n.element()
+            .is_some_and(|e| e.tag == "base" && e.attrs.contains_key("href"))
+    });
+    let href = bases
+        .first()
+        .and_then(|n| n.element())
+        .and_then(|e| e.attrs.get("href"));
+    net::document_base(url, href.map(String::as_str), policy)
+}
+
 fn img_sources(base: &str, tree: &Node, viewport: (f32, f32)) -> Vec<(u32, String, f32)> {
     fn walk(n: &Node, base: &str, viewport: (f32, f32), out: &mut Vec<(u32, String, f32)>) {
         let picture = n.tag() == Some("picture");
@@ -2241,6 +2288,64 @@ mod form_script_tests {
         let mut out = String::new();
         rt.tree().dump(0, &mut out);
         assert!(out.contains("0|3|1|1|0|rgb(0, 128, 0)"), "{out}");
+    }
+
+    /// `<base href>` sets what the page's relative addresses mean, for
+    /// links, images, forms and scripts, unless `base-uri` forbids it.
+    #[test]
+    fn base_href_and_base_uri() {
+        let html = "<base href='https://cdn.example/assets/'><base href='https://ignored.example/'>\
+             <a href=x.html>link</a><img src=a.png width=5 height=5>\
+             <form action=go><input id=q name=q value=1></form><form id=g><input id=r name=r></form>\
+             <p id=out></p><script>document.getElementById('out').textContent = document.querySelector('a').href</script>";
+        let (mut page, mut rt) = load(html);
+        assert_eq!(page.base, "https://cdn.example/assets/");
+        assert!(page
+            .dom
+            .text_content()
+            .contains("https://cdn.example/assets/x.html"));
+        let r = page.render(800.0, 600.0);
+        assert!(
+            r.links
+                .iter()
+                .any(|(_, l)| l == "https://cdn.example/assets/x.html"),
+            "{:?}",
+            r.links
+        );
+        let imgs = img_sources(&page.base, &page.dom, page.viewport);
+        assert!(
+            imgs.iter()
+                .any(|(_, u, _)| u == "https://cdn.example/assets/a.png"),
+            "{imgs:?}"
+        );
+        // A form's action is resolved against the base; with none, it goes
+        // to the page itself.
+        page.key(Some(&mut rt), Key::Tab);
+        let sub = page.key(Some(&mut rt), Key::Enter).submit.unwrap();
+        assert_eq!(sub.url, "https://cdn.example/assets/go?q=1");
+        page.key(Some(&mut rt), Key::Tab);
+        let sub = page.key(Some(&mut rt), Key::Enter).submit.unwrap();
+        assert_eq!(sub.url, "https://example.com/?r=");
+        // `base-uri 'self'` keeps the page's own address.
+        let mut host = FetchOnly(|_: &str, _: Dest| Err("none".to_string()));
+        let (page, _, _) = Page::load_with_scripts(
+            "https://example.com/",
+            html,
+            "",
+            (800.0, 600.0),
+            &["base-uri 'self'".to_string()],
+            &mut host,
+        );
+        assert_eq!(page.base, "https://example.com/");
+        assert!(page.dom.text_content().contains("https://example.com/x.html"));
+        // A `javascript:` base is never used.
+        let p = Page::parse(
+            "https://example.com/",
+            "<base href='javascript:alert(1)//'><a href=x>x</a>",
+            "",
+            &mut |_, _| Err("none".into()),
+        );
+        assert_eq!(p.base, "https://example.com/");
     }
 
     /// `:user-invalid`/`:user-valid` only once you've changed a field and

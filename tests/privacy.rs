@@ -1168,6 +1168,64 @@ fn forms_submit_through_the_browser() {
     assert!(!sub.post);
 }
 
+/// A page's `form-action` decides where its forms may go, at the first
+/// address and at every redirect after.
+#[test]
+fn form_action_holds_across_redirects() {
+    use brickle::page::Key;
+    use brickle::tab::{Input, Tab};
+    let (other, other_seen) = serve(vec![("/sink", "text/html", "<p>got it".into())]);
+    let o = format!("http://127.0.0.1:{other}");
+    let page = format!(
+        "<form action=/bounce method=post><input name=a value=1></form>\
+         <form action={o}/sink method=post><input name=b value=2></form>"
+    );
+    let (port, seen) = serve(vec![
+        (
+            "/",
+            "text/html\r\nContent-Security-Policy: form-action 'self'",
+            page,
+        ),
+        (
+            "/bounce",
+            Box::leak(format!("307 text/html\r\nLocation: {o}/sink").into_boxed_str()),
+            String::new(),
+        ),
+    ]);
+    let url = format!("http://127.0.0.1:{port}/");
+    let mut net = brickle::network::Network::empty();
+    let mut tab = Tab::open(&mut net, &url, None, false);
+    let _ = tab.render(800.0, 600.0);
+    tab.interact(&mut net, Input::Key(Key::Tab));
+    let sub = tab.interact(&mut net, Input::Key(Key::Enter)).submit.unwrap();
+    assert_eq!(sub.form_action, vec![vec!["'self'".to_string()]]);
+    // Straight to another origin: not sent, and you're told why.
+    tab.interact(&mut net, Input::Key(Key::Tab));
+    let click = tab.interact(&mut net, Input::Key(Key::Enter));
+    assert!(click.submit.is_none());
+    assert!(click.invalid.unwrap().contains("security policy"));
+    // Allowed at first, then redirected away: stopped at the redirect.
+    let after = Tab::submit(&mut net, &sub, Some(&url), false, (800.0, 600.0));
+    assert!(!after.url.contains("/sink"), "{}", after.url);
+    assert!(seen
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|r| r[0] == "POST /bounce HTTP/1.1"));
+    assert!(
+        other_seen.lock().unwrap().is_empty(),
+        "{:?}",
+        other_seen.lock().unwrap()
+    );
+    // Without the policy, the same redirect is followed.
+    let free = brickle::forms::Submission {
+        form_action: vec![],
+        ..sub
+    };
+    let after = Tab::submit(&mut net, &free, Some(&url), false, (800.0, 600.0));
+    assert!(after.url.contains("/sink"), "{}", after.url);
+}
+
 /// A page that answers a POST remembers its form, so reloading it asks
 /// before sending the form again; one reached by a redirect after the POST
 /// (the usual pattern) is a plain GET and reloads freely.
@@ -1187,6 +1245,7 @@ fn pages_answering_a_post_remember_their_form() {
         post: true,
         body: Some("item=1".into()),
         content_type: Some("application/x-www-form-urlencoded".into()),
+        form_action: vec![],
     };
     let tab = Tab::submit(&mut net, &post("/buy"), Some(&from), false, (800.0, 600.0));
     assert_eq!(tab.resubmit, Some(post("/buy")));

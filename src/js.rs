@@ -632,6 +632,8 @@ struct State {
     viewport: (f32, f32),
     /// Computed styles by node, for the DOM version they were made for.
     computed: Option<(u64, ComputedMap)>,
+    /// The base address, as of a DOM version (see [`doc_base`]).
+    base: Option<(u64, String)>,
     /// Lays the document out for scripts that ask for sizes before the
     /// page is first shown (dropped once it has been).
     measure: Option<Measure>,
@@ -1296,10 +1298,31 @@ fn n_read(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
     Ok(JsValue::undefined())
 }
 
+/// The page's base address now (its first `<base href>`), worked out
+/// again only when the document has changed.
+fn doc_base(s: &mut State) -> String {
+    if let Some((v, b)) = &s.base {
+        if *v == s.dom.version {
+            return b.clone();
+        }
+    }
+    let mut all = Vec::new();
+    s.dom.descendants(0, &mut all);
+    let href = all.iter().find_map(|&n| {
+        s.dom
+            .element(n)
+            .filter(|e| e.tag == "base")
+            .and_then(|e| e.attrs.get("href").cloned())
+    });
+    let b = crate::net::document_base(&s.url, href.as_deref(), &s.csp);
+    s.base = Some((s.dom.version, b.clone()));
+    b
+}
+
 fn n_navigate(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
     let target = arg_str(a, 0, c)?;
     with(|s| {
-        let url = crate::net::resolve(&s.url, &target);
+        let url = crate::net::resolve(&doc_base(s), &target);
         // Only ordinary web addresses; the browser re-checks everything.
         if matches!(crate::net::scheme(&url).as_str(), "http" | "https") {
             s.navigate = Some(url);
@@ -1314,7 +1337,7 @@ fn n_set_url(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
     // history.pushState: same origin only, no navigation.
     let target = arg_str(a, 0, c)?;
     let ok = with(|s| {
-        let new = crate::net::resolve(&s.url, &target);
+        let new = crate::net::resolve(&doc_base(s), &target);
         let same = url::Url::parse(&new).ok().map(|u| u.origin())
             == url::Url::parse(&s.url).ok().map(|u| u.origin());
         if same {
@@ -1353,7 +1376,7 @@ fn n_allow_handler(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsVa
 
 fn n_resolve(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
     let href = arg_str(a, 0, c)?;
-    Ok(js_string!(with(|s| crate::net::resolve(&s.url, &href))).into())
+    Ok(js_string!(with(|s| crate::net::resolve(&doc_base(s), &href))).into())
 }
 
 fn n_request(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
@@ -1391,7 +1414,7 @@ fn n_request(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
         _ => crate::net::Redirect::Follow,
     };
     let refused = with(|s| {
-        let url = crate::net::resolve(&s.url, &url);
+        let url = crate::net::resolve(&doc_base(s), &url);
         (!s.csp.connect(&url)).then(|| {
             let msg = format!("Content Security Policy: connect-src doesn't allow {url}");
             push_console(s, format!("[csp] {msg}"));
@@ -1406,7 +1429,7 @@ fn n_request(_: &JsValue, a: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
             return None;
         }
         s.next_request += 1;
-        let url = crate::net::resolve(&s.url, &url);
+        let url = crate::net::resolve(&doc_base(s), &url);
         s.requests.push((
             s.next_request,
             url,
@@ -1910,6 +1933,7 @@ impl Runtime {
     pub fn take_pending_scripts(&mut self) -> Vec<(u32, Option<String>, String)> {
         with(|s| {
             let pending = std::mem::take(&mut s.pending_scripts);
+            let base = doc_base(s);
             pending
                 .into_iter()
                 .filter_map(|id| {
@@ -1917,7 +1941,7 @@ impl Runtime {
                     if !is_classic_script(e) {
                         return None;
                     }
-                    let src = e.attrs.get("src").map(|src| crate::net::resolve(&s.url, src));
+                    let src = e.attrs.get("src").map(|src| crate::net::resolve(&base, src));
                     let mut code = String::new();
                     s.dom.text_content(id, &mut code);
                     Some((id, src, code))
@@ -1975,13 +1999,14 @@ impl Runtime {
         with(|s| {
             let mut all = Vec::new();
             s.dom.descendants(DOCUMENT, &mut all);
+            let base = doc_base(s);
             all.into_iter()
                 .filter_map(|id| {
                     let e = s.dom.element(id)?;
                     if e.tag != "script" || !is_classic_script(e) {
                         return None;
                     }
-                    let src = e.attrs.get("src").map(|src| crate::net::resolve(&s.url, src));
+                    let src = e.attrs.get("src").map(|src| crate::net::resolve(&base, src));
                     let mut code = String::new();
                     s.dom.text_content(id, &mut code);
                     Some((id, src, code))

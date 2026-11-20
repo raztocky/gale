@@ -978,6 +978,7 @@ impl FromRenderer {
                         post: d.bool()?,
                         body: d.opt_str()?,
                         content_type: d.opt_str()?,
+                        form_action: vec![],
                     })
                 } else {
                     None
@@ -1432,6 +1433,7 @@ mod tests {
                     post: true,
                     body: Some("q=1".into()),
                     content_type: Some("application/x-www-form-urlencoded".into()),
+                    form_action: vec![],
                 }),
                 focus: false,
                 copied: None,

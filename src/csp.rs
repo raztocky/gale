@@ -8,7 +8,9 @@
 //! redirects are also checked by the browser. Supported script directives: `script-src`,
 //! `script-src-elem`, `script-src-attr` and `connect-src`, with `default-src`
 //! standing in for any of them that's missing. Image/style support also covers
-//! `img-src`, `style-src`, `style-src-elem` and `style-src-attr`. Sources: `'none'`, `'self'`,
+//! `img-src`, `style-src`, `style-src-elem` and `style-src-attr`, and forms
+//! by `form-action` and `<base href>` by `base-uri` (forms checked by the browser, which sends them, at every
+//! redirect too). Sources: `'none'`, `'self'`,
 //! `*`, schemes (`https:`), hosts (`*.example.com:443/path`),
 //! `'unsafe-inline'`, `'unsafe-eval'`, `'unsafe-hashes'`, `'strict-dynamic'`,
 //! nonces and SHA-256/384/512 hashes. Several policies all have to agree.
@@ -138,6 +140,25 @@ impl Csp {
         self.lists(&["style-src-elem", "style-src", "default-src"], |l| {
             !nonce.is_some_and(|n| !n.is_empty() && has_nonce(l, n))
         })
+    }
+
+    /// May `<base href>` make `url` the page's base address (`base-uri`,
+    /// with no fallback)?
+    pub fn base_uri(&self, url: &str) -> bool {
+        self.lists(&["base-uri"], |_| true)
+            .iter()
+            .all(|l| self.url_matches(l, url, false))
+    }
+
+    /// Where the page's forms may be sent (`form-action`, which has no
+    /// `default-src` fallback), one list per policy that says.
+    pub fn form_action_sources(&self) -> Vec<Vec<String>> {
+        self.lists(&["form-action"], |_| true)
+    }
+    pub fn form_action(&self, url: &str) -> bool {
+        self.form_action_sources()
+            .iter()
+            .all(|l| self.url_matches(l, url, false))
     }
 
     pub fn is_empty(&self) -> bool {

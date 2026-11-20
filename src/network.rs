@@ -444,7 +444,7 @@ impl Network {
     /// its body (with your cookies, under the usual cookie rules).
     pub fn submit_form(&mut self, sub: &Submission, from: Option<&str>) -> Nav {
         if !sub.post {
-            return self.navigate(&sub.url, from);
+            return self.navigate_with_csp(&sub.url, from, None, &sub.form_action);
         }
         let req = ScriptRequest {
             method: "POST".into(),
@@ -457,7 +457,7 @@ impl Network {
             credentials: Credentials::Include,
             ..ScriptRequest::default()
         };
-        self.navigate_with(&sub.url, from, Some(&req))
+        self.navigate_with_csp(&sub.url, from, Some(&req), &sub.form_action)
     }
 
     /// Whether the last page loaded was the answer to a POST.
@@ -466,6 +466,18 @@ impl Network {
     }
 
     fn navigate_with(&mut self, url: &str, from: Option<&str>, post: Option<&ScriptRequest>) -> Nav {
+        self.navigate_with_csp(url, from, post, &[])
+    }
+
+    /// Load a page, held at every hop to `csp` lists (a form's
+    /// `form-action`), if any.
+    fn navigate_with_csp(
+        &mut self,
+        url: &str,
+        from: Option<&str>,
+        post: Option<&ScriptRequest>,
+        csp: &[Vec<String>],
+    ) -> Nav {
         self.document_posted = false;
         self.page_stylesheets = 0;
         self.page_scripts = 0;
@@ -474,7 +486,7 @@ impl Network {
         self.image_bytes = 0;
         self.deadline = std::time::Instant::now() + PAGE_TIME_BUDGET;
         self.page_bytes = 0;
-        let fetched = self.fetch_with(url, from, Dest::Document, post, false, &[]);
+        let fetched = self.fetch_with(url, from, Dest::Document, post, false, csp);
         if let Err(e) = self.cookies.save() {
             eprintln!("brickle: saving cookies: {e}");
         }
@@ -1121,6 +1133,13 @@ impl Network {
         let mut body = script.and_then(|s| s.body.clone());
         let mut script_headers: Vec<(String, String)> = script.map(|s| s.headers.clone()).unwrap_or_default();
         let page = if dest == Dest::Document { None } else { initiator };
+        // The page whose policy holds: for a document, only a form's
+        // `form-action` (from the page that sent it).
+        let csp_page = if dest == Dest::Document {
+            initiator.filter(|_| !csp.is_empty())
+        } else {
+            page
+        };
         // After a redirect from one origin to another (neither the page's),
         // the request's origin is hidden: `Origin: null` (as in browsers).
         let mut tainted = false;
@@ -1136,7 +1155,7 @@ impl Network {
                 return Fetch::Stopped(format!("Not a valid address: {url}"));
             };
             url = parsed.into();
-            if hop == 0 && page.is_some_and(|p| !crate::csp::request_allowed(p, csp, &url)) {
+            if hop == 0 && csp_page.is_some_and(|p| !crate::csp::request_allowed(p, csp, &url)) {
                 self.record(&url, dest, Outcome::NotAllowed, vec![]);
                 return Fetch::Stopped("Content Security Policy blocked this resource".into());
             }
@@ -1309,7 +1328,7 @@ impl Network {
                     });
                     // The page's Content Security Policy holds at every hop
                     // (the renderer only saw the first address).
-                    let refused = refused.and_then(|()| match page {
+                    let refused = refused.and_then(|()| match csp_page {
                         Some(p) if !csp.is_empty() && !crate::csp::redirect_allowed(p, csp, &next) => {
                             Err(format!(
                                 "Content Security Policy doesn't allow the redirect to {}",

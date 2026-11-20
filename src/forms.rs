@@ -792,11 +792,23 @@ pub struct Submission {
     pub post: bool,
     pub body: Option<String>,
     pub content_type: Option<String>,
+    /// The page's `form-action` lists, filled in by the browser from its
+    /// own record of the page's policy (never sent by the renderer): every
+    /// address the form goes to, redirects included, must match them.
+    pub form_action: Vec<Vec<String>>,
 }
 
 /// What submitting `form` (with `submitter`) sends, or None if it can't be
 /// submitted (no valid action, or too large).
-pub fn submission(dom: &Dom, form: u32, submitter: Option<u32>, page_url: &str) -> Option<Submission> {
+/// An empty `action` sends to `page_url`; others are resolved against the
+/// page's `base` address.
+pub fn submission(
+    dom: &Dom,
+    form: u32,
+    submitter: Option<u32>,
+    page_url: &str,
+    base: &str,
+) -> Option<Submission> {
     let attr = |id: Option<u32>, name: &str| -> Option<String> {
         id.and_then(|i| dom.element(i))
             .and_then(|e| e.attrs.get(name).cloned())
@@ -804,6 +816,7 @@ pub fn submission(dom: &Dom, form: u32, submitter: Option<u32>, page_url: &str) 
     let action = attr(submitter, "formaction")
         .or_else(|| attr(Some(form), "action"))
         .filter(|a| !a.trim().is_empty())
+        .map(|a| crate::net::resolve(base, &a))
         .unwrap_or_else(|| page_url.to_string());
     let action = crate::net::resolve(page_url, &action);
     if !matches!(crate::net::scheme(&action).as_str(), "http" | "https" | "file") {
@@ -881,6 +894,7 @@ pub fn submission(dom: &Dom, form: u32, submitter: Option<u32>, page_url: &str) 
             post: true,
             body: Some(body),
             content_type: Some(content_type),
+            form_action: vec![],
         });
     }
     let mut u = url::Url::parse(&action).ok()?;
@@ -893,6 +907,7 @@ pub fn submission(dom: &Dom, form: u32, submitter: Option<u32>, page_url: &str) 
         post: false,
         body: None,
         content_type: None,
+        form_action: vec![],
     })
 }
 
@@ -1273,7 +1288,14 @@ mod tests {
         let Activation::Submit { form, submitter } = activate(&mut d, go) else {
             panic!()
         };
-        let s = submission(&d, form, Some(submitter), "https://example.com/page?x=1#top").unwrap();
+        let s = submission(
+            &d,
+            form,
+            Some(submitter),
+            "https://example.com/page?x=1#top",
+            "https://example.com/page?x=1#top",
+        )
+        .unwrap();
         assert_eq!(
             s.url,
             "https://example.com/search?q=cats+%26+dogs&lang=en&safe=on&go=Go"
@@ -1317,7 +1339,14 @@ mod tests {
         let Activation::Submit { form, submitter } = activate(&mut d, b) else {
             panic!()
         };
-        let s = submission(&d, form, Some(submitter), "https://example.com/").unwrap();
+        let s = submission(
+            &d,
+            form,
+            Some(submitter),
+            "https://example.com/",
+            "https://example.com/",
+        )
+        .unwrap();
         assert!(s.post);
         assert_eq!(s.url, "https://other.example/up");
         let body = s.body.unwrap();
@@ -1345,7 +1374,13 @@ mod tests {
             panic!()
         };
         assert_eq!(
-            submission(&d, form, Some(submitter), "https://example.com/"),
+            submission(
+                &d,
+                form,
+                Some(submitter),
+                "https://example.com/",
+                "https://example.com/"
+            ),
             None
         );
         // A field outside any form focuses but Enter submits nothing.

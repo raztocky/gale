@@ -416,6 +416,21 @@ impl Tab {
         self.interact(net, Input::Click(x, y))
     }
 
+    /// A form the page sends is held to its `form-action` (the browser's
+    /// record of it): here for where it goes first, by the network at
+    /// every redirect after.
+    fn check_form(&self, click: &mut Click) {
+        let Some(sub) = click.submit.as_mut() else { return };
+        sub.form_action = self.policy.form_action_sources();
+        if !self.policy.form_action(&sub.url) {
+            click.invalid = Some(format!(
+                "This page's security policy doesn't allow sending the form to {}",
+                crate::filter::host_of(&sub.url)
+            ));
+            click.submit = None;
+        }
+    }
+
     /// A click, typing or a key press on the page.
     pub fn interact(&mut self, net: &mut Network, input: Input) -> Click {
         let r = match &mut self.backend {
@@ -435,7 +450,7 @@ impl Tab {
                         ..Default::default()
                     },
                 };
-                return Click {
+                let mut click = Click {
                     prevented: done.prevented,
                     changed: done.changed,
                     navigate: None,
@@ -444,6 +459,8 @@ impl Tab {
                     copied: accept_copied(done.copied, copy_key),
                     invalid: accept_invalid(done.invalid),
                 };
+                self.check_form(&mut click);
+                return click;
             }
             Backend::Sandboxed(r) => r,
         };
@@ -490,7 +507,8 @@ impl Tab {
             }
         });
         match result {
-            Ok((click, console, read)) => {
+            Ok((mut click, console, read)) => {
+                self.check_form(&mut click);
                 let room = MAX_CONSOLE.saturating_sub(self.console.len());
                 self.console.extend(console.into_iter().take(room));
                 self.note_read(read);

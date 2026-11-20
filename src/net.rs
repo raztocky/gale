@@ -1133,6 +1133,21 @@ pub fn normalize(input: &str) -> String {
 
 /// Resolve `href` relative to `base`, with the URL parser. Anything that
 /// doesn't resolve becomes `about:invalid`, which nothing will load.
+/// The address relative links on the page at `url` are resolved against:
+/// its first `<base href>` (`href`), unless that's a `data:` or
+/// `javascript:` address or the page's `base-uri` policy forbids it.
+pub fn document_base(url: &str, href: Option<&str>, policy: &crate::csp::Csp) -> String {
+    let Some(href) = href else { return url.to_string() };
+    let base = resolve(url, href);
+    if base == "about:invalid"
+        || matches!(scheme(&base).as_str(), "data" | "javascript")
+        || !policy.base_uri(&base)
+    {
+        return url.to_string();
+    }
+    base
+}
+
 pub fn resolve(base: &str, href: &str) -> String {
     url::Url::parse(base)
         .and_then(|b| b.join(href.trim()))

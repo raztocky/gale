@@ -226,7 +226,9 @@ in `src/cookies.rs`.
   `<meta>`) decides which of its scripts run (nonces, hashes, hosts, `'strict-dynamic'`, inline
   scripts and handlers only with `'unsafe-inline'`, `eval` only with `'unsafe-eval'`) and where
   scripts may send requests (`connect-src`), at every redirect hop too, so a script injected into
-  a site you allowed is held to what the site's authors allowed. Brickle never sends CSP violation
+  a site you allowed is held to what the site's authors allowed. Its `form-action` decides where
+  its forms may send what you type, with or without scripts, checked by the browser at every
+  redirect, and `base-uri` where a `<base href>` may point. Brickle never sends CSP violation
   reports: that would be a request you didn't ask for.
 - **Scripts are what the site said they are.** A script whose `integrity` hash doesn't match
   isn't run, and a file served as another type with `X-Content-Type-Options: nosniff` (or as an
