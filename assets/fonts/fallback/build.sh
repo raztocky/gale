@@ -46,4 +46,6 @@ build sym.ttf NotoSansSymbols2.ttf "U+0000-10FFFF"
 for s in Bengali Tamil Telugu Kannada Malayalam Gujarati Gurmukhi Oriya Sinhala Ethiopic Khmer Myanmar; do
   cp "/usr/share/fonts/truetype/noto/NotoSans$s-Regular.ttf" "$OUT/NotoSans$s.ttf"
 done
+# Color emoji (package fonts-noto-color-emoji): PNG pictures in a CBDT table.
+cp /usr/share/fonts/truetype/noto/NotoColorEmoji.ttf "$OUT/"
 ls -l "$OUT"

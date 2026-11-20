@@ -124,7 +124,8 @@ and bold italic, unmodified, under the SIL Open Font License (`assets/fonts/LICE
 `assets/fonts/LICENSE-Inter.txt`). Characters they lack come from DejaVu Sans
 (`assets/fonts/LICENSE-DejaVu.txt`), then Noto fonts (subsets for Chinese, Japanese and
 Korean) for Devanagari, Bengali, Tamil, Telugu, Kannada, Malayalam, Gujarati, Gurmukhi, Oriya,
-Sinhala, Thai, Khmer, Myanmar, Ethiopic, emoji and symbols, also under the OFL (`assets/fonts/fallback/OFL.txt`). Rebuild those with
+Sinhala, Thai, Khmer, Myanmar, Ethiopic, color emoji (Noto Color Emoji, drawn from its pictures;
+black-and-white Noto Emoji where only one color can be drawn) and symbols, also under the OFL (`assets/fonts/fallback/OFL.txt`). Rebuild those with
 `assets/fonts/fallback/build.sh`. Fonts other than regular and bold Sans and Serif are only parsed
 when a page actually uses them.
 

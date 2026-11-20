@@ -26,7 +26,7 @@ Planned work, roughly in priority order. Items marked *discuss* need a decision 
 - [x] Font fallback: bundled Noto fonts for CJK, Korean, Indic scripts, Thai, Sinhala, Ethiopic, Khmer, Myanmar, emoji, symbols
 - [x] More fallback scripts: Bengali, Tamil, Telugu, Kannada, Malayalam, Gujarati, Gurmukhi, Oriya,
       Sinhala, Ethiopic, Khmer, Myanmar
-- [ ] Color emoji
+- [x] Color emoji (Noto Color Emoji's pictures; U+FE0F asks for one)
 - [x] Full bidirectional text with `unicode-bidi` (UAX #9): paragraph direction, `dir`
       (`rtl`/`ltr`/`auto`), `direction` and `unicode-bidi` in CSS, `<bdi>`/`<bdo>`, numbers inside
       right-to-left text, `text-align: start/end`, mirrored brackets

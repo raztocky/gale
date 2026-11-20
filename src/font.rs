@@ -22,10 +22,12 @@ use std::sync::OnceLock;
 
 /// Number of fonts: indices 0..PRIMARY are the styled families (four per
 /// family: regular, bold, italic, bold italic), the rest are fallbacks.
-pub const COUNT: usize = 36;
+pub const COUNT: usize = 37;
 pub const PRIMARY: usize = 16;
 /// DejaVu Sans, the first fallback (regular; bold follows it).
 const DEJAVU: usize = PRIMARY;
+/// Noto Color Emoji: pictures (PNG, in its CBDT table) rather than outlines.
+pub const COLOR_EMOJI: usize = PRIMARY + 6;
 
 static FONT_DATA: [&[u8]; COUNT] = [
     include_bytes!("../assets/fonts/LiberationSans-Regular.ttf"),
@@ -50,6 +52,7 @@ static FONT_DATA: [&[u8]; COUNT] = [
     include_bytes!("../assets/fonts/fallback/NotoSansKR-Subset.ttf"),
     include_bytes!("../assets/fonts/fallback/NotoSansDevanagari.ttf"),
     include_bytes!("../assets/fonts/fallback/NotoSansThai.ttf"),
+    include_bytes!("../assets/fonts/fallback/NotoColorEmoji.ttf"),
     include_bytes!("../assets/fonts/fallback/NotoEmoji.ttf"),
     include_bytes!("../assets/fonts/fallback/NotoSansSymbols2.ttf"),
     include_bytes!("../assets/fonts/fallback/NotoSansBengali.ttf"),
@@ -138,8 +141,72 @@ pub fn rasterize(i: usize, ch: char, size: f32) -> (Metrics, Vec<u8>) {
     rasterize_glyph(i, face(i).glyph(ch).to_u32(), size)
 }
 
+/// A color emoji glyph's picture at `size` px, and where it goes (as
+/// [`rasterize_glyph`]'s metrics). None for glyphs of other fonts.
+pub fn color_glyph(i: usize, id: u32, size: f32) -> Option<(Metrics, std::sync::Arc<crate::image::Bitmap>)> {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    type Cache = HashMap<(u32, u32), Option<(Metrics, std::sync::Arc<crate::image::Bitmap>)>>;
+    thread_local! {
+        static CACHE: RefCell<Cache> = RefCell::new(HashMap::new());
+    }
+    if i != COLOR_EMOJI || !(size.is_finite() && (1.0..=MAX_COLOR_SIZE).contains(&size)) {
+        return None;
+    }
+    let key = (id, (size * 4.0) as u32);
+    if let Some(hit) = CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return hit;
+    }
+    let made = (|| {
+        let font = FontRef::new(FONT_DATA[i]).ok()?;
+        let strikes = skrifa::bitmap::BitmapStrikes::new(&font);
+        let g = strikes.glyph_for_size(Size::new(size), GlyphId::new(id))?;
+        let skrifa::bitmap::BitmapData::Png(png) = g.data else {
+            return None;
+        };
+        let picture = crate::image::decode(png).ok()?;
+        let k = size / g.ppem_y.max(1.0);
+        let (w, h) = (
+            ((g.width as f32 * k).round() as u32).max(1),
+            ((g.height as f32 * k).round() as u32).max(1),
+        );
+        let bitmap = crate::image::resize(&picture.bitmap, w, h);
+        let f = face(i);
+        // Outer bearings are in font units, inner ones in the picture's
+        // pixels (CBDT keeps its bearings there).
+        let units = size / f.units_per_em;
+        let top = g.bearing_y * units + g.inner_bearing_y * k;
+        let m = Metrics {
+            xmin: (g.bearing_x * units + g.inner_bearing_x * k).round() as i32,
+            ymin: (top - h as f32).round() as i32,
+            width: w as usize,
+            height: h as usize,
+            advance_width: f.advance(GlyphId::new(id), size),
+        };
+        Some((m, std::sync::Arc::new(bitmap)))
+    })();
+    CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() >= 512 {
+            c.clear();
+        }
+        c.insert(key, made.clone());
+    });
+    made
+}
+
+/// Largest size color emoji are drawn at (their pictures are 109 px; past
+/// this they'd only be blurrier and bigger to send).
+const MAX_COLOR_SIZE: f32 = 256.0;
+
 /// Draw glyph `id` of font `i` (as shaping chose it) at `size` px.
 pub fn rasterize_glyph(i: usize, id: u32, size: f32) -> (Metrics, Vec<u8>) {
+    // A color emoji where only coverage can be drawn (a page title, the
+    // window's own text): its shape, from the picture's opacity.
+    if let Some((m, bitmap)) = color_glyph(i, id, size) {
+        let coverage = bitmap.rgba.as_chunks::<4>().0.iter().map(|p| p[3]).collect();
+        return (m, coverage);
+    }
     let f = face(i);
     let g = GlyphId::new(id);
     let mut m = Metrics {
@@ -378,6 +445,10 @@ pub fn resolve(primary: usize, ch: char) -> usize {
     if (ch as u32) < 0x80 || ch.is_whitespace() || primary >= PRIMARY {
         return primary;
     }
+    // Emoji are pictures in color, as in other browsers.
+    if (0x1F000..=0x1FAFF).contains(&(ch as u32)) && has_glyph(COLOR_EMOJI, ch) {
+        return COLOR_EMOJI;
+    }
     if face(primary).glyph(ch) != GlyphId::NOTDEF {
         return primary;
     }
@@ -596,13 +667,23 @@ fn shape_uncached(primary: usize, size: f32, text: &str) -> Shaped {
     }
     // Runs of characters drawn by one font: (font, start, end) in bytes.
     let mut runs: Vec<(usize, usize, usize)> = Vec::new();
-    for (i, ch) in text.char_indices() {
+    let mut chars = text.char_indices().peekable();
+    while let Some((i, ch)) = chars.next() {
         let end = i + ch.len_utf8();
         let inherit = matches!(harfrust::unicode::script(ch as u32), harfrust::Script::INHERITED)
             || matches!(ch, '\u{200c}' | '\u{200d}' | '\u{fe00}'..='\u{fe0f}');
+        // A symbol followed by U+FE0F asks to be drawn as an emoji.
+        let font = match chars.peek() {
+            Some((_, '\u{fe0f}'))
+                if primary < PRIMARY && (ch as u32) >= 0x80 && has_glyph(COLOR_EMOJI, ch) =>
+            {
+                COLOR_EMOJI
+            }
+            _ => resolve(primary, ch),
+        };
         match runs.last_mut() {
-            Some(r) if inherit || r.0 == resolve(primary, ch) => r.2 = end,
-            _ => runs.push((resolve(primary, ch), i, end)),
+            Some(r) if inherit || r.0 == font => r.2 = end,
+            _ => runs.push((font, i, end)),
         }
     }
     // Text that reads right to left puts its runs (each shaped in its own
@@ -716,7 +797,7 @@ mod tests {
             ('क', 20),
             ('ก', 21),
             ('🐈', 22),
-            ('⌖', 23),
+            ('⌖', 24),
         ] {
             let got = resolve(0, ch);
             assert_eq!(got, want, "{ch}");

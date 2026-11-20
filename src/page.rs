@@ -3462,6 +3462,35 @@ mod image_tests {
     }
 
     #[test]
+    fn color_emoji() {
+        let (page, _) = load("<body style='margin:0;font-size:32px'><p>hi 😀 ❤️ ☺</p>");
+        let r = page.render(800.0, 600.0);
+        let pictures: Vec<&image::Bitmap> = r
+            .list
+            .iter()
+            .filter_map(|c| match c {
+                DisplayCommand::Image { image, .. } => Some(&**image),
+                _ => None,
+            })
+            .collect();
+        // 😀, and ❤ asked for as an emoji (U+FE0F); ☺ alone stays text.
+        assert_eq!(pictures.len(), 2);
+        let face = pictures[0];
+        let px = |x: u32, y: u32| &face.rgba[((y * face.w + x) * 4) as usize..][..4];
+        let mid = px(face.w / 2, face.h / 4);
+        assert!(
+            mid[0] > 200 && mid[1] > 120 && mid[2] < 120 && mid[3] > 200,
+            "a yellow face: {mid:?}"
+        );
+        let rects = images_drawn(&r);
+        assert!(rects[0].h > 30.0 && rects[0].h < 45.0, "{rects:?}");
+        // On the line with the text, not below it.
+        let words: Vec<_> = r.texts.iter().filter(|t| t.text.contains("hi")).collect();
+        assert!(!words.is_empty());
+        assert!((rects[0].y - words[0].rect.y).abs() < 12.0, "{rects:?}");
+    }
+
+    #[test]
     fn background_images() {
         let body = "<body style='margin:0'>";
         // Fetched like any image, and tiled across the padding box.

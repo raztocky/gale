@@ -285,10 +285,30 @@ pub fn rasterize_indexed(ops: Vec<DrawOp>) -> (DisplayList, Vec<GlyphBitmap>, Ve
                     continue;
                 }
                 let mut glyphs = Vec::new();
+                let mut pictures = Vec::new();
                 // Shaped as layout measured it: the style's font, with
                 // fallbacks for what it lacks.
                 for g in &font::shape(font, size, &text).glyphs {
                     let fi = g.font;
+                    // Color emoji are small pictures, in their own colors.
+                    if fi == font::COLOR_EMOJI {
+                        if let Some((m, picture)) = font::color_glyph(fi, g.id, size) {
+                            let gx = (x + g.x + m.xmin as f32).round();
+                            let gy = (baseline - g.y - (m.height as i32 + m.ymin) as f32).round();
+                            let rect = Rect {
+                                x: gx,
+                                y: gy,
+                                w: m.width as f32,
+                                h: m.height as f32,
+                            };
+                            let (cx, cy) = (gx + rect.w / 2.0, gy + rect.h / 2.0);
+                            if clip.is_none_or(|c| c.contains(cx, cy)) && atlas_bytes <= MAX_ATLAS_BYTES {
+                                atlas_bytes += picture.rgba.len();
+                                pictures.push(DisplayCommand::Image { rect, image: picture });
+                            }
+                            continue;
+                        }
+                    }
                     let key = (fi, g.id, (size * 4.0) as u32, italic);
                     let entry = ids.entry(key).or_insert_with(|| {
                         if atlas_bytes > MAX_ATLAS_BYTES {
@@ -324,6 +344,7 @@ pub fn rasterize_indexed(ops: Vec<DrawOp>) -> (DisplayList, Vec<GlyphBitmap>, Ve
                 if !glyphs.is_empty() {
                     list.push(DisplayCommand::Glyphs { color, glyphs });
                 }
+                list.extend(pictures);
             }
         }
     }
