@@ -23,8 +23,10 @@ Planned work, roughly in priority order. Items marked *discuss* need a decision 
 ## Text
 - [x] Text shaping with **HarfRust** (the HarfBuzz project's safe-Rust port), in the renderer:
       kerning, ligatures, Arabic/Indic/Thai shaping
-- [x] Font fallback: bundled Noto subsets for CJK, Korean, Devanagari, Thai, emoji, symbols
-- [ ] More fallback scripts on request (Bengali, Tamil, Ethiopic, ...); color emoji
+- [x] Font fallback: bundled Noto fonts for CJK, Korean, Indic scripts, Thai, Sinhala, Ethiopic, Khmer, Myanmar, emoji, symbols
+- [x] More fallback scripts: Bengali, Tamil, Telugu, Kannada, Malayalam, Gujarati, Gurmukhi, Oriya,
+      Sinhala, Ethiopic, Khmer, Myanmar
+- [ ] Color emoji
 - [x] Full bidirectional text with `unicode-bidi` (UAX #9): paragraph direction, `dir`
       (`rtl`/`ltr`/`auto`), `direction` and `unicode-bidi` in CSS, `<bdi>`/`<bdo>`, numbers inside
       right-to-left text, `text-align: start/end`, mirrored brackets

@@ -122,8 +122,9 @@ Fonts: Liberation Sans, Serif and Mono 2.1.5 (Arial, Times New Roman and Courier
 widths) and Inter 4.1 (for `system-ui`, Segoe UI, Roboto and similar), each in regular, bold, italic
 and bold italic, unmodified, under the SIL Open Font License (`assets/fonts/LICENSE-Liberation.txt`,
 `assets/fonts/LICENSE-Inter.txt`). Characters they lack come from DejaVu Sans
-(`assets/fonts/LICENSE-DejaVu.txt`), then Noto subsets for Chinese, Japanese, Korean, Devanagari,
-Thai, emoji and symbols, also under the OFL (`assets/fonts/fallback/OFL.txt`). Rebuild those with
+(`assets/fonts/LICENSE-DejaVu.txt`), then Noto fonts (subsets for Chinese, Japanese and
+Korean) for Devanagari, Bengali, Tamil, Telugu, Kannada, Malayalam, Gujarati, Gurmukhi, Oriya,
+Sinhala, Thai, Khmer, Myanmar, Ethiopic, emoji and symbols, also under the OFL (`assets/fonts/fallback/OFL.txt`). Rebuild those with
 `assets/fonts/fallback/build.sh`. Fonts other than regular and bold Sans and Serif are only parsed
 when a page actually uses them.
 

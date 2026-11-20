@@ -39,4 +39,11 @@ build deva.ttf NotoSansDevanagari.ttf "U+0900-097F,U+A8E0-A8FF,U+1CD0-1CFF,U+200
 build thai.ttf NotoSansThai.ttf "U+0E00-0E7F,U+200C-200D,U+25CC" wght=400 wdth=100
 build emoji.ttf NotoEmoji.ttf "U+00A9,U+00AE,U+203C-3299,U+1F000-1FAFF" wght=400
 build sym.ttf NotoSansSymbols2.ttf "U+0000-10FFFF"
+
+# Indic, Sinhala, Ethiopic and Southeast Asian scripts: the static Regular
+# fonts as Debian and Ubuntu ship them (package fonts-noto-core, same
+# sources and licence), copied whole.
+for s in Bengali Tamil Telugu Kannada Malayalam Gujarati Gurmukhi Oriya Sinhala Ethiopic Khmer Myanmar; do
+  cp "/usr/share/fonts/truetype/noto/NotoSans$s-Regular.ttf" "$OUT/NotoSans$s.ttf"
+done
 ls -l "$OUT"

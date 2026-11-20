@@ -22,7 +22,7 @@ use std::sync::OnceLock;
 
 /// Number of fonts: indices 0..PRIMARY are the styled families (four per
 /// family: regular, bold, italic, bold italic), the rest are fallbacks.
-pub const COUNT: usize = 24;
+pub const COUNT: usize = 36;
 pub const PRIMARY: usize = 16;
 /// DejaVu Sans, the first fallback (regular; bold follows it).
 const DEJAVU: usize = PRIMARY;
@@ -52,6 +52,18 @@ static FONT_DATA: [&[u8]; COUNT] = [
     include_bytes!("../assets/fonts/fallback/NotoSansThai.ttf"),
     include_bytes!("../assets/fonts/fallback/NotoEmoji.ttf"),
     include_bytes!("../assets/fonts/fallback/NotoSansSymbols2.ttf"),
+    include_bytes!("../assets/fonts/fallback/NotoSansBengali.ttf"),
+    include_bytes!("../assets/fonts/fallback/NotoSansTamil.ttf"),
+    include_bytes!("../assets/fonts/fallback/NotoSansTelugu.ttf"),
+    include_bytes!("../assets/fonts/fallback/NotoSansKannada.ttf"),
+    include_bytes!("../assets/fonts/fallback/NotoSansMalayalam.ttf"),
+    include_bytes!("../assets/fonts/fallback/NotoSansGujarati.ttf"),
+    include_bytes!("../assets/fonts/fallback/NotoSansGurmukhi.ttf"),
+    include_bytes!("../assets/fonts/fallback/NotoSansOriya.ttf"),
+    include_bytes!("../assets/fonts/fallback/NotoSansSinhala.ttf"),
+    include_bytes!("../assets/fonts/fallback/NotoSansEthiopic.ttf"),
+    include_bytes!("../assets/fonts/fallback/NotoSansKhmer.ttf"),
+    include_bytes!("../assets/fonts/fallback/NotoSansMyanmar.ttf"),
 ];
 
 /// A parsed font: its tables, read with skrifa (Google's font-reading
@@ -882,6 +894,27 @@ mod tests {
             assert!(sh.width.is_finite());
         }
         assert!(t.elapsed().as_secs() < 5, "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn more_scripts_have_fonts() {
+        // Bengali, Tamil, Telugu, Kannada, Malayalam, Gujarati, Gurmukhi,
+        // Oriya, Sinhala, Ethiopic, Khmer, Myanmar (DejaVu has Lao,
+        // Armenian, Georgian, Hebrew and Arabic).
+        let letters = ['অ', 'அ', 'అ', 'ಅ', 'അ', 'અ', 'ਅ', 'ଅ', 'අ', 'ሀ', 'ក', 'က'];
+        let fonts: Vec<usize> = letters.iter().map(|&c| resolve(0, c)).collect();
+        for (&c, &f) in letters.iter().zip(&fonts) {
+            assert!(f >= 24 && has_glyph(f, c), "{c} drawn with font {f}");
+        }
+        let distinct: std::collections::HashSet<_> = fonts.iter().collect();
+        assert_eq!(distinct.len(), letters.len(), "{fonts:?}");
+        // Shaped, with the script's joining: "ক্ষ" is one conjunct.
+        let conjunct = shape(0, 20.0, "ক্ষ");
+        assert!(
+            conjunct.width > 0.0 && conjunct.glyphs.len() < 3,
+            "{:?}",
+            conjunct.glyphs
+        );
     }
 
     #[test]
