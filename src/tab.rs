@@ -217,6 +217,13 @@ pub enum Input {
         top: f32,
         bottom: f32,
     },
+    /// You dragged in the focused field to a page-space point (or, with
+    /// `word`, double-clicked there).
+    Select {
+        x: f32,
+        y: f32,
+        word: bool,
+    },
 }
 
 /// What the renderer reported when a page loaded.
@@ -421,6 +428,7 @@ impl Tab {
                     Input::Type(t) => page.type_text(None, &t),
                     Input::Key(k) => page.key(None, k),
                     Input::Scroll { uid, dx, dy } => page.scroll_box(None, uid, dx, dy),
+                    Input::Select { x, y, word } => page.select_at(None, x, y, word),
                     // Pages without scripts load every image at once.
                     Input::Reveal { .. } => crate::page::Interaction {
                         focus: page.focus.is_some(),
@@ -451,6 +459,7 @@ impl Tab {
             Input::Key(k) => ToRenderer::Key(k),
             Input::Scroll { uid, dx, dy } => ToRenderer::Scroll { uid, dx, dy },
             Input::Reveal { top, bottom } => ToRenderer::Reveal { top, bottom },
+            Input::Select { x, y, word } => ToRenderer::Select { x, y, word },
         };
         let result = r.send(msg).and_then(|_| {
             match r.serve(Instant::now() + RENDERER_TIMEOUT, SCRIPT_BYTES, &mut host)? {

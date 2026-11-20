@@ -658,6 +658,7 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
         layers: vec![],
         scrollers: vec![],
         lazy: vec![],
+        fields: vec![],
         title: None,
     };
     // In flight: the URL being loaded (None for a re-layout).
@@ -746,6 +747,10 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
     let mut resize_cursor = false;
     let mut dragged = false;
     let mut word_press = false;
+    // The press was in a text field, and the field has had it as a click
+    // (when you started dragging).
+    let mut field_press = false;
+    let mut field_clicked = false;
     let mut last_press: Option<(Instant, f32, f32)> = None;
     let mut dirty = true;
     let mut frame = 0u32;
@@ -1878,10 +1883,26 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                         Some((Instant::now(), mx, my))
                     };
                     word_press = double;
-                    sel = match select::hit(&rendered.texts, &ix.text, mx, my - bar + scroll) {
-                        Some(p) if double => select::word(&rendered.texts, p),
-                        Some(p) => Some((p, p)),
-                        None => None,
+                    // In a text field, the field selects its own text.
+                    let (cx, cy) = ix.page_point(mx, my, scroll);
+                    field_press =
+                        info.interstitial.is_none() && rendered.fields.iter().any(|r| r.contains(cx, cy));
+                    field_clicked = false;
+                    sel = if field_press {
+                        if double {
+                            pending_input.push(Input::Select {
+                                x: cx,
+                                y: cy,
+                                word: true,
+                            });
+                        }
+                        None
+                    } else {
+                        match select::hit(&rendered.texts, &ix.text, mx, my - bar + scroll) {
+                            Some(p) if double => select::word(&rendered.texts, p),
+                            Some(p) => Some((p, p)),
+                            None => None,
+                        }
                     };
                     if ui.editing {
                         ui.editing = false;
@@ -1945,7 +1966,23 @@ pub fn run(start: &str, sandboxed: bool, net: Network, panel: bool) -> Result<()
                     if (mx - px).abs() + (my - py).abs() > 4.0 {
                         dragged = true;
                     }
-                    if dragged && !word_press {
+                    if dragged && !word_press && field_press {
+                        // The field gets the press as a click first.
+                        if !field_clicked {
+                            field_clicked = true;
+                            let (cx, cy) = ix.page_point(px, py, scroll);
+                            pending_input.push(Input::Click(cx, cy));
+                        }
+                        let (x, y) = ix.page_point(mx, my, scroll);
+                        match pending_input.last_mut() {
+                            Some(Input::Select {
+                                x: lx,
+                                y: ly,
+                                word: false,
+                            }) => (*lx, *ly) = (x, y),
+                            _ => pending_input.push(Input::Select { x, y, word: false }),
+                        }
+                    } else if dragged && !word_press {
                         let to = select::hit(&rendered.texts, &ix.text, mx, my - bar + scroll);
                         if let (Some((from, _)), Some(to)) = (sel, to) {
                             if sel != Some((from, to)) {
@@ -2554,6 +2591,7 @@ fn blank_rendered() -> Rendered {
         layers: vec![],
         scrollers: vec![],
         lazy: vec![],
+        fields: vec![],
         title: None,
     }
 }

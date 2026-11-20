@@ -85,6 +85,13 @@ pub enum ToRenderer {
         top: f32,
         bottom: f32,
     },
+    /// You dragged in the focused field to this page-space point, or
+    /// double-clicked there (`word`).
+    Select {
+        x: f32,
+        y: f32,
+        word: bool,
+    },
     Render {
         width: f32,
         height: f32,
@@ -529,6 +536,12 @@ impl ToRenderer {
                 e.f32(*top);
                 e.f32(*bottom);
             }
+            ToRenderer::Select { x, y, word } => {
+                e.u8(13);
+                e.f32(*x);
+                e.f32(*y);
+                e.u8(*word as u8);
+            }
             ToRenderer::ImageReply(r) => {
                 e.u8(10);
                 match r {
@@ -623,6 +636,15 @@ impl ToRenderer {
             12 => ToRenderer::Reveal {
                 top: d.f32()?,
                 bottom: d.f32()?,
+            },
+            13 => ToRenderer::Select {
+                x: d.f32()?,
+                y: d.f32()?,
+                word: match d.u8()? {
+                    0 => false,
+                    1 => true,
+                    w => return Err(format!("invalid word flag {w}")),
+                },
             },
             10 => match d.u8()? {
                 1 => {
@@ -858,6 +880,10 @@ impl FromRenderer {
                 for (top, bottom) in &r.lazy {
                     e.f32(*top);
                     e.f32(*bottom);
+                }
+                e.u32(r.fields.len() as u32);
+                for f in &r.fields {
+                    e.rect(*f);
                 }
                 // The title bitmap, if any, goes last, flagged after.
                 e.u32((r.atlas.len() + r.title.is_some() as usize) as u32);
@@ -1167,6 +1193,15 @@ impl FromRenderer {
                     }
                     lazy.push((top, bottom));
                 }
+                // Text fields, where dragging selects their text.
+                let n = d.count(16)?;
+                if n > crate::page::MAX_FIELDS {
+                    return Err("too many text fields".into());
+                }
+                let mut fields = Vec::with_capacity(n);
+                for _ in 0..n {
+                    fields.push(d.rect()?);
+                }
                 let n = d.count(4)?;
                 let mut atlas = Vec::with_capacity(n);
                 let mut atlas_bytes = 0usize;
@@ -1216,6 +1251,7 @@ impl FromRenderer {
                     title,
                     scrollers,
                     lazy,
+                    fields,
                 })
             }
             4 => FromRenderer::Dom(d.str()?),
@@ -1326,6 +1362,12 @@ mod tests {
                 data: vec![9, 8, 7],
             }),
             lazy: vec![(900.0, 1100.0)],
+            fields: vec![Rect {
+                x: 5.0,
+                y: 6.0,
+                w: 100.0,
+                h: 20.0,
+            }],
         }
     }
 

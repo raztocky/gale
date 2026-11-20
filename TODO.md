@@ -14,7 +14,8 @@ Planned work, roughly in priority order. Items marked *discuss* need a decision 
 - [x] Flexbox, CSS grid, `@media` queries, `aspect-ratio`, percentage heights
 - [x] Grid rows (`grid-template-rows`, `grid-auto-rows`, `grid-row`, `grid-area`, named areas)
 - [x] `::before`/`::after` content (strings, `attr()`, quotes), and `<details>` that open on a click
-- [ ] CSS counters (`counter()`/`counters()` in `content`), `grid-template`/`grid` shorthands
+- [x] CSS counters (`counter()`/`counters()` in `content`, `counter-reset`/`-increment`/`-set`, `list-item`), `grid-template`/`grid` shorthands
+- [ ] `grid-auto-flow: column` and `grid-auto-columns` (`grid: … / auto-flow` keeps only the rows)
 - [x] Show `<noscript>` content, and follow `<meta http-equiv=refresh>` redirects
 - [x] Cookies: session-only, first-party only, per-site keep list
 - [x] JavaScript: Boa in the sandboxed renderer, off unless you allow a site (see below)
@@ -36,7 +37,6 @@ Planned work, roughly in priority order. Items marked *discuss* need a decision 
       with HarfRust, which uses the same font-reading crates
 - [x] Scrolling inside `overflow: auto/scroll` boxes with the wheel (`Shift` for sideways), and `max-height`
 - [x] Scrolling inside boxes with the keyboard, and by dragging their scrollbar; `scrollTop`, `scrollTo()`, `scrollIntoView()` and `scroll` events for scripts
-- [ ] Lay out on demand when a script asks for sizes before the first layout
 - [x] Request panel: notes when a page's scripts read enough browser details to look like fingerprinting
 - [ ] Request panel: more trackers from a public list, once its licence is checked
 
@@ -88,12 +88,12 @@ selects (with a drop-down), buttons, labels, Tab between fields, Enter to submit
 `input`/`change`/`submit` events for scripts.
 - [x] A real drop-down for `<select>`, and `↑`/`↓` to change it.
 - [x] Moving the caret, selecting text in a field, copy, cut and paste.
-- [ ] Placing the caret and selecting in a field with the mouse.
+- [x] Placing the caret and selecting in a field with the mouse (click, drag, double-click for a word).
 - [ ] File uploads (`<input type=file>`).
 - [x] Form validation before sending (`required`, `type=email`/`url`, `pattern`, `minlength`/`maxlength`, `min`/`max`/`step`, `novalidate`), with `checkValidity()`, `setCustomValidity()` and `validity` for scripts; arrow keys step number fields.
 - [x] Date picker (calendar, typing, arrow keys) and colour picker (palette); `:valid`, `:invalid`, `:required` and `:optional` in CSS and for scripts.
 - [x] Pickers for `time` (a clock of hours and five-minute steps), `datetime-local`, `month` and `week`, with validation and arrow keys.
-- [ ] `:user-invalid` and `:user-valid` (never match for now).
+- [x] `:user-invalid` and `:user-valid` (after you change a field and leave it, or try to send its form).
 - [x] Ask before re-sending a POST on reload, back or forward (a page reached by a redirect after the POST reloads freely, as in Firefox).
 
 ## Tabs

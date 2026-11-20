@@ -414,6 +414,9 @@ pub enum Pseudo {
     /// `:valid` (true) or `:invalid` (false): a form field that's checked
     /// before sending, or a form, filled in right or not.
     Valid(bool),
+    /// `:user-valid` and `:user-invalid`: the same, for a field you've
+    /// changed and left, or whose form you tried to send.
+    UserValid(bool),
     /// `:required` (true) or `:optional` (false): an input, select or
     /// textarea with or without `required`.
     Required(bool),
@@ -766,6 +769,18 @@ impl Parser {
                 // `background: center/100% url(x)`: the size after the
                 // slash becomes its own declaration (values drop slashes).
                 let size = (name == "background").then(|| background_size(value)).flatten();
+                // `grid-template` and `grid` need their slash too: they
+                // become their longhands here.
+                if name == "grid-template" || name == "grid" {
+                    for (name, value) in grid_shorthand(value, name == "grid") {
+                        decls.push(Declaration {
+                            name: name.into(),
+                            values: parse_values(&value),
+                            important,
+                        });
+                    }
+                    continue;
+                }
                 if !name.is_empty() {
                     decls.push(Declaration {
                         name,
@@ -784,6 +799,109 @@ impl Parser {
         }
         decls
     }
+}
+
+/// Split at the first `/` outside quotes, brackets and parentheses.
+fn split_slash(value: &str) -> (&str, Option<&str>) {
+    let (mut depth, mut quote) = (0i32, None);
+    for (i, c) in value.char_indices() {
+        match (c, quote) {
+            ('"' | '\'', None) => quote = Some(c),
+            (q, Some(open)) if q == open => quote = None,
+            (_, Some(_)) => {}
+            ('(' | '[', _) => depth += 1,
+            (')' | ']', _) => depth -= 1,
+            ('/', _) if depth == 0 => return (value[..i].trim(), Some(value[i + 1..].trim())),
+            _ => {}
+        }
+    }
+    (value.trim(), None)
+}
+
+/// `grid-template` (or with `grid`, also `grid`) as longhands: rows and
+/// columns either side of a slash, or rows of area names (`"a b" 50px`)
+/// with their heights. `grid` can also say `auto-flow` on one side; only
+/// rows that flow are supported, so `auto-flow` on the columns' side just
+/// leaves the rows.
+fn grid_shorthand(value: &str, grid: bool) -> Vec<(&'static str, String)> {
+    let mut out = vec![
+        ("grid-template-rows", "none".to_string()),
+        ("grid-template-columns", "none".to_string()),
+        ("grid-template-areas", "none".to_string()),
+    ];
+    if grid {
+        out.push(("grid-auto-rows", "auto".to_string()));
+    }
+    let (rows, cols) = split_slash(value);
+    if rows.eq_ignore_ascii_case("none") && cols.is_none() {
+        return out;
+    }
+    let flows = |t: &str| t.to_ascii_lowercase().starts_with("auto-flow");
+    let after_flow = |t: &str| {
+        t.split_whitespace()
+            .filter(|w| !flows(w) && !w.eq_ignore_ascii_case("dense"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    if grid && flows(rows) {
+        let auto = after_flow(rows);
+        if !auto.is_empty() {
+            out[3].1 = auto;
+        }
+        out[1].1 = cols.unwrap_or("none").to_string();
+        return out;
+    }
+    if let Some(c) = cols {
+        out[1].1 = if grid && flows(c) {
+            "none".into()
+        } else {
+            c.to_string()
+        };
+    }
+    if rows.contains(['"', '\'']) {
+        // Area rows, each with its height after it (`auto` if none);
+        // line names in brackets are left out.
+        let (mut areas, mut heights) = (Vec::new(), Vec::<String>::new());
+        let mut rest = rows;
+        while let Some(start) = rest.find(['"', '\'']) {
+            let between: String = strip_brackets(&rest[..start]);
+            if !between.trim().is_empty() {
+                if let Some(h) = heights.last_mut() {
+                    *h = between.trim().to_string();
+                }
+            }
+            let q = rest[start..].chars().next().unwrap_or('"');
+            let Some(len) = rest[start + 1..].find(q) else {
+                break;
+            };
+            areas.push(rest[start..start + len + 2].to_string());
+            heights.push("auto".into());
+            rest = &rest[start + len + 2..];
+        }
+        let tail = strip_brackets(rest);
+        if let (false, Some(h)) = (tail.trim().is_empty(), heights.last_mut()) {
+            *h = tail.trim().to_string();
+        }
+        out[0].1 = heights.join(" ");
+        out[2].1 = areas.join(" ");
+    } else {
+        out[0].1 = rows.to_string();
+    }
+    out
+}
+
+fn strip_brackets(s: &str) -> String {
+    let mut out = String::new();
+    let mut depth = 0;
+    for c in s.chars() {
+        match c {
+            '[' => depth += 1,
+            ']' => depth -= 1,
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// The `/size` in a `background` shorthand's first layer: the value without
@@ -1115,8 +1233,8 @@ fn parse_compound(chars: &[char], i: &mut usize, depth: usize) -> Option<SimpleS
                     ("has", Some(a)) => s.pseudo.push(Pseudo::Has(list(a, true)?)),
                     (
                         "hover" | "active" | "focus" | "focus-visible" | "focus-within" | "visited"
-                        | "target" | "target-within" | "indeterminate" | "user-invalid" | "user-valid"
-                        | "autofill" | "placeholder-shown" | "fullscreen" | "modal" | "popover-open" | "open",
+                        | "target" | "target-within" | "indeterminate" | "autofill" | "placeholder-shown"
+                        | "fullscreen" | "modal" | "popover-open" | "open",
                         None,
                     ) => s.pseudo.push(Pseudo::Never),
                     // Form states we can tell from attributes. A checkbox or
@@ -1134,6 +1252,8 @@ fn parse_compound(chars: &[char], i: &mut usize, depth: usize) -> Option<SimpleS
                         value: String::new(),
                         ignore_case: false,
                     }),
+                    ("user-valid", None) => s.pseudo.push(Pseudo::UserValid(true)),
+                    ("user-invalid", None) => s.pseudo.push(Pseudo::UserValid(false)),
                     ("valid", None) => s.pseudo.push(Pseudo::Valid(true)),
                     ("invalid", None) => s.pseudo.push(Pseudo::Valid(false)),
                     ("required", None) => s.pseudo.push(Pseudo::Required(true)),

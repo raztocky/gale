@@ -62,6 +62,15 @@ pub struct Page {
     revealed: HashSet<u32>,
     /// Where the lazy images not loaded yet were at the last layout.
     lazy_boxes: RefCell<Vec<(u32, Rect)>>,
+    /// Where the text fields' text was at the last layout, for putting the
+    /// caret where you click.
+    field_runs: RefCell<Vec<forms::FieldRun>>,
+    /// Fields you've changed since they got the keyboard, and the ones
+    /// you've changed and left or tried to send (`:user-invalid`).
+    edited: HashSet<u32>,
+    interacted: HashSet<u32>,
+    /// `interacted` grew: styles may change.
+    restyle: bool,
     /// Bytes of decoded pixels kept in `images`.
     image_bytes: usize,
     /// Your text size (see `StyleContext::text_scale`).
@@ -154,7 +163,15 @@ pub struct Rendered {
     /// Where `loading=lazy` images not loaded yet are (top and bottom):
     /// the browser asks for them ([`Page::reveal`]) when you scroll near.
     pub lazy: Vec<(f32, f32)>,
+    /// Text fields (where they show), so that dragging in one selects its
+    /// text rather than the page's.
+    pub fields: Vec<Rect>,
 }
+
+/// Most text fields whose places are reported.
+pub const MAX_FIELDS: usize = 4096;
+/// Most runs of field text remembered from a layout.
+const MAX_FIELD_RUNS: usize = 20_000;
 
 /// How near (in px) you scroll to a lazy image before it's loaded.
 pub const LAZY_MARGIN: f32 = 1250.0;
@@ -515,6 +532,10 @@ impl Page {
             inline_svgs: HashMap::new(),
             revealed: HashSet::new(),
             lazy_boxes: RefCell::new(vec![]),
+            field_runs: RefCell::new(vec![]),
+            edited: HashSet::new(),
+            interacted: HashSet::new(),
+            restyle: false,
             image_bytes: 0,
             text_scale: 1.0,
             viewport: (1024.0, 768.0),
@@ -845,6 +866,11 @@ impl Page {
         submitter: Option<u32>,
         invalid: &mut Option<String>,
     ) -> Option<Submission> {
+        // Trying to send a form shows which of its fields are wrong.
+        let fields = self
+            .with_dom(rt.as_deref_mut(), |d| forms::controls(d, form))
+            .unwrap_or_default();
+        self.interact(rt.as_deref_mut(), &fields);
         let custom = rt.as_deref().map(|r| r.custom_validity()).unwrap_or_default();
         let bad = self
             .with_dom(rt.as_deref_mut(), |d| {
@@ -938,6 +964,9 @@ impl Page {
                         if let Some(c) = self.with_dom(rt.as_deref_mut(), |d| forms::Caret::at_end(d, sel)) {
                             self.caret = c;
                         }
+                        if changed {
+                            self.edited.insert(sel);
+                        }
                         if let (true, Some(rt)) = (changed, rt.as_deref_mut()) {
                             rt.fire(sel, "input", true, false);
                             rt.fire(sel, "change", true, false);
@@ -959,6 +988,9 @@ impl Page {
                 })
                 .flatten()
             });
+            if let Some(sel) = picked {
+                self.interact(rt.as_deref_mut(), &[sel]);
+            }
             if let (Some(sel), Some(rt)) = (picked, rt.as_deref_mut()) {
                 rt.fire(sel, "input", true, false);
                 rt.fire(sel, "change", true, false);
@@ -992,8 +1024,14 @@ impl Page {
                             rt.fire(f, "focus", false, false);
                         }
                     }
+                    // The caret goes where you clicked in the text.
+                    if let Some(at) = self.caret_at_point(rt.as_deref_mut(), f, x, y) {
+                        self.caret = forms::Caret { at, anchor: None };
+                        out.changed = true;
+                    }
                 }
                 Some(Activation::Changed(c)) => {
+                    self.interact(rt.as_deref_mut(), &[c]);
                     if let Some(rt) = rt.as_deref_mut() {
                         rt.fire(c, "input", true, false);
                         rt.fire(c, "change", true, false);
@@ -1012,6 +1050,9 @@ impl Page {
                         if let Some(rt) = rt.as_deref_mut() {
                             rt.fire(c, "focus", false, false);
                         }
+                    }
+                    if let Some(at) = self.caret_at_point(rt.as_deref_mut(), c, x, y) {
+                        self.caret = forms::Caret { at, anchor: None };
                     }
                     out.changed = true;
                 }
@@ -1032,6 +1073,52 @@ impl Page {
         out
     }
 
+    /// You've interacted with these fields: `:user-valid`/`:user-invalid`
+    /// apply to them from now on.
+    fn interact(&mut self, rt: Option<&mut Runtime>, fields: &[u32]) {
+        if fields.iter().all(|f| self.interacted.contains(f)) {
+            return;
+        }
+        self.interacted.extend(fields);
+        self.restyle = true;
+        self.with_dom(rt, |d| d.user_validity.extend(fields));
+    }
+
+    /// Where in field `f`'s value page-space (x, y) is, from the last layout.
+    fn caret_at_point(&mut self, rt: Option<&mut Runtime>, f: u32, x: f32, y: f32) -> Option<usize> {
+        let runs = self.field_runs.borrow().clone();
+        self.with_dom(rt, |d| forms::caret_at_point(d, f, &runs, x, y))
+            .flatten()
+    }
+
+    /// You dragged in the focused field to page-space (x, y): the selection
+    /// now runs from where you pressed to there. With `word`, you
+    /// double-clicked there: the word is selected.
+    pub fn select_at(&mut self, mut rt: Option<&mut Runtime>, x: f32, y: f32, word: bool) -> Interaction {
+        let mut out = Interaction {
+            focus: self.focus.is_some(),
+            ..Default::default()
+        };
+        let Some(f) = self.focus else { return out };
+        let Some(at) = self.caret_at_point(rt.as_deref_mut(), f, x, y) else {
+            return out;
+        };
+        let caret = if word {
+            match self.with_dom(rt, |d| forms::select_word(d, f, at)).flatten() {
+                Some(c) => c,
+                None => return out,
+            }
+        } else {
+            forms::Caret {
+                at,
+                anchor: self.caret.anchor.or(Some(self.caret.at)),
+            }
+        };
+        out.changed = caret != self.caret;
+        self.caret = caret;
+        out
+    }
+
     /// You typed text into the focused field (or pasted it).
     pub fn type_text(&mut self, mut rt: Option<&mut Runtime>, text: &str) -> Interaction {
         let mut out = Interaction::default();
@@ -1041,6 +1128,7 @@ impl Page {
         let typed = self.with_dom(rt.as_deref_mut(), |d| forms::insert(d, f, &mut caret, text)) == Some(true);
         self.caret = caret;
         if typed {
+            self.edited.insert(f);
             if let Some(rt) = rt.as_deref_mut() {
                 rt.fire(f, "input", true, false);
             }
@@ -1181,6 +1269,12 @@ impl Page {
             }
             _ => {}
         }
+        if let (Some(f), true) = (self.focus, input) {
+            self.edited.insert(f);
+        }
+        if let (Some(f), true) = (self.focus, change) {
+            self.interact(rt.as_deref_mut(), &[f]);
+        }
         if let (Some(f), Some(rt)) = (self.focus, rt.as_deref_mut()) {
             if input {
                 rt.fire(f, "input", true, false);
@@ -1213,11 +1307,15 @@ impl Page {
                     .flatten();
             }
         }
+        // A field you changed and left now shows whether it's right.
+        if let Some(w) = was_focus.filter(|&w| self.focus != Some(w) && self.edited.remove(&w)) {
+            self.interact(rt.as_deref_mut(), &[w]);
+        }
         let changed = self.dom_version(rt.as_deref_mut()) != before;
         if changed {
             self.sync(rt);
         }
-        out.changed = changed || self.focus != was_focus;
+        out.changed |= changed || self.focus != was_focus || std::mem::take(&mut self.restyle);
         out.focus = self.focus.is_some();
     }
 
@@ -1227,7 +1325,7 @@ impl Page {
             .borrow()
             .iter()
             .rev()
-            .find(|(r, uid)| *uid != 0 && r.contains(x, y))
+            .find(|(r, uid)| *uid != 0 && *uid != forms::FIELD_TEXT && r.contains(x, y))
             .map(|(_, u)| *u)
     }
 
@@ -1260,6 +1358,7 @@ impl Page {
                 open: self.open_select,
                 month: self.picker_month,
                 validity: self.validity.clone(),
+                interacted: self.interacted.clone(),
             },
         );
         let images = self.images_by_node(&tree);
@@ -1303,6 +1402,22 @@ impl Page {
         for b in &order {
             collect_hits(b, clip_of(b), &mut hits);
         }
+        // Text fields: where they show, and where their text is.
+        let editable = text_fields(&tree);
+        let fields: Vec<Rect> = if editable.is_empty() {
+            vec![]
+        } else {
+            hits.iter()
+                .filter(|(_, u)| editable.contains(u))
+                .map(|(r, _)| *r)
+                .take(MAX_FIELDS)
+                .collect()
+        };
+        let mut runs = Vec::new();
+        if !editable.is_empty() {
+            collect_field_runs(&root, None, &editable, &mut runs);
+        }
+        *self.field_runs.borrow_mut() = runs;
         *self.hits.borrow_mut() = hits;
         // Scripts see each box whole, even where it's clipped or scrolled
         // out of view.
@@ -1383,6 +1498,7 @@ impl Page {
                 .flatten(),
             scrollers,
             lazy: self.lazy_places(),
+            fields,
         }
     }
 
@@ -1936,6 +2052,53 @@ impl ScriptLoader<'_> {
 }
 
 /// One box's hit areas (called in paint order, so later boxes are on top).
+/// The fields in a (decorated) tree that you can type into.
+fn text_fields(tree: &Node) -> HashSet<u32> {
+    let mut found = Vec::new();
+    tree.walk(&mut found, &|n| {
+        n.uid != 0
+            && n.element()
+                .and_then(forms::control)
+                .is_some_and(|c| c.takes_typing())
+    });
+    found.iter().map(|n| n.uid).collect()
+}
+
+/// The runs of field text under `b` (see [`forms::FIELD_TEXT`]), with
+/// where each character starts.
+fn collect_field_runs(
+    b: &LayoutBox,
+    field: Option<u32>,
+    editable: &HashSet<u32>,
+    out: &mut Vec<forms::FieldRun>,
+) {
+    let field = if editable.contains(&b.uid) {
+        Some(b.uid)
+    } else {
+        field
+    };
+    if let (Some(field), BoxKind::Anonymous { frags, .. }) = (field, &b.kind) {
+        for f in frags.iter().filter(|f| f.uid == forms::FIELD_TEXT) {
+            if out.len() >= MAX_FIELD_RUNS {
+                return;
+            }
+            let font = font::index(&f.style);
+            let (a, d) = font::vmetrics(font, f.style.font_size);
+            out.push(forms::FieldRun {
+                field,
+                x: f.x,
+                top: f.baseline - a,
+                bottom: f.baseline + d,
+                offsets: font::shape(font, f.style.font_size, &f.text).char_offsets(&f.text),
+                text: f.text.clone(),
+            });
+        }
+    }
+    for c in &b.children {
+        collect_field_runs(c, field, editable, out);
+    }
+}
+
 fn collect_hits(b: &LayoutBox, clip: Option<Rect>, out: &mut Vec<(Rect, u32)>) {
     let mut push = |r: Rect, uid: u32| {
         let r = clip.map_or(r, |c| r.intersect(c));
@@ -2078,6 +2241,46 @@ mod form_script_tests {
         let mut out = String::new();
         rt.tree().dump(0, &mut out);
         assert!(out.contains("0|3|1|1|0|rgb(0, 128, 0)"), "{out}");
+    }
+
+    /// `:user-invalid`/`:user-valid` only once you've changed a field and
+    /// left it, or tried to send its form.
+    #[test]
+    fn user_validity_pseudo_classes() {
+        let (mut page, mut rt) = load(
+            "<style>input:user-invalid{color:red}</style>\
+             <form id=f><input id=a required><input id=b></form><p id=out></p>\
+             <script>\
+             const q = (s) => document.querySelectorAll(s).length;\
+             window.report = () => document.getElementById('out').textContent =\
+               [q(':user-invalid'), q(':user-valid'), q('form:user-invalid'),\
+                getComputedStyle(document.getElementById('a')).color].join('|');\
+             </script>",
+        );
+        let report = |rt: &mut Runtime| {
+            rt.run_script("report()", 0, "test");
+            let mut out = String::new();
+            rt.tree().dump(0, &mut out);
+            out
+        };
+        assert!(report(&mut rt).contains("0|0|0|rgb(0, 0, 0)"));
+        // Typing and deleting doesn't count until you leave the field.
+        page.key(Some(&mut rt), Key::Tab);
+        page.type_text(Some(&mut rt), "x");
+        page.key(Some(&mut rt), Key::Backspace { word: false });
+        assert!(report(&mut rt).contains("0|0|0|"));
+        let out = page.key(Some(&mut rt), Key::Tab);
+        assert!(out.changed);
+        assert!(
+            report(&mut rt).contains("1|0|0|rgb(255, 0, 0)"),
+            "{}",
+            report(&mut rt)
+        );
+        assert!(page.interacted.len() == 1);
+        // Trying to send the form marks all of its fields.
+        let out = page.key(Some(&mut rt), Key::Enter);
+        assert!(out.submit.is_none() && out.invalid.is_some());
+        assert!(report(&mut rt).contains("1|1|0|"), "{}", report(&mut rt));
     }
 
     /// React streams content in late as `<div hidden id=S:0>` and moves it
@@ -2893,16 +3096,9 @@ mod text_tests {
         // Keys: Up picks the option before.
         page.key(None, Key::Up { select: false });
         assert_eq!(value(&mut page, "s"), "Apple");
-        // A text field: the caret starts at the end and moves.
+        // A text field: the caret goes where you click, between a and b.
         let (x, y) = at(&page, "ab");
         page.click_at(None, x, y, until);
-        page.key(
-            None,
-            Key::Left {
-                select: false,
-                word: false,
-            },
-        );
         page.type_text(None, "X");
         assert_eq!(value(&mut page, "q"), "aXb");
         page.key(None, Key::Home { select: true });
@@ -2910,6 +3106,69 @@ mod text_tests {
         assert_eq!(page.key(None, Key::Cut).copied.as_deref(), Some("aX"));
         assert_eq!(value(&mut page, "q"), "b");
         assert_eq!(page.key(None, Key::Copy).copied, None, "nothing selected");
+    }
+
+    #[test]
+    fn clicking_and_dragging_in_fields() {
+        let mut page = Page::parse(
+            "https://example.com/",
+            "<input id=q value='hello world'><textarea id=t>one two\nthree four</textarea>\
+             <input id=p type=password value=secret>",
+            "",
+            &mut |_, _| Err("none".into()),
+        );
+        let until = Instant::now() + std::time::Duration::from_secs(5);
+        let r = page.render(800.0, 600.0);
+        assert_eq!(r.fields.len(), 3, "{:?}", r.fields);
+        // Where a character of a field's text is drawn (its left edge), by
+        // the runs the page keeps.
+        let uid = |p: &mut Page, id: &str| p.with_dom(None, |d| forms::by_id(d, id).unwrap()).unwrap();
+        let (q, t, pw) = (uid(&mut page, "q"), uid(&mut page, "t"), uid(&mut page, "p"));
+        let char_x = |p: &Page, f: u32, nth_run: usize, k: usize| {
+            let runs = p.field_runs.borrow();
+            let r = runs.iter().filter(|r| r.field == f).nth(nth_run).unwrap();
+            (r.x + r.offsets[k], (r.top + r.bottom) / 2.0)
+        };
+        let caret = |p: &Page| p.caret;
+        // A click just right of the "w" puts the caret after it.
+        let (x, y) = char_x(&page, q, 0, 7);
+        page.click_at(None, x - 1.0, y, until);
+        assert_eq!(caret(&page), forms::Caret { at: 7, anchor: None });
+        // Clicking again in the focused field moves it; past the end, to the end.
+        page.render(800.0, 600.0);
+        let (x, y) = char_x(&page, q, 0, 2);
+        page.click_at(None, x + 1.0, y, until);
+        assert_eq!(caret(&page).at, 2);
+        page.render(800.0, 600.0);
+        // Dragging selects from where you pressed.
+        let (x, y) = char_x(&page, q, 0, 0);
+        assert!(page.select_at(None, x, y, false).changed);
+        assert_eq!(
+            caret(&page),
+            forms::Caret {
+                at: 0,
+                anchor: Some(2)
+            }
+        );
+        assert_eq!(page.key(None, Key::Copy).copied.as_deref(), Some("he"));
+        // A double-click selects the word.
+        page.render(800.0, 600.0);
+        let runs = page.field_runs.borrow().clone();
+        let run = runs.iter().rfind(|r| r.field == q).unwrap();
+        let (x, y) = (run.x + run.offsets[run.offsets.len() - 2] - 1.0, run.top + 2.0);
+        page.select_at(None, x, y, true);
+        assert_eq!(page.key(None, Key::Copy).copied.as_deref(), Some("world"));
+        // A textarea: the second line.
+        let (x, y) = char_x(&page, t, 1, 0);
+        page.click_at(None, x + 1.0, y, until);
+        page.type_text(None, "X");
+        let v = page.with_dom(None, |d| forms::value(d, t)).unwrap();
+        assert_eq!(v, "one two\nXthree four");
+        // A password field counts its dots.
+        page.render(800.0, 600.0);
+        let (x, y) = char_x(&page, pw, 0, 3);
+        page.click_at(None, x, y, until);
+        assert_eq!(caret(&page).at, 3);
     }
 
     #[test]

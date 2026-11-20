@@ -93,6 +93,9 @@ impl crate::selectors::Tree for Dom {
     fn valid(&self, id: u32) -> Option<bool> {
         crate::validate::state(self, id)
     }
+    fn interacted(&self, id: u32) -> bool {
+        self.user_validity.contains(&id)
+    }
 }
 
 /// A mutable DOM. Node 0 is the document.
@@ -103,6 +106,9 @@ pub struct Dom {
     pub version: u64,
     /// Scripts' `setCustomValidity()` messages, by form field.
     pub custom_validity: std::collections::HashMap<u32, String>,
+    /// Fields you've changed and left, or whose form you tried to send
+    /// (for `:user-valid`/`:user-invalid`).
+    pub user_validity: std::collections::HashSet<u32>,
     /// Whether changes are written down for `MutationObserver`s (only
     /// while a script observes something, and only for scripts' changes).
     recording: bool,
@@ -1112,6 +1118,7 @@ fn computed_styles(s: &mut State) -> ComputedMap {
     }
     let mut tree = s.dom.to_tree();
     crate::forms::mark_validity(&mut tree, &crate::validate::marks(&s.dom));
+    crate::forms::mark_interacted(&mut tree, &s.dom.user_validity);
     let mut sheets = vec![(0u8, crate::page::ua_sheet())];
     sheets.extend(s.sheets.iter().map(|sh| (1u8, sh)));
     let ctx = crate::style::StyleContext {

@@ -298,6 +298,184 @@ pub struct ComputedStyle {
     /// A `::before`/`::after` box's `content`, as text. `None` (`normal`,
     /// `none`, or not set) means there's no such box.
     pub content: Option<Rc<str>>,
+    /// `content` with `counter()` or `counters()` in it: worked out while
+    /// styling, in tree order.
+    pub content_parts: Option<Rc<[ContentPart]>>,
+    /// `counter-reset`, `counter-increment` and `counter-set`, in the order
+    /// they apply.
+    pub counter_ops: Option<Rc<[CounterOp]>>,
+}
+
+/// A piece of `content`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ContentPart {
+    Text(String),
+    /// `counter(name, style)`, or with `sep`, `counters(name, sep, style)`.
+    Counter {
+        name: String,
+        sep: Option<String>,
+        style: String,
+    },
+}
+
+/// What an element does to a counter.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CounterOp {
+    Reset(String, i32),
+    Increment(String, i32),
+    Set(String, i32),
+}
+
+/// The counters in scope while styling: (name, value, depth of the element
+/// that made it), innermost last.
+#[derive(Debug, Default)]
+pub struct Counters(Vec<(String, i32, usize)>);
+
+/// Most counters in scope at once.
+const MAX_COUNTERS: usize = 1000;
+
+impl Counters {
+    fn apply(&mut self, ops: &[CounterOp], depth: usize) {
+        for op in ops {
+            match op {
+                CounterOp::Reset(name, n) => {
+                    // A sibling's counter of that name is replaced.
+                    match self.0.iter().rposition(|c| c.2 == depth && c.0 == *name) {
+                        Some(i) => self.0[i].1 = *n,
+                        None if self.0.len() < MAX_COUNTERS => self.0.push((name.clone(), *n, depth)),
+                        None => {}
+                    }
+                }
+                CounterOp::Increment(name, n) | CounterOp::Set(name, n) => {
+                    let add = matches!(op, CounterOp::Increment(..));
+                    match self.0.iter().rposition(|c| c.0 == *name) {
+                        Some(i) => {
+                            let c = &mut self.0[i].1;
+                            *c = if add { c.saturating_add(*n) } else { *n };
+                        }
+                        None if self.0.len() < MAX_COUNTERS => self.0.push((name.clone(), *n, depth)),
+                        None => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// Counters made by the children of an element at `depth` go out of
+    /// scope when it ends.
+    fn end(&mut self, depth: usize) {
+        self.0.retain(|c| c.2 <= depth);
+    }
+
+    fn text(&self, parts: &[ContentPart]) -> String {
+        let mut out = String::new();
+        for p in parts {
+            match p {
+                ContentPart::Text(t) => out.push_str(t),
+                ContentPart::Counter { name, sep, style } => {
+                    let values: Vec<i32> = self.0.iter().filter(|c| c.0 == *name).map(|c| c.1).collect();
+                    let values = match (sep, values.last()) {
+                        (_, None) => vec![0],
+                        (None, Some(&v)) => vec![v],
+                        (Some(_), Some(_)) => values,
+                    };
+                    let shown: Vec<String> = values.iter().map(|&v| counter_text(v, style)).collect();
+                    out.push_str(&shown.join(sep.as_deref().unwrap_or("")));
+                }
+            }
+            if out.len() > MAX_CONTENT * 4 {
+                break;
+            }
+        }
+        out
+    }
+}
+
+/// A counter's value written in a `list-style-type`.
+pub fn counter_text(n: i32, style: &str) -> String {
+    let alpha = |n: i32, letters: &[char]| -> String {
+        if n <= 0 {
+            return n.to_string();
+        }
+        let (mut n, mut out) = (n as u32, Vec::new());
+        let k = letters.len() as u32;
+        while n > 0 {
+            n -= 1;
+            out.push(letters[(n % k) as usize]);
+            n /= k;
+        }
+        out.iter().rev().collect()
+    };
+    let roman = |n: i32| -> String {
+        if !(1..4000).contains(&n) {
+            return n.to_string();
+        }
+        let mut n = n;
+        let mut out = String::new();
+        for (v, s) in [
+            (1000, "m"),
+            (900, "cm"),
+            (500, "d"),
+            (400, "cd"),
+            (100, "c"),
+            (90, "xc"),
+            (50, "l"),
+            (40, "xl"),
+            (10, "x"),
+            (9, "ix"),
+            (5, "v"),
+            (4, "iv"),
+            (1, "i"),
+        ] {
+            while n >= v {
+                out.push_str(s);
+                n -= v;
+            }
+        }
+        out
+    };
+    let latin: Vec<char> = ('a'..='z').collect();
+    match style {
+        "none" => String::new(),
+        "disc" => "\u{2022}".into(),
+        "circle" => "\u{25E6}".into(),
+        "square" => "\u{25AA}".into(),
+        "decimal-leading-zero" if (0..10).contains(&n) => format!("0{n}"),
+        "lower-alpha" | "lower-latin" => alpha(n, &latin),
+        "upper-alpha" | "upper-latin" => alpha(n, &latin).to_uppercase(),
+        "lower-greek" => alpha(
+            n,
+            &('\u{3b1}'..='\u{3c9}')
+                .filter(|&c| c != '\u{3c2}')
+                .collect::<Vec<_>>(),
+        ),
+        "lower-roman" => roman(n),
+        "upper-roman" => roman(n).to_uppercase(),
+        _ => n.to_string(),
+    }
+}
+
+/// `counter-reset`, `-increment` or `-set` values: names, each maybe with
+/// a number after it (`default` when it hasn't).
+fn counter_list(values: &[Value], default: i32, op: fn(String, i32) -> CounterOp, out: &mut Vec<CounterOp>) {
+    let mut i = 0;
+    while i < values.len() {
+        if let Value::Keyword(name) = &values[i] {
+            if name == "none" || name.contains('(') {
+                i += 1;
+                continue;
+            }
+            let n = match values.get(i + 1) {
+                Some(Value::Number(n)) if n.is_finite() => {
+                    i += 1;
+                    n.clamp(-1e9, 1e9) as i32
+                }
+                _ => default,
+            };
+            out.push(op(name.clone(), n));
+        }
+        i += 1;
+    }
 }
 
 impl ComputedStyle {
@@ -372,6 +550,8 @@ impl ComputedStyle {
             inset: [Len::Auto; 4],
             z_index: None,
             content: None,
+            content_parts: None,
+            counter_ops: None,
             fill: None,
             stroke: None,
         }
@@ -738,6 +918,7 @@ pub fn style_tree<'a>(root: &'a Node, ctx: &StyleContext) -> StyledNode<'a> {
         ctx,
         &Indexes {
             elements: &index,
+            counters: &Default::default(),
             pseudo: (!pseudo.entries.is_empty()).then_some(&pseudo),
         },
         &flat,
@@ -748,6 +929,8 @@ pub fn style_tree<'a>(root: &'a Node, ctx: &StyleContext) -> StyledNode<'a> {
 
 struct Indexes<'i, 's> {
     elements: &'i RuleIndex<'s>,
+    /// CSS counters, as styling reaches each element.
+    counters: &'i std::cell::RefCell<Counters>,
     /// Rules for `::before` and `::after`, if there are any.
     pseudo: Option<&'i RuleIndex<'s>>,
 }
@@ -797,6 +980,57 @@ fn content_text(values: &[Value], e: &ElementData) -> Option<Rc<str>> {
             .collect::<String>()
             .into(),
     )
+}
+
+/// `content` split into text and counters, if it has any counters (else
+/// [`content_text`] is all there is to it).
+fn content_parts(values: &[Value], e: &ElementData) -> Option<Rc<[ContentPart]>> {
+    let mut parts = Vec::new();
+    let mut counters = false;
+    for (i, v) in values.iter().enumerate() {
+        let func = |f: &str| match v {
+            Value::Keyword(k) => k
+                .strip_prefix(f)
+                .and_then(|a| a.strip_suffix(')'))
+                .map(str::to_string),
+            _ => None,
+        };
+        if let Some(args) = func("counter(") {
+            let mut a = args.split(',').map(str::trim);
+            let name = a.next().unwrap_or("").to_string();
+            let style = a.next().unwrap_or("decimal").to_string();
+            parts.push(ContentPart::Counter {
+                name,
+                sep: None,
+                style,
+            });
+            counters = true;
+        } else if let Some(args) = func("counters(") {
+            let values = crate::css::parse_values(&args);
+            let mut a = values.split(|v| *v == Value::Comma);
+            let name = match a.next() {
+                Some([Value::Keyword(n)]) => n.clone(),
+                _ => continue,
+            };
+            let sep = match a.next() {
+                Some([Value::Str(s)]) => s.clone(),
+                _ => continue,
+            };
+            let style = match a.next() {
+                Some([Value::Keyword(s)]) => s.clone(),
+                _ => "decimal".into(),
+            };
+            parts.push(ContentPart::Counter {
+                name,
+                sep: Some(sep),
+                style,
+            });
+            counters = true;
+        } else if let Some(t) = content_text(&values[i..=i], e) {
+            parts.push(ContentPart::Text(t.to_string()));
+        }
+    }
+    counters.then(|| parts.into())
 }
 
 /// Selectors bucketed by their subject's id, first class or tag, so each
@@ -910,10 +1144,20 @@ fn style_node<'a>(
                 return None;
             }
             let ps = compute(e, &style, ancestors, ctx, pseudo, (flat, id), false, Some(pe));
-            let text = ps.content.clone()?;
+            let mut text = ps.content.clone()?;
             if ps.display == Display::None {
                 return None;
             }
+            // The box counts as a child of the element.
+            let mut counters = index.counters.borrow_mut();
+            if let Some(ops) = &ps.counter_ops {
+                counters.apply(ops, ancestors.len() + 1);
+            }
+            if let Some(parts) = &ps.content_parts {
+                let t = counters.text(parts);
+                text = t.chars().take(MAX_CONTENT).collect::<String>().into();
+            }
+            drop(counters);
             let name = match pe {
                 PseudoElement::Before => "::before",
                 PseudoElement::After => "::after",
@@ -938,6 +1182,28 @@ fn style_node<'a>(
                 },
             })
         };
+        // Counters: the element's own changes, then its list item number.
+        let depth = ancestors.len();
+        if style.display != Display::None {
+            let mut counters = index.counters.borrow_mut();
+            let ops = style.counter_ops.as_deref().unwrap_or(&[]);
+            let named = |n: &str| {
+                ops.iter().any(|o| match o {
+                    CounterOp::Reset(m, _) | CounterOp::Increment(m, _) | CounterOp::Set(m, _) => m == n,
+                })
+            };
+            if matches!(e.tag.as_str(), "ol" | "ul" | "menu") && !named("list-item") {
+                let start = match e.attrs.get("start").and_then(|s| s.trim().parse::<i32>().ok()) {
+                    Some(s) => s.saturating_sub(1),
+                    None => 0,
+                };
+                counters.apply(&[CounterOp::Reset("list-item".into(), start)], depth);
+            }
+            counters.apply(ops, depth);
+            if style.display == Display::ListItem && !named("list-item") {
+                counters.apply(&[CounterOp::Increment("list-item".into(), 1)], depth);
+            }
+        }
         // Matched with the element itself as the subject, so with its own
         // ancestors.
         let before = generated(PseudoElement::Before, ancestors);
@@ -961,6 +1227,7 @@ fn style_node<'a>(
         }
         ancestors.pop();
         children.extend(generated(PseudoElement::After, ancestors));
+        index.counters.borrow_mut().end(depth);
     }
     StyledNode {
         node: NodeRef::Doc(node),
@@ -1747,6 +2014,22 @@ fn compute(
     }
     if pseudo.is_some() {
         s.content = props.get("content").and_then(|v| content_text(v, e));
+        if s.content.is_some() {
+            s.content_parts = props.get("content").and_then(|v| content_parts(v, e));
+        }
+    }
+    let mut ops = Vec::new();
+    if let Some(v) = props.get("counter-reset") {
+        counter_list(v, 0, CounterOp::Reset, &mut ops);
+    }
+    if let Some(v) = props.get("counter-increment") {
+        counter_list(v, 1, CounterOp::Increment, &mut ops);
+    }
+    if let Some(v) = props.get("counter-set") {
+        counter_list(v, 0, CounterOp::Set, &mut ops);
+    }
+    if !ops.is_empty() {
+        s.counter_ops = Some(ops.into());
     }
     // Absolutely positioned boxes don't float, and both are block-level.
     if matches!(s.position, Position::Absolute | Position::Fixed) {

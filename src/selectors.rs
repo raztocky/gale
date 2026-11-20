@@ -20,6 +20,11 @@ pub trait Tree {
     fn valid(&self, _id: u32) -> Option<bool> {
         None
     }
+    /// Whether you've changed field `id` and moved on, or tried to send
+    /// its form (`:user-valid`/`:user-invalid` only apply then).
+    fn interacted(&self, _id: u32) -> bool {
+        false
+    }
     /// Where `id` is in its parent's children.
     fn index(&self, id: u32) -> usize {
         self.parent_node(id)
@@ -246,6 +251,7 @@ fn pseudo<T: Tree + ?Sized>(t: &T, id: u32, e: &ElementData, p: &Pseudo) -> bool
         }),
         Pseudo::Never => false,
         Pseudo::Valid(want) => t.valid(id) == Some(*want),
+        Pseudo::UserValid(want) => e.tag != "form" && t.interacted(id) && t.valid(id) == Some(*want),
         Pseudo::Required(want) => {
             let field = match e.tag.as_str() {
                 "select" | "textarea" => true,
@@ -333,6 +339,10 @@ impl Tree for Flat<'_> {
         } else {
             None
         }
+    }
+    fn interacted(&self, id: u32) -> bool {
+        self.element(id)
+            .is_some_and(|e| e.has_class(crate::forms::USER_MARK))
     }
 }
 

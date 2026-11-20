@@ -520,6 +520,110 @@ pub fn selected_text(dom: &Dom, id: u32, caret: &Caret) -> Option<String> {
     Some(v[s..e].iter().collect())
 }
 
+/// The word (or run of spaces or punctuation) around character `at` in
+/// the field, as a selection: what a double-click picks.
+pub fn select_word(dom: &Dom, id: u32, at: usize) -> Option<Caret> {
+    let v = chars_of(dom, id)?;
+    let at = at.min(v.len());
+    // The character clicked on, or the one before at the end.
+    let probe = if at == v.len() { at.checked_sub(1)? } else { at };
+    let class = |c: char| (c.is_alphanumeric() || c == '_', c.is_whitespace());
+    let k = class(v[probe]);
+    if v[probe] == '\n' {
+        return Some(Caret {
+            at: probe,
+            anchor: None,
+        });
+    }
+    let mut s = probe;
+    while s > 0 && v[s - 1] != '\n' && class(v[s - 1]) == k {
+        s -= 1;
+    }
+    let mut e = probe + 1;
+    while e < v.len() && v[e] != '\n' && class(v[e]) == k {
+        e += 1;
+    }
+    Some(Caret {
+        at: e,
+        anchor: Some(s),
+    })
+}
+
+/// A run of a field's text as laid out: where it is and what it says,
+/// with the caret mark and the end marker the page drew in it.
+#[derive(Debug, Clone)]
+pub struct FieldRun {
+    pub field: u32,
+    pub x: f32,
+    pub top: f32,
+    pub bottom: f32,
+    pub text: String,
+    /// Where each character of `text` starts, and the end.
+    pub offsets: Vec<f32>,
+}
+
+/// The character position in a field's value nearest page-space (x, y),
+/// given where its text was laid out: on the line nearest `y`, before the
+/// character whose middle is right of `x`. `None` if none of it was.
+pub fn caret_at_point(dom: &Dom, id: u32, runs: &[FieldRun], x: f32, y: f32) -> Option<usize> {
+    let v = chars_of(dom, id)?;
+    let shown: Vec<char> = match kind(dom, id) {
+        Some(Control::Text { password: true }) => vec!['\u{2022}'; v.len()],
+        _ => v.clone(),
+    };
+    // Every place the caret can go: (top, bottom, x, position).
+    let mut stops: Vec<(f32, f32, f32, usize)> = Vec::new();
+    let mut from = 0usize;
+    for r in runs.iter().filter(|r| r.field == id) {
+        let raw: Vec<char> = r.text.chars().collect();
+        if r.offsets.len() != raw.len() + 1 {
+            continue;
+        }
+        let marker = |c: char| c == CARET_MARK || c == '\u{200b}';
+        let real: Vec<(usize, char)> = raw
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|&(_, c)| !marker(c))
+            .collect();
+        if real.is_empty() {
+            // Nothing but markers: an empty field, or a line's end.
+            stops.push((r.top, r.bottom, r.x + r.offsets[0], from));
+            continue;
+        }
+        let want: Vec<char> = real.iter().map(|&(_, c)| c).collect();
+        // Layout may have dropped spaces between words: find the run's
+        // text in the value from where the last one ended.
+        let found = (from..=shown.len().saturating_sub(want.len())).find(|&p| shown[p..].starts_with(&want));
+        let Some(p) = found else { continue };
+        for (k, &(i, _)) in real.iter().enumerate() {
+            stops.push((r.top, r.bottom, r.x + r.offsets[i], p + k));
+        }
+        let (last, _) = real[real.len() - 1];
+        stops.push((r.top, r.bottom, r.x + r.offsets[last + 1], p + want.len()));
+        from = p + want.len();
+    }
+    // The line: the one containing y, else the nearest.
+    let dist = |t: f32, b: f32| {
+        if y < t {
+            t - y
+        } else if y > b {
+            y - b
+        } else {
+            0.0
+        }
+    };
+    let best = stops
+        .iter()
+        .map(|&(t, b, _, _)| dist(t, b))
+        .fold(f32::INFINITY, f32::min);
+    stops
+        .iter()
+        .filter(|&&(t, b, _, _)| dist(t, b) <= best + 0.5)
+        .min_by(|a, b| (a.2 - x).abs().total_cmp(&(b.2 - x).abs()))
+        .map(|&(_, _, _, p)| p.min(v.len()))
+}
+
 /// Where `m` takes the caret from `at` in `v`.
 fn step(v: &[char], at: usize, m: Move) -> usize {
     let at = at.min(v.len());
@@ -861,6 +965,20 @@ fn text_child(s: &str) -> Node {
     dom::text(s.to_string())
 }
 
+/// The node id a field's own text is drawn with, so that the page can find
+/// where each of its characters ended up and put the caret where you
+/// click. No real node has it, and clicks never land on it.
+pub const FIELD_TEXT: u32 = crate::pickers::BASE - 1;
+
+/// The caret drawn in a focused field.
+pub const CARET_MARK: char = '\u{258f}';
+
+fn field_text(s: &str) -> Node {
+    let mut n = dom::text(s.to_string());
+    n.uid = FIELD_TEXT;
+    n
+}
+
 fn placeholder(s: &str) -> Node {
     let mut attrs = AttrMap::new();
     attrs.insert("class".into(), "-brickle-placeholder".into());
@@ -883,11 +1001,29 @@ pub struct Decor {
     pub month: Option<(i32, u32)>,
     /// Which fields and forms are filled in right (`:valid`/`:invalid`).
     pub validity: std::collections::HashMap<u32, bool>,
+    /// Fields you've interacted with (`:user-valid`/`:user-invalid`).
+    pub interacted: std::collections::HashSet<u32>,
 }
 
 /// Classes marking `:valid` and `:invalid` fields for styling.
 pub const VALID_MARK: &str = "-brickle-valid";
 pub const INVALID_MARK: &str = "-brickle-invalid";
+/// The class marking fields `:user-valid`/`:user-invalid` apply to.
+pub const USER_MARK: &str = "-brickle-user";
+
+/// Mark the fields you've interacted with (for styling a tree).
+pub fn mark_interacted(n: &mut Node, set: &std::collections::HashSet<u32>) {
+    if set.is_empty() {
+        return;
+    }
+    let mut stack = vec![n];
+    while let Some(n) = stack.pop() {
+        if n.uid != 0 && set.contains(&n.uid) {
+            add_class(n, USER_MARK);
+        }
+        stack.extend(n.children.iter_mut());
+    }
+}
 
 /// Put the `:valid`/`:invalid` marks on a tree (for styling it).
 pub fn mark_validity(n: &mut Node, marks: &std::collections::HashMap<u32, bool>) {
@@ -908,6 +1044,9 @@ const MAX_SHOWN_OPTIONS: usize = 1000;
 
 pub fn decorate(n: &mut Node, d: &Decor) {
     let focused = d.focus.is_some_and(|f| f == n.uid && n.uid != 0);
+    if n.uid != 0 && d.interacted.contains(&n.uid) {
+        add_class(n, USER_MARK);
+    }
     if let Some(&valid) = d.validity.get(&n.uid).filter(|_| n.uid != 0) {
         add_class(n, if valid { VALID_MARK } else { INVALID_MARK });
     }
@@ -926,21 +1065,25 @@ pub fn decorate(n: &mut Node, d: &Decor) {
         let part = |a: usize, b: usize| -> String { chars[a..b].iter().collect() };
         let end = chars.len();
         if !focused {
-            return vec![text_child(&format!("{shown}\u{200b}"))];
+            return vec![field_text(&format!("{shown}\u{200b}"))];
         }
         match d.caret.range(end) {
             Some((s, e)) => {
                 let mut attrs = AttrMap::new();
                 attrs.insert("class".into(), "-brickle-selected".into());
                 vec![
-                    text_child(&part(0, s)),
-                    dom::elem("span".into(), attrs, vec![text_child(&part(s, e))]),
-                    text_child(&format!("{}\u{200b}", part(e, end))),
+                    field_text(&part(0, s)),
+                    dom::elem("span".into(), attrs, vec![field_text(&part(s, e))]),
+                    field_text(&format!("{}\u{200b}", part(e, end))),
                 ]
             }
             None => {
                 let at = d.caret.at.min(end);
-                vec![text_child(&format!("{}▏{}\u{200b}", part(0, at), part(at, end)))]
+                vec![field_text(&format!(
+                    "{}{CARET_MARK}{}\u{200b}",
+                    part(0, at),
+                    part(at, end)
+                ))]
             }
         }
     };
@@ -1289,6 +1432,7 @@ mod tests {
                 open: None,
                 month: None,
                 validity: Default::default(),
+                interacted: Default::default(),
             },
         );
         let mut out = String::new();

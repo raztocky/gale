@@ -4535,6 +4535,51 @@ mod modern_layout_tests {
     }
 
     #[test]
+    fn grid_shorthands() {
+        // Areas with their row heights, and columns after the slash.
+        let b = boxes(
+            ".g{display:grid;width:600px;grid-template:[top] 'head head' 40px [mid] 'nav main' 200px / 150px 1fr}\
+             header{grid-area:head} nav{grid-area:nav} main{grid-area:main}",
+            "<div class=g><main>m</main><nav>n</nav><header>h</header></div>",
+            WIN,
+            "main",
+        );
+        assert!(
+            close(b[0].x, 150.0) && close(b[0].y, 40.0) && close(b[0].w, 450.0) && close(b[0].h, 200.0),
+            "{b:?}"
+        );
+        // `grid`: rows / columns, and rows that flow with a set height.
+        let b = boxes(
+            "p{margin:0} .g{display:grid;width:300px;grid:50px 70px / 100px 200px}",
+            "<div class=g><p>a</p><p>b</p><p>c</p></div>",
+            WIN,
+            "p",
+        );
+        assert!(
+            close(b[1].x, 100.0) && close(b[1].w, 200.0) && close(b[2].y, 50.0) && close(b[2].h, 70.0),
+            "{b:?}"
+        );
+        let b = boxes(
+            "p{margin:0} .g{display:grid;width:300px;grid:auto-flow 40px / 1fr 1fr 1fr}",
+            "<div class=g><p>a</p><p>b</p><p>c</p><p>d</p></div>",
+            WIN,
+            "p",
+        );
+        assert!(
+            close(b[2].x, 200.0) && close(b[3].y, 40.0) && close(b[3].h, 40.0),
+            "{b:?}"
+        );
+        // `none` resets what an earlier rule set.
+        let b = boxes(
+            "p{margin:0} .g{display:grid;grid-template-columns:100px 100px} .g{grid-template:none}",
+            "<div class=g><p>a</p><p>b</p></div>",
+            WIN,
+            "p",
+        );
+        assert!(close(b[1].x, 0.0), "{b:?}");
+    }
+
+    #[test]
     fn grid_rows_and_areas() {
         // Row templates, `grid-auto-rows` after them, and a row span.
         let b = boxes(
@@ -4670,6 +4715,35 @@ mod modern_layout_tests {
         let mut out = String::new();
         walk(&root, &mut out);
         out
+    }
+
+    #[test]
+    fn css_counters() {
+        let words = |css: &str, html: &str| -> Vec<String> {
+            text(css, html).split_whitespace().map(str::to_string).collect()
+        };
+        // Nested sections numbered with counters(), headings with counter().
+        assert_eq!(
+            words(
+                "body{counter-reset:h} h2{counter-increment:h} h2::before{content:counter(h, upper-roman) '.'}\
+                 ol{counter-reset:item;list-style:none} li{counter-increment:item}\
+                 li::before{content:counters(item, '.') ')'}",
+                "<h2>A</h2><h2>B</h2><ol><li>x<ol><li>y</li><li>z</li></ol></li><li>w</li></ol><h2>C</h2>",
+            ),
+            ["I.A", "II.B", "1)x", "1.1)y", "1.2)z", "2)w", "III.C"]
+        );
+        // A reset on a sibling replaces the counter (then its increment
+        // applies); an unset counter is 0;
+        // list items count themselves (from `start`).
+        assert_eq!(
+            words(
+                "p{counter-increment:n} .r{counter-reset:n 10} p::before{content:counter(n) ':'}\
+                 i::before{content:counter(none-set, lower-alpha) '|'}\
+                 li::before{content:counter(list-item, lower-alpha) '.'} ol{list-style:none}",
+                "<p>a</p><p class=r>b</p><p>c</p><i>i</i><ol start=3><li>x</li><li>y</li></ol>",
+            ),
+            ["1:a", "11:b", "12:c", "0|i", "c.x", "d.y"]
+        );
     }
 
     #[test]

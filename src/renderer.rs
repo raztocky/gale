@@ -292,6 +292,7 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
             msg @ (ToRenderer::Click { .. }
             | ToRenderer::Type(_)
             | ToRenderer::Key(_)
+            | ToRenderer::Select { .. }
             | ToRenderer::Scroll { .. }) => {
                 let p = page.as_mut().ok_or("input before load")?;
                 let until = Instant::now() + js::EVENT_BUDGET;
@@ -304,6 +305,7 @@ pub fn serve(input: &mut impl Read, output: &mut impl Write) -> Result<(), Strin
                     ToRenderer::Type(t) => p.type_text(rt.as_mut(), &t),
                     ToRenderer::Key(k) => p.key(rt.as_mut(), k),
                     ToRenderer::Scroll { uid, dx, dy } => p.scroll_box(rt.as_mut(), uid, dx, dy),
+                    ToRenderer::Select { x, y, word } => p.select_at(rt.as_mut(), x, y, word),
                     _ => unreachable!(),
                 };
                 let (mut navigate, mut console, mut read) = (None, vec![], vec![]);
