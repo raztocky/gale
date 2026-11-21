@@ -6,9 +6,9 @@
 //! Parsing the prelude is most of what a new runtime costs, so one runtime
 //! is kept and reset for each input (see `Runtime::reset_for_fuzzing`),
 //! about five times as many inputs a second. It's built anew every
-//! [`FRESH_EVERY`] inputs: Boa 0.22 keeps every prototype that has had
-//! instances alive for the engine's lifetime, so a kept engine slowly
-//! fills up with old pages. The operations below never touch the engine's
+//! [`FRESH_EVERY`] inputs: Boa 0.22 never frees a prototype that can reach
+//! one of its own instances (https://github.com/boa-dev/boa/issues/5681),
+//! so a kept engine slowly fills up with old pages. The operations below never touch the engine's
 //! built-in objects, which a reset doesn't restore; the script is a block
 //! so its declarations don't outlive it.
 //!

@@ -92,7 +92,8 @@ what's next:
 - [x] Sizes for scripts before the page is first shown (an early layout, at most 16 per load).
 - [x] Faster startup for the JS fuzzer: one runtime reset for each input, about 5x the inputs
   a second (Boa can't snapshot, or reuse a parsed prelude in another engine), built anew every
-  50 inputs because Boa 0.22 keeps old prototypes alive.
+  50 inputs because Boa 0.22 keeps old prototypes alive
+  ([boa#5681](https://github.com/boa-dev/boa/issues/5681)); once that's fixed, rebuild less often.
 - [ ] Big framework apps that don't finish starting in time with Boa (yahoo.com's React app
   takes over 10 s; its feed stays as placeholders). The 32-script limit happens to keep it
   from starting; a long script is now stopped at the time budget instead of the renderer
