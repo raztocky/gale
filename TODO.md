@@ -44,7 +44,9 @@ Planned work, roughly in priority order. Items marked *discuss* need a decision 
 - [x] Scrolling inside `overflow: auto/scroll` boxes with the wheel (`Shift` for sideways), and `max-height`
 - [x] Scrolling inside boxes with the keyboard, and by dragging their scrollbar; `scrollTop`, `scrollTo()`, `scrollIntoView()` and `scroll` events for scripts
 - [x] Request panel: notes when a page's scripts read enough browser details to look like fingerprinting
-- [ ] Request panel: more trackers from a public list, once its licence is checked
+- [ ] Request panel: more trackers from a public list. Checked 2026-11-20: Disconnect, DuckDuckGo
+      Tracker Radar and Ghostery TrackerDB are non-commercial only; AdGuard's companiesdb
+      (CC BY-SA 4.0) could be bundled. Decided not to for now
 
 ## Performance / robustness
 - [x] Paint pages into tiles once and scroll by copying pixels
@@ -88,7 +90,9 @@ what's next:
 - [x] `getComputedStyle()` from the page's stylesheets (sizes from the layout once there is one).
 - [x] `MutationObserver` callbacks (scripts' changes only, delivered in a microtask).
 - [x] Sizes for scripts before the page is first shown (an early layout, at most 16 per load).
-- [ ] Faster startup for the JS fuzzer (snapshot the prelude).
+- [x] Faster startup for the JS fuzzer: one runtime reset for each input, about 5x the inputs
+  a second (Boa can't snapshot, or reuse a parsed prelude in another engine), built anew every
+  50 inputs because Boa 0.22 keeps old prototypes alive.
 - [ ] Big framework apps that don't finish starting in time with Boa (yahoo.com's React app
   takes over 10 s; its feed stays as placeholders). The 32-script limit happens to keep it
   from starting; a long script is now stopped at the time budget instead of the renderer

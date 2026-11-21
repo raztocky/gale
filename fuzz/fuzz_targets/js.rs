@@ -2,9 +2,59 @@
 //! Scripts doing arbitrary sequences of DOM operations (the native
 //! primitives in src/js.rs are what a hostile page attacks first), then
 //! the result is styled, laid out and painted.
+//!
+//! Parsing the prelude is most of what a new runtime costs, so one runtime
+//! is kept and reset for each input (see `Runtime::reset_for_fuzzing`),
+//! about five times as many inputs a second. It's built anew every
+//! [`FRESH_EVERY`] inputs: Boa 0.22 keeps every prototype that has had
+//! instances alive for the engine's lifetime, so a kept engine slowly
+//! fills up with old pages. The operations below never touch the engine's
+//! built-in objects, which a reset doesn't restore; the script is a block
+//! so its declarations don't outlive it.
+//!
+//! A crash that only happens after earlier inputs may not reproduce on its
+//! own; run the inputs before it too (`-runs` over the corpus).
 use brickle::{html, js::Runtime, page::Page};
 use libfuzzer_sys::fuzz_target;
+use std::cell::RefCell;
+use std::mem::ManuallyDrop;
 use std::time::{Duration, Instant};
+
+const FRESH_EVERY: u32 = 50;
+
+/// No leak checks for this target: the kept runtime's strings and objects
+/// are held through Boa's tagged pointers, which LeakSanitizer can't follow,
+/// so it reports them as leaked after nearly every input. (The other targets
+/// still check for leaks.)
+#[no_mangle]
+pub extern "C" fn __asan_default_options() -> *const std::ffi::c_char {
+    c"detect_leaks=0".as_ptr()
+}
+
+thread_local! {
+    // Never dropped at exit, when the engine's own thread-locals may
+    // already be gone; replaced runtimes are dropped as usual.
+    static KEPT: ManuallyDrop<RefCell<(Option<Runtime>, u32)>> =
+        const { ManuallyDrop::new(RefCell::new((None, 0))) };
+}
+
+/// A runtime for `tree`: the kept one reset, or a new one.
+fn runtime(tree: &brickle::dom::Node) -> Option<Runtime> {
+    const URL: &str = "https://fuzz.example/";
+    KEPT.with(|k| {
+        let (kept, uses) = &mut *k.borrow_mut();
+        *uses += 1;
+        if *uses % FRESH_EVERY != 0 {
+            if let Some(mut rt) = kept.take() {
+                if rt.reset_for_fuzzing(tree, URL, (800.0, 600.0)).is_ok() {
+                    return Some(rt);
+                }
+            }
+        }
+        *kept = None;
+        Runtime::new(tree, URL, (800.0, 600.0)).ok()
+    })
+}
 
 const OPS: &[&str] = &[
     "n.push(document.createElement(['div','p','b','script','style','ul','li','a','#x'][r()%9]))",
@@ -63,7 +113,7 @@ fuzz_target!(|data: &[u8]| {
     let html_src = String::from_utf8_lossy(&data[1..1 + split.min(data.len() - 1)]);
     let ops = &data[1 + split.min(data.len() - 1)..];
     let mut script = String::from(
-        "const n = [document, document.documentElement, document.body];\n\
+        "{ const n = [document, document.documentElement, document.body];\n\
          let k = 0; const seq = [",
     );
     for b in ops {
@@ -77,8 +127,9 @@ fuzz_target!(|data: &[u8]| {
         let op = OPS[*b as usize % OPS.len()];
         script.push_str(&format!("try {{ {op} }} catch (e) {{}} // {i}\n"));
     }
+    script.push('}');
     let tree = html::parse(&html_src);
-    let Ok(mut rt) = Runtime::new(&tree, "https://fuzz.example/", (800.0, 600.0)) else {
+    let Some(mut rt) = runtime(&tree) else {
         return;
     };
     rt.run_script(&script, 0, "fuzz");
@@ -93,4 +144,5 @@ fuzz_target!(|data: &[u8]| {
     if let Some(uid) = page.hit(10.0, 10.0) {
         let _ = rt.click(uid, Instant::now() + Duration::from_millis(100));
     }
+    KEPT.with(|k| k.borrow_mut().0 = Some(rt));
 });

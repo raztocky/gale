@@ -744,6 +744,15 @@ struct Jobs {
     asyncs: RefCell<std::collections::VecDeque<boa_engine::job::NativeAsyncJob>>,
 }
 
+impl Jobs {
+    /// Drop jobs left waiting.
+    fn clear(&self) {
+        self.promise.borrow_mut().clear();
+        self.generic.borrow_mut().clear();
+        self.asyncs.borrow_mut().clear();
+    }
+}
+
 impl boa_engine::job::JobExecutor for Jobs {
     fn enqueue_job(self: Rc<Self>, job: boa_engine::job::Job, _: &mut Context) {
         match job {
@@ -1688,6 +1697,11 @@ pub struct Runtime {
     modules: Rc<Modules>,
     /// Inline module scripts' modules, by element.
     inline_modules: std::collections::HashMap<u32, boa_engine::Module>,
+    jobs: Rc<Jobs>,
+    /// The prelude's setup function (see [`Runtime::reset_for_fuzzing`]).
+    setup: JsObject,
+    /// Built-in methods the prelude wraps, as they were before it ran.
+    originals: Vec<(JsObject, JsString, JsValue)>,
     ctx: Context,
     // Declared last, so it runs after the context is gone.
     _collect: CollectOnDrop,
@@ -1711,21 +1725,98 @@ pub fn rounded_viewport(w: f32, h: f32) -> (f64, f64) {
     (r(w, 200.0), r(h, 100.0))
 }
 
+/// The renderer's side of a new page: its document and address.
+fn fresh_state(tree: &Node, url: &str, viewport: (f32, f32)) {
+    with(|s| {
+        *s = State {
+            dom: Dom::from_tree(tree),
+            url: url.to_string(),
+            viewport,
+            ..State::default()
+        }
+    });
+}
+
+/// The built-in methods the prelude replaces with wrappers that note a
+/// page reading the time zone: each object, name and method.
+fn wrapped_builtins(ctx: &mut Context) -> Vec<(JsObject, JsString, JsValue)> {
+    let paths: [(&[&str], &str); 2] = [
+        (&["Date", "prototype"], "getTimezoneOffset"),
+        (&["Intl", "DateTimeFormat", "prototype"], "resolvedOptions"),
+    ];
+    let mut out = Vec::new();
+    for (path, key) in paths {
+        let mut obj = ctx.global_object();
+        let mut found = true;
+        for name in path {
+            match obj.get(js_string!(*name), ctx).ok().and_then(|v| v.as_object()) {
+                Some(o) => obj = o,
+                None => {
+                    found = false;
+                    break;
+                }
+            }
+        }
+        if found {
+            if let Ok(v) = obj.get(js_string!(key), ctx) {
+                out.push((obj, js_string!(key), v));
+            }
+        }
+    }
+    out
+}
+
+/// Run the prelude's setup function with the native primitives, which
+/// installs the page's API on the global object.
+fn install(setup: &JsObject, ctx: &mut Context) -> Result<Internals, String> {
+    let mut obj = ObjectInitializer::new(ctx);
+    for (name, f, len) in NATIVES {
+        let f: Native = *f;
+        let checked = NativeFunction::from_copy_closure(move |this, args, ctx| {
+            check_deadline()?;
+            f(this, args, ctx)
+        });
+        obj.function(checked, js_string!(*name), *len);
+    }
+    obj.property(
+        js_string!("ua"),
+        js_string!(crate::net::user_agent()),
+        Attribute::READONLY,
+    );
+    let natives = obj.build();
+    let internals = setup
+        .call(&JsValue::undefined(), &[natives.into()], ctx)
+        .map_err(|e| format!("prelude: {e}"))?;
+    let internals = internals
+        .as_object()
+        .ok_or("prelude didn't return its internals")?;
+    let get = |name: &str, ctx: &mut Context| -> Result<JsObject, String> {
+        internals
+            .get(js_string!(name), ctx)
+            .ok()
+            .and_then(|v| v.as_object())
+            .ok_or(format!("prelude is missing {name}"))
+    };
+    Ok(Internals {
+        run_script: get("runScript", ctx)?,
+        step_timers: get("stepTimers", ctx)?,
+        dispatch: get("dispatch", ctx)?,
+        fire_load: get("fireLoad", ctx)?,
+        fire_event: get("fireEvent", ctx)?,
+        set_viewport: get("setViewport", ctx)?,
+        deliver: get("deliver", ctx)?,
+    })
+}
+
 impl Runtime {
     /// Set up scripting for a page. Only one runtime per thread.
     pub fn new(tree: &Node, url: &str, viewport: (f32, f32)) -> Result<Runtime, String> {
-        with(|s| {
-            *s = State {
-                dom: Dom::from_tree(tree),
-                url: url.to_string(),
-                viewport,
-                ..State::default()
-            }
-        });
+        fresh_state(tree, url, viewport);
         let modules = Rc::new(Modules::default());
+        let jobs = Rc::new(Jobs::default());
         let mut ctx = Context::builder()
             .host_hooks(Rc::new(Hooks))
-            .job_executor(Rc::new(Jobs::default()))
+            .job_executor(jobs.clone())
             .module_loader(modules.clone())
             .build()
             .map_err(|e| format!("can't start JavaScript: {e}"))?;
@@ -1734,57 +1825,54 @@ impl Runtime {
             limits.set_loop_iteration_limit(LOOP_LIMIT);
             limits.set_recursion_limit(RECURSION_LIMIT);
         }
-        let mut obj = ObjectInitializer::new(&mut ctx);
-        for (name, f, len) in NATIVES {
-            let f: Native = *f;
-            let checked = NativeFunction::from_copy_closure(move |this, args, ctx| {
-                check_deadline()?;
-                f(this, args, ctx)
-            });
-            obj.function(checked, js_string!(*name), *len);
-        }
-        let (vw, vh) = rounded_viewport(viewport.0, viewport.1);
-        obj.property(
-            js_string!("ua"),
-            js_string!(crate::net::user_agent()),
-            Attribute::READONLY,
-        );
-        let natives = obj.build();
         let setup = ctx
             .eval(Source::from_bytes(PRELUDE))
             .map_err(|e| format!("prelude: {e}"))?;
         let setup = setup.as_object().ok_or("prelude didn't return a function")?;
-        let internals = setup
-            .call(&JsValue::undefined(), &[natives.into()], &mut ctx)
-            .map_err(|e| format!("prelude: {e}"))?;
-        let internals = internals
-            .as_object()
-            .ok_or("prelude didn't return its internals")?;
-        let get = |name: &str, ctx: &mut Context| -> Result<JsObject, String> {
-            internals
-                .get(js_string!(name), ctx)
-                .ok()
-                .and_then(|v| v.as_object())
-                .ok_or(format!("prelude is missing {name}"))
-        };
-        let internals = Internals {
-            run_script: get("runScript", &mut ctx)?,
-            step_timers: get("stepTimers", &mut ctx)?,
-            dispatch: get("dispatch", &mut ctx)?,
-            fire_load: get("fireLoad", &mut ctx)?,
-            fire_event: get("fireEvent", &mut ctx)?,
-            set_viewport: get("setViewport", &mut ctx)?,
-            deliver: get("deliver", &mut ctx)?,
-        };
+        let originals = wrapped_builtins(&mut ctx);
+        let internals = install(&setup, &mut ctx)?;
         let mut rt = Runtime {
             internals,
             modules,
             inline_modules: Default::default(),
+            jobs,
+            setup,
+            originals,
             ctx,
             _collect: CollectOnDrop,
         };
-        rt.call(&rt.internals.set_viewport.clone(), &[vw.into(), vh.into()]);
+        rt.set_viewport_now(viewport);
         Ok(rt)
+    }
+
+    /// Fuzzing only: start over with another page in the same engine,
+    /// running the prelude's setup again instead of parsing it again (most
+    /// of what starting a runtime costs). The new page gets new globals,
+    /// timers and listeners, but anything an earlier page changed in the
+    /// engine's built-in objects stays, so the browser never does this
+    /// between pages: it would let one page affect the next.
+    #[doc(hidden)]
+    pub fn reset_for_fuzzing(&mut self, tree: &Node, url: &str, viewport: (f32, f32)) -> Result<(), String> {
+        self.jobs.clear();
+        self.modules.by_url.borrow_mut().clear();
+        self.modules.url_of.borrow_mut().clear();
+        self.inline_modules.clear();
+        self.set_deadline(None);
+        fresh_state(tree, url, viewport);
+        // Put back what the prelude wraps, or each setup would wrap the
+        // last one's wrapper (and keep that page alive through it).
+        for (obj, key, original) in &self.originals {
+            obj.set(key.clone(), original.clone(), false, &mut self.ctx)
+                .map_err(|e| format!("restoring {}: {e}", key.to_std_string_escaped()))?;
+        }
+        self.internals = install(&self.setup.clone(), &mut self.ctx)?;
+        self.set_viewport_now(viewport);
+        Ok(())
+    }
+
+    fn set_viewport_now(&mut self, viewport: (f32, f32)) {
+        let (vw, vh) = rounded_viewport(viewport.0, viewport.1);
+        self.call(&self.internals.set_viewport.clone(), &[vw.into(), vh.into()]);
     }
 
     /// Call an internal function; exceptions go to the console.
@@ -2524,6 +2612,42 @@ mod tests {
         let mut out = String::new();
         rt.tree().dump(0, &mut out);
         (rt, out)
+    }
+
+    /// The fuzzer's reset gives the next page what a new runtime would:
+    /// none of the last page's timers, listeners, jobs or document.
+    #[test]
+    fn reset_for_fuzzing_starts_a_clean_page() {
+        let page = "<p id=p>x</p>";
+        let script = "{ const p = document.getElementById('p');\
+             p.addEventListener('click', () => p.textContent += '!');\
+             setTimeout(() => p.textContent += ' timer', 5);\
+             Promise.resolve().then(() => p.textContent += ' job');\
+             p.click(); document.title = 'T'; location.hash = 'h'; }";
+        let (mut rt, fresh) = run(page, script);
+        assert!(
+            ["x!", "job", "timer"].iter().all(|w| fresh.contains(w)),
+            "{fresh}"
+        );
+        // Dirty the engine first: a listener on the window, a timer, a
+        // waiting job and a promise that never ran.
+        rt.run_script(
+            "addEventListener('load', () => document.body.append('stale'));\
+             setInterval(() => document.body.append('stale'), 1);\
+             Promise.resolve().then(() => document.body.append('stale'));",
+            0,
+            "dirty",
+        );
+        let tree = crate::html::parse(page);
+        rt.reset_for_fuzzing(&tree, "https://example.com/dir/page.html", (1000.0, 700.0))
+            .unwrap();
+        rt.run_script(script, 0, "test");
+        rt.fire_load();
+        rt.run_timers(Instant::now() + Duration::from_secs(2));
+        let mut again = String::new();
+        rt.tree().dump(0, &mut again);
+        assert_eq!(fresh, again);
+        assert!(!again.contains("stale"), "{again}");
     }
 
     /// A page's Promise polyfill built on queueMicrotask (as Yahoo's is)
