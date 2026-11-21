@@ -26,8 +26,10 @@ const MAX_REDIRECTS: usize = 5;
 /// Most `Content-Security-Policy` headers kept for a page, and the longest.
 const MAX_CSP_HEADERS: usize = 8;
 const MAX_CSP_HEADER: usize = 16 * 1024;
-/// Most external stylesheets one page may pull in.
-pub const MAX_STYLESHEETS: usize = 16;
+/// Most external stylesheets (and `@import`s) one page may pull in. Sites
+/// built with code splitting load a small stylesheet per component, often
+/// dozens; the page's byte and time budgets are what bound the cost.
+pub const MAX_STYLESHEETS: usize = 128;
 /// Total time a page's subresources may take, however many there are.
 pub const PAGE_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 /// Total bytes a page and its subresources may download.
@@ -112,6 +114,35 @@ impl LogEntry {
         matches!(self.outcome, Outcome::Loaded { .. } | Outcome::Redirected { .. })
             || matches!(self.outcome, Outcome::Failed(_) | Outcome::NeedsHttpConsent)
     }
+}
+
+/// A page's requests counted for the request badge and panel.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Tally {
+    pub total: usize,
+    /// Stopped to protect you: filter lists, your rules, and Brickle's own
+    /// checks (mixed content, local network, certificates...).
+    pub blocked: usize,
+    /// Left out because the page went over its budget (too many
+    /// stylesheets, images or script requests, too slow, too big). Not a
+    /// protection, so not counted as blocked.
+    pub skipped: usize,
+}
+
+pub fn tally(log: &[LogEntry]) -> Tally {
+    let mut t = Tally {
+        total: log.len(),
+        ..Tally::default()
+    };
+    for e in log {
+        match e.outcome {
+            Outcome::OverLimit => t.skipped += 1,
+            Outcome::Local => {}
+            _ if !e.was_sent() => t.blocked += 1,
+            _ => {}
+        }
+    }
+    t
 }
 
 /// What to do when you click "continue" on an interstitial page.

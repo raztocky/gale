@@ -486,11 +486,10 @@ fn print_log(log: &[LogEntry], page_url: &str) {
         }
     }
     let sent = log.iter().filter(|e| e.was_sent()).count();
+    let t = brickle::network::tally(log);
     println!(
-        "{} requests: {} sent, {} blocked or denied",
-        log.len(),
-        sent,
-        log.len() - sent
+        "{} requests: {} sent, {} blocked or denied, {} skipped (page budget)",
+        t.total, sent, t.blocked, t.skipped
     );
 }
 

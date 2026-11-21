@@ -8,7 +8,7 @@ use brickle::forms::Submission;
 use brickle::layout::{Edges, Rect};
 use brickle::lineedit::LineEdit;
 use brickle::net;
-use brickle::network::{Action, LogEntry, Network, Outcome};
+use brickle::network::{self, Action, LogEntry, Network, Outcome};
 use brickle::page::{self, Key as PageKey, Rendered};
 use brickle::paint::{
     self, Canvas, DisplayCommand, DisplayList, GlyphBitmap, GlyphCache, Layer, TileCache, TilePainter,
@@ -3812,17 +3812,16 @@ fn draw_menu(c: &mut Canvas, m: usize, mouse: Option<(f32, f32)>, cache: &mut Gl
     }
 }
 
-fn counts(log: &[LogEntry]) -> (usize, usize) {
-    let blocked = log
-        .iter()
-        .filter(|e| !e.was_sent() && e.outcome != Outcome::Local)
-        .count();
-    (blocked, log.len())
-}
-
+/// "3 blocked · 2 skipped · 40 requests", the skipped part only when
+/// there are some (see [`network::Tally`]).
 fn badge_text(log: &[LogEntry]) -> String {
-    let (blocked, total) = counts(log);
-    format!("{blocked} blocked · {total} requests")
+    let t = network::tally(log);
+    let skipped = if t.skipped > 0 {
+        format!(" · {} skipped", t.skipped)
+    } else {
+        String::new()
+    };
+    format!("{} blocked{skipped} · {} requests", t.blocked, t.total)
 }
 
 fn badge_rect(log: &[LogEntry], w: f32) -> Rect {
@@ -4082,7 +4081,7 @@ fn draw_chrome(
 
     // Request counter button.
     let badge = badge_rect(log, w);
-    let (blocked, _) = counts(log);
+    let blocked = network::tally(log).blocked;
     c.fill(
         badge,
         if ui.panel {
@@ -4280,12 +4279,17 @@ fn draw_panel(
         LINE,
         bars(),
     );
-    let (blocked, total) = counts(log);
+    let t = network::tally(log);
+    let skipped = if t.skipped > 0 {
+        format!("  ·  skipped {}", t.skipped)
+    } else {
+        String::new()
+    };
     text(
         c,
         x0 + 14.0,
         bars() + 22.0,
-        &format!("Requests  {total}  ·  blocked {blocked}"),
+        &format!("Requests  {}  ·  blocked {}{skipped}", t.total, t.blocked),
         BOLD,
         13.0,
         DARK,
@@ -4780,6 +4784,41 @@ mod clipboard_tests {
 #[cfg(test)]
 mod menu_tests {
     use super::*;
+
+    #[test]
+    fn badge_counts_budget_skips_apart_from_blocks() {
+        let entry = |outcome| LogEntry {
+            url: "https://a.example/x".into(),
+            dest: net::Dest::Stylesheet,
+            outcome,
+            stripped: vec![],
+            upgraded: false,
+            insecure: false,
+            allowed_by: None,
+            cookies_sent: vec![],
+            cookies_set: vec![],
+            cookies_refused: vec![],
+            cors_blocked: false,
+            list: None,
+        };
+        let mut log = vec![
+            entry(Outcome::Loaded { status: 200 }),
+            entry(Outcome::Blocked {
+                rule: "||a.example^".into(),
+            }),
+            entry(Outcome::Denied {
+                rule: "a.example".into(),
+            }),
+            entry(Outcome::Failed("timed out".into())),
+            entry(Outcome::Local),
+        ];
+        assert_eq!(badge_text(&log), "2 blocked · 5 requests");
+        log.push(entry(Outcome::OverLimit));
+        log.push(entry(Outcome::OverLimit));
+        assert_eq!(badge_text(&log), "2 blocked · 2 skipped · 7 requests");
+        let t = network::tally(&log);
+        assert_eq!((t.total, t.blocked, t.skipped), (7, 2, 2));
+    }
 
     #[test]
     fn text_size_steps_and_limits() {
