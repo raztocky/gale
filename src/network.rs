@@ -27,9 +27,10 @@ const MAX_REDIRECTS: usize = 5;
 const MAX_CSP_HEADERS: usize = 8;
 const MAX_CSP_HEADER: usize = 16 * 1024;
 /// Most external stylesheets (and `@import`s) one page may pull in. Sites
-/// built with code splitting load a small stylesheet per component, often
-/// dozens; the page's byte and time budgets are what bound the cost.
-pub const MAX_STYLESHEETS: usize = 128;
+/// built with code splitting load a small stylesheet per component: a
+/// Yahoo Finance article links 220. The page's byte and time budgets are
+/// what bound the cost.
+pub const MAX_STYLESHEETS: usize = 512;
 /// Total time a page's subresources may take, however many there are.
 pub const PAGE_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 /// Total bytes a page and its subresources may download.
