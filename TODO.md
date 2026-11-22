@@ -13,6 +13,7 @@ Planned work, roughly in priority order. Items marked *discuss* need a decision 
 - [x] Real table layout
 - [x] Flexbox, CSS grid, `@media` queries, `aspect-ratio`, percentage heights
 - [x] Grid rows (`grid-template-rows`, `grid-auto-rows`, `grid-row`, `grid-area`, named areas)
+- [x] `clip` and `clip-path: inset()` (labels meant only for screen readers stay hidden)
 - [x] `::before`/`::after` content (strings, `attr()`, quotes), and `<details>` that open on a click
 - [x] CSS counters (`counter()`/`counters()` in `content`, `counter-reset`/`-increment`/`-set`, `list-item`), `grid-template`/`grid` shorthands
 - [x] `grid-auto-flow` (`column`, `dense`) and `grid-auto-columns`
@@ -34,7 +35,8 @@ Planned work, roughly in priority order. Items marked *discuss* need a decision 
       rows from the right; logical properties (`margin-inline-start`, `padding-inline`,
       `inset-inline-*`, `float: inline-start`...); `<bdo>` reversing letters
 - [x] Unicode line breaking (UAX #14) with `unicode-linebreak`
-- [ ] Thai/Lao/Khmer word breaking (needs a dictionary)
+- Thai/Lao/Khmer word breaking (needs a dictionary): decided 2026-11-22 not to support it; long
+  lines in these scripts wrap at the edge of the box
 - [x] Page titles in the tab bar are drawn by the page's own sandboxed renderer; the browser only
       rasterizes its own text and checked URLs
 

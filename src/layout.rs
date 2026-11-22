@@ -2792,7 +2792,16 @@ pub fn box_addr(b: &LayoutBox) -> usize {
 /// clipping, and absolutely positioned ones escape the clipping of boxes
 /// outside their containing block, as in CSS.
 pub fn clip_map(root: &LayoutBox) -> HashMap<usize, Rect> {
-    fn walk(b: &LayoutBox, clip: Option<Rect>, abs_clip: Option<Rect>, out: &mut HashMap<usize, Rect>) {
+    // `clip`: whatever `overflow` clips the box's content to, by which
+    // boxes it applies to; `hard`: `clip` and `clip-path` of the box and its
+    // ancestors, which clip every descendant, fixed ones too.
+    fn walk(
+        b: &LayoutBox,
+        clip: Option<Rect>,
+        abs_clip: Option<Rect>,
+        hard: Option<Rect>,
+        out: &mut HashMap<usize, Rect>,
+    ) {
         let block = matches!(b.kind, BoxKind::Block(_));
         let inner = if block && b.style().overflow_clip {
             let p = b.dims.padding_box();
@@ -2806,20 +2815,64 @@ pub fn clip_map(root: &LayoutBox) -> HashMap<usize, Rect> {
             abs_clip
         };
         for c in &b.children {
+            let hard = both(hard, own_clip(c));
             let (cc, cabs) = match c.position() {
                 Position::Fixed => (None, None),
                 Position::Absolute => (inner_abs, inner_abs),
                 _ => (inner, inner_abs),
             };
+            let (cc, cabs) = (both(cc, hard), both(cabs, hard));
             if let Some(r) = cc {
                 out.insert(box_addr(c), r);
             }
-            walk(c, cc, cabs, out);
+            walk(c, cc, cabs, hard, out);
+        }
+    }
+    fn both(a: Option<Rect>, b: Option<Rect>) -> Option<Rect> {
+        match (a, b) {
+            (Some(a), Some(b)) => Some(a.intersect(b)),
+            (a, b) => a.or(b),
         }
     }
     let mut out = HashMap::new();
-    walk(root, None, None, &mut out);
+    walk(root, None, None, None, &mut out);
     out
+}
+
+/// The box's own `clip` (absolutely positioned boxes only) and
+/// `clip-path: inset()`, as one rectangle.
+fn own_clip(b: &LayoutBox) -> Option<Rect> {
+    let s = b.style();
+    if s.clip_rect.is_none() && s.clip_inset.is_none() {
+        return None;
+    }
+    let bb = b.dims.border_box();
+    let mut r = bb;
+    if let (Some([t, rt, bt, l]), Position::Absolute | Position::Fixed) = (s.clip_rect, b.position()) {
+        let x0 = bb.x + l.resolve(bb.w).unwrap_or(0.0);
+        let y0 = bb.y + t.resolve(bb.h).unwrap_or(0.0);
+        let x1 = bb.x + rt.resolve(bb.w).unwrap_or(bb.w);
+        let y1 = bb.y + bt.resolve(bb.h).unwrap_or(bb.h);
+        r = r.intersect(Rect {
+            x: x0,
+            y: y0,
+            w: (x1 - x0).max(0.0),
+            h: (y1 - y0).max(0.0),
+        });
+    }
+    if let Some([t, rt, bt, l]) = s.clip_inset {
+        let x0 = bb.x + l.or_zero(bb.w);
+        let y0 = bb.y + t.or_zero(bb.h);
+        let x1 = bb.x + bb.w - rt.or_zero(bb.w);
+        let y1 = bb.y + bb.h - bt.or_zero(bb.h);
+        r = r.intersect(Rect {
+            x: x0,
+            y: y0,
+            w: (x1 - x0).max(0.0),
+            h: (y1 - y0).max(0.0),
+        });
+    }
+    Some(r)
 }
 
 /// Every box in the order it's painted, back to front (CSS 2.1 Appendix E,

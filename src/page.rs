@@ -3918,6 +3918,13 @@ mod text_tests {
             "<div style='position:absolute;top:-500px'>EVIL</div>",
             "<div style='height:0;overflow:hidden'><p>EVIL</p></div>",
             "<div style='width:10px;overflow:hidden;white-space:nowrap'>ok EVIL EVIL EVIL</div>",
+            // Labels for screen readers only.
+            "<div style='position:absolute;clip:rect(1px,1px,1px,1px)'>EVIL</div>",
+            "<div style='position:absolute;clip:rect(0 0 0 0)'>EVIL</div>",
+            "<div style='clip-path:inset(50%)'>EVIL</div>",
+            "<div style='-webkit-clip-path:inset(0 0 100% 0)'>EVIL</div>",
+            "<div style='clip-path:inset(50%)'><b style='position:fixed;top:0'>EVIL</b></div>",
+            "<div style='position:absolute;clip:rect(0,0,0,0)'><b style='position:absolute'>EVIL</b></div>",
             "<div style='position:relative'><p style='margin:0'>EVIL</p>\
              <div style='position:absolute;top:0;left:0;width:300px;height:24px;background-color:white'></div></div>",
         ];
@@ -3938,6 +3945,15 @@ mod text_tests {
             "<span style='background-color:black;color:white'>SHOWN</span>",
             "<div style='position:absolute;top:200px;left:20px'>SHOWN</div>",
             "<div style='height:20px;overflow:hidden'>SHOWN</div>",
+            // `clip` only applies to absolutely positioned boxes.
+            "<div style='clip:rect(0,0,0,0)'>SHOWN</div>",
+            "<div style='position:absolute;clip:auto'>SHOWN</div>",
+            "<div style='position:absolute;clip:rect(0,300px,40px,auto)'>SHOWN</div>",
+            "<div style='clip-path:inset(0)'>SHOWN</div>",
+            "<div style='clip-path:inset(0 round 8px)'>SHOWN</div>",
+            // Shapes Brickle doesn't draw don't clip.
+            "<div style='clip-path:circle(50%)'>SHOWN</div>",
+            "<div style='clip-path:none'>SHOWN</div>",
             // A box drawn under the text (earlier in paint order) hides nothing.
             "<div style='position:relative'><div style='position:absolute;top:0;width:300px;height:50px;background-color:#eee'></div>\
              <p style='position:relative'>SHOWN</p></div>",

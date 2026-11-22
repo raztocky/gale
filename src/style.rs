@@ -329,6 +329,13 @@ pub struct ComputedStyle {
     /// `overflow` other than `visible`: the content is clipped to the
     /// padding box.
     pub overflow_clip: bool,
+    /// `clip: rect(top, right, bottom, left)`, offsets from the border box's
+    /// top-left corner (`auto` is that edge). Only clips absolutely
+    /// positioned boxes; see `layout::clip_map`.
+    pub clip_rect: Option<[Len; 4]>,
+    /// `clip-path: inset(top right bottom left)`, insets from each edge of
+    /// the border box. Other shapes aren't drawn, so they don't clip.
+    pub clip_inset: Option<[Len; 4]>,
     pub position: Position,
     /// `top`, `right`, `bottom`, `left`.
     pub inset: [Len; 4],
@@ -590,6 +597,8 @@ impl ComputedStyle {
             clear: Clear::None,
             contain_floats: false,
             overflow_clip: false,
+            clip_rect: None,
+            clip_inset: None,
             position: Position::Static,
             inset: [Len::Auto; 4],
             z_index: None,
@@ -2034,6 +2043,20 @@ fn compute(
                     _ => Position::Static,
                 }
             }
+            "clip" => {
+                s.clip_rect = clip_args(kw, "rect(", &ctxv, fs)
+                    .filter(|v| v.len() == 4)
+                    .map(|v| [v[0], v[1], v[2], v[3]])
+            }
+            "clip-path" | "-webkit-clip-path" => {
+                s.clip_inset = clip_args(kw, "inset(", &ctxv, fs).and_then(|v| match v[..] {
+                    [a] => Some([a; 4]),
+                    [a, b] => Some([a, b, a, b]),
+                    [a, b, c] => Some([a, b, c, b]),
+                    [a, b, c, d] => Some([a, b, c, d]),
+                    _ => None,
+                })
+            }
             "top" => s.inset[0] = ctxv.len(first, fs),
             "right" => s.inset[1] = ctxv.len(first, fs),
             "bottom" => s.inset[2] = ctxv.len(first, fs),
@@ -2505,6 +2528,23 @@ impl Ctx<'_> {
             None => Len::Auto,
         }
     }
+}
+
+/// The lengths inside `func(...)` (`rect(` or `inset(`), separated by
+/// commas or spaces; `auto` stays [`Len::Auto`]. Anything after `round`
+/// (an inset's rounded corners) is ignored.
+fn clip_args(kw: &str, func: &str, ctxv: &Ctx, fs: f32) -> Option<Vec<Len>> {
+    let inner = kw.strip_prefix(func)?.strip_suffix(')')?;
+    let inner = inner.split(" round ").next().unwrap_or(inner);
+    let vals: Vec<Len> = crate::css::parse_values(inner)
+        .iter()
+        .filter(|v| !matches!(v, Value::Comma))
+        .map(|v| match v {
+            Value::Number(n) if *n == 0.0 => Len::Px(0.0),
+            v => ctxv.len(Some(v), fs),
+        })
+        .collect();
+    (1..=4).contains(&vals.len()).then_some(vals)
 }
 
 /// The physical property a logical one (`padding-inline-start`,
