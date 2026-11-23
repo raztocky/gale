@@ -290,8 +290,9 @@ pub fn is_local_host(host: &str) -> bool {
 pub const LOCAL_NETWORK_ERR: &str = "blocked: resolves to a local network address";
 
 /// Brickle's TLS settings: the same as ureq's own (the *ring* provider,
-/// TLS 1.2 and 1.3, your system's trusted roots), so the handshake is
-/// unchanged, plus revocation checking. Built once.
+/// TLS 1.2 and 1.3), so the handshake is any rustls client's, plus your
+/// system's trusted roots, revocation checking and no session resumption.
+/// Used for every connection (see `BrickleTls`). Built once.
 pub fn tls_config() -> Arc<rustls::ClientConfig> {
     static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
     CONFIG
@@ -323,22 +324,178 @@ pub fn tls_config() -> Arc<rustls::ClientConfig> {
         .clone()
 }
 
+/// Wraps connections in TLS with Brickle's own rustls config
+/// ([`tls_config`]: revocation checking, no session resumption), for ureq,
+/// whose own TLS setup has no place for a custom certificate verifier. Does
+/// what ureq's `RustlsConnector` does otherwise, so the handshake is the
+/// same as any other rustls client's.
+#[derive(Debug, Default)]
+struct BrickleTls;
+
+impl<In: ureq::unversioned::transport::Transport> ureq::unversioned::transport::Connector<In> for BrickleTls {
+    type Out = ureq::unversioned::transport::Either<In, TlsTransport>;
+
+    fn connect(
+        &self,
+        details: &ureq::unversioned::transport::ConnectionDetails,
+        chained: Option<In>,
+    ) -> Result<Option<Self::Out>, ureq::Error> {
+        use ureq::unversioned::transport::{Either, LazyBuffers, TransportAdapter};
+        let Some(transport) = chained else {
+            return Err(ureq::Error::ConnectionFailed);
+        };
+        // Plain HTTP, or already TLS (never here: there's no other TLS).
+        if !details.needs_tls() || transport.is_tls() {
+            return Ok(Some(Either::A(transport)));
+        }
+        let host = details
+            .uri
+            .host()
+            .ok_or(ureq::Error::Tls("no host to connect to"))?
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_string();
+        let name = rustls::pki_types::ServerName::try_from(host)
+            .map_err(|_| ureq::Error::Tls("invalid host name"))?;
+        let mut conn = rustls::ClientConnection::new(tls_config(), name)?;
+        let mut sock = TransportAdapter::new(transport.boxed(), details.current_time.clone());
+        sock.set_timeout(details.timeout);
+        conn.complete_io(&mut sock)?;
+        Ok(Some(Either::B(TlsTransport {
+            buffers: LazyBuffers::new(
+                details.config.input_buffer_size(),
+                details.config.output_buffer_size(),
+            ),
+            stream: rustls::StreamOwned { conn, sock },
+        })))
+    }
+}
+
+/// A TLS connection made by [`BrickleTls`].
+struct TlsTransport {
+    buffers: ureq::unversioned::transport::LazyBuffers,
+    stream: rustls::StreamOwned<rustls::ClientConnection, ureq::unversioned::transport::TransportAdapter>,
+}
+
+impl std::fmt::Debug for TlsTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TlsTransport")
+    }
+}
+
+impl ureq::unversioned::transport::Transport for TlsTransport {
+    fn buffers(&mut self) -> &mut dyn ureq::unversioned::transport::Buffers {
+        &mut self.buffers
+    }
+
+    fn transmit_output(
+        &mut self,
+        amount: usize,
+        timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<(), ureq::Error> {
+        use std::io::Write;
+        use ureq::unversioned::transport::Buffers;
+        self.stream.get_mut().set_timeout(timeout);
+        let output = &self.buffers.output()[..amount];
+        self.stream.write_all(output)?;
+        Ok(())
+    }
+
+    fn await_input(
+        &mut self,
+        timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<bool, ureq::Error> {
+        use ureq::unversioned::transport::Buffers;
+        self.stream.get_mut().set_timeout(timeout);
+        let input = self.buffers.input_append_buf();
+        let amount = self.stream.read(input)?;
+        self.buffers.input_appended(amount);
+        Ok(amount > 0)
+    }
+
+    fn is_open(&mut self) -> bool {
+        self.stream.get_mut().get_mut().is_open()
+    }
+
+    fn is_tls(&self) -> bool {
+        true
+    }
+}
+
+/// An agent with Brickle's TLS, no automatic headers (every request sets
+/// Firefox's own), 4xx/5xx answered as responses, no redirects followed,
+/// and no proxy unless given.
+fn agent(
+    resolver: impl ureq::unversioned::resolver::Resolver,
+    proxy: Option<ureq::Proxy>,
+    connect: Duration,
+    total: Duration,
+    keep_idle: bool,
+) -> ureq::Agent {
+    use ureq::config::AutoHeaderValue;
+    use ureq::unversioned::transport::{ConnectProxyConnector, Connector, TcpConnector};
+    let config = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .proxy(proxy)
+        .user_agent(AutoHeaderValue::None)
+        .accept(AutoHeaderValue::None)
+        .accept_encoding(AutoHeaderValue::None)
+        .timeout_connect(Some(connect))
+        .timeout_global(Some(total))
+        .max_idle_connections(if keep_idle { 1 } else { 0 })
+        .max_idle_connections_per_host(if keep_idle { 1 } else { 0 })
+        .build();
+    let connector =
+        ().chain(ConnectProxyConnector::default())
+            .chain(TcpConnector::default())
+            .chain(BrickleTls);
+    ureq::Agent::with_parts(config, connector, resolver)
+}
+
+/// Addresses as ureq wants them: at most 16, at least one.
+fn to_resolved(
+    addrs: impl IntoIterator<Item = std::net::SocketAddr>,
+) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
+    let mut out = ureq::unversioned::resolver::ResolvedSocketAddrs::from_fn(|_| {
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
+    });
+    out.truncate(0);
+    for a in addrs.into_iter().take(16) {
+        out.push(a);
+    }
+    if out.is_empty() {
+        return Err(ureq::Error::HostNotFound);
+    }
+    Ok(out)
+}
+
+/// `host` and `port` of a request's address (the port from the scheme
+/// when it isn't written).
+fn host_port(uri: &ureq::http::Uri) -> Result<(String, u16), ureq::Error> {
+    let host = uri.host().ok_or_else(|| ureq::Error::BadUri(uri.to_string()))?;
+    let port = uri
+        .port_u16()
+        .unwrap_or(if uri.scheme_str() == Some("http") { 80 } else { 443 });
+    Ok((host.to_string(), port))
+}
+
 /// Reaches a DNS-over-HTTPS resolver at its built-in addresses only.
+#[derive(Debug)]
 struct Fixed(&'static crate::doh::Provider);
 
-impl ureq::Resolver for Fixed {
-    fn resolve(&self, netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
-        let (host, port) = netloc.rsplit_once(':').unwrap_or((netloc, "443"));
+impl ureq::unversioned::resolver::Resolver for Fixed {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        _config: &ureq::config::Config,
+        _timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
+        let (host, port) = host_port(uri)?;
         if host != self.0.host {
-            return Err(std::io::Error::other("not the DNS resolver"));
+            return Err(ureq::Error::Io(std::io::Error::other("not the DNS resolver")));
         }
-        let port = port.parse().unwrap_or(443);
-        Ok(self
-            .0
-            .addrs
-            .iter()
-            .map(|a| std::net::SocketAddr::new(*a, port))
-            .collect())
+        to_resolved(self.0.addrs.iter().map(|a| std::net::SocketAddr::new(*a, port)))
     }
 }
 
@@ -355,36 +512,50 @@ pub fn doh_exchange(p: &'static crate::doh::Provider, query: &[u8]) -> Result<Ve
         .unwrap_or_else(|e| e.into_inner())
         .entry(p.name)
         .or_insert_with(|| {
-            ureq::AgentBuilder::new()
-                .resolver(Fixed(p))
-                .timeout_connect(Duration::from_secs(5))
-                .timeout(Duration::from_secs(8))
-                .redirects(0)
-                // The resolver is only asked when there's no proxy.
-                .try_proxy_from_env(false)
-                .tls_config(tls_config())
-                .build()
+            // Never through a proxy: the resolver is asked directly.
+            agent(
+                Fixed(p),
+                None,
+                Duration::from_secs(5),
+                Duration::from_secs(8),
+                true,
+            )
         })
         .clone();
-    let resp = agent
+    let mut resp = agent
         .post(p.url)
-        .set("Accept", "application/dns-message")
-        .set("Content-Type", "application/dns-message")
-        .set("User-Agent", &user_agent())
-        .send_bytes(query)
-        .map_err(|e| match e {
-            ureq::Error::Status(s, _) => format!("HTTP {s}"),
-            e => e.to_string(),
-        })?;
-    if resp.content_type() != "application/dns-message" {
-        return Err(format!("unexpected answer type {}", resp.content_type()));
+        .header_raw("Accept", b"application/dns-message")
+        .header_raw("Content-Type", b"application/dns-message")
+        .header_raw("User-Agent", user_agent().as_bytes())
+        .send(query)
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status().as_u16()));
+    }
+    let ctype = content_type(resp.headers());
+    if ctype != "application/dns-message" {
+        return Err(format!("unexpected answer type {ctype}"));
     }
     let mut body = Vec::new();
-    resp.into_reader()
+    resp.body_mut()
+        .as_reader()
         .take(crate::doh::MAX_RESPONSE as u64 + 1)
         .read_to_end(&mut body)
         .map_err(|e| e.to_string())?;
     Ok(body)
+}
+
+/// The media type of a response, without parameters (`text/plain` if it
+/// doesn't say).
+fn content_type(headers: &ureq::http::HeaderMap) -> String {
+    let v = headers
+        .get("content-type")
+        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+        .unwrap_or_else(|| "text/plain".into());
+    match v.find(';') {
+        Some(i) => v[..i].to_string(),
+        None => v,
+    }
 }
 
 /// Finds the addresses to connect to: with DNS over HTTPS (see `doh.rs`)
@@ -393,17 +564,14 @@ pub fn doh_exchange(p: &'static crate::doh::Provider, query: &[u8]) -> Result<Ve
 /// addresses are dropped; ureq connects to exactly the addresses returned,
 /// so a site can't pass this check and then re-point its DNS at your router
 /// (DNS rebinding).
+#[derive(Debug)]
 struct Resolve {
     public_only: bool,
 }
 
-impl ureq::Resolver for Resolve {
-    fn resolve(&self, netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+impl Resolve {
+    fn lookup(&self, host: &str, port: u16) -> std::io::Result<Vec<std::net::SocketAddr>> {
         use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
-        let (host, port) = netloc
-            .rsplit_once(':')
-            .and_then(|(h, p)| Some((h, p.parse::<u16>().ok()?)))
-            .ok_or_else(|| std::io::Error::other(format!("bad address {netloc}")))?;
         let bare = host.trim_start_matches('[').trim_end_matches(']');
         let addrs: Vec<SocketAddr> = match (bare.parse::<IpAddr>(), crate::doh::provider()) {
             (Ok(ip), _) => vec![SocketAddr::new(ip, port)],
@@ -412,7 +580,7 @@ impl ureq::Resolver for Resolve {
                 .into_iter()
                 .map(|ip| SocketAddr::new(ip, port))
                 .collect(),
-            _ => netloc.to_socket_addrs()?.collect(),
+            _ => (bare, port).to_socket_addrs()?.collect(),
         };
         let addrs: Vec<_> = addrs
             .into_iter()
@@ -425,6 +593,18 @@ impl ureq::Resolver for Resolve {
             ));
         }
         Ok(addrs)
+    }
+}
+
+impl ureq::unversioned::resolver::Resolver for Resolve {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        _config: &ureq::config::Config,
+        _timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
+        let (host, port) = host_port(uri)?;
+        to_resolved(self.lookup(&host, port)?)
     }
 }
 
@@ -461,13 +641,6 @@ pub fn fetch_site(initiator: Option<&str>, target: &str) -> &'static str {
         "same-site"
     } else {
         "cross-site"
-    }
-}
-
-fn with_cookie(req: ureq::Request, cookie: Option<&str>) -> ureq::Request {
-    match cookie {
-        Some(c) => req.set("Cookie", c),
-        None => req,
     }
 }
 
@@ -726,14 +899,61 @@ fn timed_out(e: &(dyn std::error::Error + 'static)) -> bool {
 
 fn classify(e: &ureq::Error) -> NetError {
     let msg = e.to_string();
+    let cert = match e {
+        ureq::Error::Rustls(r) => certificate_error(r),
+        ureq::Error::Io(io) => certificate_error(io),
+        _ => None,
+    };
     if msg.contains(LOCAL_NETWORK_ERR) {
         NetError::LocalNetwork
-    } else if let Some(c) = certificate_error(e) {
+    } else if let Some(c) = cert {
         NetError::Certificate(c)
-    } else if timed_out(e) {
+    } else if matches!(e, ureq::Error::Timeout(_)) || matches!(e, ureq::Error::Io(io) if timed_out(io)) {
         NetError::TimedOut
     } else {
         NetError::Other(msg)
+    }
+}
+
+/// Send `method` with exactly these headers, in this order and case.
+fn send(
+    agent: &ureq::Agent,
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+    fn with<B>(mut req: ureq::RequestBuilder<B>, headers: &[(String, String)]) -> ureq::RequestBuilder<B> {
+        for (k, v) in headers {
+            req = req.header_raw(k, v.as_bytes());
+        }
+        req
+    }
+    // Methods that usually have no body still send one if given.
+    fn bodiless(
+        req: ureq::RequestBuilder<ureq::typestate::WithoutBody>,
+        body: Option<&[u8]>,
+    ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+        match body {
+            Some(b) => req.force_send_body().send(b),
+            None => req.call(),
+        }
+    }
+    fn with_body(
+        req: ureq::RequestBuilder<ureq::typestate::WithBody>,
+        body: Option<&[u8]>,
+    ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+        req.send(body.unwrap_or_default())
+    }
+    match method {
+        "GET" => bodiless(with(agent.get(url), headers), body),
+        "HEAD" => bodiless(with(agent.head(url), headers), body),
+        "DELETE" => bodiless(with(agent.delete(url), headers), body),
+        "OPTIONS" => bodiless(with(agent.options(url), headers), body),
+        "POST" => with_body(with(agent.post(url), headers), body),
+        "PUT" => with_body(with(agent.put(url), headers), body),
+        "PATCH" => with_body(with(agent.patch(url), headers), body),
+        m => Err(ureq::Error::Other(format!("method {m} isn't supported").into())),
     }
 }
 
@@ -757,32 +977,47 @@ fn http_get_timeout(
         return Err(NetError::LocalNetwork);
     }
     let proxied = proxy_configured() && !bypass_proxy(&host);
-    let mut builder = ureq::AgentBuilder::new()
-        .timeout_connect(timeout.min(Duration::from_secs(10)))
-        .timeout(timeout)
-        .redirects(0)
-        .tls_config(tls_config())
-        .try_proxy_from_env(!bypass_proxy(&host));
+    let connect = timeout.min(Duration::from_secs(10));
     // Through a proxy, the proxy resolves the name (and our resolver would
     // only see the proxy's own, often local, address), so only the literal
     // check above applies.
-    if !proxied {
-        builder = builder.resolver(Resolve { public_only });
-    }
-    let agent = builder.build();
+    let agent = if proxied {
+        agent(
+            ureq::unversioned::resolver::DefaultResolver::default(),
+            ureq::Proxy::try_from_env(),
+            connect,
+            timeout,
+            false,
+        )
+    } else {
+        agent(Resolve { public_only }, None, connect, timeout, false)
+    };
     let site = fetch_site(initiator, url);
     // Header names, values and order as sent by Firefox.
     let method = script.map(|o| o.method).unwrap_or("GET");
-    let mut req = agent.request(method, url).set("User-Agent", &user_agent());
-    req = match dest {
+    let mut hs: Vec<(String, String)> = Vec::new();
+    let mut set = |k: &str, v: &str| hs.push((k.to_string(), v.to_string()));
+    if let Ok(u) = url::Url::parse(url) {
+        let h = u.host_str().unwrap_or("");
+        match u.port() {
+            Some(p) => set("Host", &format!("{h}:{p}")),
+            None => set("Host", h),
+        }
+    }
+    set("User-Agent", &user_agent());
+    let cookie_set = |set: &mut dyn FnMut(&str, &str)| {
+        if let Some(c) = cookie {
+            set("Cookie", c);
+        }
+    };
+    match dest {
         Dest::Document => {
-            req = req
-                .set(
-                    "Accept",
-                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                )
-                .set("Accept-Language", "en-US,en;q=0.5")
-                .set("Accept-Encoding", "gzip, deflate, br, zstd");
+            set(
+                "Accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            );
+            set("Accept-Language", "en-US,en;q=0.5");
+            set("Accept-Encoding", "gzip, deflate, br, zstd");
             // A form POST: its content type and origin, as Firefox sends.
             if let Some(o) = script {
                 if let Some((_, v)) = o
@@ -790,57 +1025,54 @@ fn http_get_timeout(
                     .iter()
                     .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
                 {
-                    req = req.set("Content-Type", v);
+                    set("Content-Type", v);
                 }
                 if let Some(origin) = o.origin {
-                    req = req.set("Origin", origin);
+                    set("Origin", origin);
                 }
             }
-            req = req.set("Connection", "keep-alive");
-            req = with_cookie(req, cookie);
-            req.set("Upgrade-Insecure-Requests", "1")
-                .set("Sec-Fetch-Dest", "document")
-                .set("Sec-Fetch-Mode", "navigate")
-                .set("Sec-Fetch-Site", site)
-                .set("Sec-Fetch-User", "?1")
-                .set("Priority", "u=0, i")
+            set("Connection", "keep-alive");
+            cookie_set(&mut set);
+            set("Upgrade-Insecure-Requests", "1");
+            set("Sec-Fetch-Dest", "document");
+            set("Sec-Fetch-Mode", "navigate");
+            set("Sec-Fetch-Site", site);
+            set("Sec-Fetch-User", "?1");
+            set("Priority", "u=0, i");
         }
         Dest::Stylesheet => {
-            req = req
-                .set("Accept", "text/css,*/*;q=0.1")
-                .set("Accept-Language", "en-US,en;q=0.5")
-                .set("Accept-Encoding", "gzip, deflate, br, zstd")
-                .set("Connection", "keep-alive");
-            req = with_cookie(req, cookie);
-            req.set("Sec-Fetch-Dest", "style")
-                .set("Sec-Fetch-Mode", "no-cors")
-                .set("Sec-Fetch-Site", site)
-                .set("Priority", "u=2")
+            set("Accept", "text/css,*/*;q=0.1");
+            set("Accept-Language", "en-US,en;q=0.5");
+            set("Accept-Encoding", "gzip, deflate, br, zstd");
+            set("Connection", "keep-alive");
+            cookie_set(&mut set);
+            set("Sec-Fetch-Dest", "style");
+            set("Sec-Fetch-Mode", "no-cors");
+            set("Sec-Fetch-Site", site);
+            set("Priority", "u=2");
         }
         Dest::Script => {
-            req = req
-                .set("Accept", "*/*")
-                .set("Accept-Language", "en-US,en;q=0.5")
-                .set("Accept-Encoding", "gzip, deflate, br, zstd")
-                .set("Connection", "keep-alive");
-            req = with_cookie(req, cookie);
-            req.set("Sec-Fetch-Dest", "script")
-                .set("Sec-Fetch-Mode", "no-cors")
-                .set("Sec-Fetch-Site", site)
+            set("Accept", "*/*");
+            set("Accept-Language", "en-US,en;q=0.5");
+            set("Accept-Encoding", "gzip, deflate, br, zstd");
+            set("Connection", "keep-alive");
+            cookie_set(&mut set);
+            set("Sec-Fetch-Dest", "script");
+            set("Sec-Fetch-Mode", "no-cors");
+            set("Sec-Fetch-Site", site);
         }
         Dest::Module => {
-            req = req
-                .set("Accept", "*/*")
-                .set("Accept-Language", "en-US,en;q=0.5")
-                .set("Accept-Encoding", "gzip, deflate, br, zstd");
+            set("Accept", "*/*");
+            set("Accept-Language", "en-US,en;q=0.5");
+            set("Accept-Encoding", "gzip, deflate, br, zstd");
             if let Some(origin) = script.and_then(|o| o.origin) {
-                req = req.set("Origin", origin);
+                set("Origin", origin);
             }
-            req = req.set("Connection", "keep-alive");
-            req = with_cookie(req, cookie);
-            req.set("Sec-Fetch-Dest", "script")
-                .set("Sec-Fetch-Mode", "cors")
-                .set("Sec-Fetch-Site", site)
+            set("Connection", "keep-alive");
+            cookie_set(&mut set);
+            set("Sec-Fetch-Dest", "script");
+            set("Sec-Fetch-Mode", "cors");
+            set("Sec-Fetch-Site", site);
         }
         Dest::Xhr => {
             let o = script.ok_or_else(|| NetError::Other("script request without details".into()))?;
@@ -850,48 +1082,55 @@ fn http_get_timeout(
                 .find(|(k, _)| k.eq_ignore_ascii_case("accept"))
                 .map(|(_, v)| v.as_str())
                 .unwrap_or("*/*");
-            req = req
-                .set("Accept", accept)
-                .set("Accept-Language", "en-US,en;q=0.5")
-                .set("Accept-Encoding", "gzip, deflate, br, zstd");
+            set("Accept", accept);
+            set("Accept-Language", "en-US,en;q=0.5");
+            set("Accept-Encoding", "gzip, deflate, br, zstd");
             for (k, v) in o
                 .headers
                 .iter()
                 .filter(|(k, _)| !k.eq_ignore_ascii_case("accept"))
             {
-                req = req.set(k, v);
+                set(k, v);
             }
             if let Some(origin) = o.origin {
-                req = req.set("Origin", origin);
+                set("Origin", origin);
             }
-            req = req.set("Connection", "keep-alive");
-            req = with_cookie(req, cookie);
-            req.set("Sec-Fetch-Dest", "empty")
-                .set("Sec-Fetch-Mode", if o.cors { "cors" } else { "same-origin" })
-                .set("Sec-Fetch-Site", site)
-                .set("Priority", "u=4")
+            set("Connection", "keep-alive");
+            cookie_set(&mut set);
+            set("Sec-Fetch-Dest", "empty");
+            set("Sec-Fetch-Mode", if o.cors { "cors" } else { "same-origin" });
+            set("Sec-Fetch-Site", site);
+            set("Priority", "u=4");
         }
         Dest::Image => {
-            req = req
-                .set(
-                    "Accept",
-                    "image/avif,image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5",
-                )
-                .set("Accept-Language", "en-US,en;q=0.5")
-                .set("Accept-Encoding", "gzip, deflate, br, zstd")
-                .set("Connection", "keep-alive");
-            req = with_cookie(req, cookie);
-            req.set("Sec-Fetch-Dest", "image")
-                .set("Sec-Fetch-Mode", "no-cors")
-                .set("Sec-Fetch-Site", site)
-                .set("Priority", "u=5, i")
+            set(
+                "Accept",
+                "image/avif,image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5",
+            );
+            set("Accept-Language", "en-US,en;q=0.5");
+            set("Accept-Encoding", "gzip, deflate, br, zstd");
+            set("Connection", "keep-alive");
+            cookie_set(&mut set);
+            set("Sec-Fetch-Dest", "image");
+            set("Sec-Fetch-Mode", "no-cors");
+            set("Sec-Fetch-Site", site);
+            set("Priority", "u=5, i");
         }
-        Dest::Download => req
-            .set("Accept", "*/*")
-            .set("Accept-Language", "en-US,en;q=0.5")
-            .set("Accept-Encoding", "gzip, deflate, br, zstd")
-            .set("Connection", "keep-alive"),
-    };
+        Dest::Download => {
+            set("Accept", "*/*");
+            set("Accept-Language", "en-US,en;q=0.5");
+            set("Accept-Encoding", "gzip, deflate, br, zstd");
+            set("Connection", "keep-alive");
+        }
+    }
+    // A POST, PUT or PATCH without a body still says so, as Firefox does.
+    let body = script
+        .and_then(|o| o.body)
+        .or(matches!(method, "POST" | "PUT" | "PATCH").then_some(&[][..]));
+    // The body's length goes last (Brickle's order since it used ureq 2).
+    if let Some(b) = body {
+        set("Content-Length", &b.len().to_string());
+    }
     #[cfg(test)]
     {
         let mut map = REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -899,34 +1138,41 @@ fn http_get_timeout(
             .entry(crate::filter::host_of(url))
             .or_default() += 1;
     }
-    let sent = match script.and_then(|o| o.body) {
-        Some(body) => req.send_bytes(body),
-        None => req.call(),
-    };
+    let sent = send(&agent, method, url, &hs, body);
     let resp = match sent {
         Ok(r) => r,
-        Err(ureq::Error::Status(_, r)) => r,
         Err(e) => return Err(classify(&e)),
     };
-    let status = resp.status();
-    let set_cookies: Vec<String> = resp.all("set-cookie").into_iter().map(str::to_string).collect();
-    let mut headers = Vec::new();
-    for name in resp.headers_names() {
-        for v in resp.all(&name) {
-            headers.push((name.to_ascii_lowercase(), v.to_string()));
-        }
-    }
+    let status = resp.status().as_u16();
+    // Each header line once, names in lower case (values that aren't
+    // UTF-8 are read leniently).
+    let headers: Vec<(String, String)> = resp
+        .headers()
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.as_str().to_string(),
+                String::from_utf8_lossy(v.as_bytes()).into_owned(),
+            )
+        })
+        .collect();
+    let header = |name: &str| headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+    let set_cookies: Vec<String> = headers
+        .iter()
+        .filter(|(k, _)| k == "set-cookie")
+        .map(|(_, v)| v.clone())
+        .collect();
     if (300..400).contains(&status) {
         return Ok(Response {
             status,
-            location: resp.header("location").map(str::to_string),
+            location: header("location"),
             set_cookies,
             headers,
             body: String::new(),
             bytes: vec![],
         });
     }
-    let ctype = resp.content_type().to_ascii_lowercase();
+    let ctype = content_type(resp.headers()).to_ascii_lowercase();
     let texty = ctype.starts_with("text/")
         || ctype.contains("html")
         || ctype.contains("xml")
@@ -949,13 +1195,12 @@ fn http_get_timeout(
         return Err(NetError::Other(format!("can't display content of type {ctype}")));
     }
     // ureq decodes gzip and brotli itself; deflate and zstd are done here.
-    let encoding = resp
-        .header("content-encoding")
-        .unwrap_or("")
+    let encoding = header("content-encoding")
+        .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();
     let reader: Box<dyn Read> = Box::new(Stoppable {
-        inner: resp.into_reader().take(MAX_BYTES * 4),
+        inner: resp.into_body().into_reader().take(MAX_BYTES * 4),
         cancel: cancel.clone(),
         deadline,
     });
@@ -1021,7 +1266,7 @@ fn proxy_configured() -> bool {
     .any(|v| std::env::var(v).is_ok_and(|x| !x.trim().is_empty()))
 }
 
-/// Honour NO_PROXY (ureq 2 doesn't): comma-separated hosts, `.suffix` or
+/// Honour NO_PROXY (Brickle's own rules, not ureq's): comma-separated hosts, `.suffix` or
 /// `*.suffix` domains, and `*` for everything.
 fn bypass_proxy(host: &str) -> bool {
     let list = std::env::var("NO_PROXY")
@@ -1324,8 +1569,11 @@ mod tests {
         assert!(user_agent().ends_with(&format!("Firefox/{}.0", firefox_version().0)));
     }
 
+    /// A header line with no `:` crashed ureq 2 (found by the `response`
+    /// fuzz target). ureq 3 refuses the whole response instead: an error,
+    /// never a crash.
     #[test]
-    fn header_lines_without_a_colon_are_skipped() {
+    fn header_lines_without_a_colon_fail_cleanly() {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://127.0.0.1:{}/", listener.local_addr().unwrap().port());
@@ -1340,8 +1588,11 @@ mod tests {
             }
         });
         for _ in 0..4 {
-            let r = http_get(&url, Dest::Document, None, false, None).unwrap();
-            assert_eq!((r.status, r.body.as_str()), (200, "hi"));
+            match http_get(&url, Dest::Document, None, false, None) {
+                Err(NetError::Other(e)) => assert!(e.contains("header"), "{e}"),
+                Err(e) => panic!("{e:?}"),
+                Ok(r) => panic!("loaded: {}", r.status),
+            }
         }
     }
 
@@ -1446,7 +1697,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
-            let _ = agent.get(&format!("https://localhost:{port}/")).call();
+            let _ = agent.get(format!("https://localhost:{port}/")).call();
         });
         let (mut s, _) = listener.accept().unwrap();
         let mut head = [0u8; 5];
@@ -1502,9 +1753,17 @@ mod tests {
     fn tls_handshake_is_stock_rustls_without_resumption() {
         const SESSION_TICKET: u16 = 35;
         const PRE_SHARED_KEY: u16 = 41;
-        let agent = ureq::AgentBuilder::new().tls_config(tls_config()).build();
-        let mut ours = client_hello(agent.clone());
-        let mut stock = client_hello(ureq::AgentBuilder::new().build());
+        let ours_agent = || {
+            agent(
+                Resolve { public_only: false },
+                None,
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+                false,
+            )
+        };
+        let mut ours = client_hello(ours_agent());
+        let mut stock = client_hello(ureq::Agent::new_with_defaults());
         // rustls shuffles extensions on every connection (as Chrome does).
         ours.1.sort();
         stock.1.sort();
@@ -1513,7 +1772,7 @@ mod tests {
         stock.1.retain(|(e, _)| *e != SESSION_TICKET);
         assert_eq!(ours, stock);
         // And a second connection offers nothing from the first.
-        let again = client_hello(agent);
+        let again = client_hello(ours_agent());
         assert!(
             !again
                 .1
@@ -1566,10 +1825,21 @@ mod tests {
 
     #[test]
     fn resolver_drops_local_addresses() {
-        use ureq::Resolver;
+        use ureq::unversioned::resolver::Resolver;
         // `localhost` resolves to loopback via /etc/hosts: no network needed.
-        let err = Resolve { public_only: true }.resolve("localhost:80").unwrap_err();
+        let r = Resolve { public_only: true };
+        let err = r.lookup("localhost", 80).unwrap_err();
         assert!(err.to_string().contains(LOCAL_NETWORK_ERR));
+        let uri: ureq::http::Uri = "http://localhost:80/".parse().unwrap();
+        let config = ureq::Agent::config_builder().build();
+        let err = r
+            .resolve(
+                &uri,
+                &config,
+                ureq::unversioned::transport::NextTimeout::default(),
+            )
+            .unwrap_err();
+        assert_eq!(classify(&err), NetError::LocalNetwork);
     }
 
     #[test]
