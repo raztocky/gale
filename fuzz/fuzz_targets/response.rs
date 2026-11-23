@@ -7,9 +7,9 @@ use brickle::net::{self, Dest};
 use libfuzzer_sys::fuzz_target;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::OnceLock;
 use std::sync::mpsc::{channel, Sender};
 use std::sync::Mutex;
+use std::sync::OnceLock;
 
 /// One server for the whole run; each request answers with the next input.
 fn server() -> &'static (String, Mutex<Sender<Vec<u8>>>) {

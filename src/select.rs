@@ -197,7 +197,8 @@ fn copyable(c: char) -> bool {
         | '\u{feff}' | '\u{fff9}'..='\u{fffb}' | '\u{e0000}'..='\u{e007f}')
 }
 
-/// `text` without the characters [`copyable`] drops: for text copied from
+/// `text` without the invisible and direction-control characters that
+/// copying from the page drops: for text copied from
 /// a form field, which the page (or a compromised renderer) supplies.
 pub fn clean(text: &str) -> String {
     text.chars().filter(|c| copyable(*c)).collect()

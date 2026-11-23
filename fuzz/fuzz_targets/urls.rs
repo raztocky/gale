@@ -8,12 +8,17 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     let text = String::from_utf8_lossy(data);
-    let (a, b) = text.split_once('\u{1}').unwrap_or((&text, "https://page.example/dir/x.html"));
+    let (a, b) = text
+        .split_once('\u{1}')
+        .unwrap_or((&text, "https://page.example/dir/x.html"));
     let _ = net::canonical(a);
     let _ = net::scheme(a);
     for (base, href) in [(b, a), (a, b), ("https://page.example/dir/", a)] {
         let r = net::resolve(base, href);
-        assert!(r.is_empty() || url::Url::parse(&r).is_ok(), "{base:?} + {href:?} -> {r:?}");
+        assert!(
+            r.is_empty() || url::Url::parse(&r).is_ok(),
+            "{base:?} + {href:?} -> {r:?}"
+        );
         let _ = net::may_load(Some(base), &r);
         let _ = net::fetch_site(Some(base), &r);
     }

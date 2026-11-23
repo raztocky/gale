@@ -24,8 +24,12 @@ impl Bytes<'_> {
     }
     fn text(&mut self) -> String {
         let n = (self.u8() % 12) as usize;
-        let chars = ['a', 'B', ' ', 'é', '中', '\u{200b}', '\n', '\u{ad}', 'ß', 'İ', '🐈', '-'];
-        (0..n).map(|_| chars[(self.u8() % chars.len() as u8) as usize]).collect()
+        let chars = [
+            'a', 'B', ' ', 'é', '中', '\u{200b}', '\n', '\u{ad}', 'ß', 'İ', '🐈', '-',
+        ];
+        (0..n)
+            .map(|_| chars[(self.u8() % chars.len() as u8) as usize])
+            .collect()
     }
 }
 

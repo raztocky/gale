@@ -1,8 +1,8 @@
 //! A forgiving HTML parser: tokenizer + a simplified tree builder.
 //!
 //! This is nowhere near the full WHATWG algorithm, but it handles the things
-//! real pages lean on most: void elements, implicitly closed <p>/<li>/<td>,
-//! raw-text <script>/<style>, comments, doctypes and character references.
+//! real pages lean on most: void elements, implicitly closed `<p>`/`<li>`/`<td>`,
+//! raw-text `<script>`/`<style>`, comments, doctypes and character references.
 
 use crate::dom::{self, AttrMap, Node};
 
