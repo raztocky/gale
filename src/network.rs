@@ -2083,6 +2083,21 @@ mod tests {
     }
 
     #[test]
+    fn nested_blob_urls_dont_overflow_the_stack() {
+        // RUSTSEC-2026-0592: url 2.5.8's `origin()` recursed once per
+        // `blob:` prefix. Run on a thread with a normal 2 MiB stack.
+        let url = format!("{}https://a.example/", "blob:".repeat(10_000));
+        let (o, same) = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || (origin_of(&url), same_origin(&url, "https://a.example/")))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(o, "null");
+        assert!(!same);
+    }
+
+    #[test]
     fn page_time_budget() {
         let mut n = Network::empty();
         n.deadline = std::time::Instant::now() - std::time::Duration::from_secs(1);
