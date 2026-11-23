@@ -297,12 +297,11 @@ pub fn tls_config() -> Arc<rustls::ClientConfig> {
     CONFIG
         .get_or_init(|| {
             let mut roots = rustls::RootCertStore::empty();
-            match rustls_native_certs::load_native_certs() {
-                Ok(certs) => {
-                    roots.add_parsable_certificates(certs);
-                }
-                Err(e) => eprintln!("brickle: loading trusted certificates: {e}"),
+            let found = rustls_native_certs::load_native_certs();
+            for e in &found.errors {
+                eprintln!("brickle: loading trusted certificates: {e}");
             }
+            roots.add_parsable_certificates(found.certs);
             // The standard checks, plus revocation (see `crlite.rs`).
             let verifier = Arc::new(
                 crate::crlite::Verifier::new(Arc::new(roots)).expect("building the certificate verifier"),
@@ -1479,6 +1478,22 @@ mod tests {
         (suites, exts)
     }
 
+    /// rustls-native-certs 0.8 reports errors alongside what it found
+    /// instead of failing; make sure the system's roots still arrive.
+    #[test]
+    fn system_trusted_roots_load() {
+        let found = rustls_native_certs::load_native_certs();
+        assert!(
+            found.certs.len() > 10,
+            "{} roots, errors: {:?}",
+            found.certs.len(),
+            found.errors
+        );
+        let mut roots = rustls::RootCertStore::empty();
+        let (added, _) = roots.add_parsable_certificates(found.certs);
+        assert!(added > 10, "{added}");
+    }
+
     /// Revocation checking swaps in Brickle's own certificate verifier, but
     /// the handshake must stay byte-for-byte that of every other ureq and
     /// rustls client: matching Firefox's isn't possible with rustls, and a
@@ -1531,7 +1546,7 @@ mod tests {
             conn.handshake_kind()
         }
         let mut roots = rustls::RootCertStore::empty();
-        roots.add_parsable_certificates(rustls_native_certs::load_native_certs().unwrap());
+        roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
         let stock = Arc::new(
             rustls::ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
                 .with_safe_default_protocol_versions()
