@@ -292,8 +292,11 @@ impl NetRule {
     fn matches_url(&self, url: &str) -> bool {
         let u = url.as_bytes();
         match self.start {
-            Anchor::Start => glob(&self.tokens, u, 0, self.end_anchor),
-            Anchor::None => (0..=u.len()).any(|i| glob(&self.tokens, u, i, self.end_anchor)),
+            Anchor::Start => glob(&self.tokens, u, 0, false, self.end_anchor),
+            // A match starting anywhere is a match of `*pattern` from the
+            // start. One pass keeps the O(text * pattern) bound; trying every
+            // start separately would be cubic on long addresses.
+            Anchor::None => glob(&self.tokens, u, 0, true, self.end_anchor),
             Anchor::Host => {
                 // Candidate starts: the beginning of the host and each label in it.
                 let Some(scheme_end) = url.find("://") else {
@@ -304,9 +307,20 @@ impl NetRule {
                     .find(['/', '?', '#', ':'])
                     .map(|i| host_start + i)
                     .unwrap_or(url.len());
-                std::iter::once(host_start)
-                    .chain((host_start..host_end).filter(|&i| u[i] == b'.').map(|i| i + 1))
-                    .any(|i| glob(&self.tokens, u, i, self.end_anchor))
+                let mut starts = std::iter::once(host_start)
+                    .chain((host_start..host_end).filter(|&i| u[i] == b'.').map(|i| i + 1));
+                let Some(star) = self.tokens.iter().position(|t| matches!(t, Tok::Star)) else {
+                    // No `*`: each try is linear in the pattern.
+                    return starts.any(|i| glob(&self.tokens, u, i, false, self.end_anchor));
+                };
+                // Only the part before the first `*` depends on where the
+                // match starts; what follows floats, and floating from an
+                // earlier point can match whatever a later one can. So the
+                // earliest start whose head matches decides, in one pass.
+                let (head, tail) = (&self.tokens[..star], &self.tokens[star..]);
+                starts
+                    .find_map(|i| head_end(head, u, i))
+                    .is_some_and(|t| glob(tail, u, t, false, self.end_anchor))
             }
         }
     }
@@ -316,9 +330,30 @@ fn is_sep(c: u8) -> bool {
     !(c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.' | b'%'))
 }
 
-/// Match tokens against `text[start..]`. Classic wildcard matching with
-/// single-star backtracking: O(len(text) * len(pattern)) worst case.
-fn glob(toks: &[Tok], text: &[u8], start: usize, end_anchor: bool) -> bool {
+/// Where a star-free token run matched at `text[start..]` ends, if it does.
+fn head_end(toks: &[Tok], text: &[u8], start: usize) -> Option<usize> {
+    let mut t = start;
+    for tok in toks {
+        match tok {
+            Tok::Lit(b) => {
+                if !text.get(t..)?.starts_with(b) {
+                    return None;
+                }
+                t += b.len();
+            }
+            // `^` also matches the end of the address, without consuming.
+            Tok::Sep if t == text.len() => {}
+            Tok::Sep if is_sep(text[t]) => t += 1,
+            Tok::Sep | Tok::Star => return None,
+        }
+    }
+    Some(t)
+}
+
+/// Match tokens against `text[start..]`, as if preceded by `*` when
+/// `floating`. Classic wildcard matching with single-star backtracking:
+/// O(len(text) * len(pattern)) worst case.
+fn glob(toks: &[Tok], text: &[u8], start: usize, floating: bool, end_anchor: bool) -> bool {
     // Expand literals into single-byte units so `*` backtracking is simple.
     #[derive(Clone, Copy)]
     enum U {
@@ -326,13 +361,14 @@ fn glob(toks: &[Tok], text: &[u8], start: usize, end_anchor: bool) -> bool {
         Star,
         Sep,
     }
-    let units: Vec<U> = toks
-        .iter()
-        .flat_map(|t| match t {
+    let units: Vec<U> = floating
+        .then_some(U::Star)
+        .into_iter()
+        .chain(toks.iter().flat_map(|t| match t {
             Tok::Lit(b) => b.iter().map(|&c| U::B(c)).collect::<Vec<_>>(),
             Tok::Star => vec![U::Star],
             Tok::Sep => vec![U::Sep],
-        })
+        }))
         .collect();
     let (mut p, mut t) = (0usize, start);
     let mut star: Option<(usize, usize)> = None;
@@ -1118,6 +1154,40 @@ mod tests {
         assert!(p.contains("aff") && p.contains("ref_id"));
         let p = f.removeparam("https://other.example/?aff=1&ref_id=2", None, Dest::Document);
         assert!(!p.contains("aff") && p.contains("ref_id"));
+    }
+
+    #[test]
+    fn long_addresses_match_quickly() {
+        // Unanchored and host-anchored rules used to retry the whole
+        // backtracking match at every start: cubic on long addresses.
+        // After each `*` retry, the long literal re-matches almost to its
+        // end before failing on the `b`.
+        let lit = "a".repeat(40);
+        let path = "a".repeat(20_000);
+        let host = format!("{lit}.").repeat(500);
+        let f = Filters::parse(&format!("a*{lit}b\n||a*{lit}b\n"));
+        for url in [
+            format!("https://x.example/{path}"),
+            format!("https://{host}example/"),
+        ] {
+            let r = Req::new(&url, Some("https://y.example/"), Dest::Stylesheet);
+            let t = std::time::Instant::now();
+            assert_eq!(f.check(&r), Verdict::None);
+            assert!(t.elapsed().as_secs() < 2, "{:?}", t.elapsed());
+        }
+        // Still matches where it should.
+        let f = Filters::parse("ad*banner\n||cdn.*/ads^\n");
+        for (url, hit) in [
+            ("https://x.example/p?q=adxbanner", true),
+            ("https://x.example/banner-ad", false),
+            ("https://img.cdn.example/ads/1.png", true),
+            ("https://a.b.cdn.example/ads", true),
+            ("https://xcdn.example/ads/1.png", false),
+            ("https://cdn.example/adsx", false),
+        ] {
+            let r = Req::new(url, Some("https://y.example/"), Dest::Stylesheet);
+            assert_eq!(f.check(&r) != Verdict::None, hit, "{url}");
+        }
     }
 
     #[test]
