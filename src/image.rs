@@ -343,11 +343,17 @@ fn svg_layer_work(root: &usvg::Group, sx: f32, sy: f32, w: u32, h: u32) -> u64 {
         if !g.should_isolate() {
             continue;
         }
+        // No layer box: nothing to draw, so resvg makes no layer.
+        let Some(r) = g.layer_bounding_box() else {
+            continue;
+        };
         let area = if g.filters().is_empty() {
-            canvas_area(g.abs_layer_bounding_box().to_rect())
+            match g.abs_layer_bounding_box() {
+                Some(b) => canvas_area(b.to_rect()),
+                None => continue,
+            }
         } else {
             let t = g.abs_transform();
-            let r = g.layer_bounding_box();
             let rw = r.width() * t.sx.hypot(t.ky) * sx;
             let rh = r.height() * t.kx.hypot(t.sy) * sy;
             let fin = |v: f32| if v.is_finite() { v.min(reach) } else { reach };
@@ -469,8 +475,11 @@ fn decode_svg(bytes: &[u8], want: Option<(u32, u32)>) -> Result<Decoded, String>
             .iter()
             .all(|v| v.is_finite() && (v * scale.max(1.0)).abs() <= reach)
     };
-    let group_fits =
-        |g: &usvg::Group| fits(g.abs_layer_bounding_box().to_rect()) && fits(g.abs_stroke_bounding_box());
+    // (A group with no layer or stroke box draws nothing.)
+    let group_fits = |g: &usvg::Group| {
+        g.abs_layer_bounding_box().is_none_or(|b| fits(b.to_rect()))
+            && g.abs_stroke_bounding_box().is_none_or(fits)
+    };
     // Clip paths and masks are drawn too, but no bounding box covers them.
     let clips_fit = tree.clip_paths().iter().all(|c| group_fits(c.root()));
     let masks_fit = tree
@@ -992,6 +1001,19 @@ mod tests {
         let d = decode(big.as_bytes()).unwrap();
         assert_eq!(d.natural, (5000, 2500));
         assert_eq!((d.bitmap.w, d.bitmap.h), (STORE_SIDE, STORE_SIDE / 2));
+    }
+
+    #[test]
+    fn svg_groups_that_draw_nothing_are_fine() {
+        // Empty, see-through, and clipped to nothing: no layer or stroke box.
+        let svg = format!(
+            "<svg {NS} width='4' height='2'><defs><clipPath id='c'><rect width='0' height='0'/></clipPath></defs>\
+             <g opacity='0.5'/><g opacity='0.5' clip-path='url(#c)'><rect width='4' height='2' fill='red'/></g>\
+             <rect width='1' height='1' fill='#00f'/></svg>"
+        );
+        let d = decode(svg.as_bytes()).unwrap();
+        assert_eq!(at(&d, 0, 0), [0, 0, 255, 255]);
+        assert_eq!(at(&d, 3, 1)[3], 0, "the clipped-away rect isn't drawn");
     }
 
     #[test]
