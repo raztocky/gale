@@ -23,3 +23,9 @@ updates:
       interval: weekly
     cooldown:
       default-days: 7
+    groups:
+      # Every github/codeql-action step in a workflow must be on the same
+      # version, so they're updated together in one PR.
+      codeql-action:
+        patterns:
+          - "github/codeql-action*"
